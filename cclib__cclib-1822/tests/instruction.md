@@ -1,0 +1,122 @@
+# Issue
+
+**Title:** Update codecov/codecov-action action to v5.5.5
+
+## Description
+
+This PR contains the following updates:
+
+| Package | Type | Update | Change |
+|---|---|---|---|
+| [codecov/codecov-action](https://redirect.github.com/codecov/codecov-action) | action | minor | `v5.4.3` → `v5.5.5` |
+
+---
+
+### Release Notes
+
+<details>
+<summary>codecov/codecov-action (codecov/codecov-action)</summary>
+
+### [`v5.5.5`](https://redirect.github.com/codecov/codecov-action/releases/tag/v5.5.5)
+
+[Compare Source](https://redirect.github.com/codecov/codecov-action/compare/v5.5.4...v5.5.5)
+
+This release only contains the keybase.io change as described .
+
+**Full Changelog**: <https://github.com/codecov/codecov-action/compare/v5.5.4...v5.5.5>
+
+### [`v5.5.4`](https://redirect.github.com/codecov/codecov-action/releases/tag/v5.5.4)
+
+[Compare Source](https://redirect.github.com/codecov/codecov-action/compare/v5.5.3...v5.5.4)
+
+This is a mirror of `v5.5.2`. `v6` will be released which requires `node24`
+
+##### What's Changed
+
+- Revert "build(deps): bump actions/github-script from 7.0.1 to 8.0.0" by [@&#8203;thomasrockhu-codecov](https://redirect.github.com/thomasrockhu-codecov) in
+- chore(release): 5.5.4 by [@&#8203;thomasrockhu-codecov](https://redirect.github.com/thomasrockhu-codecov) in
+
+**Full Changelog**: <https://github.com/codecov/codecov-action/compare/v5.5.3...v5.5.4>
+
+### [`v5.5.3`](https://redirect.github.com/codecov/codecov-action/releases/tag/v5.5.3)
+
+[Compare Source](https://redirect.github.com/codecov/codecov-action/compare/v5.5.2...v5.5.3)
+
+#### What's Changed
+
+- build(deps): bump actions/github-script from 7.0.1 to 8.0.0 by [@&#8203;dependabot](https://redirect.github.com/dependabot)\[bot] in
+- chore(release): bump to 5.5.3 by [@&#8203;thomasrockhu-codecov](https://redirect.github.com/thomasrockhu-codecov) in
+
+**Full Changelog**: <https://github.com/codecov/codecov-action/compare/v5.5.2...v5.5.3>
+
+### [`v5.5.2`](https://redirect.github.com/codecov/codecov-action/blob/HEAD/CHANGELOG.md#v552)
+
+[Compare Source](https://redirect.github.com/codecov/codecov-action/compare/v5.5.1...v5.5.2)
+
+##### What's Changed
+
+**Full Changelog**: <https://github.com/codecov/codecov-action/compare/v5.5.1..v5.5.2>
+
+### [`v5.5.1`](https://redirect.github.com/codecov/codecov-action/blob/HEAD/CHANGELOG.md#v551)
+
+[Compare Source](https://redirect.github.com/codecov/codecov-action/compare/v5.5.0...v5.5.1)
+
+##### What's Changed
+
+- fix: overwrite pr number on fork by [@&#8203;thomasrockhu-codecov](https://redirect.github.com/thomasrockhu-codecov) in
+- build(deps): bump actions/checkout from 4.2.2 to 5.0.0 by [@&#8203;app/dependabot](https://redirect.github.com/app/dependabot) in
+- build(deps): bump github/codeql-action from 3.29.9 to 3.29.11 by [@&#8203;app/dependabot](https://redirect.github.com/app/dependabot) in
+- fix: update to use local app/ dir by [@&#8203;thomasrockhu-codecov](https://redirect.github.com/thomasrockhu-codecov) in
+- docs: fix typo in README by [@&#8203;datalater](https://redirect.github.com/datalater) in
+- Document a `codecov-cli` version reference example by [@&#8203;webknjaz](https://redirect.github.com/webknjaz) in
+- build(deps): bump github/codeql-action from 3.28.18 to 3.29.9 by [@&#8203;app/dependabot](https://redirect.github.com/app/dependabot) in
+- build(deps): bump ossf/scorecard-action from 2.4.1 to 2.4.2 by [@&#8203;app/dependabot](https://redirect.github.com/app/dependabot) in
+
+**Full Changelog**: <https://github.com/codecov/codecov-action/compare/v5.5.0..v5.5.1>
+
+### [`v5.5.0`](https://redirect.github.com/codecov/codecov-action/blob/HEAD/CHANGELOG.md#v550)
+
+[Compare Source](https://redirect.github.com/codecov/codecov-action/compare/v5.4.3...v5.5.0)
+
+##### What's Changed
+
+- feat: upgrade wrapper to 0.2.4 by [@&#8203;jviall](https://redirect.github.com/jviall) in
+- Pin actions/github-script by Git SHA by [@&#8203;martincostello](https://redirect.github.com/martincostello) in
+- fix: check reqs exist by [@&#8203;joseph-sentry](https://redirect.github.com/joseph-sentry) in
+- fix: Typo in README by [@&#8203;spalmurray](https://redirect.github.com/spalmurray) in
+- docs: Refine OIDC docs by [@&#8203;spalmurray](https://redirect.github.com/spalmurray) in
+- build(deps): bump github/codeql-action from 3.28.17 to 3.28.18 by [@&#8203;app/dependabot](https://redirect.github.com/app/dependabot) in
+
+**Full Changelog**: <https://github.com/codecov/codecov-action/compare/v5.4.3..v5.5.0>
+
+</details>
+
+---
+
+### Configuration
+
+📅 **Schedule**: (UTC)
+
+- Branch creation
+  - At any time (no schedule defined)
+- Automerge
+  - At any time (no schedule defined)
+
+🚦 **Automerge**: Enabled.
+
+♻ **Rebasing**: Whenever PR is behind base branch, or you tick the rebase/retry checkbox.
+
+🔕 **Ignore**: Close this PR and you won't be reminded about this update again.
+
+---
+
+ - [ ] <!-- rebase-check -->If you want to rebase/retry this PR, check this box
+
+---
+
+This PR was generated by [Mend Renovate](https://mend.io/renovate/). View the [repository job log](https://developer.mend.io/github/cclib/cclib).
+<!--renovate-debug:eyJjcmVhdGVkSW5WZXIiOiI0My4yMTkuMCIsInVwZGF0ZWRJblZlciI6IjQzLjIxOS4wIiwidGFyZ2V0QnJhbmNoIjoibWFzdGVyIiwibGFiZWxzIjpbImRlcGVuZGVuY2llcyIsImdpdGh1Yl9hY3Rpb25zIl19-->
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `03b1c74b518f`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

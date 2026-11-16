@@ -1,0 +1,497 @@
+diff --git a/bofire/protocols.py b/bofire/protocols.py
+new file mode 100644
+index 000000000..9c259b2f8
+--- /dev/null
++++ b/bofire/protocols.py
+@@ -0,0 +1,28 @@
++from typing import Protocol
++
++import pandas as pd
++
++from bofire.data_models.domain.api import Inputs, Outputs
++
++
++class Predictor(Protocol):
++    """Protocol for a predictor, which can be either a surrogate or a predictive strategy."""
++
++    @property
++    def is_fitted(self) -> bool:
++        """Check if the predictor is fitted."""
++        ...
++
++    def predict(self, experiments: pd.DataFrame) -> pd.DataFrame:
++        """Predict using the predictor."""
++        ...
++
++    @property
++    def inputs(self) -> Inputs:
++        """Get the inputs of the predictor."""
++        ...
++
++    @property
++    def outputs(self) -> Outputs:
++        """Get the outputs of the predictor."""
++        ...
+diff --git a/bofire/strategies/predictives/predictive.py b/bofire/strategies/predictives/predictive.py
+index 991b81960..22efd1c68 100644
+--- a/bofire/strategies/predictives/predictive.py
++++ b/bofire/strategies/predictives/predictive.py
+@@ -1,8 +1,9 @@
+ from abc import abstractmethod
+-from typing import List, Optional, Tuple
++from typing import Dict, List, Optional, Tuple
+ 
+ import numpy as np
+ import pandas as pd
++import shap
+ from pydantic import PositiveInt
+ 
+ from bofire.data_models.features.task import TaskInput
+@@ -11,6 +12,7 @@
+ from bofire.strategies.data_models.candidate import Candidate
+ from bofire.strategies.data_models.values import InputValue, OutputValue
+ from bofire.strategies.strategy import Strategy
++from bofire.surrogates.feature_importance import shap_importance
+ from bofire.utils.naming_conventions import (
+     get_column_names,
+     postprocess_categorical_predictions,
+@@ -29,7 +31,12 @@ def __init__(
+         **kwargs,
+     ):
+         super().__init__(data_model=data_model, **kwargs)
+-        self.is_fitted = False
++        self._is_fitted = False
++
++    @property
++    def is_fitted(self) -> bool:
++        """Check if the strategy is fitted."""
++        return self._is_fitted
+ 
+     @property
+     @abstractmethod
+@@ -134,6 +141,30 @@ def tell(
+             # initializing the ACQF.
+             self._tell()
+ 
++    def calc_shap(self, candidates: pd.DataFrame) -> Dict[str, shap.Explanation]:
++        """Calculate SHAP values for the provided candidates.
++
++        Args:
++            candidates (pd.DataFrame): Candidates for which SHAP values should
++                be calculated.
++
++        Returns:
++            Dict[str, shap.Explanation]: Dictionary with SHAP values for each
++                output feature.
++
++        """
++        if not self.is_fitted:
++            raise ValueError("Model not yet fitted.")
++        if self.experiments is None:
++            raise ValueError(
++                "No experiments available. Strategy needs experiments to perform "
++                "SHAP calculations. Use `tell` to provide experimental data.",
++            )
++
++        return shap_importance(
++            predictor=self, bg_experiments=self.experiments, experiments=candidates
++        )
++
+     def predict(self, experiments: pd.DataFrame) -> pd.DataFrame:
+         """Run predictions for the provided experiments. Only input features
+         have to be provided.
+@@ -196,7 +227,7 @@ def fit(self):
+         self.domain.validate_experiments(self.experiments, strict=True)
+         # transformed = self.transformer.fit_transform(self.experiments)
+         self._fit(self.experiments)
+-        self.is_fitted = True
++        self._is_fitted = True
+ 
+     @abstractmethod
+     def _fit(self, experiments: pd.DataFrame):
+diff --git a/bofire/strategies/strategy.py b/bofire/strategies/strategy.py
+index 29834cb85..50aa36dfd 100644
+--- a/bofire/strategies/strategy.py
++++ b/bofire/strategies/strategy.py
+@@ -6,7 +6,7 @@
+ import pandas as pd
+ from pydantic import PositiveInt
+ 
+-from bofire.data_models.domain.domain import Domain
++from bofire.data_models.domain.domain import Domain, Inputs, Outputs
+ from bofire.data_models.features.api import ContinuousInput
+ from bofire.data_models.strategies.api import Strategy as DataModel
+ from bofire.strategies.data_models.candidate import Candidate
+@@ -44,6 +44,16 @@ def domain(self) -> Domain:
+         """Returns the domain of the strategy."""
+         return self._data_model.domain
+ 
++    @property
++    def inputs(self) -> Inputs:
++        """Shortcut to access the inputs of the strategy's domain."""
++        return self.domain.inputs
++
++    @property
++    def outputs(self) -> Outputs:
++        """Shortcut to access the outputs of the strategy's domain."""
++        return self.domain.outputs
++
+     def _get_seed(self) -> int:
+         """Returns an integer sampled from the strategies random number generator,
+         that can be used to seed dependent generators.
+diff --git a/bofire/surrogates/feature_importance.py b/bofire/surrogates/feature_importance.py
+index 60ebe556d..83b852121 100644
+--- a/bofire/surrogates/feature_importance.py
++++ b/bofire/surrogates/feature_importance.py
+@@ -1,10 +1,14 @@
+ from collections.abc import Sequence
++from functools import partial
+ from typing import Dict, Optional
+ 
+ import numpy as np
+ import pandas as pd
++import shap
+ 
+ from bofire.data_models.enum import RegressionMetricsEnum
++from bofire.data_models.features.api import ContinuousOutput
++from bofire.protocols import Predictor
+ from bofire.surrogates.diagnostics import metrics
+ from bofire.surrogates.single_task_gp import SingleTaskGPSurrogate
+ from bofire.surrogates.surrogate import Surrogate
+@@ -69,6 +73,142 @@ def combine_lengthscale_importances(importances: Sequence[pd.Series]) -> pd.Data
+     return pd.concat(importances, axis=1).T
+ 
+ 
++def shap_importance(
++    predictor: Predictor,
++    experiments: pd.DataFrame,
++    bg_experiments: Optional[pd.DataFrame] = None,
++    bg_sample_size: Optional[int] = 50,
++    seed: Optional[int] = None,
++) -> Dict[str, shap.Explanation]:
++    """Compute the SHAP importance values for a surrogate or a strategy
++    and returns a dictionary with the SHAP explanations for each continuous
++    output key.
++
++    Args:
++        surrogate: Surrogate for which the SHAP values should be computed.
++        experiments: Experiments for which the SHAP values should be computed.
++        bg_experiments: Background experiments to use for the kernel SHAP
++            computation. Defaults to None, in which case `experiments` is used.
++        bg_sample_size: Sample size of the background experiments. If None, all
++            background experiments are used. Defaults to 50.
++        seed: Seed for the random sampler used to sample the background
++            experiments if bg_sample_size is provided. If None, no seed is set.
++            Defaults to None.
++    """
++    if not predictor.is_fitted:
++        raise ValueError("Model is not fitted yet.")
++
++    if bg_experiments is None:
++        bg_experiments = experiments
++
++    assert isinstance(bg_experiments, pd.DataFrame)  # only for the type checker
++    if bg_sample_size is not None:
++        if len(bg_experiments) > bg_sample_size:  # type: ignore
++            bg_experiments = bg_experiments.sample(  # type: ignore
++                n=bg_sample_size, random_state=seed, replace=False
++            )
++
++    # we need to define a predict function that can be used by the shap explainer
++    def predict(X: np.ndarray, output_key: str) -> np.ndarray:
++        """Predict function for the surrogate."""
++        preds = predictor.predict(
++            pd.DataFrame(
++                X, columns=predictor.inputs.get_keys()
++            )  # get the correct column names here
++        )[output_key + "_pred"].to_numpy()
++        return preds
++
++    explanations = {}
++
++    for output_key in predictor.outputs.get_keys(ContinuousOutput):
++        explainer = shap.KernelExplainer(
++            model=partial(predict, output_key=output_key),
++            data=bg_experiments[predictor.inputs.get_keys()],  # type: ignore
++            link="identity",
++        )
++        explanations[output_key] = explainer(
++            experiments[predictor.inputs.get_keys()].to_numpy(), silent=True
++        )
++
++    return explanations
++
++
++def shap_importance_hook(
++    surrogate: Surrogate,
++    X_train: pd.DataFrame,
++    y_train: pd.DataFrame,
++    X_test: pd.DataFrame,
++    y_test: pd.DataFrame,
++):
++    """Hook that can be used within `model.cross_validate` to compute a cross
++    validated SHAP feature importance.
++    """
++    return shap_importance(
++        predictor=surrogate,
++        experiments=X_test,
++        bg_experiments=X_train,
++        bg_sample_size=50,
++        seed=42,
++    )
++
++
++def combine_shap_importances(
++    shap_values: Sequence[Dict[str, shap.Explanation]],
++) -> Dict[str, shap.Explanation]:
++    """Combines a sequence of  dictionaries of SHAP explanations into one dictionary of
++    SHAP explanations.
++
++    Args:
++        shap_values: List of SHAP Explanation objects to combine.
++
++    Returns:
++        Combined SHAP Explanation object.
++    """
++
++    def _combine_shap_explanations(
++        explanations: Sequence[shap.Explanation],
++    ) -> shap.Explanation:
++        """Combines a sequence of SHAP explanations into one SHAP explanation."""
++
++        # Check if all explanations have the same feature names
++        feature_names = explanations[0].feature_names
++        for expl in explanations[1:]:
++            if expl.feature_names != feature_names:
++                raise ValueError(
++                    "All SHAP explanations must have the same feature names."
++                )
++
++        return shap.Explanation(
++            values=np.concatenate([expl.values for expl in explanations], axis=0),
++            base_values=np.concatenate(
++                [expl.base_values for expl in explanations], axis=0
++            ),
++            data=np.concatenate([expl.data for expl in explanations], axis=0),
++            display_data=None,
++            instance_names=None,
++            feature_names=explanations[0].feature_names,
++            output_names=None,
++            output_indexes=None,
++            lower_bounds=None,
++            upper_bounds=None,
++            error_std=None,
++            main_effects=None,
++            hierarchical_values=None,
++            clustering=None,
++        )
++
++    keys = shap_values[0].keys()
++    if not all(key in sv for sv in shap_values for key in keys):
++        raise ValueError("All SHAP values must contain the same keys.")
++
++    combined_shap_values = {}
++    for key in keys:
++        combined_shap_values[key] = _combine_shap_explanations(
++            [sv[key] for sv in shap_values]
++        )
++    return combined_shap_values
++
++
+ def permutation_importance(
+     surrogate: Surrogate,
+     X: pd.DataFrame,
+diff --git a/bofire/surrogates/surrogate.py b/bofire/surrogates/surrogate.py
+index 6495bfcbf..6a360bd8a 100644
+--- a/bofire/surrogates/surrogate.py
++++ b/bofire/surrogates/surrogate.py
+@@ -36,10 +36,8 @@ def is_fitted(self) -> bool:
+         """Return True if model is fitted, else False."""
+         return self.model is not None
+ 
+-    def predict(self, X: pd.DataFrame) -> pd.DataFrame:
+-        # check if model is fitted
+-        if not self.is_fitted:
+-            raise ValueError("Model is not fitted/available yet.")
++    def _prepare_data_for_predict(self, X: pd.DataFrame) -> pd.DataFrame:
++        """Prepare the data for prediction."""
+         # validate
+         X = self.inputs.validate_experiments(X, strict=False)
+         # transform
+@@ -47,6 +45,14 @@ def predict(self, X: pd.DataFrame) -> pd.DataFrame:
+         # make sure that all is float64
+         for c in Xt.columns:
+             Xt[c] = pd.to_numeric(Xt[c], errors="raise")
++        return Xt
++
++    def predict(self, experiments: pd.DataFrame) -> pd.DataFrame:
++        # check if model is fitted
++        if not self.is_fitted:
++            raise ValueError("Model is not fitted/available yet.")
++        # prepare data
++        Xt = self._prepare_data_for_predict(experiments)
+         # predict
+         preds, stds = self._predict(Xt)
+         # set up column names
+diff --git a/pyproject.toml b/pyproject.toml
+index d86294723..c3f5ad90b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -41,6 +41,7 @@ optimization = [
+     "cvxpy[CLARABEL,SCIP]",
+     "scikit-learn>=1.0.0,<1.6",
+     "pymoo>=0.6.0",
++    "shap>=0.48.0",
+ ]
+ entmoot = ["entmoot>=2.0.6"]
+ xgb = ["xgboost>=1.7.5"]
+@@ -87,6 +88,7 @@ all = [
+     "matplotlib",
+     "seaborn",
+     "pymoo>=0.6.0",
++    "shap>=0.48.0",
+ ]
+ 
+ [tool.setuptools.packages]
+diff --git a/tests/bofire/strategies/test_sobo.py b/tests/bofire/strategies/test_sobo.py
+index 6bcd2aed8..d549bfcfb 100644
+--- a/tests/bofire/strategies/test_sobo.py
++++ b/tests/bofire/strategies/test_sobo.py
+@@ -103,6 +103,19 @@ def test_SOBO_get_acqf(acqf, expected):
+     assert isinstance(acqfs[0], expected)
+ 
+ 
++def test_SOBO_calc_shap():
++    benchmark = Himmelblau()
++    experiments = benchmark.f(benchmark.domain.inputs.sample(5), return_complete=True)
++    samples = benchmark.domain.inputs.sample(2)
++    data_model = data_models.SoboStrategy(
++        domain=benchmark.domain,
++        acquisition_function=qLogEI(),
++    )
++    strategy = SoboStrategy(data_model=data_model)
++    strategy.tell(experiments=experiments)
++    strategy.calc_shap(samples)
++
++
+ def test_SOBO_calc_acquisition():
+     benchmark = Himmelblau()
+     experiments = benchmark.f(benchmark.domain.inputs.sample(10), return_complete=True)
+diff --git a/tests/bofire/strategies/test_strategy.py b/tests/bofire/strategies/test_strategy.py
+index 59f5bc11d..7f32f3992 100644
+--- a/tests/bofire/strategies/test_strategy.py
++++ b/tests/bofire/strategies/test_strategy.py
+@@ -556,6 +556,6 @@ def test_predictive_strategy_predict_not_ready(domain):
+     candidates = generate_candidates(domain=domain)
+     with pytest.raises(ValueError, match="Model not yet fitted."):
+         strategy.predict(candidates)
+-    strategy.is_fitted = True
++    strategy._is_fitted = True
+     with pytest.raises(ValueError, match="No experiments available."):
+         strategy.predict(candidates)
+diff --git a/tests/bofire/surrogates/test_feature_importance.py b/tests/bofire/surrogates/test_feature_importance.py
+index 02ad24c1d..e02e72169 100644
+--- a/tests/bofire/surrogates/test_feature_importance.py
++++ b/tests/bofire/surrogates/test_feature_importance.py
+@@ -1,20 +1,26 @@
+ import numpy as np
+ import pandas as pd
+ import pytest
++import shap
+ 
+ import bofire.surrogates.api as surrogates
++from bofire.benchmarks.api import DTLZ2
+ from bofire.data_models.domain.api import Inputs, Outputs
+ from bofire.data_models.features.api import ContinuousInput, ContinuousOutput
+ from bofire.data_models.kernels.api import RBFKernel, ScaleKernel
+ from bofire.data_models.surrogates.api import SingleTaskGPSurrogate
++from bofire.strategies.api import MoboStrategy
+ from bofire.surrogates.diagnostics import metrics
+ from bofire.surrogates.feature_importance import (
+     combine_lengthscale_importances,
+     combine_permutation_importances,
++    combine_shap_importances,
+     lengthscale_importance,
+     lengthscale_importance_hook,
+     permutation_importance,
+     permutation_importance_hook,
++    shap_importance,
++    shap_importance_hook,
+ )
+ 
+ 
+@@ -40,6 +46,74 @@ def get_model_and_data():
+     return model, experiments
+ 
+ 
++def test_shap_importance_for_surrogate():
++    model, experiments = get_model_and_data()
++    surrogate_data = SingleTaskGPSurrogate(
++        inputs=model.inputs,
++        outputs=model.outputs,
++    )
++    surrogate = surrogates.map(surrogate_data)
++    surrogate.fit(experiments)
++    importance = shap_importance(
++        predictor=surrogate, experiments=experiments, bg_experiments=experiments
++    )
++    assert sorted(importance.keys()) == sorted(surrogate.outputs.get_keys())
++    assert isinstance(importance["y"], shap.Explanation)
++    # now we test the hook
++    X = experiments[model.inputs.get_keys()]
++    y = experiments[["y"]]
++    importance = shap_importance_hook(
++        surrogate=surrogate, X_train=X, y_train=y, X_test=X, y_test=y
++    )
++    assert sorted(importance.keys()) == sorted(surrogate.outputs.get_keys())
++    assert isinstance(importance["y"], shap.Explanation)
++
++
++def test_shap_importance_for_predictive_strategy():
++    # we use here a MO benchmark to check that it works also over multiple outputs
++    bench = DTLZ2(dim=6)
++    experiments = bench.f(bench.domain.inputs.sample(n=10), return_complete=True)
++    candidates = bench.domain.inputs.sample(n=4)
++    strategy = MoboStrategy.make(domain=bench.domain)
++    strategy.tell(experiments=experiments)
++    importance = shap_importance(
++        predictor=strategy, bg_experiments=strategy.experiments, experiments=candidates
++    )
++    assert sorted(importance.keys()) == sorted(strategy.domain.outputs.get_keys())
++    for key in importance.keys():
++        assert isinstance(importance[key], shap.Explanation)
++        assert len(importance[key].values) == len(candidates)
++        assert len(importance[key].data) == len(candidates)
++        assert len(importance[key].feature_names) == len(
++            strategy.domain.inputs.get_keys()
++        )
++
++
++def test_combine_shap_importances():
++    model, experiments = get_model_and_data()
++    surrogate_data = SingleTaskGPSurrogate(
++        inputs=model.inputs,
++        outputs=model.outputs,
++    )
++    surrogate = surrogates.map(surrogate_data)
++    _, _, pi = surrogate.cross_validate(
++        experiments=experiments,
++        folds=3,
++        hooks={"shap_importance": shap_importance_hook},
++    )
++
++    assert isinstance(pi["shap_importance"], list)
++    assert len(pi["shap_importance"]) == 3
++    combined = combine_shap_importances(
++        shap_values=pi["shap_importance"],
++    )
++    assert isinstance(combined, dict)
++    assert isinstance(combined["y"], shap.Explanation)
++    assert len(combined["y"].values) == len(experiments)
++    assert len(combined["y"].data) == len(experiments)
++    assert len(combined["y"].feature_names) == len(surrogate.inputs.get_keys())
++
++
+ def test_lengthscale_importance_invalid():
+     model, experiments = get_model_and_data()
+     for kernel in [ScaleKernel(base_kernel=RBFKernel(ard=False)), RBFKernel(ard=False)]:

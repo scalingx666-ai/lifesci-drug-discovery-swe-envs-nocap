@@ -1,0 +1,1054 @@
+diff --git a/.github/workflows/gxy-autoupdate.yml b/.github/workflows/gxy-autoupdate.yml
+index a9e5e55f7a..f8d494223b 100644
+--- a/.github/workflows/gxy-autoupdate.yml
++++ b/.github/workflows/gxy-autoupdate.yml
+@@ -61,7 +61,7 @@ jobs:
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.12'
+-      - run: pip install --no-cache-dir gxy-tool-bot==0.2.1
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
+       - name: Detect outdated tools
+         id: detect
+         env:
+@@ -120,12 +120,40 @@ jobs:
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.12'
+-      - run: pip install --no-cache-dir gxy-tool-bot==0.2.1
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
+       - run: pip install "planemo>=0.75.43"
+       - name: Install micromamba
+         run: |
+           curl -Ls "https://micro.mamba.pm/api/micromamba/linux-64/latest" | tar -xvj -C /tmp
+           echo "/tmp/bin" >> $GITHUB_PATH
++      # planemo_test / run_in_conda run model-chosen commands next to the LLM
++      # key and a write token. The bot runs them as this unprivileged user
++      # (GXY_TOOL_BOT_EXEC_USER), which can't read the bot process's
++      # environment. The bot writes its output outside the runner's home,
++      # which stays closed to that user.
++      - name: Create the exec user
++        id: exec_user
++        run: |
++          # An older gxy-tool-bot ignores GXY_TOOL_BOT_EXEC_USER and would run the
++          # model's commands as this user, next to the key: refuse it.
++          python -c "from gxy_tool_bot.generator import _run_model_command" || {
++            echo "::error::This gxy-tool-bot can't run commands as another user; update it"; exit 1; }
++          sudo useradd -M -s /usr/sbin/nologin gxyexec
++          # The runner runs cron: without this, a crontab outlives the pkill below.
++          echo gxyexec | sudo tee -a /etc/cron.deny >/dev/null
++          if sudo -u gxyexec sudo -n true 2>/dev/null || sudo -u gxyexec docker ps >/dev/null 2>&1; then
++            echo "::error::gxyexec must have neither sudo nor docker"
++            exit 1
++          fi
++          # Everything of the runner's (workspace, RUNNER_TEMP) is under its home.
++          if sudo -u gxyexec test -r "$HOME" -o -x "$HOME"; then
++            echo "::error::gxyexec can reach $HOME"
++            exit 1
++          fi
++          WORK=$(mktemp -d /tmp/gxy-work.XXXXXX)
++          chmod 755 "$WORK"
++          echo "GXY_TOOL_BOT_EXEC_USER=gxyexec" >> "$GITHUB_ENV"
++          echo "WORK=$WORK" >> "$GITHUB_ENV"
+       - name: Run autoupdate
+         id: autoupdate
+         env:
+@@ -147,11 +175,35 @@ jobs:
+           gxy-tool-bot autoupdate \
+             --tool-dir "tools/$TOOL_DIR" \
+             --config .gxy-tool-bot.yml \
+-            --output generated/ \
++            --output "$WORK/generated" \
+             --commit-msg-path $GITHUB_WORKSPACE/.commit-msg \
+             --pr-body-path $GITHUB_WORKSPACE/.pr-body \
+             --pr-title-path $GITHUB_WORKSPACE/.pr-title \
+             "${OVERRIDE_ARGS[@]}"
++      # Before this job touches the files again: nothing of gxyexec's may keep
++      # running, and the output may hold only plain files and dirs (a link
++      # would be followed by the steps below). The steps below use a snapshot
++      # in generated/, which gxyexec can't reach.
++      - name: Stop the exec user and check the output
++        id: isolation
++        if: always() && env.WORK != ''
++        run: |
++          sudo pkill -KILL -u gxyexec || true
++          sudo crontab -r -u gxyexec 2>/dev/null || true
++          sleep 1
++          if pgrep -u gxyexec >/dev/null; then
++            echo "::error::gxyexec still has processes running"
++            exit 1
++          fi
++          rm -rf generated
++          [ -d "$WORK/generated" ] || exit 0
++          cp -a "$WORK/generated" generated
++          if [ -n "$(find generated ! -type f ! -type d)" ]; then
++            echo "::error::The output holds links or special files:"
++            find generated ! -type f ! -type d
++            rm -rf generated
++            exit 1
++          fi
+       - name: Check skip marker
+         id: check
+         if: steps.autoupdate.outcome == 'success'
+@@ -253,7 +305,7 @@ jobs:
+             ${{ github.workspace }}/tools/${{ matrix.tool.tool_dir }}/test-data/*.tar
+           if-no-files-found: ignore
+       - name: Report autoupdate failure
+-        if: steps.autoupdate.outcome == 'failure' || steps.create_pr.outcome == 'failure'
++        if: failure() && (steps.exec_user.outcome == 'failure' || steps.autoupdate.outcome == 'failure' || steps.isolation.outcome == 'failure' || steps.format.outcome == 'failure' || steps.create_pr.outcome == 'failure')
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |
+diff --git a/.github/workflows/gxy-on-fork-pr-review.yml b/.github/workflows/gxy-on-fork-pr-review.yml
+new file mode 100644
+index 0000000000..4d08218bcd
+--- /dev/null
++++ b/.github/workflows/gxy-on-fork-pr-review.yml
+@@ -0,0 +1,187 @@
++# Bot review for PRs from forks.
++#
++# Fork PRs get no secrets on `pull_request`, so this runs on
++# `pull_request_target`, in the base repository with its secrets. That is
++# only safe because nothing from the PR is executed: the job checks out the
++# default branch, extracts the PR's files into a detached worktree as plain
++# data, and the reviewer has no shell tools. Do NOT add a checkout of the PR
++# or any step that runs its content.
++#
++# A maintainer requests a review by applying the `review` (or
++# `tool-bot:review`) label; nothing runs on PR open or new pushes. Triage
++# users can apply labels too, so the job first checks that the labeler has
++# write access; their login is also passed to the bot as --actor for the
++# allowed_maintainers check.
++#
++# Optional extra gate: create a `fork-review` environment with required
++# reviewers (Settings → Environments). Each run then waits for an approval
++# before proceeding, and the approver sees the commit under review. Give it
++# its own GXY_TOOL_BOT_API_KEY to be able to revoke that access on its own.
++# Without the environment, runs proceed as soon as a maintainer labels —
++# still maintainer-gated, just without the explicit confirmation.
++#
++# Deployment note:
++#   - Public repositories block `pull_request_target` by default unless an
++#     Actions event policy allows it (enforced from November 2026). Allow it
++#     for this workflow only:
++#       gh api -X POST repos/OWNER/REPO/actions/policies --input - <<'EOF'
++#       {"name": "fork review", "enforcement": "active",
++#        "conditions": {"workflow_path": {"include": [".github/workflows/gxy-on-fork-pr-review.yml"], "exclude": []}},
++#        "rules": [{"type": "restrict_action_events", "parameters": {"allowed_events": ["pull_request_target"]}}]}
++#       EOF
++on:
++  pull_request_target:
++    types: [labeled]
++
++permissions: {}
++
++# Two jobs so no job holds both the LLM key and a GitHub write token:
++#   review — LLM key, read-only token: reviews the files, writes the comment
++#   post   — write token, no key, no PR content: posts it
++jobs:
++  review:
++    name: Review fork PR
++    # Fork PRs only, and only the review labels count. pull_request_target
++    # runs the workflow from the PR's base branch, so only PRs against the
++    # default branch: an older branch could hold an older copy of this file.
++    if: |
++      github.event.pull_request.head.repo.full_name != github.repository &&
++      github.event.pull_request.base.ref == github.event.repository.default_branch &&
++      (github.event.label.name == 'review' ||
++       github.event.label.name == 'tool-bot:review')
++    runs-on: ubuntu-latest
++    environment: fork-review
++    # A second label (or the other review label) waits instead of reviewing
++    # the same PR in parallel.
++    concurrency:
++      group: fork-review-pr-${{ github.event.pull_request.number }}
++      cancel-in-progress: false
++    permissions:
++      contents: read
++      pull-requests: read
++      actions: read
++      checks: read
++    env:
++      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      PR_NUMBER: ${{ github.event.pull_request.number }}
++      # The commit the reviewer approved — never the branch, which can move.
++      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
++    steps:
++      - name: Check the labeler has write access
++        env:
++          SENDER: ${{ github.event.sender.login }}
++        run: |
++          # "permission" is admin, write (also for maintain), read (also for triage) or none.
++          PERM=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$SENDER/permission" --jq .permission)
++          if [ "$PERM" != "admin" ] && [ "$PERM" != "write" ]; then
++            echo "::error::$SENDER has $PERM access; only users with write access can request a fork review"
++            exit 1
++          fi
++      # The default branch (see the job's if): config and workflow come from
++      # here, not the PR.
++      - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
++      - name: Extract the PR's tool files
++        id: pr_files
++        run: |
++          TOOL_DIR=$(gh pr diff $PR_NUMBER --name-only | grep -oP '^tools/\K[^/]+' | sort -u | head -1)
++          # First character must not be a dot: '.' and '..' pass
++          # [A-Za-z0-9_.-] but resolve outside tools/.
++          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*$ ]]; then
++            echo "No reviewable tool directory under tools/ in this PR (got '$TOOL_DIR')"
++            exit 1
++          fi
++          # The tool dir above comes from the PR as it is now: only review
++          # if that is still the labeled commit.
++          if [ "$(gh pr view $PR_NUMBER --json headRefOid --jq .headRefOid)" != "$HEAD_SHA" ]; then
++            echo "The PR has new commits since the label was applied; apply the label again to review them."
++            exit 1
++          fi
++          git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
++          # A worktree, not `git archive`: archive honors `export-ignore`, so a
++          # PR could hide a file from review with its own .gitattributes.
++          # core.symlinks=false checks links out as plain files holding the
++          # target path: the bot reads tool files following links, so a PR
++          # link to e.g. /proc/self/environ would put the key in the prompt.
++          git -c core.symlinks=false worktree add --detach "$RUNNER_TEMP/pr" "$HEAD_SHA"
++          echo "tool_dir=$TOOL_DIR" >> $GITHUB_OUTPUT
++          echo "Reviewing tools/$TOOL_DIR at $HEAD_SHA"
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.12'
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
++      # The bot offers its planemo_test / run_in_conda (shell) tools whenever
++      # planemo, micromamba or conda is on PATH. The runner image symlinks
++      # /usr/bin/conda.
++      - name: Keep shell tools off PATH
++        run: |
++          sudo rm -f /usr/bin/conda
++          for t in planemo micromamba conda; do
++            if command -v "$t" >/dev/null; then
++              echo "::error::$t is on PATH, the review bot would get shell tools"
++              exit 1
++            fi
++          done
++      - name: Review tool files
++        env:
++          GXY_TOOL_BOT_API_KEY: ${{ secrets.GXY_TOOL_BOT_API_KEY }}
++          GITHUB_REF_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
++          TOOL_DIR: ${{ steps.pr_files.outputs.tool_dir }}
++        run: |
++          # The sender is the maintainer who applied the label — the same
++          # actor semantics as same-repo review.
++          gxy-tool-bot review \
++            --pr $PR_NUMBER \
++            --config .gxy-tool-bot.yml \
++            --tool-dir "$RUNNER_TEMP/pr/tools/$TOOL_DIR" \
++            --actor ${{ github.event.sender.login }} \
++            --comment-dir "$RUNNER_TEMP/comments"
++      - name: Upload comments
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: review-comments
++          path: ${{ runner.temp }}/comments/
++          if-no-files-found: ignore
++
++  post:
++    name: Post review
++    needs: review
++    # Not when the review job was skipped (same-repo PR or another label).
++    # A cancelled or timed-out run still gets its label removed.
++    if: always() && needs.review.result != 'skipped'
++    runs-on: ubuntu-latest
++    permissions:
++      pull-requests: write
++      # Label edits on a PR go through the issues endpoint.
++      issues: write
++    env:
++      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      GH_REPO: ${{ github.repository }}
++      PR_NUMBER: ${{ github.event.pull_request.number }}
++    steps:
++      # Left on, the label would block a re-review (that needs a new label
++      # event).
++      - name: Remove review label
++        run: |
++          gh pr edit $PR_NUMBER --remove-label "tool-bot:review" || true
++          gh pr edit $PR_NUMBER --remove-label "review" || true
++      # The comments are model output: post them as plain bodies, never run them.
++      - uses: actions/download-artifact@v4
++        continue-on-error: true
++        with:
++          name: review-comments
++          path: ${{ runner.temp }}/comments
++      - name: Post comments
++        env:
++          REVIEW_RESULT: ${{ needs.review.result }}
++        run: |
++          shopt -s nullglob
++          files=("$RUNNER_TEMP"/comments/*.md)
++          for f in "${files[@]}"; do
++            gh pr comment $PR_NUMBER --body-file "$f"
++          done
++          if [ "$REVIEW_RESULT" != "success" ] && [ ${#files[@]} -eq 0 ]; then
++            gh pr comment $PR_NUMBER --body "⚠️ Review failed. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
++          fi
+diff --git a/.github/workflows/gxy-on-pr-feedback.yml b/.github/workflows/gxy-on-pr-feedback.yml
+index a510c82cbd..53e1d3fa56 100644
+--- a/.github/workflows/gxy-on-pr-feedback.yml
++++ b/.github/workflows/gxy-on-pr-feedback.yml
+@@ -18,34 +18,43 @@ on:
+         type: string
+         default: ""
+ 
++# Three jobs so no job holds both the LLM key and a GitHub write token:
++#   start   — write token, no key: fork check, status comment, label removal
++#   fix     — LLM key, read-only token: runs the bot on the PR branch and
++#             uploads the edited tool directory, comments and commit message
++#   publish — write token, no key: checks the upload, commits, pushes, posts
++#
++# Shared group with on-pr-review: a review run must wait for a feedback
++# run to finish pushing, or it reports findings on superseded files.
++# Only runs that address feedback join it (same test as the start job): a
++# run for any other label would queue there and cancel a pending review.
++concurrency:
++  group: ${{ (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'tool-bot:address-feedback') || contains(github.event.pull_request.labels.*.name, 'address-feedback')) && format('pr-{0}', github.event.pull_request.number || inputs.pr_number) || github.run_id }}
++  cancel-in-progress: false
++
++env:
++  PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
++
+ jobs:
+-  address-feedback:
+-    name: Address PR Feedback
++  start:
++    name: Start feedback
+     # Dual-match: both the prefixed (tool-bot:*) and original unprefixed label
+     # names trigger. If your repo only has the prefixed labels (e.g. created by
+     # scripts/create-labels.sh), you can drop the unprefixed alternative.
+     if: contains(github.event.pull_request.labels.*.name, 'tool-bot:address-feedback') || contains(github.event.pull_request.labels.*.name, 'address-feedback') || github.event_name == 'workflow_dispatch'
+     runs-on: ubuntu-latest
+     permissions:
+-      contents: write
+       pull-requests: write
++      # Label edits on a PR go through the issues endpoint — without this the
++      # removal below fails silently (|| true) and the trigger label stays on,
++      # so every later `labeled` event re-runs the whole flow.
+       issues: write
+-      actions: read
+-      checks: read
+-    # Shared group with on-pr-review: a review run must wait for a feedback
+-    # run to finish pushing, or it reports findings on superseded files.
+-    concurrency:
+-      group: pr-${{ github.event.pull_request.number || inputs.pr_number }}
+-      cancel-in-progress: false
+     env:
+-      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
++      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      # No checkout in this job — gh needs the repo spelled out.
++      GH_REPO: ${{ github.repository }}
+     steps:
+       - name: Check PR is not from a fork
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-          # gh resolves the repo from git remotes — this step runs before
+-          # checkout, so there is no .git and gh needs GH_REPO explicitly.
+-          GH_REPO: ${{ github.repository }}
+         run: |
+           HEAD_REPO=$(gh pr view $PR_NUMBER --json headRepository --jq '.headRepository.nameWithOwner')
+           if [ "$HEAD_REPO" != "${{ github.repository }}" ]; then
+@@ -54,9 +63,36 @@ jobs:
+             echo "PR head is on fork $HEAD_REPO — feedback requires same-repo branches."
+             exit 1
+           fi
+-      # refs/pull/<N>/head lives on the base repo, so it resolves for fork
+-      # PRs too — and for workflow_dispatch runs, where pull_request is null.
++      - name: Post status comment
++        run: |
++          gh pr comment $PR_NUMBER --body "🔧 Addressing feedback — [view progress](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
++      - name: Remove address-feedback label
++        run: |
++          # Remove whichever spelling(s) exist — prefixed and legacy.
++          gh pr edit $PR_NUMBER --remove-label "tool-bot:address-feedback" || true
++          gh pr edit $PR_NUMBER --remove-label "address-feedback" || true
++
++  fix:
++    name: Address PR Feedback
++    needs: start
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      pull-requests: read
++      actions: read
++      checks: read
++    outputs:
++      tool_dir: ${{ steps.find_tool_dir.outputs.tool_dir }}
++      # Publish commits on top of this commit, so a push made meanwhile
++      # makes its push fail instead of being reverted.
++      sha: ${{ steps.pr.outputs.commit }}
++      # A failed exec-user check or format fails the fix, so publish reports that.
++      outcome: ${{ steps.isolation.outcome == 'success' && steps.format.outcome == 'success' && steps.address.outcome || 'failure' }}
++    steps:
++      # refs/pull/<N>/head lives on the base repo, and also resolves for
++      # workflow_dispatch runs, where pull_request is null.
+       - uses: actions/checkout@v4
++        id: pr
+         with:
+           persist-credentials: false
+           ref: refs/pull/${{ env.PR_NUMBER }}/head
+@@ -65,29 +101,15 @@ jobs:
+         run: |
+           git fetch origin ${{ github.event.repository.default_branch }}
+           git checkout FETCH_HEAD -- .gxy-tool-bot.yml
+-      - name: Post status comment
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          gh pr comment $PR_NUMBER --body "🔧 Addressing feedback — [view progress](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.12'
+-      - run: pip install --no-cache-dir gxy-tool-bot==0.2.1
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
+       - run: pip install "planemo>=0.75.43"
+       - name: Install micromamba
+         run: |
+           curl -Ls "https://micro.mamba.pm/api/micromamba/linux-64/latest" | tar -xvj -C /tmp
+           echo "/tmp/bin" >> $GITHUB_PATH
+-      - name: Remove address-feedback label
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          # Remove whichever spelling(s) exist — prefixed and legacy.
+-          gh pr edit $PR_NUMBER \
+-            --remove-label "tool-bot:address-feedback" || true
+-          gh pr edit $PR_NUMBER \
+-            --remove-label "address-feedback" || true
+       - name: Find tool directory
+         id: find_tool_dir
+         env:
+@@ -113,14 +135,50 @@ jobs:
+           fi
+           # TOOL_DIR feeds 'rm -rf tools/$TOOL_DIR' later — reject anything
+           # that isn't a plain directory name (traversal via a retitled PR).
+-          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_.-]+$ ]]; then
++          # The first character must not be a dot: '.' and '..' would pass
++          # [A-Za-z0-9_.-] but resolve outside tools/.
++          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*$ ]]; then
+             echo "Refusing unsafe tool directory name: $TOOL_DIR"
+             exit 1
+           fi
+           echo "tool_dir=$TOOL_DIR" >> $GITHUB_OUTPUT
+           echo "Found tool directory: $TOOL_DIR"
++      # planemo_test / run_in_conda run model-chosen commands next to the LLM
++      # key. The bot runs them as this unprivileged user
++      # (GXY_TOOL_BOT_EXEC_USER), which can't read the bot process's
++      # environment. It works on a copy of the tool dir outside the runner's
++      # home, which stays closed to it.
++      - name: Create the exec user
++        env:
++          TOOL_DIR: ${{ steps.find_tool_dir.outputs.tool_dir }}
++        run: |
++          # An older gxy-tool-bot ignores GXY_TOOL_BOT_EXEC_USER and would run the
++          # model's commands as this user, next to the key: refuse it.
++          python -c "from gxy_tool_bot.generator import _run_model_command" || {
++            echo "::error::This gxy-tool-bot can't run commands as another user; update it"; exit 1; }
++          sudo useradd -M -s /usr/sbin/nologin gxyexec
++          # The runner runs cron: without this, a crontab outlives the pkill below.
++          echo gxyexec | sudo tee -a /etc/cron.deny >/dev/null
++          if sudo -u gxyexec sudo -n true 2>/dev/null || sudo -u gxyexec docker ps >/dev/null 2>&1; then
++            echo "::error::gxyexec must have neither sudo nor docker"
++            exit 1
++          fi
++          # Everything of the runner's (workspace, RUNNER_TEMP) is under its home.
++          if sudo -u gxyexec test -r "$HOME" -o -x "$HOME"; then
++            echo "::error::gxyexec can reach $HOME"
++            exit 1
++          fi
++          WORK=$(mktemp -d /tmp/gxy-work.XXXXXX)
++          cp -a "tools/$TOOL_DIR" "$WORK/"
++          # Not writable for gxyexec: it could swap the tool dir for a link. The bot
++          # opens the tool dir itself to it.
++          chmod 755 "$WORK"
++          echo "GXY_TOOL_BOT_EXEC_USER=gxyexec" >> "$GITHUB_ENV"
++          echo "WORK_TOOL_DIR=$WORK/$TOOL_DIR" >> "$GITHUB_ENV"
+       - name: Address feedback
+         id: address
++        # Failures are reported by the publish job.
++        continue-on-error: true
+         env:
+           GXY_TOOL_BOT_API_KEY: ${{ secrets.GXY_TOOL_BOT_API_KEY }}
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+@@ -138,47 +196,158 @@ jobs:
+           gxy-tool-bot address-feedback \
+             --pr $PR_NUMBER \
+             --config .gxy-tool-bot.yml \
+-            --tool-dir tools/${{ steps.find_tool_dir.outputs.tool_dir }} \
++            --tool-dir "$WORK_TOOL_DIR" \
+             --actor ${{ github.event.sender.login || 'manual' }} \
+-            --commit-msg-path $GITHUB_WORKSPACE/.commit-msg \
++            --commit-msg-path "$RUNNER_TEMP/result/commit-msg" \
++            --comment-dir "$RUNNER_TEMP/result/comments" \
+             "${OVERRIDE_ARGS[@]}"
++      # Before this job touches the files again: nothing of gxyexec's may keep
++      # running, and the tool dir may hold only plain files and dirs (a link
++      # would be followed by the steps below and by the upload). The steps
++      # below use a snapshot in RUNNER_TEMP, which gxyexec can't reach.
++      - name: Stop the exec user and check the tool dir
++        id: isolation
++        if: always() && env.WORK_TOOL_DIR != ''
++        env:
++          TOOL_DIR: ${{ steps.find_tool_dir.outputs.tool_dir }}
++        run: |
++          sudo pkill -KILL -u gxyexec || true
++          sudo crontab -r -u gxyexec 2>/dev/null || true
++          sleep 1
++          if pgrep -u gxyexec >/dev/null; then
++            echo "::error::gxyexec still has processes running"
++            exit 1
++          fi
++          cp -a "$WORK_TOOL_DIR" "$RUNNER_TEMP/tool"
++          # Links are allowed only where the PR has the same link (some tools
++          # keep links in test-data).
++          # Keep this check in sync with "Check result" in the publish job.
++          BAD=$(cd "$RUNNER_TEMP/tool" && find . ! -type f ! -type d | while IFS= read -r p; do
++            orig="$GITHUB_WORKSPACE/tools/$TOOL_DIR/$p"
++            if [ -L "$p" ] && [ -L "$orig" ] && [ "$(readlink "$p")" = "$(readlink "$orig")" ]; then continue; fi
++            echo "$p"
++          done)
++          if [ -n "$BAD" ]; then
++            echo "::error::The tool dir holds new links or special files:"
++            echo "$BAD"
++            exit 1
++          fi
+       - name: Format updated XML with planemo
+-        if: steps.address.outcome == 'success'
++        id: format
++        if: steps.address.outcome == 'success' && steps.isolation.outcome == 'success'
++        run: |
++          planemo format --recursive "$RUNNER_TEMP/tool/"
++      - name: Collect result
++        if: always()
++        run: |
++          mkdir -p "$RUNNER_TEMP/result"
++          if [ "${{ steps.address.outcome }}" = "success" ] && [ "${{ steps.isolation.outcome }}" = "success" ]; then
++            cp -a "$RUNNER_TEMP/tool" "$RUNNER_TEMP/result/tool"
++            rm -f "$RUNNER_TEMP/result/tool/.tool-name"
++          fi
++          # Flag files the CLI writes for the publish job.
++          for f in .gave-up .validation-failed; do
++            [ -f "$GITHUB_WORKSPACE/$f" ] && cp "$GITHUB_WORKSPACE/$f" "$RUNNER_TEMP/result/"
++          done
++          # An artifact stores every file as 644: a tarball keeps the
++          # executable bits and the PR's links.
++          tar -C "$RUNNER_TEMP" -cf "$RUNNER_TEMP/result.tar" result
++      - name: Upload result
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: feedback-result
++          path: ${{ runner.temp }}/result.tar
++          if-no-files-found: ignore
++
++  publish:
++    name: Publish feedback
++    needs: [start, fix]
++    if: always() && needs.start.result == 'success'
++    runs-on: ubuntu-latest
++    permissions:
++      contents: write
++      pull-requests: write
++    env:
++      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      TOOL_DIR: ${{ needs.fix.outputs.tool_dir }}
++      FIX_OUTCOME: ${{ needs.fix.outputs.outcome }}
++    steps:
++      # The commit the fix job worked on, not the branch as it is now.
++      - uses: actions/checkout@v4
++        with:
++          persist-credentials: false
++          ref: ${{ needs.fix.outputs.sha || format('refs/pull/{0}/head', env.PR_NUMBER) }}
++          fetch-depth: 0
++      # Everything in the artifact is model output: copy it as data, never run it.
++      - uses: actions/download-artifact@v4
++        continue-on-error: true
++        with:
++          name: feedback-result
++          path: ${{ runner.temp }}/artifact
++      - name: Unpack result
++        run: |
++          if [ -f "$RUNNER_TEMP/artifact/result.tar" ]; then
++            tar -C "$RUNNER_TEMP" --no-same-owner -xf "$RUNNER_TEMP/artifact/result.tar"
++          fi
++      - name: Check result
++        id: check
++        if: env.FIX_OUTCOME == 'success'
+         run: |
+-          planemo format --recursive tools/${{ steps.find_tool_dir.outputs.tool_dir }}/
++          RESULT="$RUNNER_TEMP/result/tool"
++          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*$ ]]; then
++            echo "::error::Refusing unsafe tool directory name: $TOOL_DIR"; exit 1
++          fi
++          if [ ! -d "$RESULT" ]; then
++            echo "::error::No tool files in the result"; exit 1
++          fi
++          # Only plain files and directories (and the PR's own links, as in
++          # the fix job), and a sane size.
++          # Keep the link check in sync with the isolation step in the fix job.
++          BAD=$(cd "$RESULT" && find . ! -type f ! -type d | while IFS= read -r p; do
++            orig="$GITHUB_WORKSPACE/tools/$TOOL_DIR/$p"
++            if [ -L "$p" ] && [ -L "$orig" ] && [ "$(readlink "$p")" = "$(readlink "$orig")" ]; then continue; fi
++            echo "$p"
++          done)
++          if [ -n "$BAD" ]; then
++            echo "::error::Result contains new symlinks or special files:"; echo "$BAD"; exit 1
++          fi
++          if [ "$(du -sb "$RESULT" | cut -f1)" -gt 104857600 ]; then
++            echo "::error::Result is larger than 100 MB"; exit 1
++          fi
+       - name: Commit and push changes
+-        if: steps.address.outcome == 'success'
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++        id: commit
++        if: steps.check.outcome == 'success'
+         run: |
++          # The model only ever edits tools/<dir>/: replace exactly that.
++          rm -rf "tools/$TOOL_DIR"
++          cp -a "$RUNNER_TEMP/result/tool" "tools/$TOOL_DIR"
+           # Checkout does not persist the token; git push gets it from GH_TOKEN via gh.
+           gh auth setup-git
+           git config user.name "gxy-tool-bot"
+           git config user.email "gxy-tool-bot@users.noreply.github.com"
+-          TOOL_DIR=${{ steps.find_tool_dir.outputs.tool_dir }}
+-          rm -f "tools/$TOOL_DIR/.tool-name"
+           # Detect files that are gitignored (e.g. .tar test data)
+           IGNORED_FILES=$(find "tools/$TOOL_DIR" -type f | git check-ignore --no-index --stdin 2>/dev/null || true)
+           # Add everything that isn't ignored
+-          git add tools/$TOOL_DIR/ || true
++          git add -A "tools/$TOOL_DIR/" || true
+           if git diff --cached --quiet; then
+             echo "No changes to commit"
+           else
+-            # Use LLM-generated commit message if available, otherwise fallback
+-            if [ -f "$GITHUB_WORKSPACE/.commit-msg" ]; then
+-              COMMIT_MSG=$(cat "$GITHUB_WORKSPACE/.commit-msg")
++            # LLM-generated commit message if there is one: drop control
++            # characters and cap its length. Otherwise the fallback.
++            MSG_FILE="$RUNNER_TEMP/result/commit-msg"
++            if [ -s "$MSG_FILE" ]; then
++              tr -d '\000-\010\013\014\016-\037\177' < "$MSG_FILE" | head -c 4000 > "$RUNNER_TEMP/commit-msg"
+             else
+-              COMMIT_MSG="Address feedback on PR #$PR_NUMBER"
++              echo "Address feedback on PR #$PR_NUMBER" > "$RUNNER_TEMP/commit-msg"
+             fi
+-            git commit -m "$COMMIT_MSG"
++            git commit -F "$RUNNER_TEMP/commit-msg"
+             # Checked out refs/pull/<N>/head (detached HEAD) — push must be
+-            # explicit. The fork check above guarantees the PR head branch
++            # explicit. The fork check in start guarantees the PR head branch
+             # lives in this repo, so this always targets the PR's own branch.
+             HEAD_BRANCH=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName')
+             git push origin "HEAD:$HEAD_BRANCH"
+           fi
+-          # Clean up intermediary file
+-          rm -f "$GITHUB_WORKSPACE/.commit-msg"
+           # If some files were gitignored, post a comment for human review
+           if [ -n "$IGNORED_FILES" ]; then
+             IGNORED_MSG="⚠️ The following files were generated but are excluded by .gitignore and were NOT committed:\n\n"
+@@ -189,31 +358,30 @@ jobs:
+             gh pr comment $PR_NUMBER --body "$(echo -e "$IGNORED_MSG")"
+           fi
+       - name: Upload gitignored files as artifacts
+-        if: steps.address.outcome == 'success'
++        if: steps.commit.outcome == 'success'
+         uses: actions/upload-artifact@v4
+         with:
+           name: gitignored-test-data
+           path: |
+-            ${{ github.workspace }}/tools/${{ steps.find_tool_dir.outputs.tool_dir }}/test-data/*.tar
++            ${{ github.workspace }}/tools/${{ env.TOOL_DIR }}/test-data/*.tar
+           if-no-files-found: ignore
+-      - name: Post validation issues comment
+-        if: steps.address.outcome == 'success'
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      - name: Post comments
++        if: always()
+         run: |
+-          if [ -f "$GITHUB_WORKSPACE/.validation-failed" ]; then
++          # The bot's own comments (summary, validation errors, give-up reason):
++          # only if the change was pushed or the bot gave up, not when the
++          # push or the result check refused it.
++          if [ "${{ steps.commit.outcome }}" = "success" ] || [ -f "$RUNNER_TEMP/result/.gave-up" ]; then
++            shopt -s nullglob
++            for f in "$RUNNER_TEMP"/result/comments/*.md; do
++              gh pr comment $PR_NUMBER --body-file "$f"
++            done
++          fi
++          if [ "${{ steps.commit.outcome }}" = "success" ] && [ -f "$RUNNER_TEMP/result/.validation-failed" ]; then
+             gh pr comment $PR_NUMBER --body "⚠️ Validation issues were found after addressing feedback. Add the \`tool-bot:address-feedback\` (or \`address-feedback\`) label to have the bot attempt fixes again."
+-            rm -f "$GITHUB_WORKSPACE/.validation-failed"
+           fi
+-      - name: Handle failure
+-        if: steps.address.outcome == 'failure'
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          if [ -f "$GITHUB_WORKSPACE/.gave-up" ]; then
++          if [ "${{ steps.commit.outcome }}" != "success" ] && [ ! -f "$RUNNER_TEMP/result/.gave-up" ]; then
+             # The CLI already posted the agent's give-up reason — don't post
+             # a second, contradictory comment.
+-            rm -f "$GITHUB_WORKSPACE/.gave-up"
+-          else
+             gh pr comment $PR_NUMBER --body "⚠️ Failed to address feedback. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+           fi
+diff --git a/.github/workflows/gxy-on-pr-review.yml b/.github/workflows/gxy-on-pr-review.yml
+index 1332cef71d..70a1a83982 100644
+--- a/.github/workflows/gxy-on-pr-review.yml
++++ b/.github/workflows/gxy-on-pr-review.yml
+@@ -2,18 +2,50 @@ on:
+   pull_request:
+     types: [labeled]
+ 
++# Three jobs so no job holds both the LLM key and a GitHub write token:
++#   start  — write token, no key: fork check, status comment, label removal
++#   review — LLM key, read-only token: runs the bot, writes the comment to files
++#   post   — write token, no key, no PR code: posts those files
+ jobs:
+-  review:
+-    name: Review Tool Files
++  start:
++    name: Start review
+     # Dual-match: both the prefixed (tool-bot:*) and original unprefixed label
+     # names trigger. If your repo only has the prefixed labels (e.g. created by
+     # scripts/create-labels.sh), you can drop the unprefixed alternative.
+-    if: contains(github.event.pull_request.labels.*.name, 'tool-bot:review') || contains(github.event.pull_request.labels.*.name, 'review')
++    # Fork PRs are reviewed by on-fork-pr-review.yml: skip them here.
++    if: |
++      github.event.pull_request.head.repo.full_name == github.repository &&
++      (contains(github.event.pull_request.labels.*.name, 'tool-bot:review') ||
++       contains(github.event.pull_request.labels.*.name, 'review'))
+     runs-on: ubuntu-latest
+     permissions:
+-      contents: read
+       pull-requests: write
++      # Label edits on a PR go through the issues endpoint — without this the
++      # removal below fails silently (|| true) and the trigger label stays on,
++      # so every later `labeled` event re-runs the whole flow.
+       issues: write
++    env:
++      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      # No checkout in this job — gh needs the repo spelled out.
++      GH_REPO: ${{ github.repository }}
++      PR_NUMBER: ${{ github.event.pull_request.number }}
++    steps:
++      - name: Post status comment
++        run: |
++          gh pr comment $PR_NUMBER --body "🔍 Reviewing tool files — [view progress](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
++      - name: Remove review label
++        run: |
++          # Remove whichever spelling(s) exist — prefixed and legacy.
++          gh pr edit $PR_NUMBER --remove-label "tool-bot:review" || true
++          gh pr edit $PR_NUMBER --remove-label "review" || true
++
++  review:
++    name: Review Tool Files
++    needs: start
++    runs-on: ubuntu-latest
++    permissions:
++      contents: read
++      pull-requests: read
+       actions: read
+       checks: read
+     # Shared group with on-pr-feedback — see that file's note.
+@@ -21,23 +53,8 @@ jobs:
+       group: pr-${{ github.event.pull_request.number }}
+       cancel-in-progress: false
+     steps:
+-      - name: Check PR is not from a fork
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-          # gh resolves the repo from git remotes — this step runs before
+-          # checkout, so there is no .git and gh needs GH_REPO explicitly.
+-          GH_REPO: ${{ github.repository }}
+-        run: |
+-          HEAD_REPO=$(gh pr view ${{ github.event.pull_request.number }} --json headRepository --jq '.headRepository.nameWithOwner')
+-          if [ "$HEAD_REPO" != "${{ github.repository }}" ]; then
+-            # On fork PRs the token is read-only and secrets are withheld —
+-            # a comment couldn't post anyway, so the log line is the message.
+-            echo "PR head is on fork $HEAD_REPO — review requires same-repo branches (fork tokens are read-only and secrets are withheld)."
+-            exit 1
+-          fi
+-      # refs/pull/<N>/head lives on the base repo, so it resolves for fork
+-      # PRs too — head.ref alone is just a branch name that doesn't exist
+-      # here when the contributor's branch is on their fork.
++      # refs/pull/<N>/head lives on the base repo; head.ref alone is just a
++      # branch name.
+       - uses: actions/checkout@v4
+         with:
+           persist-credentials: false
+@@ -47,15 +64,10 @@ jobs:
+         run: |
+           git fetch origin ${{ github.event.repository.default_branch }}
+           git checkout FETCH_HEAD -- .gxy-tool-bot.yml
+-      - name: Post status comment
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          gh pr comment ${{ github.event.pull_request.number }} --body "🔍 Reviewing tool files — [view progress](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.12'
+-      - run: pip install --no-cache-dir gxy-tool-bot==0.2.1
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
+       # The bot offers its planemo_test / run_in_conda (shell) tools whenever
+       # planemo, micromamba or conda is on PATH, and review reads PR content
+       # next to secrets — so none of them may be. PR CI already lints and tests.
+@@ -69,15 +81,6 @@ jobs:
+               exit 1
+             fi
+           done
+-      - name: Remove review label
+-        env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+-        run: |
+-          # Remove whichever spelling(s) exist — prefixed and legacy.
+-          gh pr edit ${{ github.event.pull_request.number }} \
+-            --remove-label "tool-bot:review" || true
+-          gh pr edit ${{ github.event.pull_request.number }} \
+-            --remove-label "review" || true
+       - name: Find tool directory
+         id: find_tool_dir
+         env:
+@@ -107,14 +110,15 @@ jobs:
+           fi
+           # TOOL_DIR feeds paths under tools/ later — reject anything that
+           # isn't a plain directory name (traversal via a retitled PR).
+-          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_.-]+$ ]]; then
++          # The first character must not be a dot: '.' and '..' would pass
++          # [A-Za-z0-9_.-] but resolve outside tools/.
++          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*$ ]]; then
+             echo "Refusing unsafe tool directory name: $TOOL_DIR"
+             exit 1
+           fi
+           echo "tool_dir=$TOOL_DIR" >> $GITHUB_OUTPUT
+           echo "Found tool directory: $TOOL_DIR"
+       - name: Review tool files
+-        id: review
+         env:
+           GXY_TOOL_BOT_API_KEY: ${{ secrets.GXY_TOOL_BOT_API_KEY }}
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+@@ -124,10 +128,43 @@ jobs:
+             --pr ${{ github.event.pull_request.number }} \
+             --config .gxy-tool-bot.yml \
+             --tool-dir tools/${{ steps.find_tool_dir.outputs.tool_dir }} \
+-            --actor ${{ github.event.sender.login }}
+-      - name: Handle failure
+-        if: steps.review.outcome == 'failure'
++            --actor ${{ github.event.sender.login }} \
++            --comment-dir "$RUNNER_TEMP/comments"
++      - name: Upload comments
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: review-comments
++          path: ${{ runner.temp }}/comments/
++          if-no-files-found: ignore
++
++  post:
++    name: Post review
++    needs: [start, review]
++    if: always() && needs.start.result == 'success'
++    runs-on: ubuntu-latest
++    permissions:
++      pull-requests: write
++    env:
++      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++      GH_REPO: ${{ github.repository }}
++      PR_NUMBER: ${{ github.event.pull_request.number }}
++    steps:
++      # The comments are model output: post them as plain bodies, never run them.
++      - uses: actions/download-artifact@v4
++        continue-on-error: true
++        with:
++          name: review-comments
++          path: ${{ runner.temp }}/comments
++      - name: Post comments
+         env:
+-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
++          REVIEW_RESULT: ${{ needs.review.result }}
+         run: |
+-          gh pr comment ${{ github.event.pull_request.number }} --body "⚠️ Review failed. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
++          shopt -s nullglob
++          files=("$RUNNER_TEMP"/comments/*.md)
++          for f in "${files[@]}"; do
++            gh pr comment $PR_NUMBER --body-file "$f"
++          done
++          if [ "$REVIEW_RESULT" != "success" ] && [ ${#files[@]} -eq 0 ]; then
++            gh pr comment $PR_NUMBER --body "⚠️ Review failed. Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
++          fi
+diff --git a/.github/workflows/gxy-on-ready-to-implement.yml b/.github/workflows/gxy-on-ready-to-implement.yml
+index 2bfd81fa24..5d20162c4d 100644
+--- a/.github/workflows/gxy-on-ready-to-implement.yml
++++ b/.github/workflows/gxy-on-ready-to-implement.yml
+@@ -54,7 +54,7 @@ jobs:
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.12'
+-      - run: pip install --no-cache-dir gxy-tool-bot==0.2.1
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
+       - run: pip install "planemo>=0.75.43"
+       - name: Install micromamba
+         run: |
+@@ -74,6 +74,34 @@ jobs:
+             --remove-label "tool-bot:generation-failed" || true
+           gh issue edit $ISSUE_NUMBER \
+             --remove-label "generation-failed" || true
++      # planemo_test / run_in_conda run model-chosen commands next to the LLM
++      # key and a write token. The bot runs them as this unprivileged user
++      # (GXY_TOOL_BOT_EXEC_USER), which can't read the bot process's
++      # environment. The bot writes its output outside the runner's home,
++      # which stays closed to that user.
++      - name: Create the exec user
++        id: exec_user
++        run: |
++          # An older gxy-tool-bot ignores GXY_TOOL_BOT_EXEC_USER and would run the
++          # model's commands as this user, next to the key: refuse it.
++          python -c "from gxy_tool_bot.generator import _run_model_command" || {
++            echo "::error::This gxy-tool-bot can't run commands as another user; update it"; exit 1; }
++          sudo useradd -M -s /usr/sbin/nologin gxyexec
++          # The runner runs cron: without this, a crontab outlives the pkill below.
++          echo gxyexec | sudo tee -a /etc/cron.deny >/dev/null
++          if sudo -u gxyexec sudo -n true 2>/dev/null || sudo -u gxyexec docker ps >/dev/null 2>&1; then
++            echo "::error::gxyexec must have neither sudo nor docker"
++            exit 1
++          fi
++          # Everything of the runner's (workspace, RUNNER_TEMP) is under its home.
++          if sudo -u gxyexec test -r "$HOME" -o -x "$HOME"; then
++            echo "::error::gxyexec can reach $HOME"
++            exit 1
++          fi
++          WORK=$(mktemp -d /tmp/gxy-work.XXXXXX)
++          chmod 755 "$WORK"
++          echo "GXY_TOOL_BOT_EXEC_USER=gxyexec" >> "$GITHUB_ENV"
++          echo "WORK=$WORK" >> "$GITHUB_ENV"
+       - name: Generate tool files
+         id: generate
+         env:
+@@ -93,11 +121,35 @@ jobs:
+           gxy-tool-bot generate \
+             --issue $ISSUE_NUMBER \
+             --config .gxy-tool-bot.yml \
+-            --output generated/ \
++            --output "$WORK/generated" \
+             --actor ${{ github.event.sender.login || 'manual' }} \
+             --commit-msg-path $GITHUB_WORKSPACE/.commit-msg \
+             --pr-body-path $GITHUB_WORKSPACE/.pr-body \
+             "${OVERRIDE_ARGS[@]}"
++      # Before this job touches the files again: nothing of gxyexec's may keep
++      # running, and the output may hold only plain files and dirs (a link
++      # would be followed by the steps below). The steps below use a snapshot
++      # in generated/, which gxyexec can't reach.
++      - name: Stop the exec user and check the output
++        id: isolation
++        if: always() && env.WORK != ''
++        run: |
++          sudo pkill -KILL -u gxyexec || true
++          sudo crontab -r -u gxyexec 2>/dev/null || true
++          sleep 1
++          if pgrep -u gxyexec >/dev/null; then
++            echo "::error::gxyexec still has processes running"
++            exit 1
++          fi
++          rm -rf generated
++          [ -d "$WORK/generated" ] || exit 0
++          cp -a "$WORK/generated" generated
++          if [ -n "$(find generated ! -type f ! -type d)" ]; then
++            echo "::error::The output holds links or special files:"
++            find generated ! -type f ! -type d
++            rm -rf generated
++            exit 1
++          fi
+       - name: Format generated XML with planemo
+         id: format
+         if: steps.generate.outcome == 'success'
+@@ -116,7 +168,9 @@ jobs:
+           TOOL_DIR=$(cat generated/.tool-name)
+           # .tool-name is agent-written and feeds 'rm -rf tools/$TOOL_DIR'
+           # below — reject anything that isn't a plain directory name.
+-          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_.-]+$ ]]; then
++          # The first character must not be a dot: '.' and '..' would pass
++          # [A-Za-z0-9_.-] but resolve outside tools/.
++          if [[ ! "$TOOL_DIR" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*$ ]]; then
+             echo "Refusing unsafe tool directory name: $TOOL_DIR"
+             exit 1
+           fi
+@@ -228,7 +282,7 @@ jobs:
+           fi
+           rm -f "$GITHUB_WORKSPACE/.validation-failed"
+       - name: Handle generation failure
+-        if: steps.generate.outcome == 'failure'
++        if: failure() && (steps.exec_user.outcome == 'failure' || steps.generate.outcome == 'failure' || steps.isolation.outcome == 'failure' || steps.format.outcome == 'failure')
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |
+@@ -242,7 +296,7 @@ jobs:
+               gh issue edit $ISSUE_NUMBER --add-label "generation-failed"
+           fi
+       - name: Handle PR creation failure
+-        if: steps.create_pr.outcome == 'failure'
++        if: failure() && steps.create_pr.outcome == 'failure'
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |
+diff --git a/.github/workflows/gxy-on-tool-request.yml b/.github/workflows/gxy-on-tool-request.yml
+index 913ed4e27f..9ee8a4fcf9 100644
+--- a/.github/workflows/gxy-on-tool-request.yml
++++ b/.github/workflows/gxy-on-tool-request.yml
+@@ -1,6 +1,9 @@
+ on:
+   issues:
+-    types: [opened, labeled]
++    # `labeled` only: a label applied at issue creation (the issue templates
++    # do this) still fires `labeled`, so `opened` was redundant — and it made
++    # every new request run this job twice.
++    types: [labeled]
+ 
+ jobs:
+   plan:
+@@ -13,18 +16,12 @@ jobs:
+     # .gxy-tool-bot.yml (or keep the legacy names), else update issues
+     # misroute to the new-tool flow and plan-ready label writes 422.
+     if: |
+-      (github.event.action == 'opened' &&
+-       (contains(github.event.issue.labels.*.name, 'tool-bot:tool-request') ||
+-        contains(github.event.issue.labels.*.name, 'tool-request') ||
+-        contains(github.event.issue.labels.*.name, 'tool-bot:tool-update') ||
+-        contains(github.event.issue.labels.*.name, 'tool-update'))) ||
+-      (github.event.action == 'labeled' &&
+-       (github.event.label.name == 'tool-bot:retry-plan' ||
+-        github.event.label.name == 'retry-plan' ||
+-        github.event.label.name == 'tool-bot:tool-request' ||
+-        github.event.label.name == 'tool-request' ||
+-        github.event.label.name == 'tool-bot:tool-update' ||
+-        github.event.label.name == 'tool-update'))
++      github.event.label.name == 'tool-bot:retry-plan' ||
++      github.event.label.name == 'retry-plan' ||
++      github.event.label.name == 'tool-bot:tool-request' ||
++      github.event.label.name == 'tool-request' ||
++      github.event.label.name == 'tool-bot:tool-update' ||
++      github.event.label.name == 'tool-update'
+     runs-on: ubuntu-latest
+     permissions:
+       contents: read
+@@ -44,9 +41,8 @@ jobs:
+       - uses: actions/setup-python@v5
+         with:
+           python-version: '3.12'
+-      - run: pip install --no-cache-dir gxy-tool-bot==0.2.1
++      - run: pip install --no-cache-dir gxy-tool-bot==0.2.3
+       - name: Remove retry-plan and generation-failed labels
+-        if: github.event.action == 'labeled'
+         env:
+           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+         run: |

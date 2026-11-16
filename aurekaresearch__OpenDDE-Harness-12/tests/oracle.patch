@@ -1,0 +1,1041 @@
+diff --git a/docs/protein-design-yaml.md b/docs/protein-design-yaml.md
+index df4fa3c..5d8d2ab 100644
+--- a/docs/protein-design-yaml.md
++++ b/docs/protein-design-yaml.md
+@@ -317,10 +317,29 @@ change selected terms only.
+ Terminal refolding currently uses unique, gate-passing, finitely scored trajectory
+ parents ordered by the objective, capped at `4 * top_k`. SolubleMPNN samples 40
+ variants per parent and selects up to the required four distinct valid variants
+-for refolding. Failed or insufficient groups remain failures. Agent rankings must
+-cover eligible candidates with contiguous ranks. If the post-filter agent fails,
+-the implementation can fall back to deterministic objective ordering; inspect
+-`final_selection` errors and mode rather than assuming agent ranking succeeded.
++for refolding. Failed or insufficient groups remain failures.
++
++Post-filter input is bounded to `max(80, top_k)` eligible candidates. The shortlist
++round-robins leaders in interface/fold confidence, pose RMSD, sequence likelihood,
++the configured objective, and (for antibodies) CDR/framework contact fractions.
++An ID-ordered queue provides coverage for sparse evidence. It prefers sequences
++below 90% positional identity to those already admitted, then fills remaining
++slots without the diversity preference. This is a deterministic context-reduction
++heuristic, not a validated biological quality score or a guarantee of global Top-K.
++Missing metrics remain unknown. All candidates and full evidence remain in the
++artifact; the model sees concise projections and explicitly marked excerpts.
++
++The agent returns only `min(top_k, eligible_count)` decisions, with distinct
++shortlisted IDs and contiguous ranks starting at 1. Rationales and explanation
++lists have length limits. Larger explicit `top_k` values still increase context
++and output costs; the default is 20. `final_selection.shortlist` records shortlist
++membership and method. Eligible candidates not selected have null rank and status
++`not_selected` or `not_shortlisted`; neither means hard eligibility failure.
++
++If the post-filter agent fails, selection falls back to deterministic objective
++ordering over all eligible candidates, not only the shortlist. Inspect
++`final_selection` errors and mode rather than assuming agent selection succeeded.
++Truncated model responses are never accepted as complete PostFilter selections.
+ 
+ ## Fold fields
+ 
+diff --git a/opendde_harness/plugin/protein_design/agents/phases.py b/opendde_harness/plugin/protein_design/agents/phases.py
+index fdbbac7..b857bb9 100644
+--- a/opendde_harness/plugin/protein_design/agents/phases.py
++++ b/opendde_harness/plugin/protein_design/agents/phases.py
+@@ -21,6 +21,7 @@
+ from opendde_harness.plugin.protein_design.agents.profiles import AgentRole, profile_for
+ from opendde_harness.plugin.protein_design.agents.prompt_context import (
+     bounded_design_memories,
++    compact_gate,
+     compact_gate_feedback,
+     context_json,
+     design_population,
+@@ -44,6 +45,7 @@
+     WorkflowConfig,
+ )
+ from opendde_harness.plugin.protein_design.core.design_cases import recurring_offender_ids
++from opendde_harness.plugin.protein_design.core.post_filter import shortlist_candidates
+ from opendde_harness.plugin.protein_design.prompts import (
+     ANALYZE_REPORT_PROMPT,
+     DESIGN_PROMPT,
+@@ -55,6 +57,25 @@
+ from opendde_harness.plugin.protein_design.tools.agent import ToolContext
+ 
+ 
++def _finite_post_filter_values(value: Any) -> Any:
++    if isinstance(value, float) and not math.isfinite(value):
++        return None
++    if isinstance(value, Mapping):
++        return {str(key): _finite_post_filter_values(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_finite_post_filter_values(item) for item in value]
++    return value
++
++
++def _post_filter_excerpt(value: Any) -> Any:
++    """Keep bulky raw evidence on disk; explicitly label incomplete excerpts."""
++    value = _finite_post_filter_values(value)
++    text = json.dumps(value, ensure_ascii=False, default=str)
++    if len(text) <= 400:
++        return value
++    return {"excerpt": text[:360], "truncated": True}
++
++
+ def _forced_design_skill(config: WorkflowConfig, cycle: int) -> str | None:
+     """Return an explicitly configured basin-reset skill, if one is due."""
+     full_skill = MINIBINDER_FULL_SKILL if config.design_type == "minibinder" else FULL_REDESIGN_SKILL
+@@ -556,13 +577,17 @@ async def post_filter_run(
+         candidates: list[Candidate],
+         analysis: AnalyzeAgentOutput,
+     ) -> PostFilterAgentOutput:
++        candidates = shortlist_candidates(
++            candidates, top_k=config.post_filter_top_k, minimize=config.minimize, design_type=config.design_type
++        )
++        top_k = min(config.post_filter_top_k, len(candidates))
+         recurring_offenders = recurring_offender_ids(config.metadata.get("recurring_offenders"))
+         prompt = json.dumps(
+             {
+                 "target": config.target,
+                 "objective_key": config.objective_key,
+                 "minimize": config.minimize,
+-                "analysis": analysis.model_dump(mode="json"),
++                "analysis": analysis.downstream_header[:2000],
+                 "cdr_regions": prompt_positions(config.cdr_regions),
+                 "metric_definitions": {
+                     "iptm": "Interface confidence, 0-1; higher is generally better, not measured affinity.",
+@@ -576,8 +601,8 @@ async def post_filter_run(
+                     "loglikelihood": "Sequence-model compatibility; higher is generally better for comparable sequences.",
+                     "objective": "Search objective only; direction is given by minimize. Do not let it dictate final order.",
+                 },
+-                "top_k": min(config.post_filter_top_k, len(candidates)),
+-                "rank_count": len(candidates),
++                "top_k": top_k,
++                "rank_count": top_k,
+                 "candidate_evidence": [self._post_filter_evidence(item, recurring_offenders) for item in candidates],
+             },
+             ensure_ascii=False,
+@@ -586,8 +611,8 @@ async def post_filter_run(
+         if config.design_type == "minibinder":
+             prompt = minibinder_prompt(
+                 config,
+-                top_k=min(config.post_filter_top_k, len(candidates)),
+-                rank_count=len(candidates),
++                top_k=top_k,
++                rank_count=top_k,
+                 candidate_evidence=[
+                     self._post_filter_evidence(item, recurring_offenders, design_type=config.design_type)
+                     for item in candidates
+@@ -598,7 +623,7 @@ async def post_filter_run(
+         return await self._session.run(
+             profile,
+             prompt,
+-            output_validator=lambda output: output.validate_ranking(candidate_ids),
++            output_validator=lambda output: output.validate_ranking(candidate_ids, top_k=top_k),
+             skills=self._catalog.select(profile.default_skills),
+             tool_context=ToolContext(
+                 compute=self._compute,
+@@ -643,29 +668,27 @@ def _post_filter_evidence(
+             "candidate_id": candidate.candidate_id,
+             "sequence": candidate.sequence,
+             "objective": candidate.objective,
+-            "objective_components": dict(components),
++            "objective_components": _post_filter_excerpt(components),
+             "refold_metrics": supplied,
+-            "binder_rmsd_evidence": metadata.get("binder_rmsd_evidence", {"available": False}),
+-            "gate_evidence": dict(gate),
++            "binder_rmsd_evidence": _post_filter_excerpt(metadata.get("binder_rmsd_evidence", {"available": False})),
++            "gate_evidence": _post_filter_excerpt(compact_gate(gate, minibinder=design_type == "minibinder")),
+             "gate_passed": metadata.get("gate_passed", metrics.get("gate_passed")),
+-            "chains": metadata.get("chains", {}),
+             "interface": {
+                 "cdr_contact_fraction": metrics.get("cdr_contact_fraction"),
+                 "framework_contact_fraction": metrics.get("framework_contact_fraction"),
+-                "contacted_hotspots": gate.get("contacted_hotspots", []),
+-                "missed_hotspots": gate.get("missed_hotspots", []),
++                "contacted_hotspots": _post_filter_excerpt(gate.get("contacted_hotspots", [])),
++                "missed_hotspots": _post_filter_excerpt(gate.get("missed_hotspots", [])),
+                 "cdr3_target_contacts": gate.get("cdr3_total_target_contacts"),
+-                "recurring_offenders": recurring_offenders,
++                "recurring_offenders": _post_filter_excerpt(recurring_offenders),
+             },
+             "developability": {
+-                "objective": metadata.get("developability_evidence", {}),
+-                "quality_agent": metadata.get("quality_check", {}),
++                "objective": _post_filter_excerpt(metadata.get("developability_evidence", {})),
++                "quality_agent": _post_filter_excerpt(metadata.get("quality_check", {})),
+             },
+             "lineage": {
+                 "parent_id": metadata.get("parent_id"),
+                 "skill_id": metadata.get("skill_id"),
+             },
+-            "structure_path": candidate.structure_path,
+             "missing_fields": [name for name, value in supplied.items() if value is None],
+         }
+         if design_type == "minibinder":
+@@ -682,7 +705,9 @@ def _post_filter_evidence(
+                 }
+             )
+             evidence["not_applicable"] = ["cdr_contact_fraction", "framework_contact_fraction", "cdr3_target_contacts"]
+-        return evidence
++        # JSON permits NaN by default, but it is not measured evidence. Normalize
++        # all nested values, not only the named refold metrics.
++        return _finite_post_filter_values(evidence)
+ 
+     @staticmethod
+     def _tool_metadata(config: WorkflowConfig, **values: Any) -> dict[str, Any]:
+diff --git a/opendde_harness/plugin/protein_design/agents/session.py b/opendde_harness/plugin/protein_design/agents/session.py
+index d9ce64b..6cdd0f4 100644
+--- a/opendde_harness/plugin/protein_design/agents/session.py
++++ b/opendde_harness/plugin/protein_design/agents/session.py
+@@ -19,7 +19,7 @@
+ from opendde_harness.context_engine.segments.render import render_router_skills
+ from opendde_harness.memory_engine.skill_forge.loader import SkillLoader
+ from opendde_harness.plugin.protein_design.agents.context import WorkflowInstructions
+-from opendde_harness.plugin.protein_design.agents.profiles import AgentProfile
++from opendde_harness.plugin.protein_design.agents.profiles import AgentProfile, AgentRole
+ from opendde_harness.plugin.protein_design.agents.skills import SkillDocument
+ from opendde_harness.plugin.protein_design.core.progress import (
+     DesignProgressEvent,
+@@ -358,6 +358,8 @@ async def _run_profile(
+                     ]
+                 continue
+             try:
++                if truncated and profile.role == AgentRole.POST_FILTER:
++                    raise ValueError("PostFilter output was truncated. Return complete, concise Top-K JSON only.")
+                 value = json.loads(repair_json(content))
+                 validated = cast(T, schema.model_validate(value))
+                 selected_skill = getattr(validated, "skill_id", None)
+diff --git a/opendde_harness/plugin/protein_design/core/contracts.py b/opendde_harness/plugin/protein_design/core/contracts.py
+index 3bf4b10..6bddf95 100644
+--- a/opendde_harness/plugin/protein_design/core/contracts.py
++++ b/opendde_harness/plugin/protein_design/core/contracts.py
+@@ -6,7 +6,7 @@
+ from collections import Counter
+ from collections.abc import Mapping
+ from enum import StrEnum
+-from typing import Any, Literal
++from typing import Annotated, Any, Literal
+ 
+ from pydantic import BaseModel, ConfigDict, Field, model_validator
+ 
+@@ -405,31 +405,32 @@ class QualityBatchOutput(ContractModel):
+ class PostFilterDecision(ContractModel):
+     candidate_id: str = Field(min_length=1)
+     rank: int = Field(ge=1, strict=True)
+-    rationale: str = Field(min_length=1)
+-    strengths: list[str] = Field(default_factory=list)
+-    risks: list[str] = Field(default_factory=list)
++    rationale: str = Field(min_length=1, max_length=240)
++    strengths: list[Annotated[str, Field(max_length=160)]] = Field(default_factory=list, max_length=2)
++    risks: list[Annotated[str, Field(max_length=160)]] = Field(default_factory=list, max_length=2)
+ 
+ 
+ class PostFilterAgentOutput(ContractModel):
+-    strategy_summary: str = Field(min_length=1)
++    strategy_summary: str = Field(min_length=1, max_length=600)
+     decisions: list[PostFilterDecision] = Field(min_length=1)
+-    risk_notes: list[str] = Field(default_factory=list, max_length=8)
++    risk_notes: list[Annotated[str, Field(max_length=240)]] = Field(default_factory=list, max_length=8)
+ 
+-    def validate_ranking(self, candidate_ids: set[str]) -> None:
++    def validate_ranking(self, candidate_ids: set[str], *, top_k: int | None = None) -> None:
++        expected = len(candidate_ids) if top_k is None else min(top_k, len(candidate_ids))
+         counts = Counter(item.candidate_id for item in self.decisions)
+-        missing = sorted(candidate_ids - counts.keys())
++        missing = sorted(candidate_ids - counts.keys()) if expected == len(candidate_ids) else []
+         unexpected = sorted(counts.keys() - candidate_ids)
+         duplicates = sorted(candidate_id for candidate_id, count in counts.items() if count > 1)
+-        if missing or unexpected or duplicates:
++        if missing or unexpected or duplicates or len(self.decisions) != expected:
+             raise ValueError(
+-                "PostFilter Agent must rank every eligible candidate exactly once; "
++                f"PostFilter Agent must return exactly {expected} distinct supplied candidates; "
+                 f"missing IDs: {missing}; unexpected IDs: {unexpected}; duplicate IDs: {duplicates}. "
+                 "Return the complete corrected ranking, not only the changed entries."
+             )
+-        if sorted(item.rank for item in self.decisions) != list(range(1, len(candidate_ids) + 1)):
++        if sorted(item.rank for item in self.decisions) != list(range(1, expected + 1)):
+             raise ValueError(
+                 "PostFilter Agent ranks must be unique and contiguous from 1 "
+-                f"through {len(candidate_ids)}; received ranks: {[item.rank for item in self.decisions]}. "
++                f"through {expected}; received ranks: {[item.rank for item in self.decisions]}. "
+                 "Return the complete corrected ranking."
+             )
+ 
+diff --git a/opendde_harness/plugin/protein_design/core/orchestrator.py b/opendde_harness/plugin/protein_design/core/orchestrator.py
+index 4635628..08e9f34 100644
+--- a/opendde_harness/plugin/protein_design/core/orchestrator.py
++++ b/opendde_harness/plugin/protein_design/core/orchestrator.py
+@@ -32,6 +32,7 @@
+     ParentSampler,
+     WorkingParentTracker,
+ )
++from opendde_harness.plugin.protein_design.core.post_filter import shortlist_audit, shortlist_candidates
+ from opendde_harness.plugin.protein_design.core.post_mpnn import prepare_post_mpnn
+ from opendde_harness.plugin.protein_design.core.progress import (
+     DesignProgressEvent,
+@@ -991,6 +992,8 @@ async def _terminal_selection(
+         stop_event: asyncio.Event,
+         run_span: Any,
+     ) -> tuple[list[Candidate], dict[str, Any]]:
++        if stop_event.is_set():
++            raise RuntimeError("Task stopped before terminal selection")
+         self._event("final_visualization")
+         if run_state.total_scored_candidates == 0:
+             raise RuntimeError("protein-design search produced no successfully scored candidates")
+@@ -1066,10 +1069,18 @@ async def _terminal_selection(
+             ]
+         eligible_ids = {candidate.candidate_id for candidate in eligible}
+         rejected = [candidate for candidate in terminal if candidate.candidate_id not in eligible_ids]
++        shortlist: list[Candidate] | None = None
+         if config.post_filter_enabled and eligible:
+             self._event("post_filter")
+             try:
+-                post_filter = await self._phases.post_filter_run(config, eligible, analysis)
++                if stop_event.is_set():
++                    raise RuntimeError("Task stopped before post-filter")
++                shortlist = shortlist_candidates(
++                    eligible, top_k=config.post_filter_top_k, minimize=config.minimize, design_type=config.design_type
++                )
++                post_filter = await self._phases.post_filter_run(config, shortlist, analysis)
++                if stop_event.is_set():
++                    raise RuntimeError("Task stopped during post-filter")
+                 final_selection = self._post_filter_policy_selection(
+                     post_filter.model_dump(mode="json"),
+                     eligible=eligible,
+@@ -1079,6 +1090,8 @@ async def _terminal_selection(
+                     post_refold_error=post_refold_error,
+                 )
+             except Exception as exc:
++                if stop_event.is_set():
++                    raise
+                 post_filter_error = str(exc) or type(exc).__name__
+                 final_selection = self._objective_final_selection(
+                     eligible=eligible,
+@@ -1104,6 +1117,10 @@ async def _terminal_selection(
+                 config=config,
+                 strategy_summary="Python objective ordering; post-filter disabled.",
+             )
++        if stop_event.is_set():
++            raise RuntimeError("Task stopped during terminal selection")
++        if shortlist is not None:
++            final_selection["shortlist"] = shortlist_audit(eligible, shortlist)
+         final_selection.update(
+             {
+                 "post_filter_enabled": bool(config.post_filter_enabled),
+@@ -1123,6 +1140,8 @@ async def _terminal_selection(
+             )
+             final_selection["target_chain_ids"] = list(config.target_chain_ids)
+             final_selection["binder_chain_ids"] = list(config.binder_chains)
++        if stop_event.is_set():
++            raise RuntimeError("Task stopped while exporting terminal structures")
+         attach_artifact(
+             run_span,
+             "protein_design.final_selection",
+@@ -1259,7 +1278,7 @@ def _failed_post_filter_selection(
+     ) -> dict[str, Any]:
+         return cls._final_selection_payload(
+             strategy_summary="Final selection failed; search candidates are preserved without fallback ranking.",
+-            decisions=[],
++            decisions=[cls._hard_rejection_decision(candidate, None) for candidate in terminal],
+             terminal=terminal,
+             eligible=eligible,
+             post_refold_error=post_refold_error,
+@@ -1268,7 +1287,7 @@ def _failed_post_filter_selection(
+         )
+ 
+     @staticmethod
+-    def _hard_rejection_decision(candidate: Candidate, rank: int) -> dict[str, Any]:
++    def _hard_rejection_decision(candidate: Candidate, rank: int | None) -> dict[str, Any]:
+         reason = candidate.metadata.get("post_refold_error") or candidate.metadata.get("error")
+         return {
+             "candidate_id": candidate.candidate_id,
+@@ -1279,6 +1298,7 @@ def _hard_rejection_decision(candidate: Candidate, rank: int) -> dict[str, Any]:
+             "risks": [reason or "not_post_filter_eligible"],
+             "objective": candidate.objective,
+             "hard_eligible": False,
++            "selection_status": "hard_rejected",
+         }
+ 
+     @classmethod
+@@ -1312,7 +1332,7 @@ def _objective_final_selection(
+             for rank, candidate in enumerate(ordered, start=1)
+         ]
+         decisions.extend(
+-            cls._hard_rejection_decision(candidate, len(decisions) + index)
++            cls._hard_rejection_decision(candidate, len(ordered) + index)
+             for index, candidate in enumerate(rejected, start=1)
+         )
+         return cls._final_selection_payload(
+@@ -1338,8 +1358,12 @@ def _post_filter_policy_selection(
+     ) -> dict[str, Any]:
+         output = PostFilterAgentOutput.model_validate(value)
+         by_id = {candidate.candidate_id: candidate for candidate in eligible}
++        shortlist = shortlist_candidates(
++            eligible, top_k=config.post_filter_top_k, minimize=config.minimize, design_type=config.design_type
++        )
++        shortlisted_ids = {item.candidate_id for item in shortlist}
+         decisions = output.decisions
+-        output.validate_ranking(set(by_id))
++        output.validate_ranking(shortlisted_ids, top_k=config.post_filter_top_k)
+         ranked = sorted(decisions, key=lambda item: item.rank)
+         result = [
+             {
+@@ -1347,13 +1371,29 @@ def _post_filter_policy_selection(
+                 "pass_filter": item.rank <= config.post_filter_top_k,
+                 "objective": by_id[item.candidate_id].objective,
+                 "hard_eligible": True,
++                "selection_status": "selected",
+             }
+             for item in ranked
+         ]
++        selected_ids = {item.candidate_id for item in ranked}
+         result.extend(
+-            cls._hard_rejection_decision(candidate, len(ranked) + index)
+-            for index, candidate in enumerate(rejected, start=1)
++            {
++                "candidate_id": candidate.candidate_id,
++                "rank": None,
++                "pass_filter": False,
++                "objective": candidate.objective,
++                "hard_eligible": True,
++                "selection_status": "not_selected" if candidate.candidate_id in shortlisted_ids else "not_shortlisted",
++                "rationale": "Not selected by the agent from the shortlist."
++                if candidate.candidate_id in shortlisted_ids
++                else "Outside the bounded multi-metric/diversity shortlist; not assessed by the agent.",
++                "strengths": [],
++                "risks": [],
++            }
++            for candidate in eligible
++            if candidate.candidate_id not in selected_ids
+         )
++        result.extend(cls._hard_rejection_decision(candidate, None) for candidate in rejected)
+         payload = cls._final_selection_payload(
+             strategy_summary=output.strategy_summary,
+             decisions=result,
+@@ -1364,6 +1404,7 @@ def _post_filter_policy_selection(
+             mode="agent",
+         )
+         payload["risk_notes"] = output.risk_notes
++        payload["shortlist"] = shortlist_audit(eligible, shortlist)
+         return payload
+ 
+     @classmethod
+diff --git a/opendde_harness/plugin/protein_design/core/post_filter.py b/opendde_harness/plugin/protein_design/core/post_filter.py
+new file mode 100644
+index 0000000..fc6a1fb
+--- /dev/null
++++ b/opendde_harness/plugin/protein_design/core/post_filter.py
+@@ -0,0 +1,93 @@
++"""Deterministic context reduction, not a replacement for agent selection."""
++
++from __future__ import annotations
++
++import math
++from collections import deque
++
++from opendde_harness.plugin.protein_design.core.contracts import Candidate
++
++
++def shortlist_candidates(
++    candidates: list[Candidate], *, top_k: int, minimize: bool, design_type: str = "antibody"
++) -> list[Candidate]:
++    """Round-robin metric leaders, preferring distinct sequences before filling.
++
++    No weighted score is computed. Missing measurements do not become zero.
++    The ID-ordered queue also gives candidates with sparse evidence a route in.
++    At most max(80, top_k) records enter the model context; final order is the
++    agent's decision, not the order of this shortlist.
++    """
++    if not candidates:
++        raise ValueError("PostFilter requires at least one candidate")
++    if len({item.candidate_id for item in candidates}) != len(candidates):
++        raise ValueError("PostFilter candidate IDs must be unique")
++    if top_k < 1:
++        raise ValueError("PostFilter top_k must be positive")
++    ordered = sorted(candidates, key=lambda item: item.candidate_id)
++    limit = max(80, top_k)
++    if len(ordered) <= limit:
++        return ordered
++
++    metrics = [
++        ("iptm", False),
++        ("ipsae", False),
++        ("plddt", False),
++        ("ptm", False),
++        ("binder_rmsd", True),
++        ("loglikelihood", False),
++    ]
++    if design_type != "minibinder":
++        metrics.extend([("cdr_contact_fraction", False), ("framework_contact_fraction", True)])
++    metrics.append(("objective", minimize))
++    queues = []
++    for name, lower in metrics:
++        values = [(item, item.objective if name == "objective" else item.metrics.get(name)) for item in ordered]
++        finite = [
++            (item, float(value))
++            for item, value in values
++            if value is not None and not isinstance(value, bool) and math.isfinite(value)
++        ]
++        queues.append(
++            [
++                item
++                for item, _ in sorted(finite, key=lambda pair: (pair[1] if lower else -pair[1], pair[0].candidate_id))
++            ]
++        )
++    queues.append(ordered)
++    selected: list[Candidate] = []
++    seen: set[str] = set()
++    for prefer_diversity in (True, False):
++        pending = [deque(queue) for queue in queues]
++        while any(pending) and len(selected) < limit:
++            for queue in pending:
++                while queue:
++                    item = queue.popleft()
++                    if item.candidate_id in seen:
++                        continue
++                    if prefer_diversity and any(_similar_sequence(item.sequence, other.sequence) for other in selected):
++                        continue
++                    selected.append(item)
++                    seen.add(item.candidate_id)
++                    break
++                if len(selected) == limit:
++                    break
++    return selected
++
++
++def _similar_sequence(left: str, right: str) -> bool:
++    """Cheap, explicit shortlist heuristic; not an alignment or affinity model."""
++    if not left or not right:
++        return False
++    return sum(a == b for a, b in zip(left, right)) / max(len(left), len(right)) >= 0.9
++
++
++def shortlist_audit(candidates: list[Candidate], shortlist: list[Candidate]) -> dict:
++    return {
++        "method": "metric_round_robin_sequence_diversity",
++        "eligible_count": len(candidates),
++        "candidate_ids": [item.candidate_id for item in shortlist],
++        "sequence_identity_threshold": 0.9,
++        "description": "Metric leaders and ID-ordered coverage; prefer sequence diversity, then fill. "
++        "Missing metrics remain unknown. Shortlist order is not a final ranking.",
++    }
+diff --git a/opendde_harness/plugin/protein_design/prompts/minibinder.py b/opendde_harness/plugin/protein_design/prompts/minibinder.py
+index 9950f2f..b2217e1 100644
+--- a/opendde_harness/plugin/protein_design/prompts/minibinder.py
++++ b/opendde_harness/plugin/protein_design/prompts/minibinder.py
+@@ -15,6 +15,6 @@
+     "design": "Select exactly one allowed skill_id. For full redesign assign every mutable position exactly once using canonical amino acids, including unchanged residues; the point-mutation budget does not apply. For point mutation emit distinct candidates with candidate_id and mutations (chain_id, position, from_aa, to_aa). Respect the mutation budget. For inverse folding return the anchor/control proposal described in its skill. Consider foldability, target interface and earlier outcomes; never modify the target. applied_learned_skill_ids must refer only to retrieved advisory skills.",
+     "quality": "Assess supplied sequence and structure evidence for each candidate ID. Keep expression, specificity, immunogenicity and solubility Unknown unless supported. Do not apply antibody-specific rules. Use pass_check=false only for a concrete supported concern; explain uncertainty separately. Return results keyed by candidate_id.",
+     "reflection": "Compare current candidates using the stated objective direction, target contact evidence, fold confidence and previous trajectory. Give evidence-backed recommendations confined to mutable positions. Do not invent residue-level interactions or new measurements.",
+-    "post_filter": "Rank every supplied candidate exactly once with unique contiguous ranks starting at 1. Balance interface evidence, fold confidence, refold pose consistency, supplied QC evidence and sequence diversity. Avoid double counting correlated confidence scores. Missing evidence is unknown, not a penalty. Explain strengths, risks and tradeoffs.",
++    "post_filter": "Select exactly top_k distinct candidates from the supplied bounded shortlist with unique contiguous ranks from 1 to top_k. Input order is not a ranking. Balance interface evidence, fold confidence, refold pose consistency, supplied QC evidence and sequence diversity. Avoid double counting correlated confidence scores. Missing evidence and truncated excerpts are unknown, not a penalty. Keep rationales within 240 characters, at most two strengths and two risks per selection (160 characters per item), strategy_summary within 600 characters, and at most eight risk_notes (240 characters per note). Do not explain unselected candidates.",
+     "parent_selection": "Select exactly one supplied candidate as the next parent using the configured objective direction, diversity and recorded outcomes. Return its exact ID in parent_selection.selected_parent_name.",
+ }
+diff --git a/opendde_harness/plugin/protein_design/prompts/post_filter.py b/opendde_harness/plugin/protein_design/prompts/post_filter.py
+index cf645fe..b9fa721 100644
+--- a/opendde_harness/plugin/protein_design/prompts/post_filter.py
++++ b/opendde_harness/plugin/protein_design/prompts/post_filter.py
+@@ -2,7 +2,10 @@
+ 
+ POST_FILTER_AGENT_INSTRUCTIONS = """You are the antibody PostFilter Agent.
+ 
+-Rank every supplied candidate holistically using current-run post-refold evidence.
++Select exactly top_k distinct candidates from the supplied bounded shortlist,
++using current-run post-refold evidence. Rank only those selected candidates.
++The shortlist balances metric leaders and sequence diversity; its input order
++is not a ranking. Candidates outside the shortlist have not been assessed by you.
+ You own the final order: balance interface and fold confidence, binder pose RMSD,
+ CDR engagement, hotspot support, developability, and sequence diversity. Explain
+ tradeoffs and conflicting signals. Do not use fixed weights, a predetermined
+@@ -10,7 +13,10 @@
+ Geometry gate results are evidence, not an automatic exclusion rule.
+ Missing measurements are unknown, never zero, favorable evidence, or a penalty.
+ Never invent measurements, contacts, residues, or experimental facts.
+-Return every candidate exactly once with unique contiguous ranks from 1 and
+-evidence-backed rationales, strengths, and risks. Python validates this order
+-and takes the first top_k candidates without rescoring or diversity reordering.
++Return exactly top_k decisions with unique contiguous ranks from 1 to top_k.
++Keep each rationale within 240 characters, at most two strengths and two risks
++(160 characters per item), and strategy_summary within 600 characters. Use at
++most eight risk_notes (240 characters per note). Do not explain every
++unselected candidate. Excerpts marked truncated are incomplete, not negative evidence.
++Python validates this selection without rescoring or diversity reordering.
+ Return only the configured structured output."""
+diff --git a/opendde_harness/plugin/protein_design/skills/post-filter/SKILL.md b/opendde_harness/plugin/protein_design/skills/post-filter/SKILL.md
+index 0285fe2..19195ab 100644
+--- a/opendde_harness/plugin/protein_design/skills/post-filter/SKILL.md
++++ b/opendde_harness/plugin/protein_design/skills/post-filter/SKILL.md
+@@ -1,8 +1,8 @@
+ ---
+ name: post-filter
+ description: |
+-  Rank all usable post-refold candidates from the complete search trajectory
+-  through holistic evidence-based judgment and explain the final order.
++  Select a concise Top-K from a bounded post-refold shortlist
++  through holistic evidence-based judgment.
+ ---
+ 
+ # Post-Refold Selection
+@@ -11,8 +11,9 @@ description: |
+ 
+ You own the final ranking. Candidates originate from the complete search
+ trajectory, including candidates no longer in the population. Python excludes
+-only unusable refold results and validates your output; it does not calculate
+-weighted scores, preselect by objective, or reorder for diversity.
++unusable refold results, then builds a bounded shortlist by round-robin metric
++leaders and sequence diversity. This is a context budget, not a quality gate
++or final ranking. Python validates your selection without rescoring or reordering it.
+ 
+ Weigh interface and fold confidence, target-aligned binder pose RMSD, CDR
+ engagement, hotspot support, sequence compatibility, measured developability,
+@@ -33,10 +34,14 @@ their underlying measurements; avoid double-counting.
+ 
+ ## Output
+ 
+-- `strategy_summary`: explain the evidence and tradeoffs behind the order.
+-- `decisions`: every supplied candidate exactly once, with `candidate_id`,
+-  unique contiguous `rank` starting at 1, `rationale`, `strengths`, and `risks`.
+-- `risk_notes`: evidence-backed batch-wide risks; use an empty list if none.
+-
+-Python takes the first `top_k` candidates from your order. Your ranking must
+-cover the full supplied batch even when fewer candidates will be selected.
++- `strategy_summary`: explain the evidence and tradeoffs within 600 characters.
++- `decisions`: exactly `top_k` distinct supplied candidates, with `candidate_id`,
++  unique contiguous `rank` from 1 to `top_k`, `rationale` (at most 240 characters),
++  and at most two `strengths` and two `risks` (160 characters per item).
++- `risk_notes`: at most eight evidence-backed batch-wide risks, 240 characters
++  per note; use an empty list if none.
++
++Do not rank or explain unselected candidates. Never choose an ID not supplied
++in the shortlist. Excerpts marked truncated are incomplete evidence, not defects.
++Python preserves all original candidates and records who was not shortlisted
++separately from hard eligibility failures.
+diff --git a/opendde_harness/tracing/viewer/protein-design-store.js b/opendde_harness/tracing/viewer/protein-design-store.js
+index ac8ba4c..ff7cbc6 100644
+--- a/opendde_harness/tracing/viewer/protein-design-store.js
++++ b/opendde_harness/tracing/viewer/protein-design-store.js
+@@ -265,7 +265,8 @@ function projectPostFilter(summary, readArtifact) {
+       )
+       return {
+         candidateId,
+-        rank: Number(decision?.rank || 0),
++        rank: finiteNumber(decision?.rank),
++        selectionStatus: String(decision?.selection_status || ''),
+         objective: finiteNumber(decision?.objective),
+         sequence: typeof candidate.sequence === 'string' ? candidate.sequence : '',
+         metrics,
+diff --git a/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js b/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js
+index edebb99..0e93e13 100644
+--- a/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js
++++ b/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js
+@@ -115,6 +115,37 @@ test('post-filter reuses candidate rows and refolded metrics without mutating de
+   assert.match(html, /data-table-metrics=".*&quot;plddt&quot;:0.8/)
+ })
+ 
++test('post-filter distinguishes unreviewed shortlist exclusions from agent decisions', () => {
++  const run = {
++    taskId: 'run',
++    cycles: [],
++    postFilter: {
++      decisions: [
++        {
++          candidateId: 'a',
++          rank: null,
++          passFilter: false,
++          hardEligible: true,
++          selectionStatus: 'not_shortlisted',
++          sequence: 'AAA'
++        },
++        {
++          candidateId: 'b',
++          rank: null,
++          passFilter: false,
++          hardEligible: true,
++          selectionStatus: 'not_selected',
++          sequence: 'BBB'
++        }
++      ]
++    }
++  }
++  const html = renderProteinDesignDashboard({ run: resultRun(run, 'post-filter') })
++  assert.match(html, /Not shortlisted/)
++  assert.match(html, /Not selected/)
++  assert.doesNotMatch(html, /Hard rejected|#0/)
++})
++
+ test('post-filter does not reuse design candidates when decisions are absent', () => {
+   const run = { cycles: [{ cycle: 1, candidates: [{ candidateId: 'design-only' }] }] }
+   const projected = resultRun(run, 'post-filter')
+diff --git a/opendde_harness/tracing/viewer/test/protein-design-store.test.js b/opendde_harness/tracing/viewer/test/protein-design-store.test.js
+index 2a6dcee..22998d1 100644
+--- a/opendde_harness/tracing/viewer/test/protein-design-store.test.js
++++ b/opendde_harness/tracing/viewer/test/protein-design-store.test.js
+@@ -529,6 +529,25 @@ test('keeps an unfinished agent activity visible while it is running', () => {
+   assert.deepEqual(projected.run.events, [event])
+ })
+ 
++test('post-filter preserves unranked shortlist status rather than creating rank zero', () => {
++  const artifact = {
++    mode: 'agent',
++    post_filter_enabled: true,
++    post_filter_executed: true,
++    candidates: [{ candidate_id: 'c1', sequence: 'ACDE' }],
++    decisions: [
++      { candidate_id: 'c1', rank: null, hard_eligible: true, pass_filter: false, selection_status: 'not_shortlisted' }
++    ]
++  }
++  const projected = projectProteinDesignRuns({
++    spans: [runSpan('task-1', { finalSelectionArtifactPath: '/final.json' })],
++    selectedRunId: 'task-1',
++    readArtifact: () => artifact
++  })
++  assert.equal(projected.run.postFilter.decisions[0].rank, null)
++  assert.equal(projected.run.postFilter.decisions[0].selectionStatus, 'not_shortlisted')
++})
++
+ test('post-filter failures are failed, never fallback, and obsolete scores are ignored', () => {
+   for (const failure of [
+     { mode: 'failed', post_filter_error: 'agent unavailable' },
+diff --git a/opendde_harness/tracing/viewer/ui/protein-design-candidates.js b/opendde_harness/tracing/viewer/ui/protein-design-candidates.js
+index 5132116..082f988 100644
+--- a/opendde_harness/tracing/viewer/ui/protein-design-candidates.js
++++ b/opendde_harness/tracing/viewer/ui/protein-design-candidates.js
+@@ -481,7 +481,7 @@
+     const sequence = candidate.sequence || 'Sequence unavailable'
+     const decision = candidate.postFilterDecision
+     const decisionLabel = decision
+-      ? `#${decision.rank || '-'} · ${decision.passFilter ? 'Selected' : decision.hardEligible ? 'Not selected' : 'Hard rejected'}`
++      ? `${decision.rank ? `#${decision.rank} · ` : ''}${decision.passFilter ? 'Selected' : !decision.hardEligible ? 'Hard rejected' : decision.selectionStatus === 'not_shortlisted' ? 'Not shortlisted' : 'Not selected'}`
+       : ''
+     const decisionDetail = decision
+       ? [
+diff --git a/tests/test_protein_design_post_filter_retry.py b/tests/test_protein_design_post_filter_retry.py
+index 56b250a..98d8ee2 100644
+--- a/tests/test_protein_design_post_filter_retry.py
++++ b/tests/test_protein_design_post_filter_retry.py
+@@ -52,7 +52,7 @@ def run(provider):
+         target="test",
+         objective_key="loss",
+         minimize=True,
+-        post_filter_top_k=1,
++        post_filter_top_k=2,
+         cdr_regions={},
+         cycles=1,
+         reflection_interval=10,
+diff --git a/tests/test_protein_design_post_filter_selection.py b/tests/test_protein_design_post_filter_selection.py
+new file mode 100644
+index 0000000..1ee9933
+--- /dev/null
++++ b/tests/test_protein_design_post_filter_selection.py
+@@ -0,0 +1,312 @@
++"""Bounded post-refold selection and auditable final decisions."""
++
++import asyncio
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from opendde_harness.plugin.protein_design.agents.phases import ProteinDesignPhases
++from opendde_harness.plugin.protein_design.agents.session import OpenDDEHarnessStructuredSession
++from opendde_harness.plugin.protein_design.core.contracts import (
++    AnalyzeAgentOutput,
++    Candidate,
++    PostFilterAgentOutput,
++    WorkflowConfig,
++)
++from opendde_harness.plugin.protein_design.core.orchestrator import DesignOrchestrator
++from opendde_harness.providers.base import LLMResponse
++
++
++def candidate(index, **kwargs):
++    return Candidate(
++        candidate_id=f"c{index:03}",
++        sequence="ACDEFGHIKL",
++        objective=float(index),
++        structure_path=f"{index}.pdb",
++        **kwargs,
++    )
++
++
++def selection(ids):
++    return PostFilterAgentOutput(
++        strategy_summary="Interface support balanced against uncertainty",
++        decisions=[
++            {"candidate_id": name, "rank": rank, "rationale": "Supplied interface evidence"}
++            for rank, name in enumerate(ids, 1)
++        ],
++    )
++
++
++def test_top_k_subset_is_valid_without_ranking_unselected_candidates():
++    selection(["c002"]).validate_ranking({"c001", "c002"}, top_k=1)
++
++
++@pytest.mark.parametrize("ids", [["c001", "c001"], ["unknown"], ["c001", "c002"]])
++def test_subset_rejects_duplicates_unknown_ids_and_wrong_count(ids):
++    with pytest.raises(ValueError):
++        selection(ids).validate_ranking({"c001", "c002"}, top_k=1)
++
++
++@pytest.mark.parametrize("design_type", ["antibody", "minibinder"])
++def test_large_pool_requests_only_top_k_with_bounded_evidence(design_type):
++    class Session:
++        async def run(self, profile, prompt, **kwargs):
++            payload = json.loads(prompt)
++            assert payload["rank_count"] == 20
++            assert 20 <= len(payload["candidate_evidence"]) <= 80
++            assert len(prompt) < 160_000
++            assert "NaN" not in prompt and "Infinity" not in prompt
++            result = selection([item["candidate_id"] for item in payload["candidate_evidence"][:20]])
++            kwargs["output_validator"](result)
++            return result
++
++    config = WorkflowConfig(target="T", design_type=design_type, post_filter_top_k=20)
++    candidates = [
++        candidate(
++            i,
++            metrics={"iptm": i / 300, "ptm": float("nan")},
++            metadata={
++                "gate_evidence": {"raw_contacts": ["x" * 1000] * 1000},
++                "quality_check": {"reasoning": "x" * 100_000},
++            },
++        )
++        for i in range(287)
++    ]
++    phases = ProteinDesignPhases(Session(), None, None, catalog=SimpleNamespace(select=lambda _: []))
++    output = asyncio.run(phases.post_filter_run(config, candidates, AnalyzeAgentOutput(downstream_header="test")))
++    assert len(output.decisions) == 20
++    assert len(candidates) == 287
++    assert len(candidates[0].metadata["quality_check"]["reasoning"]) == 100_000
++
++
++def test_policy_preserves_unselected_candidates_without_inventing_agent_ranks():
++    candidates = [candidate(i) for i in range(100)]
++    payload = DesignOrchestrator._post_filter_policy_selection(
++        selection(["c000"]).model_dump(),
++        eligible=candidates,
++        rejected=[],
++        terminal=candidates,
++        config=WorkflowConfig(target="T", post_filter_top_k=1),
++        post_refold_error=None,
++    )
++    assert payload["selected_candidate_ids"] == ["c000"]
++    assert len(payload["candidates"]) == len(payload["decisions"]) == 100
++    unselected = payload["decisions"][1:]
++    assert all(item["hard_eligible"] and not item["pass_filter"] and item["rank"] is None for item in unselected)
++    assert {item["selection_status"] for item in unselected} == {"not_selected", "not_shortlisted"}
++    assert len(payload["shortlist"]["candidate_ids"]) <= 80
++
++
++@pytest.mark.parametrize("candidates", [[], [candidate(0), candidate(0)]])
++def test_invalid_input_fails_before_calling_provider(candidates):
++    class Provider:
++        async def chat_with_retry(self, **kwargs):
++            raise AssertionError("invalid input must not reach provider")
++
++    phases = ProteinDesignPhases(
++        OpenDDEHarnessStructuredSession(Provider(), "test"), None, None, catalog=SimpleNamespace(select=lambda _: [])
++    )
++    with pytest.raises(ValueError, match="candidate"):
++        asyncio.run(
++            phases.post_filter_run(WorkflowConfig(target="T"), candidates, AnalyzeAgentOutput(downstream_header="test"))
++        )
++
++
++@pytest.mark.parametrize("max_tokens", [None, 32768])
++def test_truncated_top_k_is_retried_not_accepted_as_complete(max_tokens):
++    class Provider:
++        def __init__(self):
++            self.calls = 0
++
++        async def chat_with_retry(self, **kwargs):
++            self.calls += 1
++            if self.calls == 1:
++                return LLMResponse(selection(["c000"]).model_dump_json(), finish_reason="length")
++            return LLMResponse(selection(["c001"]).model_dump_json())
++
++    provider = Provider()
++    phases = ProteinDesignPhases(
++        OpenDDEHarnessStructuredSession(provider, "test"), None, None, catalog=SimpleNamespace(select=lambda _: [])
++    )
++    result = asyncio.run(
++        phases.post_filter_run(
++            WorkflowConfig(target="T", post_filter_top_k=1, llm_max_tokens=max_tokens),
++            [candidate(0), candidate(1)],
++            AnalyzeAgentOutput(downstream_header="test"),
++        )
++    )
++    assert [item.candidate_id for item in result.decisions] == ["c001"]
++    assert provider.calls == 2
++
++
++def test_shortlist_keeps_metric_leaders_and_diverse_sequences_independent_of_input_order():
++    from opendde_harness.plugin.protein_design.core.post_filter import shortlist_candidates
++
++    candidates = [candidate(i) for i in range(287)]
++    candidates[280].metrics = {"iptm": 0.99}
++    candidates[281].metrics = {"binder_rmsd": 0.1}
++    candidates[282].sequence = "YYYYYYYYYY"
++    candidates[282].objective = None
++    candidates[283].metrics = {"ipsae": float("nan"), "iptm": float("inf")}
++    first = shortlist_candidates(candidates, top_k=20, minimize=True)
++    second = shortlist_candidates(list(reversed(candidates)), top_k=20, minimize=True)
++    ids = [item.candidate_id for item in first]
++    assert len(ids) == len(set(ids)) == 80
++    assert {"c000", "c280", "c281", "c282"} <= set(ids)
++    assert ids == [item.candidate_id for item in second]
++
++
++def test_shortlist_respects_objective_direction_and_never_returns_less_than_requested():
++    from opendde_harness.plugin.protein_design.core.post_filter import shortlist_candidates
++
++    candidates = [candidate(i) for i in range(287)]
++    result = shortlist_candidates(candidates, top_k=100, minimize=False)
++    assert len(result) == 100
++    assert result[0].candidate_id == "c286"
++    assert len(shortlist_candidates(candidates[:2], top_k=20, minimize=False)) == 2
++
++
++@pytest.mark.parametrize("field", ["strengths", "risks"])
++def test_explanations_cannot_hide_unbounded_text_in_lists(field):
++    value = selection(["c001"]).model_dump()
++    value["decisions"][0][field] = ["x" * 10000]
++    with pytest.raises(ValueError):
++        PostFilterAgentOutput.model_validate(value)
++
++
++def terminal_selection(mode):
++    """Exercise MPNN -> refold -> phase -> selection; only compute/LLM are fake."""
++    from opendde_harness.plugin.protein_design.core.contracts import TaskSnapshot, TaskState
++    from opendde_harness.plugin.protein_design.core.orchestrator import _ProgressState, _RunState
++    from opendde_harness.tracing import trace
++
++    stop = asyncio.Event()
++
++    class Compute:
++        updated = None
++
++        async def generate_soluble_mpnn(self, request):
++            return {
++                "candidates": [
++                    {"chains": {"B": aa + "CDEFGHIKL"}, "metadata": {"soluble_mpnn_scores": {"B": float(i)}}}
++                    for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY" * 2)
++                ]
++            }
++
++        async def submit_fold(self, request):
++            self.candidates = request.candidates
++            return SimpleNamespace(job_id="fold")
++
++        async def wait_fold(self, *args, **kwargs):
++            return SimpleNamespace(
++                error=None,
++                result={
++                    "candidates": [
++                        {
++                            **item,
++                            "objective": float(i),
++                            "structure_path": "refold.pdb",
++                            "metrics": {"iptm": 0.8},
++                            "metadata": {"success": mode != "no_eligible"},
++                        }
++                        for i, item in enumerate(self.candidates)
++                    ]
++                },
++            )
++
++        async def pose_rmsd(self, request):
++            return {"rmsd": 0.2}
++
++        async def read_structure(self, *args, **kwargs):
++            if mode == "stop_export" and getattr(self, "post_filter_finished", False):
++                stop.set()
++            raise FileNotFoundError("No physical GPU structure in this unit test")
++
++        async def update_population(self, value):
++            self.updated = value
++
++    class Session:
++        async def run(self, profile, prompt, **kwargs):
++            assert mode != "no_eligible", "empty eligible pool must not reach the model"
++            if mode in ("stop_error", "stop_return"):
++                stop.set()
++            if mode in ("error", "stop_error"):
++                raise ValueError("invalid model output")
++            payload = json.loads(prompt)
++            result = selection([payload["candidate_evidence"][-1]["candidate_id"]])
++            kwargs["output_validator"](result)
++            compute.post_filter_finished = True
++            return result
++
++    compute = Compute()
++    phases = ProteinDesignPhases(Session(), compute, None, catalog=SimpleNamespace(select=lambda _: []))
++    config = WorkflowConfig(
++        target="T",
++        post_filter_enabled=True,
++        post_filter_top_k=1,
++        binder_chains={"B": "ACDEFGHIKL"},
++        mutable_positions={"B": [0]},
++    )
++    state = _RunState(
++        parents=[],
++        snapshot=TaskSnapshot(task_id="t", status=TaskState.RUNNING, target="T", total_cycles=1),
++        total_scored_candidates=1,
++        search_history=[{**candidate(0).model_dump(), "gate_passed": True}],
++    )
++    orchestrator = DesignOrchestrator(compute, None, phases)
++    orchestrator._progress_state = _ProgressState(task_id="t", total_cycles=1)
++    with trace.span("test-terminal-selection") as span:
++        result = asyncio.run(
++            orchestrator._terminal_selection(
++                state,
++                "t",
++                config,
++                analysis=AnalyzeAgentOutput(downstream_header="test"),
++                stop_event=stop,
++                run_span=span,
++            )
++        )
++    return result[1], compute.updated
++
++
++@pytest.mark.parametrize("mode", ["stop_error", "stop_return", "stop_export"])
++def test_stop_during_post_filter_never_publishes_completed_selection(mode):
++    with pytest.raises((RuntimeError, ValueError), match="stopped|invalid model output"):
++        terminal_selection(mode)
++
++
++def test_terminal_agent_selection_and_fallback_are_distinct_and_auditable():
++    agent, updated = terminal_selection("success")
++    assert agent["mode"] == "agent"
++    assert agent["selected_candidate_ids"] == ["c000__mpnn_04"]
++    assert len(agent["decisions"]) == 4
++    assert updated["final_selection"] == agent
++    fallback, _ = terminal_selection("error")
++    assert fallback["mode"] == "deterministic"
++    assert fallback["selected_candidate_ids"] == ["c000__mpnn_01"]
++    assert fallback["post_filter_error"] == "invalid model output"
++    assert fallback["shortlist"]["candidate_ids"] == agent["shortlist"]["candidate_ids"]
++
++
++def test_no_eligible_post_refold_candidates_skips_model_and_preserves_failures():
++    result, _ = terminal_selection("no_eligible")
++    assert result["mode"] == "failed"
++    assert not result["post_filter_executed"]
++    assert result["selected_candidate_ids"] == []
++    assert len(result["candidates"]) == 4
++    assert len(result["decisions"]) == 4
++    assert all(not item["hard_eligible"] and item["rank"] is None for item in result["decisions"])
++
++
++def test_deterministic_fallback_has_stable_contiguous_ranks_for_multiple_rejections():
++    eligible = [candidate(0)]
++    rejected = [candidate(i) for i in range(1, 4)]
++    result = DesignOrchestrator._objective_final_selection(
++        eligible=eligible,
++        rejected=rejected,
++        terminal=eligible + rejected,
++        config=WorkflowConfig(target="T", post_filter_top_k=1),
++        strategy_summary="Fallback",
++    )
++    assert [item["rank"] for item in result["decisions"]] == [1, 2, 3, 4]

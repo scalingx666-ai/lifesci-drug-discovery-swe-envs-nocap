@@ -1,0 +1,376 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 59629ab1fb..2d6429881a 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -133,6 +133,9 @@ Custom `@classproperty` from `baybe.utils.basic` for class-level computed proper
+ - Method names start with verbs. Comments capitalize first word.
+ - Always capitalize words that correspond to names of inventors, e.g. `Bayesian`,
+   `Boolean` or `Gaussian`
++- Use `make_` prefix for functions/methods that construct and return a **new** object.
++  Use `get_` prefix for functions/methods that retrieve and return an **already existing**
++  object. Never use `build_` as a substitute for either.
+ 
+ ## 5. Type Annotations
+ - **Full coverage**: All signatures including returns. Every field annotated.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6bb0610121..142b4cdebc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+   automatic data augmentation when assigned to the `symmetries` attribute of a
+   `BayesianRecommender`
+ - `Parameter.is_equivalent` method for structural parameter comparison
++- `posterior_mean_function` method to `GaussianProcessSurrogate`
+ 
+ ### Changed
+ - `BOTORCH` GP preset now includes `BetaPrior(2.5, 1.5)` for the task covariance
+diff --git a/baybe/surrogates/gaussian_process/components/mean.py b/baybe/surrogates/gaussian_process/components/mean.py
+index e8c3408f91..5adefc4888 100644
+--- a/baybe/surrogates/gaussian_process/components/mean.py
++++ b/baybe/surrogates/gaussian_process/components/mean.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import gc
+ from typing import TYPE_CHECKING, Any
+ 
+ import pandas as pd
+@@ -40,3 +41,7 @@ def __call__(
+         from gpytorch.means import ConstantMean
+ 
+         return ConstantMean()
++
++
++# Collect leftover original slotted classes created by attrs
++gc.collect()
+diff --git a/baybe/surrogates/gaussian_process/core.py b/baybe/surrogates/gaussian_process/core.py
+index b1c41ad048..81d7f00c26 100644
+--- a/baybe/surrogates/gaussian_process/core.py
++++ b/baybe/surrogates/gaussian_process/core.py
+@@ -5,6 +5,7 @@
+ import gc
+ import importlib
+ import os
++import warnings
+ from functools import partial
+ from typing import TYPE_CHECKING, ClassVar
+ 
+@@ -50,11 +51,12 @@
+ from baybe.symmetries.base import Symmetry
+ from baybe.utils.boolean import strtobool
+ from baybe.utils.conversion import to_string
++from baybe.utils.dataframe import to_tensor
+ 
+ if TYPE_CHECKING:
+     from botorch.models.gpytorch import GPyTorchModel
+-    from botorch.models.transforms.input import InputTransform
+-    from botorch.models.transforms.outcome import OutcomeTransform
++    from botorch.models.transforms.input import InputTransform, Normalize
++    from botorch.models.transforms.outcome import OutcomeTransform, Standardize
+     from botorch.posteriors import Posterior
+     from gpytorch.kernels import Kernel as GPyTorchKernel
+     from gpytorch.likelihoods import Likelihood as GPyTorchLikelihood
+@@ -220,6 +222,26 @@ class GaussianProcessSurrogate(Surrogate):
+     _model = field(init=False, default=None, eq=False)
+     """The fitted BoTorch model."""
+ 
++    @staticmethod
++    def _make_input_transform(context: _ModelContext) -> Normalize:
++        """Create the input transform for the Gaussian process."""
++        from botorch.models.transforms.input import Normalize
++
++        return Normalize(
++            len(context.searchspace.comp_rep_columns),
++            bounds=context.parameter_bounds,
++            indices=context.numerical_indices,
++        )
++
++    @staticmethod
++    def _make_outcome_transform(train_y: Tensor) -> Standardize:
++        """Create the (unfitted) outcome transform for the Gaussian process."""
++        from botorch.models.transforms.outcome import Standardize
++
++        outcome_transform = Standardize(m=train_y.shape[-1])
++        outcome_transform(train_y)
++        return outcome_transform
++
+     @classmethod
+     def from_preset(
+         cls,
+@@ -270,6 +292,62 @@ def from_preset(
+         gp._custom_kernel = False  # preset are first-party features
+         return gp
+ 
++    def posterior_mean_function(
++        self,
++        searchspace: SearchSpace,
++        objective: Objective,
++        measurements: pd.DataFrame,
++    ) -> GPyTorchMean:
++        """Create a GPyTorch mean module representing the surrogate's posterior mean.
++
++        The method can be used to create the mean for a new
++        :class:`GaussianProcessSurrogate` in two ways:
++
++        * **Eagerly:** By calling the method and passing the returned module to a GP.
++        * **Lazily:** By passing the bound method itself, without eagerly calling it.
++            This works because the method signature complies with
++            :class:`~.components.mean.MeanFactoryProtocol`, i.e., the new GP will use it
++            as a factory and call it automatically at fit time.
++
++        If the mean-providing GP has not been fitted at call time, its prior mean module
++        is returned instead (which coincides with the posterior in this case) and a
++        :class:`UserWarning` is emitted.
++
++        Args:
++            searchspace: The search space of the *new* GP.
++            objective: The objective of the *new* GP.
++            measurements: The training data of the *new* GP.
++
++        Returns:
++            A mean module ready to be used as the mean of a new
++            :class:`GaussianProcessSurrogate`.
++        """
++        if self._model is None:
++            warnings.warn(
++                f"'{self.__class__.__name__}' has not been fitted yet. "
++                f"Therefore, the prior mean is returned (which coincides with the "
++                f"posterior in this case).",
++                UserWarning,
++            )
++            mean_factory = self.mean_factory or BayBEMeanFactory()
++            return mean_factory(searchspace, objective, measurements)
++
++        context = _ModelContext(searchspace, objective, measurements)
++
++        train_y = to_tensor(objective._pre_transform(measurements, allow_extra=True))
++        if train_y.ndim == 1:
++            train_y = train_y.unsqueeze(-1)
++
++        input_transform = self._make_input_transform(context)
++        input_transform.eval()
++
++        outcome_transform = self._make_outcome_transform(train_y)
++        outcome_transform.eval()
++
++        return _make_posterior_mean_module(
++            self._model, input_transform, outcome_transform
++        )
++
+     @override
+     def to_botorch(self) -> GPyTorchModel:
+         if self._model is None:
+@@ -375,14 +453,13 @@ def _fit(self, train_x: Tensor, train_y: Tensor) -> None:
+         kernel, mean, likelihood, criterion = self._resolve_components(context)
+ 
+         import botorch
+-        from botorch.models.transforms import Normalize, Standardize
+ 
+-        input_transform = Normalize(
+-            train_x.shape[-1],
+-            bounds=context.parameter_bounds,
+-            indices=context.numerical_indices,
+-        )
+-        outcome_transform = Standardize(train_y.shape[-1])
++        ### Input/output scaling
++        # NOTE: For GPs, we let BoTorch handle scaling (see [Scaling Workaround] above)
++        input_transform = self._make_input_transform(context)
++        outcome_transform = self._make_outcome_transform(train_y)
++
++        ### Model construction and fitting
+         self._model = botorch.models.SingleTaskGP(
+             train_x,
+             train_y,
+@@ -416,5 +493,70 @@ def __str__(self) -> str:
+         return to_string(super().__str__(), *fields)
+ 
+ 
++def _make_posterior_mean_module(
++    model: GPyTorchModel,
++    input_transform: Normalize,
++    outcome_transform: Standardize,
++) -> GPyTorchMean:
++    """Make a :class:`~gpytorch.means.Mean` that represents the posterior mean of a GP.
++
++    Computationally, this is achieved by wrapping a deep copy of the provided GP with
++    all parameters frozen, so that training a new GP consuming the module cannot alter
++    the pretrained one.
++
++    Transformations are applied to automatically align the spaces of the providing and
++    consuming model, bridging the gap between their different modeling contexts:
++
++    * **Input un-normalization**:
++      When the new GP calls the produced module during training or inference, the inputs
++      have already been normalized by the new GP's input transform. For this purpose,
++      the inputs are un-normalized before passed to the pretrained GP. Without this
++      step, the pretrained GP would receive inputs on the wrong scale and return
++      meaningless predictions.
++
++    * Output **un-standardization:**
++      The produced mean values are expected in the original GP's output space, i.e.,
++      the prior mean of the consuming GP should exactly match the posterior mean of the
++      pretrained GP. However, the consuming GP transforms the output values of the
++      mean module into its own scale, which would corrupt the result. To cancel out
++      this effect, the inverse of this transformation is applied to the pretrained
++      module output before passing it to the consuming GP.
++
++    Args:
++        model: The fitted GP whose posterior mean is to be extracted.
++        input_transform: The new GP's input transform, used to un-normalize inputs.
++        outcome_transform: The new GP's outcome transform, used to un-standardize
++            outputs.
++
++    Returns:
++        A mean module ready for use in a new GP.
++    """
++    from copy import deepcopy
++
++    import gpytorch
++
++    frozen_model = deepcopy(model)
++    for param in frozen_model.parameters():
++        param.requires_grad = False
++    frozen_model.eval()
++
++    class _PosteriorMean(gpytorch.means.Mean):
++        """GPyTorch mean wrapping a frozen GP's posterior."""
++
++        def __init__(self) -> None:
++            super().__init__()
++            self.gp = frozen_model
++
++        @override
++        def forward(self, x: Tensor) -> Tensor:
++            """Compute the prior mean in the new GP's standardized output space."""
++            x_raw = input_transform.untransform(x)
++            posterior_mean = self.gp.posterior(x_raw).mean
++            standardized, _ = outcome_transform(posterior_mean)
++            return standardized.squeeze(-1)
++
++    return _PosteriorMean()
++
++
+ # Collect leftover original slotted classes processed by `attrs.define`
+ gc.collect()
+diff --git a/tests/test_gp.py b/tests/test_gp.py
+index de4bbe5ef6..7595a51b62 100644
+--- a/tests/test_gp.py
++++ b/tests/test_gp.py
+@@ -2,6 +2,7 @@
+ 
+ import sys
+ 
++import numpy as np
+ import pandas as pd
+ import pytest
+ import torch
+@@ -24,7 +25,10 @@
+ from baybe.kernels.basic import MaternKernel, RBFKernel
+ from baybe.kernels.composite import ScaleKernel
+ from baybe.parameters.categorical import TaskParameter
+-from baybe.parameters.numerical import NumericalContinuousParameter
++from baybe.parameters.numerical import (
++    NumericalContinuousParameter,
++    NumericalDiscreteParameter,
++)
+ from baybe.searchspace.core import SearchSpace
+ from baybe.surrogates.gaussian_process.components.fit_criterion import FitCriterion
+ from baybe.surrogates.gaussian_process.components.generic import PlainGPComponentFactory
+@@ -262,3 +266,96 @@ def test_to_botorch_before_fit():
+     """Attempting to access an untrained surrogate raises an error."""
+     with pytest.raises(ModelNotTrainedError):
+         GaussianProcessSurrogate().to_botorch()
++
++
++# Parameter ranges
++_RANGE_NARROW = tuple(range(6))
++_RANGE_WIDE = tuple(range(11))
++
++
++def _predict_on_posterior_mean(
++    pretrained_gp: GaussianProcessSurrogate, x: list[float]
++) -> pd.DataFrame:
++    """Build measurements whose targets follow the pretrained GP posterior mean."""
++    points = pd.DataFrame({"x": x})
++    return points.assign(
++        t=pretrained_gp.posterior_stats(points, stats=["mean"])["t_mean"]
++    )
++
++
++@pytest.fixture(name="pretrained_gp")
++def fixture_pretrained_gp() -> GaussianProcessSurrogate:
++    """A GP trained on a narrow search space with three points."""
++    surrogate = GaussianProcessSurrogate()
++    surrogate.fit(
++        NumericalDiscreteParameter("x", _RANGE_NARROW).to_searchspace(),
++        objective,
++        pd.DataFrame({"x": list(_RANGE_NARROW), "t": [2 * x for x in _RANGE_NARROW]}),
++    )
++    return surrogate
++
++
++@pytest.mark.parametrize(
++    "prebuilt",
++    [param(False, id="bound_method"), param(True, id="prebuilt_module")],
++)
++def test_posterior_mean_transfer(
++    pretrained_gp: GaussianProcessSurrogate, prebuilt: bool
++) -> None:
++    """A pretrained GP posterior mean can seed the prior mean of a new GP.
++
++    This test covers both ways of supplying the mean (bound-method factory and
++    pre-built module). It verifies that:
++
++    * Fitting the new GP builds a valid model.
++    * If the new GP is trained on targets generated from the pretrained GP
++      posterior mean, its posterior mean at a held-out point matches the
++      pretrained GP's posterior mean.
++    * Fitting the new GP leaves the pretrained GP's hyperparameters untouched.
++
++    The matching-mean expectation is specific to this constructed setup and is
++    not intended as a universal claim for arbitrary training data.
++    """
++    # Record hyperparameters for later comparison
++    pretrained_params = {
++        k: v.detach().clone() for k, v in pretrained_gp.to_botorch().named_parameters()
++    }
++
++    # Train/test data
++    x_train_reduced = [_RANGE_WIDE[0], _RANGE_WIDE[-1]]
++    y_train_reduced = _predict_on_posterior_mean(pretrained_gp, x_train_reduced)
++    x_test = list(_RANGE_WIDE[1:-1])
++
++    # Build a new GP with the pretrained mean on a wider search space (to ensure
++    # that input normalization is applied correctly)
++    wider_searchspace = NumericalDiscreteParameter("x", _RANGE_WIDE).to_searchspace()
++    if prebuilt:
++        mean = pretrained_gp.posterior_mean_function(
++            wider_searchspace, objective, y_train_reduced
++        )
++    else:
++        mean = pretrained_gp.posterior_mean_function
++    new_gp = GaussianProcessSurrogate(mean_or_factory=mean)
++    new_gp.fit(wider_searchspace, objective, y_train_reduced)
++
++    assert new_gp.to_botorch() is not None
++
++    # Predictions must exactly match the pretrained mean since the new training data of
++    # the new GP lies exactly on the mean and hence no corrections are applied
++    candidates = pd.DataFrame({"x": x_test})
++    expected = pretrained_gp.posterior_stats(candidates, stats=["mean"])["t_mean"]
++    actual = new_gp.posterior_stats(candidates, stats=["mean"])["t_mean"]
++    assert np.allclose(actual, expected)
++
++    # Assert that the hyperparameters of the original GP are unchanged
++    for k, v in pretrained_gp.to_botorch().named_parameters():
++        assert torch.equal(v, pretrained_params[k])
++
++
++def test_posterior_mean_warns_if_not_fitted() -> None:
++    """An untrained surrogate warns and returns the prior mean instead."""
++    with pytest.warns(UserWarning, match="has not been fitted yet"):
++        mean = GaussianProcessSurrogate().posterior_mean_function(
++            searchspace, objective, measurements
++        )
++    assert mean is not None

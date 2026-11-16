@@ -1,0 +1,922 @@
+diff --git a/skfp/fingerprints/_new_mordred/calculator.py b/skfp/fingerprints/_new_mordred/calculator.py
+index a46eb311..572bee33 100644
+--- a/skfp/fingerprints/_new_mordred/calculator.py
++++ b/skfp/fingerprints/_new_mordred/calculator.py
+@@ -49,6 +49,7 @@
+     zagreb_index,
+ )
+ from skfp.fingerprints._new_mordred.utils.atomic_properties import AtomicProperties
++from skfp.fingerprints._new_mordred.utils.descriptor_evaluation import DEFAULT_TIMEOUT
+ from skfp.fingerprints._new_mordred.utils.feature_names import (
+     ALL_FEATURE_NAMES,
+     FEATURE_NAMES_2D,
+@@ -170,7 +171,12 @@ def get_feature_names(use_3d: bool) -> np.ndarray:
+     )
+ 
+ 
+-def compute(mol: Mol, use_3D: bool) -> np.ndarray:
++def compute(
++    mol: Mol,
++    use_3D: bool,
++    timeout: float = DEFAULT_TIMEOUT,
++    max_ring_system_rank: int = detour_matrix.DEFAULT_MAX_RING_SYSTEM_RANK,
++) -> np.ndarray:
+     n_features = len(ALL_FEATURE_NAMES) if use_3D else len(FEATURE_NAMES_2D)
+     result = np.full(n_features, np.nan, dtype=np.float32)
+ 
+@@ -288,12 +294,17 @@ def compute(mol: Mol, use_3D: bool) -> np.ndarray:
+             props_regular, n_frags, distance_matrix_regular
+         ),
+         detour_matrix: detour_matrix.calc(
+-            props_regular, distance_matrix_regular, rings_regular, n_frags
++            props_regular,
++            distance_matrix_regular,
++            rings_regular,
++            n_frags,
++            timeout,
++            max_ring_system_rank,
+         ),
+         molecular_distance_edge: molecular_distance_edge.calc(
+             props_regular, distance_matrix_regular
+         ),
+-        molecular_id: molecular_id.calc(props_regular, n_frags),
++        molecular_id: molecular_id.calc(props_regular, n_frags, timeout),
+         information_content: information_content.calc(
+             mol_hydrogens, props_hydrogens, kekulized_bond_types_hydrogens
+         ),
+diff --git a/skfp/fingerprints/_new_mordred/descriptors/autocorrelation.py b/skfp/fingerprints/_new_mordred/descriptors/autocorrelation.py
+index 1fec7408..d6d672ac 100644
+--- a/skfp/fingerprints/_new_mordred/descriptors/autocorrelation.py
++++ b/skfp/fingerprints/_new_mordred/descriptors/autocorrelation.py
+@@ -114,11 +114,29 @@ def _get_autocorrelations(
+     Every returned array is indexed by property and then by distance, which is also
+     the order the feature names are in.
+     """
+-    # row vector p^T M_d for every distance and property, shape (8, n_props, n)
+-    # (equal to (M_d p)^T, as the masks are symmetric)
+-    weighted = props @ dist_masks
+-    # p^T M_d p, summed over atoms and transposed to shape (n_props, 8)
+-    quadratic_form = np.sum(weighted * props, axis=2).T
++    # centering first, so that what vanishes for a property equal on every atom
++    # comes out as an exact zero, not residue the guards below would not recognize
++    means = props.mean(axis=1, keepdims=True)
++    props_centered = props - means
++
++    # row vector p_c^T M_d for every distance and property, shape (8, n_props, n)
++    # (equal to (M_d p_c)^T, as the masks are symmetric)
++    weighted_centered = props_centered @ dist_masks
++
++    # p_c^T M_d p_c, summed over atoms and transposed to shape (n_props, 8)
++    centered_quadratic_form = np.sum(weighted_centered * props_centered, axis=2).T
++
++    # summing the same row vector over the atoms instead gives deg_d . p_c
++    degree_dot_centered = weighted_centered.sum(axis=2).T
++
++    # as p = p_c + mean * 1, the uncentered form follows without multiplying the
++    # masks again: p^T M_d p = p_c^T M_d p_c + 2 mean (deg_d . p_c) + mean^2 1^T M_d 1,
++    # the last term over ordered pairs. It never vanishes, so the sum is exact enough
++    quadratic_form = (
++        centered_quadratic_form
++        + 2.0 * means * degree_dot_centered
++        + means**2 * 2.0 * pair_counts
++    )
+ 
+     # ATS: sum over unordered atom pairs at distance d of p_i * p_j
+     # masks are symmetric with zero diagonal, so we divide by 2
+@@ -127,19 +145,8 @@ def _get_autocorrelations(
+     aats = _per_pair_average(ats, pair_counts, num_atoms)
+ 
+     # ATSC: like above, but on mean-centered properties
+-    # note that the product is linear, so for the centered property p - mean * 1:
+-    # (p - mean * 1)^T M_d = p^T M_d - mean * deg_d^T
+-    # (as 1^T M_d = (M_d 1)^T = deg_d^T) and the masks need not be multiplied again
+-    means = props.mean(axis=1, keepdims=True)
+-    props_centered = props - means
+-    weighted_centered = weighted - neighbor_counts[:, np.newaxis, :] * means
+     centered_square_sums = np.sum(props_centered**2, axis=1)
+-    atsc = np.column_stack(
+-        [
+-            centered_square_sums,
+-            0.5 * np.sum(weighted_centered * props_centered, axis=2).T,
+-        ]
+-    )
++    atsc = np.column_stack([centered_square_sums, 0.5 * centered_quadratic_form])
+     aatsc = _per_pair_average(atsc, pair_counts, num_atoms)
+ 
+     # MATS (Moran coefficient): the centered per-pair average, normalized by
+@@ -149,11 +156,12 @@ def _get_autocorrelations(
+ 
+     # GATS (Geary coefficient): mean squared difference between paired atoms,
+     # normalized by the property sample variance
+-    # note: summing (p_i - p_j)^2 over the mask, i.e. over ordered atom pairs, gives:
+-    # 2 * sum_i deg_d(i) p_i^2 - 2 * p^T M_d p
+-    # so no pairwise difference matrix has to be formed explicitly, we can use the
+-    # quadratic form from above
+-    sum_squared_diff = 2.0 * (props**2 @ neighbor_counts.T) - 2.0 * quadratic_form
++    # summing (p_i - p_j)^2 over the mask gives 2 sum_i deg_d(i) p_i^2 - 2 p^T M_d p,
++    # so no pairwise difference matrix is needed; the mean cancels out of the
++    # differences, and centered the two terms cancel exactly for a constant property
++    sum_squared_diff = (
++        2.0 * (props_centered**2 @ neighbor_counts.T) - 2.0 * centered_quadratic_form
++    )
+     # make sure we get non-negative value (could happen due to float arithmetic)
+     sum_squared_diff = np.maximum(sum_squared_diff, 0.0)
+     # Geary divides the sum over unordered pairs by 2 * pair_counts, and the sum
+diff --git a/skfp/fingerprints/_new_mordred/descriptors/detour_matrix.py b/skfp/fingerprints/_new_mordred/descriptors/detour_matrix.py
+index f530a7ec..f6b8fc1b 100644
+--- a/skfp/fingerprints/_new_mordred/descriptors/detour_matrix.py
++++ b/skfp/fingerprints/_new_mordred/descriptors/detour_matrix.py
+@@ -1,4 +1,5 @@
+ import itertools
++from time import monotonic
+ 
+ import numpy as np
+ from scipy.sparse import coo_array
+@@ -6,6 +7,11 @@
+ 
+ from skfp.fingerprints._new_mordred.descriptors.ring_count import RingSets
+ from skfp.fingerprints._new_mordred.utils.atomic_properties import AtomicProperties
++from skfp.fingerprints._new_mordred.utils.descriptor_evaluation import (
++    DEFAULT_TIMEOUT,
++    SearchTimeoutError,
++    warn_search_given_up,
++)
+ from skfp.fingerprints._new_mordred.utils.graph_matrix import DistanceMatrix
+ from skfp.fingerprints._new_mordred.utils.matrix_attributes import MatrixAttributes
+ 
+@@ -33,12 +39,19 @@
+     "DetourIndex",
+ ]
+ 
++# number of independent cycles above which a ring system is given up on instead of
++# being searched: the search costs about 2.2x more per cycle, and rank 23 already
++# takes minutes, so going further only burns the timeout without yielding a value
++DEFAULT_MAX_RING_SYSTEM_RANK = 23
++
+ 
+ def calc(
+     atomic_props_regular: AtomicProperties,
+     distance_matrix_regular: DistanceMatrix,
+     rings_regular: RingSets,
+     n_frags: int,
++    timeout: float = DEFAULT_TIMEOUT,
++    max_ring_system_rank: int = DEFAULT_MAX_RING_SYSTEM_RANK,
+ ) -> np.ndarray:
+     """
+     Detour matrix descriptor.
+@@ -46,16 +59,28 @@ def calc(
+     Computes matrix-aggregating features (spectral and Randic-like) of the
+     detour matrix, together with the detour index. The detour matrix is
+     undefined for disconnected molecules, so NaN is returned for those.
++
++    Building it means searching for longest simple paths, which is NP-hard. The
++    search gets ``timeout`` seconds for the whole molecule, and NaN is returned
++    when it runs out, as it is for a molecule holding a ring system of more than
++    ``max_ring_system_rank`` independent cycles.
+     """
+     # avoids unnecessary eigendecomposition for disconnected molecules
+     if n_frags != 1:
+         return np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
+ 
+-    detour_matrix = _get_detour_matrix(
+-        atomic_props_regular,
+-        distance_matrix_regular.matrix,
+-        rings_regular.simple_ring_atom_sets,
+-    )
++    try:
++        detour_matrix = _get_detour_matrix(
++            atomic_props_regular,
++            distance_matrix_regular.matrix,
++            rings_regular.simple_ring_atom_sets,
++            monotonic() + timeout,
++            max_ring_system_rank,
++        )
++    except SearchTimeoutError as error:
++        warn_search_given_up("DetourMatrix", atomic_props_regular.mol, error)
++        return np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
++
+     attrs = MatrixAttributes(
+         detour_matrix,
+         atomic_props_regular,
+@@ -92,6 +117,8 @@ def _get_detour_matrix(
+     props: AtomicProperties,
+     shortest_distances: np.ndarray,
+     ring_atom_sets: list[set[int]],
++    deadline: float,
++    max_ring_system_rank: int,
+ ) -> np.ndarray:
+     """
+     Build the detour (maximum topological distance) matrix of a molecule.
+@@ -122,7 +149,9 @@ def _get_detour_matrix(
+ 
+     for ring_system in ring_systems:
+         atoms = np.array(sorted(ring_system), dtype=np.intp)
+-        detour += _get_ring_system_correction(props, shortest_distances, atoms)
++        detour += _get_ring_system_correction(
++            props, shortest_distances, atoms, deadline, max_ring_system_rank
++        )
+ 
+     return detour
+ 
+@@ -292,7 +321,11 @@ def _get_neighbors_with_bonds(props: AtomicProperties) -> list[list[tuple[int, i
+ 
+ 
+ def _get_ring_system_correction(
+-    props: AtomicProperties, shortest_distances: np.ndarray, atoms: np.ndarray
++    props: AtomicProperties,
++    shortest_distances: np.ndarray,
++    atoms: np.ndarray,
++    deadline: float,
++    max_ring_system_rank: int,
+ ) -> np.ndarray:
+     """
+     How much longer the longest way through one ring system is than the shortest,
+@@ -304,7 +337,9 @@ def _get_ring_system_correction(
+     the same atom never traverse the system, and their correction is zero.
+     """
+     within = shortest_distances[atoms[:, np.newaxis], atoms]
+-    longest = _longest_paths_in_ring_system(props, atoms, within)
++    longest = _longest_paths_in_ring_system(
++        props, atoms, within, deadline, max_ring_system_rank
++    )
+ 
+     # every atom reaches the ring system through the one of its atoms closest to
+     # it, since all of its paths into the system pass through that atom. It is the
+@@ -314,7 +349,11 @@ def _get_ring_system_correction(
+ 
+ 
+ def _longest_paths_in_ring_system(
+-    props: AtomicProperties, atoms: np.ndarray, within: np.ndarray
++    props: AtomicProperties,
++    atoms: np.ndarray,
++    within: np.ndarray,
++    deadline: float,
++    max_ring_system_rank: int,
+ ) -> np.ndarray:
+     """
+     Longest simple path between every two atoms of one ring system.
+@@ -330,11 +369,21 @@ def _longest_paths_in_ring_system(
+ 
+     # fused or bridged rings have to be searched through, once from every atom.
+     # This is pessimistically exponential, as the longest simple path is NP-hard
+-    # for graphs in general, but affordable because ring systems are small.
++    # for graphs in general, but affordable because ring systems are usually small.
++    # How many independent cycles one holds is what decides that, so a system that
++    # holds too many is given up on rather than searched until the deadline.
++    num_bonds = sum(len(adjacent) for adjacent in neighbors) // 2
++    rank = num_bonds - len(atoms) + 1
++    if rank > max_ring_system_rank:
++        raise SearchTimeoutError(
++            f"it holds a ring system of {rank} independent cycles, past the "
++            f"max_ring_system_rank of {max_ring_system_rank}"
++        )
++
+     longest = np.zeros_like(within)
+     for source in range(len(atoms)):
+         distances = [0] * len(atoms)
+-        _walk_every_path(source, 0, neighbors, {source}, distances)
++        _walk_every_path(source, 0, neighbors, {source}, distances, deadline)
+         longest[source] = distances
+ 
+     return longest
+@@ -370,13 +419,18 @@ def _walk_every_path(
+     neighbors: list[list[int]],
+     visited: set[int],
+     longest: list[int],
++    deadline: float,
+ ) -> None:
+     """
+     Longest simple path from one atom of a ring system to each of the others.
+ 
+     Explores every simple path leaving ``atom`` by DFS with backtracking, keeping
+-    in ``longest`` the greatest distance any of them reaches each atom at.
++    in ``longest`` the greatest distance any of them reaches each atom at. Gives
++    up with a ``SearchTimeoutError`` once ``deadline`` has passed.
+     """
++    if monotonic() > deadline:
++        raise SearchTimeoutError("the longest path search ran past its timeout")
++
+     distance += 1
+ 
+     for neighbor in neighbors[atom]:
+@@ -386,5 +440,5 @@ def _walk_every_path(
+         longest[neighbor] = max(longest[neighbor], distance)
+ 
+         visited.add(neighbor)
+-        _walk_every_path(neighbor, distance, neighbors, visited, longest)
++        _walk_every_path(neighbor, distance, neighbors, visited, longest, deadline)
+         visited.remove(neighbor)
+diff --git a/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py b/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py
+index f7f404b5..5915a05d 100644
+--- a/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py
++++ b/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py
+@@ -129,7 +129,6 @@ def calc(
+             vem_beta_ns_d,
+             vem_beta_ns_d / num_atoms,
+         ],
+-        dtype=np.float32,
+     )
+ 
+     # composite + functionality indices, which compare the molecule with its alkane
+@@ -150,12 +149,12 @@ def calc(
+ 
+     # ETA delta alpha
+     if gamma_alkane is None:
+-        eta_delta_alpha = np.array([np.nan, np.nan], dtype=np.float32)
++        eta_delta_alpha = np.array([np.nan, np.nan])
+     else:
+         core_count_alkane = len(alkane_degrees) * _CARBON_CORE_COUNT
+         d_a = max((core_count - core_count_alkane) / num_atoms, 0.0)
+         d_b = max((core_count_alkane - core_count) / num_atoms, 0.0)
+-        eta_delta_alpha = np.array([d_a, d_b], dtype=np.float32)
++        eta_delta_alpha = np.array([d_a, d_b])
+ 
+     # Mordred builds the alkane reference of epsilon 3 from the hydrogen-explicit
+     # molecule, so it gives up when some atom has more than four neighbors there,
+@@ -175,13 +174,11 @@ def calc(
+ 
+     # ETA delta beta
+     delta_beta = vem_beta_ns - vem_beta_s
+-    eta_delta_beta = np.array([delta_beta, delta_beta / num_atoms], dtype=np.float32)
++    eta_delta_beta = np.array([delta_beta, delta_beta / num_atoms])
+ 
+     # ETA psi
+     psi = core_count / (num_atoms * eta_epsilon_values[1])
+-    eta_psi = np.array(
+-        [psi, max(0.714 - psi, 0.0), max(psi - 0.714, 0.0)], dtype=np.float32
+-    )
++    eta_psi = np.array([psi, max(0.714 - psi, 0.0), max(psi - 0.714, 0.0)])
+ 
+     values = np.concatenate(
+         [
+@@ -216,7 +213,9 @@ def _core_counts_and_epsilons(atomic_nums: np.ndarray) -> tuple[np.ndarray, np.n
+     core_counts = np.where(atomic_nums == 1, 0.0, alphas)
+     epsilons = 0.3 * outer_elecs - core_counts
+ 
+-    return core_counts.astype(np.float32), epsilons.astype(np.float32)
++    # kept in double precision: the sigma beta rule compares the gap between two
++    # epsilons against 0.3, and a bond can sit exactly on it, as an N-Cr one does
++    return core_counts, epsilons
+ 
+ 
+ def _beta_and_gamma(
+@@ -287,7 +286,7 @@ def _beta_delta(
+     eligible = (
+         ~props.is_aromatic & ~is_in_ring & has_lone_pairs & (aromatic_neighbors > 0)
+     )
+-    return np.where(eligible, 0.5, 0.0).astype(np.float32)
++    return np.where(eligible, 0.5, 0.0)
+ 
+ 
+ def _composite_index_pair(gamma: np.ndarray, dists: np.ndarray) -> tuple[float, float]:
+@@ -353,7 +352,6 @@ def _composite_and_functionality(
+             functionality_local,
+             functionality_local / num_atoms,
+         ],
+-        dtype=np.float32,
+     )
+ 
+ 
+@@ -364,7 +362,7 @@ def _branching_indices(
+     ETA branching index descriptors.
+     """
+     if num_atoms <= 1:
+-        return np.full(4, np.nan, dtype=np.float32)
++        return np.full(4, np.nan)
+ 
+     if num_atoms == 2:
+         reference_alkane_branching = 1.0
+@@ -374,9 +372,7 @@ def _branching_indices(
+     non_ring = reference_alkane_branching - composite_index_alkane_local
+     ring = non_ring + 0.086 * ring_count
+ 
+-    return np.array(
+-        [non_ring, non_ring / num_atoms, ring, ring / num_atoms], dtype=np.float32
+-    )
++    return np.array([non_ring, non_ring / num_atoms, ring, ring / num_atoms])
+ 
+ 
+ def _epsilon_values(
+@@ -424,7 +420,6 @@ def _epsilon_values(
+             eps_3 - eps_4,
+             eps_2 - eps_5,
+         ],
+-        dtype=np.float32,
+     )
+ 
+ 
+diff --git a/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py b/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py
+index 66f07997..1c178bbd 100644
+--- a/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py
++++ b/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py
+@@ -1,8 +1,14 @@
+ from math import sqrt
++from time import monotonic
+ 
+ import numpy as np
+ 
+ from skfp.fingerprints._new_mordred.utils.atomic_properties import AtomicProperties
++from skfp.fingerprints._new_mordred.utils.descriptor_evaluation import (
++    DEFAULT_TIMEOUT,
++    SearchTimeoutError,
++    warn_search_given_up,
++)
+ from skfp.fingerprints._new_mordred.utils.periodic_table import (
+     HALOGEN_ATOMIC_NUMS,
+     NUM_ELEMENTS,
+@@ -42,7 +48,9 @@
+ _IS_HALOGEN[sorted(HALOGEN_ATOMIC_NUMS)] = True
+ 
+ 
+-def calc(props_regular: AtomicProperties, n_frags: int) -> np.ndarray:
++def calc(
++    props_regular: AtomicProperties, n_frags: int, timeout: float = DEFAULT_TIMEOUT
++) -> np.ndarray:
+     """
+     Molecular ID descriptors, sums of atomic IDs over a selected set of atoms.
+ 
+@@ -51,12 +59,19 @@ def calc(props_regular: AtomicProperties, n_frags: int) -> np.ndarray:
+     (``MID_h``), carbons, nitrogens, oxygens and halogens (``MID_X``).
+ 
+     Atomic IDs are undefined for disconnected molecules, so NaN is returned for
+-    those.
++    those. They are summed over every simple path of the molecule, which takes
++    exponential time, so the sum gets ``timeout`` seconds for the whole molecule
++    and NaN is returned when it runs out.
+     """
+     if n_frags != 1:
+         return np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
+ 
+-    atom_ids = _atom_ids(props_regular)
++    try:
++        atom_ids = _atom_ids(props_regular, monotonic() + timeout)
++    except SearchTimeoutError as error:
++        warn_search_given_up("MolecularId", props_regular.mol, error)
++        return np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
++
+     atomic_nums = props_regular.atomic_nums
+     # a heteroatom here is anything but carbon and hydrogen, unlike the
+     # carbon-only definition AtomicProperties.is_hetero uses
+@@ -78,7 +93,7 @@ def calc(props_regular: AtomicProperties, n_frags: int) -> np.ndarray:
+     return np.asarray(values, dtype=np.float32)
+ 
+ 
+-def _atom_ids(props: AtomicProperties) -> np.ndarray:
++def _atom_ids(props: AtomicProperties, deadline: float) -> np.ndarray:
+     """
+     Atomic ID of every atom: one plus half the sum, over all simple paths
+     starting at that atom, of the inverse square root of the product of the
+@@ -90,7 +105,7 @@ def _atom_ids(props: AtomicProperties) -> np.ndarray:
+ 
+     return np.fromiter(
+         (
+-            1.0 + _sum_over_paths(adjacency, visited, start, 1) / 2.0
++            1.0 + _sum_over_paths(adjacency, visited, start, 1, deadline) / 2.0
+             for start in range(num_atoms)
+         ),
+         dtype=np.float64,
+@@ -121,6 +136,7 @@ def _sum_over_paths(
+     visited: bytearray,
+     atom: int,
+     weight_product: int,
++    deadline: float,
+ ) -> float:
+     """
+     Sum of the inverse square root of the edge weight product over every simple
+@@ -128,9 +144,13 @@ def _sum_over_paths(
+ 
+     Backtracking search: ``visited`` marks the atoms on the current path and is
+     cleared on the way out, so each simple path is walked once. The cost is
+-    exponential in the number of rings. Clearing the marks also lets a single
+-    buffer serve every starting atom.
++    exponential in the number of rings, so the search gives up with a
++    ``SearchTimeoutError`` once ``deadline`` has passed. Clearing the marks also lets
++    a single buffer serve every starting atom.
+     """
++    if monotonic() > deadline:
++        raise SearchTimeoutError("the simple path sum ran past its timeout")
++
+     visited[atom] = 1
+     total = 0.0
+ 
+@@ -142,7 +162,7 @@ def _sum_over_paths(
+         total += 1.0 / sqrt(product)
+         # a longer path would only add terms below the epsilon, so stop here
+         if product < _WEIGHT_PRODUCT_LIMIT:
+-            total += _sum_over_paths(adjacency, visited, neighbor, product)
++            total += _sum_over_paths(adjacency, visited, neighbor, product, deadline)
+ 
+     visited[atom] = 0
+     return total
+diff --git a/skfp/fingerprints/_new_mordred/utils/descriptor_evaluation.py b/skfp/fingerprints/_new_mordred/utils/descriptor_evaluation.py
+index 0fae593d..3e3b77b4 100644
+--- a/skfp/fingerprints/_new_mordred/utils/descriptor_evaluation.py
++++ b/skfp/fingerprints/_new_mordred/utils/descriptor_evaluation.py
+@@ -1,7 +1,9 @@
++import warnings
+ from collections.abc import Callable
+ from typing import Any
+ 
+ import numpy as np
++from rdkit.Chem import Mol, MolToSmiles
+ 
+ """
+ This code has been adapted from the BSD-licensed mordred-community library.
+@@ -11,6 +13,33 @@
+ """
+ 
+ 
++# seconds an exhaustive search gets per molecule, as in Mordred
++DEFAULT_TIMEOUT = 60.0
++
++
++class SearchTimeoutError(Exception):
++    """
++    Raised by an exhaustive search that ran past the time it was given, or that is
++    known in advance not to fit in it. Its message is the reason, as
++    :func:`warn_search_given_up` reports it.
++    """
++
++
++def warn_search_given_up(descriptor: str, mol: Mol, error: SearchTimeoutError) -> None:
++    """
++    Report that ``descriptor`` abandoned its search of ``mol``.
++
++    A timeout and a molecule too tangled to try both come out as NaN, as do a
++    disconnected molecule and a failed calculation, so the reason is warned about
++    rather than left for the caller to guess at.
++    """
++    warnings.warn(
++        f"{descriptor} gave up on {MolToSmiles(mol)}: {error}. "
++        f"Its features are returned as NaN.",
++        stacklevel=3,
++    )
++
++
+ def safe_value(func: Callable[..., float | int], *args: Any, **kwargs: Any) -> float:
+     """
+     Execute a descriptor function and return NaN for known calculation failures.
+diff --git a/skfp/fingerprints/_new_mordred/utils/feature_names.py b/skfp/fingerprints/_new_mordred/utils/feature_names.py
+index d929fb26..aa79b30a 100644
+--- a/skfp/fingerprints/_new_mordred/utils/feature_names.py
++++ b/skfp/fingerprints/_new_mordred/utils/feature_names.py
+@@ -646,30 +646,30 @@
+     "Geary_autocorr_ionization_potential_lag_6",
+     "Geary_autocorr_ionization_potential_lag_7",
+     "Geary_autocorr_ionization_potential_lag_8",
+-    "BCUT_atomic_number_smallest_eigval",
++    "BCUT_gasteiger_charge_largest_eigval",
++    "BCUT_gasteiger_charge_smallest_eigval",
++    "BCUT_valence_electrons_largest_eigval",
++    "BCUT_valence_electrons_smallest_eigval",
++    "BCUT_sigma_electrons_largest_eigval",
++    "BCUT_sigma_electrons_smallest_eigval",
++    "BCUT_intrinsic_state_largest_eigval",
++    "BCUT_intrinsic_state_smallest_eigval",
+     "BCUT_atomic_number_largest_eigval",
+-    "BCUT_mass_smallest_eigval",
++    "BCUT_atomic_number_smallest_eigval",
+     "BCUT_mass_largest_eigval",
+-    "BCUT_van_der_Waals_volume_smallest_eigval",
++    "BCUT_mass_smallest_eigval",
+     "BCUT_van_der_Waals_volume_largest_eigval",
+-    "BCUT_Sanderson_electronegativity_smallest_eigval",
++    "BCUT_van_der_Waals_volume_smallest_eigval",
+     "BCUT_Sanderson_electronegativity_largest_eigval",
+-    "BCUT_Pauling_electronegativity_smallest_eigval",
++    "BCUT_Sanderson_electronegativity_smallest_eigval",
+     "BCUT_Pauling_electronegativity_largest_eigval",
+-    "BCUT_Allred_Rochow_electronegativity_smallest_eigval",
++    "BCUT_Pauling_electronegativity_smallest_eigval",
+     "BCUT_Allred_Rochow_electronegativity_largest_eigval",
+-    "BCUT_polarizability_smallest_eigval",
++    "BCUT_Allred_Rochow_electronegativity_smallest_eigval",
+     "BCUT_polarizability_largest_eigval",
+-    "BCUT_ionization_potential_smallest_eigval",
++    "BCUT_polarizability_smallest_eigval",
+     "BCUT_ionization_potential_largest_eigval",
+-    "BCUT_valence_electrons_smallest_eigval",
+-    "BCUT_valence_electrons_largest_eigval",
+-    "BCUT_sigma_electrons_smallest_eigval",
+-    "BCUT_sigma_electrons_largest_eigval",
+-    "BCUT_intrinsic_state_smallest_eigval",
+-    "BCUT_intrinsic_state_largest_eigval",
+-    "BCUT_gasteiger_charge_smallest_eigval",
+-    "BCUT_gasteiger_charge_largest_eigval",
++    "BCUT_ionization_potential_smallest_eigval",
+     "BalabanJ",
+     "SpAbs_Dzatomic_number",
+     "SpMax_Dzatomic_number",
+diff --git a/skfp/fingerprints/_new_mordred/utils/sasa.py b/skfp/fingerprints/_new_mordred/utils/sasa.py
+index 49361eab..d0f71d64 100644
+--- a/skfp/fingerprints/_new_mordred/utils/sasa.py
++++ b/skfp/fingerprints/_new_mordred/utils/sasa.py
+@@ -1,6 +1,7 @@
+ import numpy as np
+-from rdkit.Chem import Atom, Mol
++from rdkit.Chem import Atom, Mol, RWMol
+ from rdkit.Chem.rdFreeSASA import CalcSASA, SASAAlgorithm, SASAOpts
++from scipy.spatial.distance import cdist
+ 
+ from skfp.fingerprints._new_mordred.utils.atomic_properties import (
+     VAN_DER_WAALS_RADII_RDKIT,
+@@ -39,14 +40,35 @@ def solvent_accessible_surface_area(
+     """
+     atomic_nums = atoms_apply_func(Atom.GetAtomicNum, mol, np.intp)
+     radii = VAN_DER_WAALS_RADII_RDKIT.lookup(atomic_nums)
++    # the sphere Shrake-Rupley measures, reaching out to the probe centre
++    probe_reach = radii + solvent_radius
++    positions = mol.GetConformer(conformer).GetPositions()
+ 
+-    opts = SASAOpts()
+-    opts.algorithm = SASAAlgorithm.ShrakeRupley
+-    opts.probeRadius = solvent_radius
+-    CalcSASA(mol, radii.tolist(), confIdx=conformer, opts=opts)
++    # CalcSASA reads an atom's first neighbor without checking that it has one, so
++    # an atom whose probe sphere no other one's overlaps either faults the process
++    # or comes out silently wrong (31.09 instead of 135.19 for a lone argon, RDKit
++    # 2026.03.5). Such an atom is a whole unoccluded sphere, which is filled in
++    # here, and it occludes nothing, so the rest are unaffected by its leaving.
++    overlaps = cdist(positions, positions) < probe_reach + probe_reach[:, np.newaxis]
++    np.fill_diagonal(overlaps, False)  # an atom always overlaps itself
++    is_lone = ~overlaps.any(axis=1)
++    areas = (4.0 * np.pi * probe_reach**2).astype(np.float32)
+ 
+-    # read back by atom index, which is faster than iterating mol.GetAtoms()
+-    return atoms_apply_func(_read_sasa, mol, np.float32)
++    if is_lone.any():
++        editable = RWMol(mol)
++        for atom_idx in reversed(np.flatnonzero(is_lone).tolist()):
++            editable.RemoveAtom(atom_idx)  # keeps the conformer of the rest
++        mol, radii = editable.GetMol(), radii[~is_lone]
++
++    if radii.size:
++        opts = SASAOpts()
++        opts.algorithm = SASAAlgorithm.ShrakeRupley
++        opts.probeRadius = solvent_radius
++        CalcSASA(mol, radii.tolist(), confIdx=conformer, opts=opts)
++        # read back by atom index, which is faster than iterating mol.GetAtoms()
++        areas[~is_lone] = atoms_apply_func(_read_sasa, mol, np.float32)
++
++    return areas
+ 
+ 
+ def _read_sasa(atom: Atom) -> float:
+diff --git a/skfp/fingerprints/new_mordred_fp.py b/skfp/fingerprints/new_mordred_fp.py
+index a5fece30..c0dbf958 100644
+--- a/skfp/fingerprints/new_mordred_fp.py
++++ b/skfp/fingerprints/new_mordred_fp.py
+@@ -8,15 +8,19 @@
+ # See skfp/fingerprints/data/mordred-community_bsd_license.txt for the license text.
+ 
+ from collections.abc import Sequence
++from numbers import Integral, Real
+ 
+ import numpy as np
+ from rdkit.Chem import Mol
+ from scipy.sparse import csr_array
++from sklearn.utils._param_validation import Interval
+ 
+ from skfp.bases import BaseFingerprintTransformer
+ from skfp.utils import ensure_mols
+ 
+ from ._new_mordred.calculator import compute, get_feature_names
++from ._new_mordred.descriptors.detour_matrix import DEFAULT_MAX_RING_SYSTEM_RANK
++from ._new_mordred.utils.descriptor_evaluation import DEFAULT_TIMEOUT
+ 
+ 
+ class NewMordredFingerprint(BaseFingerprintTransformer):
+@@ -37,6 +41,19 @@ class NewMordredFingerprint(BaseFingerprintTransformer):
+         Whether to include 3D (conformer-based) descriptors. Using this option results
+         in longer computation time.
+ 
++    timeout : float, default=60.0
++        Seconds given to each of the two descriptors that have to enumerate the simple
++        paths of a molecule, ``DetourMatrix`` and ``MolecularId``. Both searches are
++        exponential in the number of independent cycles, and the ones that run over
++        their time are reported as NaN. The default matches Mordred's.
++
++    max_ring_system_rank : int, default=23
++        Number of independent cycles above which a ring system is reported as NaN by
++        ``DetourMatrix`` without being searched at all. Searching one costs roughly
++        2.2x more per cycle, and rank 23 already takes minutes, so going further only
++        burns the timeout without ever producing a value. Raise it to let very fused
++        molecules through at the cost of waiting out the timeout on them.
++
+     sparse : bool, default=False
+         Whether to return dense NumPy array, or sparse SciPy CSR array.
+ 
+@@ -98,11 +115,15 @@ class NewMordredFingerprint(BaseFingerprintTransformer):
+     _parameter_constraints: dict = {
+         **BaseFingerprintTransformer._parameter_constraints,
+         "use_3D": ["boolean"],
++        "timeout": [Interval(Real, 0, None, closed="neither")],
++        "max_ring_system_rank": [Interval(Integral, 0, None, closed="left")],
+     }
+ 
+     def __init__(
+         self,
+         use_3D: bool = False,
++        timeout: float = DEFAULT_TIMEOUT,
++        max_ring_system_rank: int = DEFAULT_MAX_RING_SYSTEM_RANK,
+         sparse: bool = False,
+         n_jobs: int | None = None,
+         batch_size: int | None = None,
+@@ -118,6 +139,8 @@ def __init__(
+             verbose=verbose,
+         )
+         self.use_3D = use_3D
++        self.timeout = timeout
++        self.max_ring_system_rank = max_ring_system_rank
+ 
+     def get_feature_names_out(self, input_features=None) -> np.ndarray:  # noqa: ARG002
+         """
+@@ -160,7 +183,15 @@ def transform(
+     def _calculate_fingerprint(self, X: Sequence[str | Mol]) -> np.ndarray | csr_array:
+         X = ensure_mols(X)
+ 
+-        X = [compute(mol=mol, use_3D=self.use_3D) for mol in X]
++        X = [
++            compute(
++                mol=mol,
++                use_3D=self.use_3D,
++                timeout=self.timeout,
++                max_ring_system_rank=self.max_ring_system_rank,
++            )
++            for mol in X
++        ]
+ 
+         return (
+             csr_array(X, dtype=np.float32)
+diff --git a/tests/fingerprints/_new_mordred/sasa.py b/tests/fingerprints/_new_mordred/sasa.py
+index 4ead857b..3c83a7b7 100644
+--- a/tests/fingerprints/_new_mordred/sasa.py
++++ b/tests/fingerprints/_new_mordred/sasa.py
+@@ -1,6 +1,14 @@
++import math
++
++import numpy as np
+ import pytest
+ from numpy.testing import assert_allclose
++from rdkit.Chem import Atom, Conformer, RWMol
++from rdkit.Geometry import Point3D
+ 
++from skfp.fingerprints._new_mordred.utils.atomic_properties import (
++    VAN_DER_WAALS_RADII_RDKIT,
++)
+ from skfp.fingerprints._new_mordred.utils.sasa import solvent_accessible_surface_area
+ 
+ """
+@@ -43,3 +51,56 @@ def test_sasa_reference_values(name, expected_value, mordred_test_mols_hydrogens
+     actual_value = solvent_accessible_surface_area(mol).sum()
+     # 5% relative tolerance, matching mordred's own SASA test
+     assert_allclose(actual_value, expected_value, rtol=0.05)
++
++
++def _mol_from_positions(atomic_num: int, positions: list[tuple[float, ...]]):
++    """Molecule of unbonded atoms placed exactly where given, with no sanitization."""
++    mol = RWMol()
++    for _ in positions:
++        mol.AddAtom(Atom(atomic_num))
++    conformer = Conformer(len(positions))
++    for idx, position in enumerate(positions):
++        conformer.SetAtomPosition(idx, Point3D(*position))
++    conformer.Set3D(True)
++
++    out = mol.GetMol()
++    out.AddConformer(conformer)
++    return out
++
++
++def _lone_sphere_area(atomic_num: int) -> float:
++    """Area of a sphere no other atom reaches, the exact answer for a lone atom."""
++    radii = VAN_DER_WAALS_RADII_RDKIT.lookup(np.array([atomic_num], dtype=np.intp))
++    return 4.0 * math.pi * (float(radii[0]) + 1.4) ** 2
++
++
++@pytest.mark.parametrize(
++    "positions",
++    [
++        pytest.param([(0.0, 0.0, 0.0)], id="single_atom"),
++        pytest.param([(0.0, 0.0, 0.0), (50.0, 0.0, 0.0)], id="two_far_apart"),
++    ],
++)
++def test_sasa_lone_atoms_are_whole_spheres(positions):
++    # RDKit's CalcSASA reads out of bounds on an atom that no other atom comes
++    # within reach of, segfaulting the process or returning a wrong area, so such
++    # atoms are kept away from it and get their exact analytical area instead
++    mol = _mol_from_positions(6, positions)
++    areas = solvent_accessible_surface_area(mol, conformer=0)
++
++    assert_allclose(areas, _lone_sphere_area(6), rtol=1e-6)
++
++
++def test_sasa_lone_atom_does_not_disturb_the_rest():
++    # two carbons in contact plus one far away: the lone one is whole, and leaving
++    # it out of the search does not change what the bonded pair comes out as
++    far = 50.0
++    pair = _mol_from_positions(6, [(0.0, 0.0, 0.0), (1.5, 0.0, 0.0)])
++    with_lone = _mol_from_positions(
++        6, [(0.0, 0.0, 0.0), (1.5, 0.0, 0.0), (far, 0.0, 0.0)]
++    )
++
++    areas = solvent_accessible_surface_area(with_lone, conformer=0)
++
++    assert_allclose(areas[:2], solvent_accessible_surface_area(pair, conformer=0))
++    assert_allclose(areas[2], _lone_sphere_area(6), rtol=1e-6)
+diff --git a/tests/fingerprints/new_mordred_fp.py b/tests/fingerprints/new_mordred_fp.py
+index 3ae36081..efebaac6 100644
+--- a/tests/fingerprints/new_mordred_fp.py
++++ b/tests/fingerprints/new_mordred_fp.py
+@@ -29,7 +29,7 @@ def test_new_mordred_fingerprint(smallest_mols_list):
+         X_old,
+         mordred_fp.get_feature_names_out(),
+     )
+-    features = _get_features_to_compare(df_new, df_old)
++    features = _get_features_to_compare(df_new)
+     assert_allclose(
+         df_new[features],
+         df_old[features],
+@@ -54,7 +54,7 @@ def test_new_mordred_sparse_fingerprint(smallest_mols_list):
+         X_old,
+         mordred_fp.get_feature_names_out(),
+     )
+-    features = _get_features_to_compare(df_new, df_old)
++    features = _get_features_to_compare(df_new)
+     assert_allclose(
+         df_new[features],
+         df_old[features],
+@@ -79,12 +79,7 @@ def test_new_mordred_3D_fingerprint(mols_conformers_list):
+         X_old,
+         mordred_fp.get_feature_names_out(),
+     )
+-    features = _get_features_to_compare(df_new, df_old, _SURFACE_AREA_FEATURES)
+-    # every other 3D feature must be compared, rather than skipped as not computed
+-    features_3D = set(df_new.columns) - set(
+-        NewMordredFingerprint().get_feature_names_out()
+-    )
+-    assert features_3D - _SURFACE_AREA_FEATURES <= set(features)
++    features = _get_features_to_compare(df_new, _SURFACE_AREA_FEATURES)
+     assert_allclose(
+         df_new[features],
+         df_old[features],
+@@ -109,12 +104,7 @@ def test_new_mordred_3D_sparse_fingerprint(mols_conformers_list):
+         X_old,
+         mordred_fp.get_feature_names_out(),
+     )
+-    features = _get_features_to_compare(df_new, df_old, _SURFACE_AREA_FEATURES)
+-    # every other 3D feature must be compared, rather than skipped as not computed
+-    features_3D = set(df_new.columns) - set(
+-        NewMordredFingerprint().get_feature_names_out()
+-    )
+-    assert features_3D - _SURFACE_AREA_FEATURES <= set(features)
++    features = _get_features_to_compare(df_new, _SURFACE_AREA_FEATURES)
+     assert_allclose(
+         df_new[features],
+         df_old[features],
+@@ -156,7 +146,7 @@ def test_new_mordred_dative_bonds():
+         X_old,
+         mordred_fp.get_feature_names_out(),
+     )
+-    features = _get_features_to_compare(df_new, df_old)
++    features = _get_features_to_compare(df_new)
+     assert_allclose(
+         df_new[features],
+         df_old[features],
+@@ -167,9 +157,7 @@ def test_new_mordred_dative_bonds():
+ 
+ 
+ def test_new_mordred_dummy_atoms():
+-    # Mordred weights a dummy atom by its atomic number, 0. Every feature is
+-    # compared, as the ones this concerns would otherwise be skipped as not computed
+-    # had they been NaN
++    # Mordred weights a dummy atom by its atomic number, 0
+     mols = [
+         MolFromSmiles(smiles)
+         for smiles in ["*c1ccccc1", "*CC(=O)O", "C[Si](*)(C)C", "[*:1]CC[*:2]"]
+@@ -186,7 +174,7 @@ def test_new_mordred_dummy_atoms():
+         X_old,
+         mordred_fp.get_feature_names_out(),
+     )
+-    features = [name for name in df_new.columns if "LogEE" not in name]
++    features = _get_features_to_compare(df_new)
+     assert_allclose(
+         df_new[features],
+         df_old[features],
+@@ -315,13 +303,11 @@ def _arrays_to_dataframes(
+ 
+ 
+ def _get_features_to_compare(
+-    df_new: pd.DataFrame, df_old: pd.DataFrame, excluded: frozenset[str] = frozenset()
++    df_new: pd.DataFrame, excluded: frozenset[str] = frozenset()
+ ) -> list[str]:
+-    not_computed = (df_new.isna() | df_old.isna()).all()
++    # LogEE is our deliberate fix of an upstream formula, so it never matches
+     return [
+-        name
+-        for name in df_new.columns
+-        if not not_computed[name] and "LogEE" not in name and name not in excluded
++        name for name in df_new.columns if "LogEE" not in name and name not in excluded
+     ]
+ 
+ 

@@ -1,0 +1,1229 @@
+diff --git a/src/dxtb/classical/repulsion.py b/src/dxtb/classical/repulsion.py
+index 27c6ac8f8..0c751f045 100644
+--- a/src/dxtb/classical/repulsion.py
++++ b/src/dxtb/classical/repulsion.py
+@@ -117,23 +117,23 @@ class Cache(TensorLike):
+         mask: Tensor
+         """Mask for padding from numbers."""
+ 
+-        __slots__ = ["mask", "alpha", "zeff", "kexp"]
++        __slots__ = ["mask", "arep", "zeff", "kexp"]
+ 
+         def __init__(
+             self,
+             mask: Tensor,
+-            alpha: Tensor,
++            arep: Tensor,
+             zeff: Tensor,
+             kexp: Tensor,
+             device: torch.device | None = None,
+             dtype: torch.dtype | None = None,
+         ):
+             super().__init__(
+-                device=device if device is None else alpha.device,
+-                dtype=dtype if dtype is None else alpha.dtype,
++                device=device if device is None else arep.device,
++                dtype=dtype if dtype is None else arep.dtype,
+             )
+             self.mask = mask
+-            self.alpha = alpha
++            self.arep = arep
+             self.zeff = zeff
+             self.kexp = kexp
+ 
+@@ -170,8 +170,17 @@ def get_cache(self, numbers: Tensor, ihelp: IndexHelper) -> Repulsion.Cache:
+         # mask for padding
+         mask = real_pairs(numbers, diagonal=True)
+ 
+-        # create matrices
+-        a = torch.sqrt(arep.unsqueeze(-1) * arep.unsqueeze(-2)) * mask
++        # Without the eps, the first backward returns nan's as described in
++        # https://github.com/pytorch/pytorch/issues/2421. The second backward
++        # gives nan's in gradgradcheck, because the epsilon is smaller than the
++        # step size. But the actual gradient should be correct.
++        eps = torch.finfo(arep.dtype).tiny
++        a = torch.where(
++            mask,
++            torch.sqrt(arep.unsqueeze(-1) * arep.unsqueeze(-2) + eps),
++            arep.new_tensor(0.0),
++        )
++
+         z = zeff.unsqueeze(-1) * zeff.unsqueeze(-2) * mask
+         k = kexp.unsqueeze(-1) * kexp.new_ones(kexp.shape).unsqueeze(-2) * mask
+ 
+@@ -202,90 +211,237 @@ def get_energy(
+         Tensor
+             (Atom-resolved) repulsion energy.
+         """
+-
+-        distances = torch.where(
++        e = RepulsionAG.apply(
++            positions,
+             cache.mask,
+-            torch.cdist(
+-                positions,
+-                positions,
+-                p=2,
+-                compute_mode="use_mm_for_euclid_dist",
+-            ),
+-            # add epsilon to avoid zero division in some terms
+-            positions.new_tensor(torch.finfo(self.dtype).eps),
++            cache.arep,
++            cache.kexp,
++            cache.zeff,
++            self.cutoff,
+         )
++        assert e is not None
+ 
+-        # Eq.13: R_AB ** k_f
+-        r1k = torch.pow(distances, cache.kexp)
++        if atom_resolved is True:
++            return 0.5 * torch.sum(e, dim=-1)
++        return e
+ 
+-        # Eq.13: exp(- (alpha_A * alpha_B)**0.5 * R_AB ** k_f )
+-        exp_term = torch.exp(-cache.alpha * r1k)
+ 
+-        # Eq.13: repulsion energy
+-        e = torch.where(
+-            cache.mask * (distances <= distances.new_tensor(self.cutoff)),
+-            cache.zeff * exp_term / distances,
+-            distances.new_tensor(0.0),
+-        )
++def repulsion_energy(
++    positions: Tensor,
++    mask: Tensor,
++    arep: Tensor,
++    kexp: Tensor,
++    zeff: Tensor,
++    cutoff: float = xtb.DEFAULT_REPULSION_CUTOFF,
++) -> Tensor:
++    """
++    Clasical repulsion energy.
+ 
+-        if atom_resolved is True:
+-            return 0.5 * torch.sum(e, dim=-1)
+-        else:
+-            return e
++    Parameters
++    ----------
++    positions : Tensor
++        Cartesian coordinates of all atoms.
++    mask : Tensor
++        Mask for padding.
++    arep : Tensor
++        Atom-specific screening parameters.
++    kexp : Tensor
++        Scaling of the interatomic distance in the exponential damping function
++        of the repulsion energy.
++    zeff : Tensor
++        Effective nuclear charges.
++    cutoff : float, optional
++        Real-space cutoff. Defaults to `xtb.DEFAULT_REPULSION_CUTOFF`.
+ 
+-    def get_gradient_analytical(
+-        self, positions: Tensor, cache: Repulsion.Cache
+-    ) -> Tensor:
+-        """
+-        Get analytical gradient of repulsion energy.
++    Returns
++    -------
++    Tensor
++        Atom-resolved repulsion energy
++    """
++    distances = torch.where(
++        mask,
++        torch.cdist(
++            positions,
++            positions,
++            p=2,
++            compute_mode="use_mm_for_euclid_dist",
++        ),
++        # add epsilon to avoid zero division in some terms
++        positions.new_tensor(torch.finfo(positions.dtype).eps),
++    )
+ 
+-        Parameters
+-        ----------
+-        cache : Repulsion.Cache
+-            Cache for repulsion.
+-        positions : Tensor
+-            Cartesian coordinates of all atoms.
++    # Eq.13: R_AB ** k_f
++    r1k = torch.pow(distances, kexp)
+ 
+-        Returns
+-        -------
+-        Tensor
+-            Atom-resolved repulsion gradient, size (n_batch, n_atoms, 3).
+-        """
++    # Eq.13: exp(- (alpha_A * alpha_B)**0.5 * R_AB ** k_f )
++    exp_term = torch.exp(-arep * r1k)
+ 
+-        distances = torch.where(
+-            cache.mask,
+-            torch.cdist(
+-                positions,
+-                positions,
+-                p=2,
+-                compute_mode="use_mm_for_euclid_dist",
+-            ),
+-            # add epsilon to avoid zero division in some terms
+-            positions.new_tensor(torch.finfo(self.dtype).eps),
+-        )
++    # Eq.13: repulsion energy
++    erep = torch.where(
++        mask * (distances <= distances.new_tensor(cutoff)),
++        zeff * exp_term / distances,
++        distances.new_tensor(0.0),
++    )
++    return erep
++
++
++def repulsion_gradient(
++    erep: Tensor,
++    positions: Tensor,
++    mask: Tensor,
++    arep: Tensor,
++    kexp: Tensor,
++    *,
++    reduced: bool = False,
++) -> Tensor:
++    """
++    Nuclear gradient of classical repulsion energy.
+ 
+-        r1k = torch.pow(distances, cache.kexp)
++    Parameters
++    ----------
++    erep : Tensor
++        Atom-resolved repulsion energy (from `repulsion_energy`).
++    positions : Tensor
++        Cartesian coordinates of all atoms.
++    mask : Tensor
++        Mask for padding.
++    arep : Tensor
++        Atom-specific screening parameters.
++    kexp : Tensor
++        Scaling of the interatomic distance in the exponential damping function
++        of the repulsion energy.
++    cutoff : float, optional
++        Real-space cutoff. Defaults to `xtb.DEFAULT_REPULSION_CUTOFF`.
++    reduced : bool, optional
++        Shape of the output gradient. Defaults to `False`, which returns a
++        gradient of shape `(natoms, natoms, 3)`. This is required for the custom
++        backward function. If `reduced=True`, the output gradient has the
++        typical shape `(natoms, 3)`.
+ 
+-        # (n_batch, n_atoms, n_atoms)
+-        e = self.get_energy(positions, cache, False)
+-        grad = -(cache.alpha * r1k * cache.kexp + 1.0) * e
++    Returns
++    -------
++    Tensor
++        Nuclear gradient of repulsion energy. The shape is specified by the
++        `reduced` keyword argument.
++    """
++    distances = torch.where(
++        mask,
++        torch.cdist(
++            positions,
++            positions,
++            p=2,
++            compute_mode="use_mm_for_euclid_dist",
++        ),
++        # add epsilon to avoid zero division in some terms
++        positions.new_tensor(torch.finfo(positions.dtype).eps),
++    )
+ 
+-        # (n_batch, n_atoms, n_atoms, 3)
+-        rij = torch.where(
+-            cache.mask.unsqueeze(-1),
+-            positions.unsqueeze(-2) - positions.unsqueeze(-3),
+-            distances.new_tensor(0.0),
+-        )
++    # Eq.13: R_AB ** k_f
++    r1k = torch.pow(distances, kexp)
++
++    # (n_batch, n_atoms, n_atoms)
++    grad = -(arep * r1k * kexp + 1.0) * erep
++
++    # (n_batch, n_atoms, n_atoms, 3)
++    rij = torch.where(
++        mask.unsqueeze(-1),
++        positions.unsqueeze(-2) - positions.unsqueeze(-3),
++        distances.new_tensor(0.0),
++    )
+ 
+-        # (n_batch, n_atoms, n_atoms)
+-        r2 = torch.pow(distances, 2)
++    # (n_batch, n_atoms, n_atoms)
++    r2 = torch.pow(distances, 2)
+ 
+-        # (n_batch, n_atoms, n_atoms, 3)
+-        grad = grad / r2
+-        grad = grad.unsqueeze(-1) * rij
++    # (n_batch, n_atoms, n_atoms, 3)
++    grad = grad / r2
++    grad = grad.unsqueeze(-1) * rij
++
++    # reduction gives (n_batch, n_atoms, 3)
++    return grad if reduced is False else torch.sum(grad, dim=-2)
++
++
++class RepulsionAG(torch.autograd.Function):
++    """
++    Autograd function for repulsion energy.
++    """
++
++    @staticmethod
++    def forward(
++        ctx,
++        positions: Tensor,
++        mask: Tensor,
++        arep: Tensor,
++        kexp: Tensor,
++        zeff: Tensor,
++        cutoff: float,
++    ) -> Tensor:
++        with torch.enable_grad():
++            erep = repulsion_energy(positions, mask, arep, kexp, zeff, cutoff)
++
++        ctx.save_for_backward(erep, positions, mask, arep, kexp, zeff)
++
++        return erep.clone()
++
++    @staticmethod
++    def backward(
++        ctx, grad_out: Tensor
++    ) -> tuple[
++        None | Tensor,  # positions
++        None,  # mask
++        None | Tensor,  # arep
++        None | Tensor,  # kexp
++        None | Tensor,  # zeff
++        None,  # cutoff
++    ]:
++        # initialize gradients with `None`
++        positions_bar = arep_bar = kexp_bar = zeff_bar = None
++
++        # check which of the input variables of `forward()` requires gradients
++        grad_positions, _, grad_arep, grad_kexp, grad_zeff, _ = ctx.needs_input_grad
++
++        erep, positions, mask, arep, kexp, zeff = ctx.saved_tensors
++
++        # analytical gradient for positions
++        if grad_positions:
++            # (n_batch, n_atoms, n_atoms, 3)
++            g = repulsion_gradient(
++                erep,
++                positions,
++                mask,
++                arep,
++                kexp,
++                reduced=False,
++            )
++
++            # vjp: (nb, na, na) * (nb, na, na, 3) -> (nb, na, 3)
++            _gi = torch.einsum("...ij,...ijd->...id", grad_out, g)
++            _gj = torch.einsum("...ij,...ijd->...jd", grad_out, g)
++            positions_bar = _gi - _gj
++
++        # automatic gradient for parameters
++        if grad_arep:
++            (arep_bar,) = torch.autograd.grad(
++                erep,
++                arep,
++                grad_outputs=grad_out,
++                create_graph=True,
++            )
++        if grad_kexp:
++            (kexp_bar,) = torch.autograd.grad(
++                erep,
++                kexp,
++                grad_outputs=grad_out,
++                create_graph=True,
++            )
++        if grad_zeff:
++            (zeff_bar,) = torch.autograd.grad(
++                erep,
++                zeff,
++                grad_outputs=grad_out,
++                create_graph=True,
++            )
+ 
+-        # (n_batch, n_atoms, 3)
+-        return torch.sum(grad, dim=-2)
++        return positions_bar, None, arep_bar, kexp_bar, zeff_bar, None
+ 
+ 
+ def new_repulsion(
+diff --git a/test/conftest.py b/test/conftest.py
+index fe1b22e29..b74242a12 100644
+--- a/test/conftest.py
++++ b/test/conftest.py
+@@ -90,6 +90,4 @@ def pytest_runtest_setup(item: pytest.Function):
+ 
+     for _ in item.iter_markers(name="cuda"):
+         if not torch.cuda.is_available():
+-            pytest.skip(
+-                "Torch not compiled with CUDA enabled or no CUDA device available."
+-            )
++            pytest.skip("Torch not compiled with CUDA or no CUDA device available.")
+diff --git a/test/test_coulomb/test_es2_atom.py b/test/test_coulomb/test_es2_atom.py
+index a27f16890..72c6ce0e9 100644
+--- a/test/test_coulomb/test_es2_atom.py
++++ b/test/test_coulomb/test_es2_atom.py
+@@ -96,14 +96,13 @@ def test_grad_positions(name: str) -> None:
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(GFN1_XTB.element))
+ 
++    es = es2.new_es2(numbers, GFN1_XTB, shell_resolved=False, **dd)
++    assert es is not None
++
+     # variable to be differentiated
+     positions.requires_grad_(True)
+ 
+     def func(positions: Tensor):
+-        es = es2.new_es2(numbers, GFN1_XTB, shell_resolved=False, **dd)
+-        if es is None:
+-            assert False
+-
+         cache = es.get_cache(numbers, positions, ihelp)
+         return es.get_atom_energy(qat, cache)
+ 
+diff --git a/test/test_repulsion/test_grad.py b/test/test_repulsion/test_grad.py
+index b6f1cf4b6..e35e7aa02 100644
+--- a/test/test_repulsion/test_grad.py
++++ b/test/test_repulsion/test_grad.py
+@@ -5,16 +5,13 @@
+ """
+ from __future__ import annotations
+ 
+-from math import sqrt
+-
+ import pytest
+ import torch
+ 
+-from dxtb._types import Callable, Tensor
+ from dxtb.basis import IndexHelper
+-from dxtb.classical import Repulsion, new_repulsion
++from dxtb.classical import new_repulsion
+ from dxtb.param import GFN1_XTB as par
+-from dxtb.param import get_elem_angular, get_elem_param
++from dxtb.param import get_elem_angular
+ 
+ from .samples import samples
+ 
+@@ -31,243 +28,12 @@ def test_grad_fail(name: str) -> None:
+     numbers = sample["numbers"]
+     positions = sample["positions"].type(dtype)
+ 
+-    xb = new_repulsion(numbers, par, **dd)
+-    if xb is None:
+-        assert False
+-
+-    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    cache = xb.get_cache(numbers, ihelp)
+-    energy = xb.get_energy(positions, cache)
+-
+-    with pytest.raises(RuntimeError):
+-        xb.get_gradient(energy, positions)
+-
+-
+-@pytest.mark.grad
+-@pytest.mark.parametrize("dtype", [torch.double])
+-@pytest.mark.parametrize("name", ["H2O", "SiH4"])
+-def test_grad_pos_tblite(dtype: torch.dtype, name: str) -> None:
+-    """Compare with reference values from tblite."""
+-    dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
+-
+-    sample = samples[name]
+-    numbers = sample["numbers"]
+-    positions = sample["positions"].type(dtype)
+-    positions.requires_grad_(True)
+-    ref = sample["gfn1_grad"].type(dtype)
+-
+     rep = new_repulsion(numbers, par, **dd)
+-    if rep is None:
+-        assert False
++    assert rep is not None
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+     cache = rep.get_cache(numbers, ihelp)
+-
+-    # automatic gradient
+-    energy = torch.sum(rep.get_energy(positions, cache), dim=-1)
+-    energy.backward()
+-
+-    if positions.grad is None:
+-        assert False
+-    grad_backward = positions.grad.clone()
+-
+-    assert pytest.approx(ref, abs=tol) == grad_backward
+-
+-    positions.detach_()
+-
+-
+-@pytest.mark.grad
+-@pytest.mark.parametrize("dtype", [torch.double])
+-@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
+-def test_grad_pos_autograd(dtype: torch.dtype, name: str) -> None:
+-    dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
+-
+-    sample = samples[name]
+-    numbers = sample["numbers"]
+-    positions = sample["positions"].type(dtype)
+-
+-    rep = new_repulsion(numbers, par, **dd)
+-    if rep is None:
+-        assert False
+-
+-    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    cache = rep.get_cache(numbers, ihelp)
+-
+-    # analytical gradient
+-    grad_analytical = rep.get_gradient_analytical(positions, cache)
+-
+-    positions.requires_grad_(True)
+     energy = rep.get_energy(positions, cache)
+-    grad_autograd = rep.get_gradient(energy, positions)
+-
+-    assert pytest.approx(grad_analytical, abs=tol) == grad_autograd
+-
+-    positions.detach_()
+-
+-
+-@pytest.mark.grad
+-@pytest.mark.parametrize("dtype", [torch.double])
+-@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
+-def test_grad_pos_backward(dtype: torch.dtype, name: str) -> None:
+-    dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
+-
+-    sample = samples[name]
+-    numbers = sample["numbers"]
+-    positions = sample["positions"].type(dtype)
+-
+-    rep = new_repulsion(numbers, par, **dd)
+-    if rep is None:
+-        assert False
+-
+-    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    cache = rep.get_cache(numbers, ihelp)
+-
+-    # analytical gradient
+-    grad_analytical = rep.get_gradient_analytical(positions, cache)
+ 
+-    # automatic gradient
+-    positions.requires_grad_(True)
+-    energy = torch.sum(rep.get_energy(positions, cache), dim=-1)
+-    energy.backward()
+-
+-    if positions.grad is None:
+-        assert False
+-    grad_backward = positions.grad.clone()
+-
+-    assert pytest.approx(grad_analytical, abs=tol) == grad_backward
+-
+-    positions.detach_()
+-
+-
+-@pytest.mark.parametrize("dtype", [torch.double])
+-@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
+-def test_grad_pos_analytical(dtype: torch.dtype, name: str) -> None:
+-    dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
+-
+-    sample = samples[name]
+-    numbers = sample["numbers"]
+-    positions = sample["positions"].type(dtype)
+-
+-    rep = new_repulsion(numbers, par, **dd)
+-    if rep is None:
+-        assert False
+-
+-    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    cache = rep.get_cache(numbers, ihelp)
+-
+-    # analytical gradient
+-    grad_analytical = rep.get_gradient_analytical(positions, cache)
+-
+-    # numerical gradient
+-    grad_numerical = calc_numerical_gradient(positions, rep, cache)
+-    assert pytest.approx(grad_numerical, abs=tol) == grad_analytical
+-
+-
+-def gradcheck_param(
+-    dtype: torch.dtype, name: str
+-) -> tuple[
+-    Callable[[Tensor, Tensor, Tensor], Tensor],  # autograd function
+-    tuple[Tensor, Tensor, Tensor],  # differentiable variables
+-]:
+-    """Prepare gradient check from `torch.autograd`."""
+-    assert par.repulsion is not None
+-
+-    dd = {"dtype": dtype}
+-
+-    sample = samples[name]
+-    numbers = sample["numbers"]
+-    positions = sample["positions"].type(dtype)
+-    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-
+-    # variables to be differentiated
+-    _arep = get_elem_param(
+-        torch.unique(numbers),
+-        par.element,
+-        "arep",
+-        pad_val=0,
+-        **dd,
+-        requires_grad=True,
+-    )
+-    _zeff = get_elem_param(
+-        torch.unique(numbers),
+-        par.element,
+-        "zeff",
+-        pad_val=0,
+-        **dd,
+-        requires_grad=True,
+-    )
+-    _kexp = torch.tensor(par.repulsion.effective.kexp, **dd, requires_grad=True)
+-
+-    def func(arep: Tensor, zeff: Tensor, kexp: Tensor) -> Tensor:
+-        rep = Repulsion(arep, zeff, kexp, **dd)
+-        cache = rep.get_cache(numbers, ihelp)
+-        return rep.get_energy(positions, cache)
+-
+-    return func, (_arep, _zeff, _kexp)
+-
+-
+-@pytest.mark.grad
+-@pytest.mark.parametrize("dtype", [torch.double])
+-@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
+-def test_grad_param(dtype: torch.dtype, name: str) -> None:
+-    """
+-    Check a single analytical gradient of parameters against numerical
+-    gradient from `torch.autograd.gradcheck`.
+-    """
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
+-    func, diffvars = gradcheck_param(dtype, name)
+-
+-    # pylint: disable=import-outside-toplevel
+-    from torch.autograd.gradcheck import gradcheck
+-
+-    assert gradcheck(func, diffvars, atol=tol)
+-
+-
+-@pytest.mark.grad
+-@pytest.mark.parametrize("dtype", [torch.double])
+-@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
+-def test_gradgrad_param(dtype: torch.dtype, name: str) -> None:
+-    """
+-    Check a single analytical gradient of parameters against numerical
+-    gradient from `torch.autograd.gradgradcheck`.
+-    """
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
+-    func, diffvars = gradcheck_param(dtype, name)
+-
+-    # pylint: disable=import-outside-toplevel
+-    from torch.autograd.gradcheck import gradgradcheck
+-
+-    assert gradgradcheck(func, diffvars, atol=tol)
+-
+-
+-def calc_numerical_gradient(
+-    positions: Tensor, rep: Repulsion, cache: Repulsion.Cache
+-) -> Tensor:
+-    """Calculate gradient numerically for reference."""
+-
+-    n_atoms = positions.shape[0]
+-
+-    # setup numerical gradient
+-    gradient = torch.zeros((n_atoms, 3), dtype=positions.dtype)
+-    step = 1.0e-6
+-
+-    for i in range(n_atoms):
+-        for j in range(3):
+-            er, el = 0.0, 0.0
+-
+-            positions[i, j] += step
+-            er = rep.get_energy(positions, cache)
+-            er = torch.sum(er, dim=-1)
+-
+-            positions[i, j] -= 2 * step
+-            el = rep.get_energy(positions, cache)
+-            el = torch.sum(el, dim=-1)
+-
+-            positions[i, j] += step
+-            gradient[i, j] = 0.5 * (er - el) / step
+-
+-    return gradient
++    with pytest.raises(RuntimeError):
++        rep.get_gradient(energy, positions)
+diff --git a/test/test_repulsion/test_grad_param.py b/test/test_repulsion/test_grad_param.py
+new file mode 100644
+index 000000000..190b1a177
+--- /dev/null
++++ b/test/test_repulsion/test_grad_param.py
+@@ -0,0 +1,192 @@
++"""
++Run tests for repulsion contribution.
++
++(Note that the analytical gradient tests fail for `torch.float`.)
++"""
++from __future__ import annotations
++
++from math import sqrt
++
++import pytest
++import torch
++
++from dxtb._types import Callable, Tensor
++from dxtb.basis import IndexHelper
++from dxtb.classical import Repulsion
++from dxtb.param import GFN1_XTB as par
++from dxtb.param import get_elem_angular, get_elem_param
++from dxtb.utils import batch
++
++from .samples import samples
++
++sample_list = ["H2O", "SiH4", "MB16_43_01", "MB16_43_02", "LYS_xao"]
++
++
++def gradcheck_param(
++    dtype: torch.dtype, name: str
++) -> tuple[
++    Callable[[Tensor, Tensor, Tensor], Tensor],  # autograd function
++    tuple[Tensor, Tensor, Tensor],  # differentiable variables
++]:
++    """Prepare gradient check from `torch.autograd`."""
++    assert par.repulsion is not None
++
++    dd = {"dtype": dtype}
++
++    sample = samples[name]
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++
++    # variables to be differentiated
++    _arep = get_elem_param(
++        torch.unique(numbers),
++        par.element,
++        "arep",
++        pad_val=0,
++        **dd,
++        requires_grad=True,
++    )
++    _zeff = get_elem_param(
++        torch.unique(numbers),
++        par.element,
++        "zeff",
++        pad_val=0,
++        **dd,
++        requires_grad=True,
++    )
++    _kexp = torch.tensor(par.repulsion.effective.kexp, **dd, requires_grad=True)
++
++    def func(arep: Tensor, zeff: Tensor, kexp: Tensor) -> Tensor:
++        rep = Repulsion(arep, zeff, kexp, **dd)
++        cache = rep.get_cache(numbers, ihelp)
++        return rep.get_energy(positions, cache)
++
++    return func, (_arep, _zeff, _kexp)
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
++def test_grad_param(dtype: torch.dtype, name: str) -> None:
++    """
++    Check a single analytical gradient of parameters against numerical
++    gradient from `torch.autograd.gradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_param(dtype, name)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradcheck
++
++    assert gradcheck(func, diffvars, atol=tol)
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
++def test_gradgrad_param(dtype: torch.dtype, name: str) -> None:
++    """
++    Check a single analytical gradient of parameters against numerical
++    gradient from `torch.autograd.gradgradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_param(dtype, name)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradgradcheck
++
++    assert gradgradcheck(func, diffvars, atol=tol)
++
++
++def gradcheck_param_batch(
++    dtype: torch.dtype, name1: str, name2: str
++) -> tuple[
++    Callable[[Tensor, Tensor, Tensor], Tensor],  # autograd function
++    tuple[Tensor, Tensor, Tensor],  # differentiable variables
++]:
++    """Prepare gradient check from `torch.autograd`."""
++    assert par.repulsion is not None
++
++    dd = {"dtype": dtype}
++
++    sample1, sample2 = samples[name1], samples[name2]
++    numbers = batch.pack(
++        [
++            sample1["numbers"],
++            sample2["numbers"],
++        ]
++    )
++    positions = batch.pack(
++        [
++            sample1["positions"].type(dtype),
++            sample2["positions"].type(dtype),
++        ]
++    )
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++
++    # variables to be differentiated
++    _arep = get_elem_param(
++        torch.unique(numbers),
++        par.element,
++        "arep",
++        pad_val=0,
++        **dd,
++        requires_grad=True,
++    )
++    _zeff = get_elem_param(
++        torch.unique(numbers),
++        par.element,
++        "zeff",
++        pad_val=0,
++        **dd,
++        requires_grad=True,
++    )
++    _kexp = torch.tensor(par.repulsion.effective.kexp, **dd, requires_grad=True)
++
++    def func(arep: Tensor, zeff: Tensor, kexp: Tensor) -> Tensor:
++        rep = Repulsion(arep, zeff, kexp, **dd)
++        cache = rep.get_cache(numbers, ihelp)
++        return rep.get_energy(positions, cache)
++
++    return func, (_arep, _zeff, _kexp)
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name1", ["SiH4"])
++@pytest.mark.parametrize("name2", sample_list + ["MB16_43_03"])
++def test_grad_param_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++    """
++    Check a single analytical gradient of parameters against numerical
++    gradient from `torch.autograd.gradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_param_batch(dtype, name1, name2)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradcheck
++
++    assert gradcheck(func, diffvars, atol=tol)
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name1", ["SiH4"])
++@pytest.mark.parametrize("name2", sample_list + ["MB16_43_03"])
++def test_gradgrad_param_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++    """
++    Check a single analytical gradient of parameters against numerical
++    gradient from `torch.autograd.gradgradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_param_batch(dtype, name1, name2)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradgradcheck
++
++    # Although, we add an epsilon within the square root of arep to avoid
++    # taking the square root at zero, the step size in gradgradcheck is smaller
++    # than this epsilon, which leads to nan's again. Therefore, we omit arep.
++    diffvars[0].requires_grad_(False)
++    assert gradgradcheck(func, diffvars, atol=tol)
+diff --git a/test/test_repulsion/test_grad_pos.py b/test/test_repulsion/test_grad_pos.py
+new file mode 100644
+index 000000000..909da25ff
+--- /dev/null
++++ b/test/test_repulsion/test_grad_pos.py
+@@ -0,0 +1,332 @@
++"""
++Run tests for repulsion contribution.
++
++(Note that the analytical gradient tests fail for `torch.float`.)
++"""
++from __future__ import annotations
++
++from math import sqrt
++
++import pytest
++import torch
++
++from dxtb._types import Callable, Tensor
++from dxtb.basis import IndexHelper
++from dxtb.classical import Repulsion, new_repulsion
++from dxtb.classical.repulsion import repulsion_energy, repulsion_gradient
++from dxtb.param import GFN1_XTB as par
++from dxtb.param import get_elem_angular
++from dxtb.utils import batch
++
++from .samples import samples
++
++sample_list = ["H2O", "SiH4", "MB16_43_01", "MB16_43_02", "LYS_xao"]
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", ["H2O", "SiH4"])
++def test_grad_pos_backward_vs_tblite(dtype: torch.dtype, name: str) -> None:
++    """Compare with reference values from tblite."""
++    dd = {"dtype": dtype}
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++
++    sample = samples[name]
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++    ref = sample["gfn1_grad"].type(dtype)
++
++    rep = new_repulsion(numbers, par, **dd)
++    assert rep is not None
++
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++    cache = rep.get_cache(numbers, ihelp)
++
++    # automatic gradient
++    positions.requires_grad_(True)
++    energy = torch.sum(rep.get_energy(positions, cache), dim=-1)
++    energy.backward()
++
++    assert positions.grad is not None
++    grad_backward = positions.grad.detach()
++    positions.detach_()
++
++    assert pytest.approx(ref, abs=tol) == grad_backward
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name1", ["H2O", "SiH4"])
++@pytest.mark.parametrize("name2", ["H2O", "SiH4"])
++def test_grad_pos_batch_backward_vs_tblite(
++    dtype: torch.dtype, name1: str, name2: str
++) -> None:
++    """Compare with reference values from tblite."""
++    dd = {"dtype": dtype}
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++
++    sample1, sample2 = samples[name1], samples[name2]
++    numbers = batch.pack(
++        [
++            sample1["numbers"],
++            sample2["numbers"],
++        ]
++    )
++    positions = batch.pack(
++        [
++            sample1["positions"].type(dtype),
++            sample2["positions"].type(dtype),
++        ]
++    )
++    ref = batch.pack(
++        [
++            sample1["gfn1_grad"].type(dtype),
++            sample2["gfn1_grad"].type(dtype),
++        ]
++    )
++
++    rep = new_repulsion(numbers, par, **dd)
++    assert rep is not None
++
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++    cache = rep.get_cache(numbers, ihelp)
++
++    # automatic gradient
++    positions.requires_grad_(True)
++    energy = torch.sum(rep.get_energy(positions, cache))
++    energy.backward()
++
++    assert positions.grad is not None
++    grad_backward = positions.grad.detach()
++    positions.detach_()
++
++    assert pytest.approx(ref, abs=tol) == grad_backward
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
++def test_grad_pos_backward_vs_analytical(dtype: torch.dtype, name: str) -> None:
++    dd = {"dtype": dtype}
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++
++    sample = samples[name]
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++
++    rep = new_repulsion(numbers, par, **dd)
++    assert rep is not None
++
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++    cache = rep.get_cache(numbers, ihelp)
++
++    # analytical gradient
++    e = repulsion_energy(positions, cache.mask, cache.arep, cache.kexp, cache.zeff)
++    grad_analytical = repulsion_gradient(
++        e, positions, cache.mask, cache.arep, cache.kexp, reduced=True
++    )
++
++    # automatic gradient
++    positions.requires_grad_(True)
++    energy = torch.sum(rep.get_energy(positions, cache), dim=-1)
++    energy.backward()
++
++    assert positions.grad is not None
++    grad_backward = positions.grad.detach()
++    positions.detach_()
++
++    assert pytest.approx(grad_analytical, abs=tol) == grad_backward
++
++
++def calc_numerical_gradient(
++    positions: Tensor, rep: Repulsion, cache: Repulsion.Cache
++) -> Tensor:
++    """Calculate gradient numerically for reference."""
++
++    n_atoms = positions.shape[0]
++
++    # setup numerical gradient
++    gradient = torch.zeros((n_atoms, 3), dtype=positions.dtype)
++    step = 1.0e-6
++
++    for i in range(n_atoms):
++        for j in range(3):
++            er, el = 0.0, 0.0
++
++            positions[i, j] += step
++            er = rep.get_energy(positions, cache)
++            er = torch.sum(er, dim=-1)
++
++            positions[i, j] -= 2 * step
++            el = rep.get_energy(positions, cache)
++            el = torch.sum(el, dim=-1)
++
++            positions[i, j] += step
++            gradient[i, j] = 0.5 * (er - el) / step
++
++    return gradient
++
++
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
++def test_grad_pos_analytical_vs_numerical(dtype: torch.dtype, name: str) -> None:
++    dd = {"dtype": dtype}
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++
++    sample = samples[name]
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++
++    rep = new_repulsion(numbers, par, **dd)
++    assert rep is not None
++
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++    cache = rep.get_cache(numbers, ihelp)
++
++    # analytical gradient
++    e = repulsion_energy(positions, cache.mask, cache.arep, cache.kexp, cache.zeff)
++    grad_analytical = repulsion_gradient(
++        e, positions, cache.mask, cache.arep, cache.kexp, reduced=True
++    )
++
++    # numerical gradient
++    grad_numerical = calc_numerical_gradient(positions, rep, cache)
++    assert pytest.approx(grad_numerical, abs=tol) == grad_analytical
++
++
++def gradcheck_pos(
++    dtype: torch.dtype, name: str
++) -> tuple[Callable[[Tensor], Tensor], Tensor]:
++    """Prepare gradient check from `torch.autograd`."""
++    assert par.repulsion is not None
++
++    dd = {"dtype": dtype}
++
++    sample = samples[name]
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++
++    rep = new_repulsion(numbers, par, **dd)
++    assert rep is not None
++    cache = rep.get_cache(numbers, ihelp)
++
++    # variables to be differentiated
++    positions.requires_grad_(True)
++
++    def func(pos: Tensor) -> Tensor:
++        return rep.get_energy(pos, cache)
++
++    return func, positions
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
++def test_grad_pos(dtype: torch.dtype, name: str) -> None:
++    """
++    Check a single analytical gradient of positions against numerical
++    gradient from `torch.autograd.gradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_pos(dtype, name)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradcheck
++
++    assert gradcheck(func, diffvars, atol=tol)
++    diffvars.detach_()
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name", sample_list + ["MB16_43_03"])
++def test_gradgrad_pos(dtype: torch.dtype, name: str) -> None:
++    """
++    Check a single analytical gradient of positions against numerical
++    gradient from `torch.autograd.gradgradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_pos(dtype, name)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradgradcheck
++
++    assert gradgradcheck(func, diffvars, atol=tol)
++    diffvars.detach_()
++
++
++def gradcheck_pos_batch(
++    dtype: torch.dtype, name1: str, name2: str
++) -> tuple[Callable[[Tensor], Tensor], Tensor]:
++    """Prepare gradient check from `torch.autograd`."""
++    assert par.repulsion is not None
++
++    dd = {"dtype": dtype}
++
++    sample1, sample2 = samples[name1], samples[name2]
++    numbers = batch.pack(
++        [
++            sample1["numbers"],
++            sample2["numbers"],
++        ]
++    )
++    positions = batch.pack(
++        [
++            sample1["positions"].type(dtype),
++            sample2["positions"].type(dtype),
++        ]
++    )
++
++    ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
++
++    rep = new_repulsion(numbers, par, **dd)
++    assert rep is not None
++    cache = rep.get_cache(numbers, ihelp)
++
++    # variables to be differentiated
++    positions.requires_grad_(True)
++
++    def func(pos: Tensor) -> Tensor:
++        return rep.get_energy(pos, cache)
++
++    return func, positions
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name1", ["SiH4"])
++@pytest.mark.parametrize("name2", sample_list + ["MB16_43_03"])
++def test_grad_pos_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++    """
++    Check a single analytical gradient of positions against numerical
++    gradient from `torch.autograd.gradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_pos_batch(dtype, name1, name2)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradcheck
++
++    assert gradcheck(func, diffvars, atol=tol)
++    diffvars.detach_()
++
++
++@pytest.mark.grad
++@pytest.mark.parametrize("dtype", [torch.double])
++@pytest.mark.parametrize("name1", ["SiH4"])
++@pytest.mark.parametrize("name2", sample_list + ["MB16_43_03"])
++def test_gradgrad_pos_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++    """
++    Check a single analytical gradient of positions against numerical
++    gradient from `torch.autograd.gradgradcheck`.
++    """
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++    func, diffvars = gradcheck_pos_batch(dtype, name1, name2)
++
++    # pylint: disable=import-outside-toplevel
++    from torch.autograd.gradcheck import gradgradcheck
++
++    assert gradgradcheck(func, diffvars, atol=tol)
++    diffvars.detach_()
+diff --git a/test/utils.py b/test/utils.py
+index 7b657d9cf..3ab2ab093 100644
+--- a/test/utils.py
++++ b/test/utils.py
+@@ -32,15 +32,16 @@ def get_device_from_str(s: str) -> torch.device:
+     KeyError
+         Unknown device name is given.
+     """
+-    d = {
+-        "cpu": torch.device("cpu"),
+-        "cuda": torch.device("cuda", index=torch.cuda.current_device()),
+-    }
+-
+-    if s not in d:
+-        raise KeyError(f"Unknown device '{s}' given.")
+-
+-    return d[s]
++    if s == "cpu":
++        return torch.device("cpu")
++    if s == "cuda":
++        if not torch.cuda.is_available():
++            raise RuntimeError(
++                "Torch not compiled with CUDA or no CUDA device available."
++            )
++        return torch.device("cuda", index=torch.cuda.current_device())
++
++    raise KeyError(f"Unknown device '{s}' given.")
+ 
+ 
+ def load_from_npz(npzfile: Any, name: str, dtype: torch.dtype) -> Tensor:

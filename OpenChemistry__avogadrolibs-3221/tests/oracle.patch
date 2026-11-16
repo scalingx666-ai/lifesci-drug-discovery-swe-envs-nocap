@@ -1,0 +1,1247 @@
+diff --git a/.github/workflows/build_wheels.yml b/.github/workflows/build_wheels.yml
+index fd828e254fa..8e4c493e8ed 100644
+--- a/.github/workflows/build_wheels.yml
++++ b/.github/workflows/build_wheels.yml
+@@ -42,8 +42,12 @@ env:
+   # Run tests
+   CIBW_TEST_REQUIRES: pytest
+ 
+-  # Run a very simple test to make sure the wheels are working
+-  CIBW_TEST_COMMAND: pytest {project}/scripts/github-actions/simple_test.py
++  # Run a very simple test, plus the binding safety tests, to make sure the
++  # wheels are working
++  CIBW_TEST_COMMAND: >
++    pytest {project}/scripts/github-actions/simple_test.py
++    {project}/python/tests/test_core_bindings.py
++    {project}/python/tests/test_io_bindings.py
+ 
+   # We can't currently test Mac arm64 builds on x64
+   CIBW_TEST_SKIP: "*_arm64"
+diff --git a/avogadro/core/bond.h b/avogadro/core/bond.h
+index c3b8fefb1bf..d6124c3f99c 100644
+--- a/avogadro/core/bond.h
++++ b/avogadro/core/bond.h
+@@ -217,6 +217,8 @@ template <class Molecule_T>
+ typename BondTemplate<Molecule_T>::AtomType BondTemplate<Molecule_T>::atom1()
+   const
+ {
++  if (!isValid())
++    return AtomType();
+   return AtomType(m_molecule, m_molecule->bondPairs()[m_index].first);
+ }
+ 
+@@ -224,6 +226,8 @@ template <class Molecule_T>
+ typename BondTemplate<Molecule_T>::AtomType BondTemplate<Molecule_T>::atom2()
+   const
+ {
++  if (!isValid())
++    return AtomType();
+   return AtomType(m_molecule, m_molecule->bondPairs()[m_index].second);
+ }
+ 
+diff --git a/avogadro/core/molecule.cpp b/avogadro/core/molecule.cpp
+index 81e07667b71..2cb2021a120 100644
+--- a/avogadro/core/molecule.cpp
++++ b/avogadro/core/molecule.cpp
+@@ -1386,7 +1386,10 @@ void Molecule::clearAtoms()
+ 
+ Molecule::AtomType Molecule::atom(Index index) const
+ {
+-  assert(index < atomCount());
++  // Not assert(): NDEBUG removes it, and callers such as the Python bindings
++  // can pass any index. Return an invalid proxy instead.
++  if (index >= atomCount())
++    return AtomType();
+   return AtomType(const_cast<Molecule*>(this), index);
+ }
+ 
+@@ -1495,7 +1498,10 @@ void Molecule::clearBonds()
+ 
+ Molecule::BondType Molecule::bond(Index index) const
+ {
+-  assert(index < bondCount());
++  // See atom(): refuse an out-of-range index rather than build a proxy that
++  // reads past the end of the bond arrays.
++  if (index >= bondCount())
++    return BondType();
+ 
+   return BondType(const_cast<Molecule*>(this), index);
+ }
+diff --git a/python/basisset.cpp b/python/basisset.cpp
+index 5ac1204303f..99fff3b2fdc 100644
+--- a/python/basisset.cpp
++++ b/python/basisset.cpp
+@@ -10,6 +10,8 @@
+ #include <avogadro/core/gaussiansettools.h>
+ #include <avogadro/core/molecule.h>
+ 
++#include <cstring>
++
+ namespace py = pybind11;
+ 
+ using namespace Avogadro;
+@@ -45,27 +47,27 @@ void exportBasisSet(py::module_& m)
+     .def(
+       "mo_energy",
+       [](BasisSet& self, BasisSet::ElectronType type) -> py::array_t<double> {
+-        auto& energies = self.moEnergy(type);
+-        if (energies.empty())
+-          return py::array_t<double>(0);
+-        return py::array_t<double>({ static_cast<Py_ssize_t>(energies.size()) },
+-                                   { static_cast<Py_ssize_t>(sizeof(double)) },
+-                                   energies.data(), py::cast(self));
++        const auto& energies = self.moEnergy(type);
++        py::array_t<double> result(static_cast<Py_ssize_t>(energies.size()));
++        if (!energies.empty())
++          std::memcpy(result.mutable_data(), energies.data(),
++                      energies.size() * sizeof(double));
++        return result;
+       },
+       py::arg("type") = BasisSet::Paired,
+-      "MO energies as a numpy array (Hartrees)")
++      "MO energies as a numpy array (Hartrees; a copy)")
+     .def(
+       "mo_occupancy",
+       [](BasisSet& self, BasisSet::ElectronType type) -> py::array_t<uint8_t> {
+-        auto& occ = self.moOccupancy(type);
+-        if (occ.empty())
+-          return py::array_t<uint8_t>(0);
+-        return py::array_t<uint8_t>(
+-          { static_cast<Py_ssize_t>(occ.size()) },
+-          { static_cast<Py_ssize_t>(sizeof(uint8_t)) }, occ.data(),
+-          py::cast(self));
++        const auto& occ = self.moOccupancy(type);
++        py::array_t<uint8_t> result(static_cast<Py_ssize_t>(occ.size()));
++        if (!occ.empty())
++          std::memcpy(result.mutable_data(), occ.data(),
++                      occ.size() * sizeof(uint8_t));
++        return result;
+       },
+-      py::arg("type") = BasisSet::Paired, "MO occupancies as a numpy array");
++      py::arg("type") = BasisSet::Paired,
++      "MO occupancies as a numpy array (a copy)");
+ 
+   // --- ScfType enum (namespace level) ---
+ 
+diff --git a/python/core.cpp b/python/core.cpp
+index 4e02f2d00ff..74eda4462d6 100644
+--- a/python/core.cpp
++++ b/python/core.cpp
+@@ -7,11 +7,42 @@
+ #include <avogadro/core/molecule.h>
+ #include <avogadro/core/unitcell.h>
+ 
++#include <stdexcept>
++#include <utility>
++
+ namespace py = pybind11;
+ 
+ using namespace Avogadro;
+ using namespace Avogadro::Core;
+ 
++namespace {
++
++// Atom and Bond are lightweight proxies (molecule pointer + index). One that
++// is not valid (e.g. Molecule.bond(a, b) when there is no such bond) must not
++// be dereferenced, so every accessor except index/is_valid goes through
++// these wrappers and raises RuntimeError instead of crashing.
++template <typename T, typename R>
++auto guardedGet(R (T::*getter)() const, const char* what)
++{
++  return [getter, what](const T& self) -> R {
++    if (!self.isValid())
++      throw std::runtime_error(what);
++    return (self.*getter)();
++  };
++}
++
++template <typename T, typename R, typename Arg>
++auto guardedSet(R (T::*setter)(Arg), const char* what)
++{
++  return [setter, what](T& self, Arg value) {
++    if (!self.isValid())
++      throw std::runtime_error(what);
++    (self.*setter)(std::forward<Arg>(value));
++  };
++}
++
++} // namespace
++
+ PYBIND11_MODULE(core, m)
+ {
+   m.doc() = "AvogadroCore Python binding";
+@@ -22,13 +53,18 @@ PYBIND11_MODULE(core, m)
+   py::class_<atomBase>(m, "atomBase");
+   py::class_<Atom, atomBase>(m, "Atom")
+     .def_property_readonly("index", &Atom::index, "Index in the molecule")
+-    .def_property("atomic_number", &Atom::atomicNumber, &Atom::setAtomicNumber,
+-                  "The atomic number")
+-    .def_property("position", &Atom::position3d, &Atom::setPosition3d,
++    .def_property(
++      "atomic_number", guardedGet(&Atom::atomicNumber, "invalid atom"),
++      guardedSet(&Atom::setAtomicNumber, "invalid atom"), "The atomic number")
++    .def_property("position", guardedGet(&Atom::position3d, "invalid atom"),
++                  guardedSet(&Atom::setPosition3d, "invalid atom"),
+                   "The 3D position of the atom")
+-    .def_property("formal_charge", &Atom::formalCharge, &Atom::setFormalCharge,
++    .def_property("formal_charge",
++                  guardedGet(&Atom::formalCharge, "invalid atom"),
++                  guardedSet(&Atom::setFormalCharge, "invalid atom"),
+                   "The formal charge of the atom")
+-    .def_property("is_selected", &Atom::selected, &Atom::setSelected,
++    .def_property("is_selected", guardedGet(&Atom::selected, "invalid atom"),
++                  guardedSet(&Atom::setSelected, "invalid atom"),
+                   "Whether the atom is selected")
+     .def("is_valid", &Atom::isValid, "Check if the object is valid");
+ 
+@@ -38,11 +74,26 @@ PYBIND11_MODULE(core, m)
+   py::class_<bondBase>(m, "bondBase");
+   py::class_<Bond, bondBase>(m, "Bond")
+     .def_property_readonly("index", &Bond::index, "Index in the molecule")
+-    .def_property("order", &Bond::order, &Bond::setOrder,
++    .def_property("order", guardedGet(&Bond::order, "invalid bond"),
++                  guardedSet(&Bond::setOrder, "invalid bond"),
+                   "The order of the bond (single = 1, double = 2, etc)")
+     .def("is_valid", &Bond::isValid, "Check if the object is valid")
+-    .def("atom1", &Bond::atom1, "The first atom")
+-    .def("atom2", &Bond::atom2, "The second atom");
++    .def(
++      "atom1",
++      [](const Bond& self) {
++        if (!self.isValid())
++          throw std::runtime_error("invalid bond");
++        return keepAlive(*self.molecule(), self.atom1());
++      },
++      "The first atom")
++    .def(
++      "atom2",
++      [](const Bond& self) {
++        if (!self.isValid())
++          throw std::runtime_error("invalid bond");
++        return keepAlive(*self.molecule(), self.atom2());
++      },
++      "The second atom");
+ 
+   // --- UnitCell ---
+ 
+diff --git a/python/cube.cpp b/python/cube.cpp
+index 9840514b87b..45bc9ab8cf1 100644
+--- a/python/cube.cpp
++++ b/python/cube.cpp
+@@ -7,6 +7,8 @@
+ #include <avogadro/core/cube.h>
+ #include <avogadro/core/molecule.h>
+ 
++#include <string>
++
+ namespace py = pybind11;
+ 
+ using namespace Avogadro;
+@@ -50,14 +52,16 @@ void exportCube(py::module_& m)
+   bool (Cube::*setValue_idx)(unsigned int, float) = &Cube::setValue;
+ 
+   cubeClass
+-    // Data as 3D numpy array (zero-copy view)
++    // Data as a 3D numpy array: a zero-copy, read-only view (cubes can be
++    // many MB). Writes go through the setter, which also refreshes the
++    // min/max values.
+     .def_property(
+       "data",
+       [](Cube& self) -> py::array_t<float> {
+         auto* vec = self.data();
+         if (vec->empty())
+           return py::array_t<float>();
+-        return py::array_t<float>(
++        auto view = py::array_t<float>(
+           { static_cast<Py_ssize_t>(self.nx()),
+             static_cast<Py_ssize_t>(self.ny()),
+             static_cast<Py_ssize_t>(self.nz()) },
+@@ -65,13 +69,32 @@ void exportCube(py::module_& m)
+             static_cast<Py_ssize_t>(self.nz() * sizeof(float)),
+             static_cast<Py_ssize_t>(sizeof(float)) },
+           vec->data(), py::cast(self));
++        // Not writeable: an in-place write would skip the min/max update
++        // that the setter does.
++        view.attr("setflags")(py::arg("write") = false);
++        return view;
+       },
+       [](Cube& self, py::array_t<float, py::array::c_style> arr) {
+         auto buf = arr.request();
++        // Cube::setData() accepts only exactly nx*ny*nz values, so this is
++        // also false for an empty array and when no limits have been set
++        // yet (nx*ny*nz == 0): there is nothing sensible to size the data
++        // against then.
++        const auto expected =
++          static_cast<Py_ssize_t>(self.nx()) * self.ny() * self.nz();
+         auto* ptr = static_cast<float*>(buf.ptr);
+-        self.setData(std::vector<float>(ptr, ptr + buf.size));
++        if (buf.size != expected ||
++            !self.setData(std::vector<float>(ptr, ptr + buf.size)))
++          throw py::value_error(
++            "Cube data must have nx*ny*nz = " + std::to_string(expected) +
++            " values (set the limits first), got " + std::to_string(buf.size));
+       },
+-      "Cube data as a numpy array of shape (nx, ny, nz)")
++      "Cube data as a read-only numpy array of shape (nx, ny, nz). This is a "
++      "view of the cube's storage, not a copy, and is invalidated by "
++      "set_limits() or by assigning to data; do not keep it across those. "
++      "To modify the data, assign a new array: cube.data = new_array (it must "
++      "have nx*ny*nz values, so set the limits first, or ValueError is "
++      "raised).")
+     // Spatial properties
+     .def_property_readonly("min", &Cube::min, "The minimum corner of the cube")
+     .def_property_readonly("max", &Cube::max, "The maximum corner of the cube")
+diff --git a/python/exporters.h b/python/exporters.h
+index 072edb0d4ac..84fcbdd8417 100644
+--- a/python/exporters.h
++++ b/python/exporters.h
+@@ -3,6 +3,24 @@
+ 
+ #include <pybind11/pybind11.h>
+ 
++#include <utility>
++
++// Return value (an Atom or Bond proxy) as a Python object that keeps owner
++// alive. py::keep_alive<0, 1> would be the usual tool, but pybind11 3.1 runs
++// its post-call hook even when argument conversion failed, and then
++// dereferences the "try next overload" sentinel as if it were the return
++// value: m.atom(-1) or Bond.atom1(5) segfaults instead of raising TypeError.
++// Doing it by hand only runs on a successful call.
++template <typename Owner, typename T>
++pybind11::object keepAlive(Owner& owner, T&& value)
++{
++  pybind11::object result = pybind11::cast(std::forward<T>(value));
++  pybind11::object ownerObject =
++    pybind11::cast(&owner, pybind11::return_value_policy::reference);
++  pybind11::detail::keep_alive_impl(result, ownerObject);
++  return result;
++}
++
+ void exportCube(pybind11::module_& m);
+ void exportBasisSet(pybind11::module_& m);
+ void exportMolecule(pybind11::module_& m);
+diff --git a/python/io.cpp b/python/io.cpp
+index 700f659d824..826997f9e78 100644
+--- a/python/io.cpp
++++ b/python/io.cpp
+@@ -13,6 +13,9 @@
+ #include <avogadro/quantumio/nwchemlog.h>
+ #include <avogadro/quantumio/orca.h>
+ 
++#include <stdexcept>
++#include <string>
++
+ namespace py = pybind11;
+ 
+ using namespace Avogadro;
+@@ -27,34 +30,52 @@ class ffm
+ public:
+   ffm() : m_ffm(FileFormatManager::instance()) {}
+ 
++  // Each operation starts by clearing the manager's (thread-local) error, so
++  // error() describes only the call that just failed.
++  [[noreturn]] void fail(const char* what) const
++  {
++    std::string message = m_ffm.error();
++    while (!message.empty() &&
++           (message.back() == '\n' || message.back() == '\r'))
++      message.pop_back();
++    if (message.empty())
++      message = std::string(what) + " failed";
++    throw std::runtime_error(message);
++  }
++
+   bool readFile(Core::Molecule& molecule, const std::string& fileName,
+                 const std::string& fileExtension = std::string(),
+                 const std::string& options = std::string()) const
+   {
+-    return m_ffm.readFile(molecule, fileName, fileExtension, options);
++    if (!m_ffm.readFile(molecule, fileName, fileExtension, options))
++      fail("Reading the file");
++    return true;
+   }
+ 
+   bool writeFile(const Core::Molecule& molecule, const std::string& fileName,
+                  const std::string& fileExtension = std::string(),
+                  const std::string& options = std::string()) const
+   {
+-    return m_ffm.writeFile(molecule, fileName, fileExtension, options);
++    if (!m_ffm.writeFile(molecule, fileName, fileExtension, options))
++      fail("Writing the file");
++    return true;
+   }
+ 
+   bool readString(Core::Molecule& molecule, const std::string& string,
+                   const std::string& fileExtension,
+                   const std::string& options = std::string()) const
+   {
+-    return m_ffm.readString(molecule, string, fileExtension, options);
++    if (!m_ffm.readString(molecule, string, fileExtension, options))
++      fail("Reading the string");
++    return true;
+   }
+ 
+   std::string writeString(const Molecule& mol, const std::string& ext,
+                           const std::string& options = std::string())
+   {
+     std::string fileStr;
+-    bool ok = m_ffm.writeString(mol, fileStr, ext, options);
+-    if (!ok)
+-      fileStr = "Error: " + FileFormatManager::instance().error();
++    if (!m_ffm.writeString(mol, fileStr, ext, options))
++      fail("Writing the string");
+     return fileStr;
+   }
+ 
+@@ -81,19 +102,29 @@ PYBIND11_MODULE(io, m)
+   /// This class uses a singleton pattern, make it accessible through Python.
+   py::class_<ffm>(m, "FileFormatManager")
+     .def(py::init<>())
+-    .def("read_file", &ffm::readFile,
+-         "Read in a molecule from the supplied file path", py::arg("molecule"),
+-         py::arg("file_name"), py::arg("file_extension") = std::string(),
+-         py::arg("options") = std::string())
+-    .def("write_file", &ffm::writeFile,
+-         "Write the molecule to the supplied file path", py::arg("molecule"),
+-         py::arg("file_name"), py::arg("file_extension") = std::string(),
+-         py::arg("options") = std::string())
++    .def(
++      "read_file", &ffm::readFile,
++      "Read in a molecule from the supplied file path. Returns True, or raises "
++      "RuntimeError (with the reason) on failure",
++      py::arg("molecule"), py::arg("file_name"),
++      py::arg("file_extension") = std::string(),
++      py::arg("options") = std::string())
++    .def(
++      "write_file", &ffm::writeFile,
++      "Write the molecule to the supplied file path. Returns True, or raises "
++      "RuntimeError (with the reason) on failure",
++      py::arg("molecule"), py::arg("file_name"),
++      py::arg("file_extension") = std::string(),
++      py::arg("options") = std::string())
+     .def("read_string", &ffm::readString,
+-         "Read in a molecule from the supplied string", py::arg("molecule"),
+-         py::arg("string"), py::arg("file_extension"),
++         "Read in a molecule from the supplied string. Returns True, or raises "
++         "RuntimeError (with the reason) on failure",
++         py::arg("molecule"), py::arg("string"), py::arg("file_extension"),
+          py::arg("options") = std::string())
+-    .def("write_string", &ffm::writeString,
+-         "Write a molecule to the supplied string", py::arg("mol"),
+-         py::arg("file_extension"), py::arg("options") = std::string());
++    .def(
++      "write_string", &ffm::writeString,
++      "Write a molecule to a string and return it. Raises RuntimeError (with "
++      "the reason) on failure",
++      py::arg("mol"), py::arg("file_extension"),
++      py::arg("options") = std::string());
+ }
+diff --git a/python/molecule.cpp b/python/molecule.cpp
+index e196bfcc9ce..b433dda7cc1 100644
+--- a/python/molecule.cpp
++++ b/python/molecule.cpp
+@@ -9,50 +9,128 @@
+ #include <avogadro/core/molecule.h>
+ #include <avogadro/core/unitcell.h>
+ 
++#include <algorithm>
+ #include <cstring>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ namespace py = pybind11;
+ 
+ using namespace Avogadro;
+ using namespace Avogadro::Core;
+ 
+-// Ensure std::pair<Index,Index> has no padding for zero-copy numpy views.
++namespace {
++
++// The Atom/Bond proxies hold a raw pointer to their molecule; refuse proxies
++// from another molecule rather than index this one with a foreign index.
++void requireOwnedAtom(const Molecule& self, const Atom& atom)
++{
++  if (!atom.isValid() || atom.molecule() != &self)
++    throw py::value_error("Atom does not belong to this molecule");
++}
++
++// The setters need one entry per atom; say what was expected.
++std::string lengthMessage(const char* name, size_t expected, size_t got)
++{
++  return std::string(name) + " must have one entry per atom (expected " +
++         std::to_string(expected) + ", got " + std::to_string(got) + ")";
++}
++
++// Copy count rows of width elements of type T into a new (count, width)
++// numpy array, or a flat (count,) one when width is 0. The result owns its
++// data: a view into Core::Array would dangle as soon as the molecule
++// reallocates, and Core::Array is copy-on-write, so writes through a view of
++// its const buffer could change other molecules sharing it.
++template <typename T>
++py::array_t<T> copyToArray(const void* source, size_t count, size_t width = 0)
++{
++  std::vector<Py_ssize_t> shape{ static_cast<Py_ssize_t>(count) };
++  if (width > 0)
++    shape.push_back(static_cast<Py_ssize_t>(width));
++  py::array_t<T> result(shape);
++  if (count > 0)
++    std::memcpy(result.mutable_data(), source,
++                count * std::max<size_t>(width, 1) * sizeof(T));
++  return result;
++}
++
++} // namespace
++
++// The bulk getters memcpy these types into plain numpy arrays.
+ static_assert(sizeof(std::pair<Index, Index>) == 2 * sizeof(Index),
+-              "std::pair<Index,Index> must be contiguous for numpy view");
++              "std::pair<Index,Index> must be contiguous to copy into numpy");
++static_assert(sizeof(Vector3) == 3 * sizeof(double),
++              "Vector3 must be contiguous to copy into numpy");
+ 
+ void exportMolecule(py::module_& m)
+ {
+   // Function pointer overloads
+   Index (Molecule::*atomCount0)() const = &Molecule::atomCount;
+   Index (Molecule::*atomCount1)(unsigned char) const = &Molecule::atomCount;
+-  Bond (Molecule::*addBond1)(Index, Index, unsigned char) = &Molecule::addBond;
+-  Bond (Molecule::*addBond2)(const Atom&, const Atom&, unsigned char) =
+-    &Molecule::addBond;
+-  Bond (Molecule::*bond0)(Index) const = &Molecule::bond;
+-  Bond (Molecule::*bond1)(const Atom&, const Atom&) const = &Molecule::bond;
+-  Bond (Molecule::*bond2)(Index, Index) const = &Molecule::bond;
+   Cube* (Molecule::*cube0)(Index) = &Molecule::cube;
+   UnitCell* (Molecule::*unitCell0)() = &Molecule::unitCell;
+ 
+   py::class_<Molecule>(m, "Molecule")
+     .def(py::init<>())
+     // --- Per-atom/bond access ---
+-    .def("add_atom",
+-         static_cast<Atom (Molecule::*)(unsigned char)>(&Molecule::addAtom),
+-         "Add an atom")
++    // Atom and Bond are proxies holding a raw Molecule pointer, so every one
++    // returned must keep the molecule alive (see keepAlive).
++    .def(
++      "add_atom",
++      [](Molecule& self, unsigned char atomicNumber) {
++        return keepAlive(self, self.addAtom(atomicNumber));
++      },
++      "Add an atom")
+     .def("atom_count", atomCount0, "The number of atoms")
+     .def("atom_count", atomCount1,
+          "The number of atoms with the supplied atomic number")
+-    .def("atom", &Molecule::atom, "The atom at the specified index")
+-    .def("add_bond", addBond1, "Add a new bond", py::arg("a1"), py::arg("a2"),
+-         py::arg("order") = 1)
+-    .def("add_bond", addBond2, "Add a new bond", py::arg("a1"), py::arg("a2"),
+-         py::arg("order") = 1)
++    .def(
++      "atom",
++      [](Molecule& self, Index index) {
++        if (index >= self.atomCount())
++          throw py::index_error("atom index out of range");
++        return keepAlive(self, self.atom(index));
++      },
++      "The atom at the specified index")
++    .def(
++      "add_bond",
++      [](Molecule& self, Index a1, Index a2, unsigned char order) {
++        return keepAlive(self, self.addBond(a1, a2, order));
++      },
++      "Add a new bond", py::arg("a1"), py::arg("a2"), py::arg("order") = 1)
++    .def(
++      "add_bond",
++      [](Molecule& self, const Atom& a1, const Atom& a2, unsigned char order) {
++        requireOwnedAtom(self, a1);
++        requireOwnedAtom(self, a2);
++        return keepAlive(self, self.addBond(a1, a2, order));
++      },
++      "Add a new bond", py::arg("a1"), py::arg("a2"), py::arg("order") = 1)
+     .def("bond_count", &Molecule::bondCount, "The number of bonds")
+-    .def("bond", bond0, "The bond at the specified index")
+-    .def("bond", bond1, "The bond between the specified atoms")
+-    .def("bond", bond2, "The bond between the specified atoms")
++    .def(
++      "bond",
++      [](Molecule& self, Index index) {
++        if (index >= self.bondCount())
++          throw py::index_error("bond index out of range");
++        return keepAlive(self, self.bond(index));
++      },
++      "The bond at the specified index")
++    .def(
++      "bond",
++      [](Molecule& self, const Atom& a, const Atom& b) {
++        requireOwnedAtom(self, a);
++        requireOwnedAtom(self, b);
++        return keepAlive(self, self.bond(a, b));
++      },
++      "The bond between the specified atoms (invalid if there is none)")
++    .def(
++      "bond",
++      [](Molecule& self, Index a, Index b) {
++        return keepAlive(self, self.bond(a, b));
++      },
++      "The bond between the atoms at the specified indices (invalid if "
++      "there is none)")
+     .def("add_cube", &Molecule::addCube,
+          py::return_value_policy::reference_internal, "Add a new cube")
+     .def("cube_count", &Molecule::cubeCount, "The number of cubes")
+@@ -74,90 +152,79 @@ void exportMolecule(py::module_& m)
+          py::arg("delimiter") = "", py::arg("show_counts_over") = 1)
+     .def("mass", &Molecule::mass, "The mass of the molecule")
+ 
+-    // --- Bulk array properties (numpy, zero-copy read) ---
++    // --- Bulk array properties (numpy; getters return copies) ---
+     .def_property(
+       "positions",
+       [](const Molecule& self) -> py::array_t<double> {
+         const auto& pos = self.atomPositions3d();
+-        if (pos.empty())
+-          return py::array_t<double>(std::vector<Py_ssize_t>{ 0, 3 });
+-        return py::array_t<double>(
+-          std::vector<Py_ssize_t>{ static_cast<Py_ssize_t>(pos.size()), 3 },
+-          { static_cast<Py_ssize_t>(3 * sizeof(double)),
+-            static_cast<Py_ssize_t>(sizeof(double)) },
+-          reinterpret_cast<const double*>(pos.constData()), py::cast(self));
++        return copyToArray<double>(pos.constData(), pos.size(), 3);
+       },
+       [](Molecule& self, py::array_t<double, py::array::c_style> arr) {
+         auto buf = arr.request();
+         if (buf.ndim != 2 || buf.shape[1] != 3)
+           throw py::value_error("Expected shape (N, 3)");
+         Core::Array<Vector3> positions(buf.shape[0]);
+-        std::memcpy(positions.data(), buf.ptr,
+-                    buf.shape[0] * 3 * sizeof(double));
+-        self.setAtomPositions3d(positions);
++        if (buf.shape[0] > 0)
++          std::memcpy(positions.data(), buf.ptr,
++                      buf.shape[0] * 3 * sizeof(double));
++        if (!self.setAtomPositions3d(positions))
++          throw py::value_error(
++            lengthMessage("positions", self.atomCount(), positions.size()));
+       },
+-      "Atomic positions as an (N, 3) numpy array")
++      "Atomic positions as an (N, 3) numpy array (a copy; assign to the "
++      "property to change them)")
+     .def_property(
+       "atomic_numbers",
+       [](const Molecule& self) -> py::array_t<uint8_t> {
+         const auto& nums = self.atomicNumbers();
+-        if (nums.empty())
+-          return py::array_t<uint8_t>(0);
+-        return py::array_t<uint8_t>(
+-          { static_cast<Py_ssize_t>(nums.size()) },
+-          { static_cast<Py_ssize_t>(sizeof(uint8_t)) },
+-          reinterpret_cast<const uint8_t*>(nums.constData()), py::cast(self));
++        return copyToArray<uint8_t>(nums.constData(), nums.size());
+       },
+       [](Molecule& self, py::array_t<uint8_t, py::array::c_style> arr) {
+         auto buf = arr.request();
++        if (buf.ndim != 1)
++          throw py::value_error("Expected a 1-D array of atomic numbers");
+         Core::Array<unsigned char> nums(buf.shape[0]);
+-        std::memcpy(nums.data(), buf.ptr, buf.shape[0]);
+-        self.setAtomicNumbers(nums);
++        if (buf.shape[0] > 0)
++          std::memcpy(nums.data(), buf.ptr, buf.shape[0]);
++        if (!self.setAtomicNumbers(nums))
++          throw py::value_error(
++            lengthMessage("atomic_numbers", self.atomCount(), nums.size()));
+       },
+-      "Atomic numbers as a uint8 numpy array")
++      "Atomic numbers as a uint8 numpy array (a copy; assign to the property "
++      "to change them)")
+     .def_property(
+       "formal_charges",
+       [](const Molecule& self) -> py::array_t<int8_t> {
+         const auto& charges = self.formalCharges();
+-        if (charges.empty())
+-          return py::array_t<int8_t>(0);
+-        return py::array_t<int8_t>(
+-          { static_cast<Py_ssize_t>(charges.size()) },
+-          { static_cast<Py_ssize_t>(sizeof(int8_t)) },
+-          reinterpret_cast<const int8_t*>(charges.constData()), py::cast(self));
++        return copyToArray<int8_t>(charges.constData(), charges.size());
+       },
+       [](Molecule& self, py::array_t<int8_t, py::array::c_style> arr) {
+         auto buf = arr.request();
++        if (buf.ndim != 1)
++          throw py::value_error("Expected a 1-D array of formal charges");
+         Core::Array<signed char> charges(buf.shape[0]);
+-        std::memcpy(charges.data(), buf.ptr, buf.shape[0]);
+-        self.setFormalCharges(charges);
++        if (buf.shape[0] > 0)
++          std::memcpy(charges.data(), buf.ptr, buf.shape[0]);
++        if (!self.setFormalCharges(charges))
++          throw py::value_error(
++            lengthMessage("formal_charges", self.atomCount(), charges.size()));
+       },
+-      "Formal charges as an int8 numpy array")
++      "Formal charges as an int8 numpy array (a copy; assign to the property "
++      "to change them)")
+     .def_property_readonly(
+       "bond_pairs",
+       [](const Molecule& self) -> py::array_t<size_t> {
+         const auto& pairs = self.bondPairs();
+-        if (pairs.empty())
+-          return py::array_t<size_t>(std::vector<Py_ssize_t>{ 0, 2 });
+-        return py::array_t<size_t>(
+-          std::vector<Py_ssize_t>{ static_cast<Py_ssize_t>(pairs.size()), 2 },
+-          { static_cast<Py_ssize_t>(2 * sizeof(size_t)),
+-            static_cast<Py_ssize_t>(sizeof(size_t)) },
+-          reinterpret_cast<const size_t*>(pairs.constData()), py::cast(self));
++        return copyToArray<size_t>(pairs.constData(), pairs.size(), 2);
+       },
+-      "Bond pairs as an (M, 2) numpy array of atom indices")
++      "Bond pairs as an (M, 2) numpy array of atom indices (a copy)")
+     .def_property_readonly(
+       "bond_orders",
+       [](const Molecule& self) -> py::array_t<uint8_t> {
+         const auto& orders = self.bondOrders();
+-        if (orders.empty())
+-          return py::array_t<uint8_t>(0);
+-        return py::array_t<uint8_t>(
+-          { static_cast<Py_ssize_t>(orders.size()) },
+-          { static_cast<Py_ssize_t>(sizeof(uint8_t)) },
+-          reinterpret_cast<const uint8_t*>(orders.constData()), py::cast(self));
++        return copyToArray<uint8_t>(orders.constData(), orders.size());
+       },
+-      "Bond orders as a uint8 numpy array")
++      "Bond orders as a uint8 numpy array (a copy)")
+ 
+     // --- Partial charges ---
+     .def("partial_charges", &Molecule::partialCharges, py::arg("type"),
+@@ -202,15 +269,9 @@ void exportMolecule(py::module_& m)
+       "force_vectors",
+       [](const Molecule& self) -> py::array_t<double> {
+         const auto& forces = self.forceVectors();
+-        if (forces.empty())
+-          return py::array_t<double>(std::vector<Py_ssize_t>{ 0, 3 });
+-        return py::array_t<double>(
+-          std::vector<Py_ssize_t>{ static_cast<Py_ssize_t>(forces.size()), 3 },
+-          { static_cast<Py_ssize_t>(3 * sizeof(double)),
+-            static_cast<Py_ssize_t>(sizeof(double)) },
+-          reinterpret_cast<const double*>(forces.constData()), py::cast(self));
++        return copyToArray<double>(forces.constData(), forces.size(), 3);
+       },
+-      "Force vectors as an (N, 3) numpy array")
++      "Force vectors as an (N, 3) numpy array (a copy)")
+ 
+     // --- Vibration data (returns by value, must copy) ---
+     .def_property_readonly(
+diff --git a/python/tests/test_core_bindings.py b/python/tests/test_core_bindings.py
+new file mode 100644
+index 00000000000..2e1d42ad832
+--- /dev/null
++++ b/python/tests/test_core_bindings.py
+@@ -0,0 +1,364 @@
++"""Safety tests for the avogadro.core pybind11 bindings.
++
++These need the compiled extension modules (a built wheel), so they skip
++cleanly in a source checkout.
++"""
++
++import gc
++
++import pytest
++
++np = pytest.importorskip("numpy")
++core = pytest.importorskip("avogadro.core")
++
++
++def make_water():
++    mol = core.Molecule()
++    mol.add_atom(8)
++    mol.add_atom(1)
++    mol.add_atom(1)
++    mol.add_bond(0, 1, 1)
++    mol.add_bond(0, 2, 1)
++    return mol
++
++
++# --- Atom/Bond lifetime ---
++
++
++def test_atom_outlives_molecule_reference():
++    atom = core.Molecule().add_atom(6)
++    gc.collect()
++    assert atom.atomic_number == 6
++    assert atom.is_valid()
++
++
++def test_atom_from_index_outlives_molecule_reference():
++    atom = make_water().atom(0)
++    gc.collect()
++    assert atom.atomic_number == 8
++
++
++def test_bond_and_its_atoms_outlive_molecule_reference():
++    bond = make_water().bond(0)
++    gc.collect()
++    assert bond.order == 1
++    assert bond.atom1().atomic_number == 8
++    assert bond.atom2().atomic_number == 1
++
++
++def test_add_bond_result_outlives_molecule_reference():
++    mol = core.Molecule()
++    a = mol.add_atom(6)
++    b = mol.add_atom(6)
++    bond = mol.add_bond(a, b, 2)
++    del mol, a, b
++    gc.collect()
++    assert bond.order == 2
++
++
++def test_bond_between_atoms_outlives_molecule_reference():
++    mol = make_water()
++    bond = mol.bond(mol.atom(0), mol.atom(1))
++    bond2 = mol.bond(0, 2)
++    del mol
++    gc.collect()
++    assert bond.order == 1
++    assert bond2.atom2().atomic_number == 1
++
++
++# --- Out-of-range / invalid proxies ---
++
++
++@pytest.mark.parametrize("index", [3, 1000, 2**40])
++def test_atom_index_out_of_range(index):
++    with pytest.raises(IndexError):
++        make_water().atom(index)
++
++
++@pytest.mark.parametrize("index", [2, 1000, 2**40])
++def test_bond_index_out_of_range(index):
++    with pytest.raises(IndexError):
++        make_water().bond(index)
++
++
++def test_negative_index_rejected():
++    mol = make_water()
++    with pytest.raises((IndexError, TypeError)):
++        mol.atom(-1)
++    with pytest.raises((IndexError, TypeError)):
++        mol.bond(-1)
++
++
++def test_bond_atom_rejects_wrong_self_type():
++    # pybind11 3.1's keep_alive post-call hook crashed when argument
++    # conversion failed, including for the implicit self argument.
++    with pytest.raises(TypeError):
++        core.Bond.atom1(5)
++    with pytest.raises(TypeError):
++        core.Bond.atom2("not a bond")
++
++
++def test_missing_bond_is_invalid_and_guarded():
++    mol = core.Molecule()
++    mol.add_atom(6)
++    bond = mol.bond(0, 0)
++    assert not bond.is_valid()
++    with pytest.raises(RuntimeError, match="invalid bond"):
++        bond.atom1()
++    with pytest.raises(RuntimeError, match="invalid bond"):
++        bond.atom2()
++    with pytest.raises(RuntimeError, match="invalid bond"):
++        bond.order
++    with pytest.raises(RuntimeError, match="invalid bond"):
++        bond.order = 2
++
++
++def test_bond_with_out_of_range_atoms_is_invalid():
++    bond = make_water().bond(0, 99)
++    assert not bond.is_valid()
++    with pytest.raises(RuntimeError, match="invalid bond"):
++        bond.atom1()
++
++
++def test_unbonded_pair_is_invalid():
++    mol = make_water()
++    bond = mol.bond(1, 2)  # the two hydrogens
++    assert not bond.is_valid()
++    with pytest.raises(RuntimeError):
++        bond.atom1()
++
++
++def test_valid_proxies_still_work():
++    mol = make_water()
++    assert mol.atom(1).atomic_number == 1
++    assert mol.atom(0).index == 0
++    assert mol.bond(1).atom1().index == 0
++    assert mol.bond(1).atom2().index == 2
++    assert mol.bond(mol.atom(0), mol.atom(2)).index == 1
++    assert mol.bond(2, 0).index == 1
++    atom = mol.atom(0)
++    atom.atomic_number = 16
++    assert mol.atom(0).atomic_number == 16
++
++
++def test_bond_rejects_atom_from_another_molecule():
++    mol = make_water()
++    other = make_water()
++    with pytest.raises(ValueError):
++        mol.bond(mol.atom(0), other.atom(1))
++
++
++# --- Bulk arrays are copies ---
++
++
++def test_positions_survive_reallocation():
++    mol = core.Molecule()
++    mol.add_atom(6)
++    mol.positions = np.array([[1.0, 2.0, 3.0]])
++    old = mol.positions
++    expected = old.copy()
++    for _ in range(1000):
++        mol.add_atom(1)
++    mol.positions = np.full((1001, 3), 7.0)
++    assert np.array_equal(old, expected)
++
++
++def test_atomic_numbers_survive_reallocation():
++    mol = make_water()
++    old = mol.atomic_numbers
++    for _ in range(1000):
++        mol.add_atom(6)
++    mol.atomic_numbers = np.full(1003, 9, dtype=np.uint8)
++    assert old.tolist() == [8, 1, 1]
++
++
++def test_bond_arrays_survive_reallocation():
++    mol = make_water()
++    pairs, orders = mol.bond_pairs, mol.bond_orders
++    for _ in range(500):
++        a = mol.add_atom(6)
++        b = mol.add_atom(6)
++        mol.add_bond(a, b, 3)
++    assert pairs.tolist() == [[0, 1], [0, 2]]
++    assert orders.tolist() == [1, 1]
++
++
++def test_writing_returned_array_does_not_change_molecule():
++    mol = make_water()
++    mol.positions = np.arange(9, dtype=float).reshape(3, 3)
++    mol.formal_charges = np.array([-1, 0, 1], dtype=np.int8)
++
++    mol.atomic_numbers[0] = 99
++    mol.positions[0, 0] = 99.0
++    mol.formal_charges[0] = 5
++    mol.bond_orders[0] = 3
++    mol.bond_pairs[0, 0] = 2
++
++    assert mol.atomic_numbers.tolist() == [8, 1, 1]
++    assert mol.positions[0, 0] == 0.0
++    assert mol.formal_charges.tolist() == [-1, 0, 1]
++    assert mol.bond_orders.tolist() == [1, 1]
++    assert mol.bond_pairs.tolist() == [[0, 1], [0, 2]]
++
++
++def test_write_does_not_leak_into_copied_molecule():
++    # Core::Array is copy-on-write; a write through a view of the shared
++    # buffer used to be visible in every molecule sharing it.
++    mol = make_water()
++    mol.positions = np.ones((3, 3))
++    other = core.Molecule()
++    for z in (8, 1, 1):
++        other.add_atom(z)
++    other.positions = mol.positions
++    view = mol.positions
++    view[:] = -5.0
++    assert np.all(other.positions == 1.0)
++    assert np.all(mol.positions == 1.0)
++
++
++def test_bulk_array_shapes_and_dtypes():
++    mol = make_water()
++    mol.positions = np.zeros((3, 3))
++    assert mol.positions.shape == (3, 3)
++    assert mol.positions.dtype == np.float64
++    assert mol.atomic_numbers.shape == (3,)
++    assert mol.atomic_numbers.dtype == np.uint8
++    assert mol.formal_charges.dtype == np.int8
++    assert mol.bond_pairs.shape == (2, 2)
++    assert mol.bond_pairs.dtype == np.uintp
++    assert mol.bond_orders.shape == (2,)
++    assert mol.bond_orders.dtype == np.uint8
++    assert mol.positions.flags.c_contiguous
++    assert mol.bond_pairs.flags.c_contiguous
++
++
++def test_empty_bulk_arrays():
++    mol = core.Molecule()
++    assert mol.positions.shape == (0, 3)
++    assert mol.force_vectors.shape == (0, 3)
++    assert mol.bond_pairs.shape == (0, 2)
++    assert mol.atomic_numbers.shape == (0,)
++    assert mol.formal_charges.shape == (0,)
++    assert mol.bond_orders.shape == (0,)
++    assert mol.positions.dtype == np.float64
++    assert mol.bond_pairs.dtype == np.uintp
++
++
++def make_cube(points=(3, 4, 5)):
++    mol = core.Molecule()
++    cube = mol.add_cube()
++    assert cube.set_limits(np.zeros(3), np.array(points, dtype=np.int32), 0.5)
++    return mol, cube
++
++
++def test_cube_data_is_read_only_view():
++    mol, cube = make_cube()
++    cube.fill(1.0)
++    data = cube.data
++    assert data.shape == (3, 4, 5)
++    assert not data.flags.writeable
++    with pytest.raises(ValueError):
++        data[0, 0, 0] = 5.0
++    assert cube.value(0, 0, 0) == 1.0
++
++
++def test_cube_data_assignment_still_works():
++    mol, cube = make_cube()
++    cube.data = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
++    assert cube.value(1, 2, 3) == np.float32(1 * 20 + 2 * 5 + 3)
++    assert cube.data[1, 2, 3] == np.float32(33)
++
++
++# --- Setters validate their input ---
++
++
++def test_set_positions_roundtrip():
++    mol = make_water()
++    pos = np.arange(9, dtype=float).reshape(3, 3)
++    mol.positions = pos
++    assert np.array_equal(mol.positions, pos)
++
++
++@pytest.mark.parametrize("rows", [0, 2, 4, 100])
++def test_set_positions_wrong_length(rows):
++    mol = make_water()
++    mol.positions = np.ones((3, 3))
++    if rows == 0:
++        # An empty array is accepted by the core (it clears the positions)
++        mol.positions = np.zeros((0, 3))
++        assert mol.positions.shape == (0, 3)
++        return
++    with pytest.raises(ValueError, match="3.*%d|%d.*3" % (rows, rows)):
++        mol.positions = np.zeros((rows, 3))
++    assert np.all(mol.positions == 1.0)
++
++
++@pytest.mark.parametrize("shape", [(3,), (3, 2), (3, 4), (1, 3, 3), ()])
++def test_set_positions_wrong_shape(shape):
++    mol = make_water()
++    with pytest.raises(ValueError):
++        mol.positions = np.zeros(shape)
++
++
++def test_set_atomic_numbers_roundtrip():
++    mol = make_water()
++    mol.atomic_numbers = np.array([6, 7, 8], dtype=np.uint8)
++    assert mol.atomic_numbers.tolist() == [6, 7, 8]
++    assert mol.atom(1).atomic_number == 7
++
++
++@pytest.mark.parametrize("count", [0, 2, 4])
++def test_set_atomic_numbers_wrong_length(count):
++    mol = make_water()
++    with pytest.raises(ValueError, match="3.*%d|%d.*3" % (count, count)):
++        mol.atomic_numbers = np.ones(count, dtype=np.uint8)
++    assert mol.atomic_numbers.tolist() == [8, 1, 1]
++
++
++def test_set_atomic_numbers_wrong_ndim():
++    mol = make_water()
++    with pytest.raises(ValueError):
++        mol.atomic_numbers = np.array(6, dtype=np.uint8)  # 0-d
++    with pytest.raises(ValueError):
++        mol.atomic_numbers = np.ones((3, 1), dtype=np.uint8)
++    assert mol.atomic_numbers.tolist() == [8, 1, 1]
++
++
++def test_set_formal_charges():
++    mol = make_water()
++    mol.formal_charges = np.array([-2, 1, 1], dtype=np.int8)
++    assert mol.formal_charges.tolist() == [-2, 1, 1]
++    with pytest.raises(ValueError, match="3.*2|2.*3"):
++        mol.formal_charges = np.zeros(2, dtype=np.int8)
++    with pytest.raises(ValueError):
++        mol.formal_charges = np.array(1, dtype=np.int8)
++    assert mol.formal_charges.tolist() == [-2, 1, 1]
++
++
++def test_set_atomic_numbers_updates_element_state():
++    mol = make_water()
++    mol.atomic_numbers = np.array([6, 6, 6], dtype=np.uint8)
++    assert mol.formula() == "C3"
++
++
++def test_cube_data_wrong_size():
++    mol, cube = make_cube((3, 4, 5))
++    with pytest.raises(ValueError, match="60"):
++        cube.data = np.zeros(59, dtype=np.float32)
++    with pytest.raises(ValueError):
++        cube.data = np.zeros((3, 4, 6), dtype=np.float32)
++    with pytest.raises(ValueError):
++        cube.data = np.zeros(0, dtype=np.float32)
++
++
++def test_cube_data_flat_array_of_right_size():
++    mol, cube = make_cube((3, 4, 5))
++    cube.data = np.arange(60, dtype=np.float32)
++    assert cube.data.shape == (3, 4, 5)
++    assert cube.data[0, 0, 4] == 4.0
++
++
++def test_cube_data_before_limits_rejected():
++    cube = core.Molecule().add_cube()
++    with pytest.raises(ValueError):
++        cube.data = np.ones(8, dtype=np.float32)
+diff --git a/python/tests/test_io_bindings.py b/python/tests/test_io_bindings.py
+new file mode 100644
+index 00000000000..790a0b0c84d
+--- /dev/null
++++ b/python/tests/test_io_bindings.py
+@@ -0,0 +1,99 @@
++"""Error handling tests for the avogadro.io pybind11 bindings.
++
++These need the compiled extension modules (a built wheel), so they skip
++cleanly in a source checkout.
++"""
++
++import pytest
++
++core = pytest.importorskip("avogadro.core")
++io = pytest.importorskip("avogadro.io")
++
++ETHANE_XYZ = """8
++Ethane
++H      1.18508   -0.00384    0.98752
++C      0.75162   -0.02244   -0.02084
++H      1.16693    0.83301   -0.56931
++H      1.11552   -0.93289   -0.51453
++C     -0.75159    0.02250    0.02089
++H     -1.16688   -0.83337    0.56870
++H     -1.11569    0.93261    0.51508
++H     -1.18499    0.00442   -0.98752
++"""
++
++
++@pytest.fixture
++def manager():
++    return io.FileFormatManager()
++
++
++def test_read_string_success(manager):
++    mol = core.Molecule()
++    assert manager.read_string(mol, ETHANE_XYZ, "xyz") is True
++    assert mol.atom_count() == 8
++
++
++def test_read_string_unknown_format_raises(manager):
++    with pytest.raises(RuntimeError, match="nosuchformat"):
++        manager.read_string(core.Molecule(), ETHANE_XYZ, "nosuchformat")
++
++
++def test_read_string_malformed_input_raises(manager):
++    with pytest.raises(RuntimeError):
++        manager.read_string(core.Molecule(), "not an xyz file\n", "xyz")
++
++
++def test_read_file_missing_raises(manager, tmp_path):
++    with pytest.raises(RuntimeError):
++        manager.read_file(core.Molecule(), str(tmp_path / "missing.xyz"))
++
++
++def test_read_file_unknown_extension_raises(manager, tmp_path):
++    path = tmp_path / "mol.nosuchformat"
++    path.write_text(ETHANE_XYZ)
++    with pytest.raises(RuntimeError):
++        manager.read_file(core.Molecule(), str(path))
++
++
++def test_file_roundtrip_success(manager, tmp_path):
++    mol = core.Molecule()
++    assert manager.read_string(mol, ETHANE_XYZ, "xyz")
++    path = str(tmp_path / "out.xyz")
++    assert manager.write_file(mol, path) is True
++    again = core.Molecule()
++    assert manager.read_file(again, path) is True
++    assert again.atom_count() == 8
++
++
++def test_write_file_unwritable_path_raises(manager, tmp_path):
++    mol = core.Molecule()
++    assert manager.read_string(mol, ETHANE_XYZ, "xyz")
++    with pytest.raises(RuntimeError):
++        manager.write_file(mol, str(tmp_path / "no_such_dir" / "out.xyz"))
++
++
++def test_write_file_unknown_extension_raises(manager, tmp_path):
++    with pytest.raises(RuntimeError):
++        manager.write_file(core.Molecule(), str(tmp_path / "x.nosuchformat"))
++
++
++def test_write_string_success(manager):
++    mol = core.Molecule()
++    assert manager.read_string(mol, ETHANE_XYZ, "xyz")
++    text = manager.write_string(mol, "xyz")
++    assert text.splitlines()[0].strip() == "8"
++
++
++def test_write_string_unknown_format_raises(manager):
++    with pytest.raises(RuntimeError, match="nosuchformat"):
++        manager.write_string(core.Molecule(), "nosuchformat")
++
++
++def test_error_does_not_leak_into_next_call(manager):
++    with pytest.raises(RuntimeError):
++        manager.read_string(core.Molecule(), ETHANE_XYZ, "nosuchformat")
++    with pytest.raises(RuntimeError) as info:
++        manager.read_string(core.Molecule(), "not an xyz file\n", "xyz")
++    assert "nosuchformat" not in str(info.value)
++    mol = core.Molecule()
++    assert manager.read_string(mol, ETHANE_XYZ, "xyz") is True
+diff --git a/tests/core/bondtest.cpp b/tests/core/bondtest.cpp
+index 72885bed835..5851d1d1a31 100644
+--- a/tests/core/bondtest.cpp
++++ b/tests/core/bondtest.cpp
+@@ -39,3 +39,34 @@ TEST(BondTest, operators)
+   EXPECT_FALSE(bond1 == molecule.bond(1));
+   EXPECT_TRUE(bond1 != bond2);
+ }
++
++TEST(BondTest, outOfRangeProxies)
++{
++  Molecule molecule;
++  Atom a = molecule.addAtom(6);
++  Atom b = molecule.addAtom(8);
++  molecule.addBond(a, b, 1);
++  Atom c = molecule.addAtom(1);
++
++  // out-of-range indices give invalid proxies, not out-of-bounds ones
++  EXPECT_TRUE(molecule.atom(2).isValid());
++  EXPECT_FALSE(molecule.atom(3).isValid());
++  EXPECT_FALSE(molecule.atom(1000).isValid());
++  EXPECT_TRUE(molecule.bond(0).isValid());
++  EXPECT_FALSE(molecule.bond(1).isValid());
++  EXPECT_FALSE(molecule.bond(1000).isValid());
++
++  // an invalid bond hands back invalid atoms rather than crashing
++  Bond none = molecule.bond(a, c);
++  EXPECT_FALSE(none.isValid());
++  EXPECT_FALSE(none.atom1().isValid());
++  EXPECT_FALSE(none.atom2().isValid());
++
++  Bond defaultBond;
++  EXPECT_FALSE(defaultBond.isValid());
++  EXPECT_FALSE(defaultBond.atom1().isValid());
++  EXPECT_FALSE(defaultBond.atom2().isValid());
++
++  Bond past = molecule.bond(5);
++  EXPECT_FALSE(past.atom1().isValid());
++}

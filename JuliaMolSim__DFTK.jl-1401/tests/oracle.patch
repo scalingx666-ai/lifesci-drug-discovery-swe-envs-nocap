@@ -1,0 +1,290 @@
+diff --git a/Project.toml b/Project.toml
+index f8e1ab793f..63a7e6bca9 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -1,6 +1,6 @@
+ name = "DFTK"
+ uuid = "acf6eb54-70d9-11e9-0013-234b7a5f5337"
+-version = "0.8.0"
++version = "0.8.1"
+ authors = ["Michael F. Herbst <info@michael-herbst.com>", "Antoine Levitt <antoine.levitt@inria.fr>"]
+ 
+ [deps]
+diff --git a/examples/exact_exchange.jl b/examples/exact_exchange.jl
+index 4932c2c7ad..82313d8555 100644
+--- a/examples/exact_exchange.jl
++++ b/examples/exact_exchange.jl
+@@ -3,10 +3,10 @@
+ # This is a quick sketch how to run a simple hybrid DFT calculation using DFTK.
+ #
+ # !!! warning "Preliminary implementation"
+-#     Hybrid-DFT is not yet performance-optimised and has only seen rudimentary testing
+-#     so far. Further k-point sampling requires a Monkhorst-Pack grid without symmetry 
+-#     reduction (`symmetries=false`) and the interface is not yet considered stable.
+-#     We appreciate any issues, bug reports or PRs.
++#     Hybrid-DFT is not yet performance-optimised, MPI parallelisation does not work
++#     and all treatment of ``k``-point symmetry is disabled when using exact exchange terms.
++#     As the implementation is still in an early stage we appreciate any issues,
++#     bug reports or PRs.
+ #
+ using AtomsBuilder
+ using DFTK
+@@ -27,3 +27,5 @@ basis  = PlaneWaveBasis(model; basis.Ecut, basis.kgrid)
+ scfres = self_consistent_field(basis; tol=1e-4, scfres.ρ, scfres.ψ, scfres.occupation,
+                                scfres.eigenvalues, solver=DFTK.scf_damping_solver());
+ nothing  # hide
++
++# See also [`HSE`](@ref) and [`model_HF`](@ref) for setting up Hartree-Fock calculations.
+diff --git a/src/postprocess/band_structure.jl b/src/postprocess/band_structure.jl
+index bba7d59638..517d1c5ec9 100644
+--- a/src/postprocess/band_structure.jl
++++ b/src/postprocess/band_structure.jl
+@@ -58,7 +58,7 @@ All kwargs not specified below are passed to [`diagonalize_all_kblocks`](@ref):
+     #      AbstractBandData type from which the BandData and ScfResults
+     #      types subtype. In a first version the ScfResult could just contain
+     #      the currently used named tuple and forward all operations to it.
+-    (; basis=bs_basis, ψ=eigres.X, eigenvalues=eigres.λ, ρ, εF, occupation,
++    (; basis=bs_basis, ψ=eigres.X, eigenvalues=eigres.λ, ρ, τ, hubbard_n, εF, occupation,
+      diagonalization=[eigres], seed)
+ end
+ 
+diff --git a/src/terms/local.jl b/src/terms/local.jl
+index 1892a8e51b..d5cc18c88c 100644
+--- a/src/terms/local.jl
++++ b/src/terms/local.jl
+@@ -12,8 +12,9 @@ abstract type TermLocalPotential <: TermLinear end
+     potview(data, spin) = ndims(data) == 4 ? (@view data[:, :, :, spin]) : data
+     ops = [RealSpaceMultiplication(basis, kpt, potview(term.potential_values, kpt.spin))
+            for kpt in basis.kpoints]
+-    if :ρ in keys(kwargs)
+-        E = sum(total_density(kwargs[:ρ]) .* term.potential_values) * basis.dvol
++    ρ = get(kwargs, :ρ, nothing)
++    if !isnothing(ρ)
++        E = sum(total_density(ρ) .* term.potential_values) * basis.dvol
+     else
+         E = T(Inf)
+     end
+diff --git a/src/workarounds/forwarddiff_rules.jl b/src/workarounds/forwarddiff_rules.jl
+index cf360ca7e4..b3c9dc76c5 100644
+--- a/src/workarounds/forwarddiff_rules.jl
++++ b/src/workarounds/forwarddiff_rules.jl
+@@ -309,6 +309,50 @@ end
+        scfres.seed, scfres.algorithm, scfres.runtime_ns)
+ end
+ 
++@timing "compute_bands ForwardDiff" function compute_bands(basis_dual::PlaneWaveBasis{T},
++       kgrid::Union{AbstractKgrid,AbstractKgridGenerator};
++       ρ=nothing, τ=nothing, hubbard_n=nothing, kwargs...) where {T <: Dual}
++    @assert isnothing(hubbard_n)  # This case is not yet implemented.
++
++    # Primal pass (also does all argument checking)
++    basis_primal = construct_value(basis_dual)
++    bands_primal = compute_bands(basis_primal, kgrid;
++                                 ρ=ForwardDiff.value.(ρ),
++                                 τ=ForwardDiff.value.(τ),
++                                 hubbard_n, kwargs...)
++
++    basis = PlaneWaveBasis(basis_dual, kgrid)
++    ham_dual = Hamiltonian(basis; bands_primal.ψ, bands_primal.occupation,
++                           ρ, τ, hubbard_n, bands_primal.eigenvalues, bands_primal.εF,
++                           exxalg=VanillaExx())
++    Hψ_dual = ham_dual * bands_primal.ψ
++
++    # 1st order perturbation theory of eigenvalues
++    δeigenvalues = ntuple(ForwardDiff.npartials(T)) do α
++        δHψ = [ForwardDiff.partials.(δHψk, α) for δHψk in Hψ_dual]
++        map(bands_primal.ψ, δHψ) do ψk, δHψk
++            map(eachcol(ψk), eachcol(δHψk)) do ψnk, δHψnk
++                real(dot(ψnk, δHψnk))  # δε_{nk} = <ψnk | δH | ψnk>
++            end
++        end
++    end
++
++    # Convert and combine
++    DT = Dual{ForwardDiff.tagtype(T)}
++    eigenvalues = map(bands_primal.eigenvalues, δeigenvalues...) do εk, δεk...
++        map((εnk, δεnk...) -> DT(εnk, δεnk), εk, δεk...)
++    end
++    if isnothing(bands_primal.εF)
++        occupation = nothing
++    else
++        (; occupation) = compute_occupation(basis, eigenvalues, bands_primal.εF)
++    end
++
++    # Same as the return value of the primal, except ψ is deliberately not returned
++    (; basis, eigenvalues, ρ, τ, hubbard_n, bands_primal.εF, occupation,
++       bands_primal.diagonalization, bands_primal.seed)
++end
++
+ # For GPU kernels to compile, dynamic function calls must be avoided. Therefore, the quadrature
+ # must be known and passed ahead of time, and the Dual type explicitly parametrized.
+ function hankel(quadrature, r::AbstractVector, r2_f::AbstractVector, l::Integer, p::Dual{Tg,V,N}) where {Tg,V,N}
+diff --git a/test/forwarddiff/parameters.jl b/test/forwarddiff/parameters.jl
+index f0972192c1..1f329cf888 100644
+--- a/test/forwarddiff/parameters.jl
++++ b/test/forwarddiff/parameters.jl
+@@ -67,13 +67,13 @@ end
+     end
+ end
+ 
+-@testitem "meta-GGA scfres PSP sensitivity using ForwardDiff" #=
++@testitem "scfres PSP sensitivity using ForwardDiff (r2SCAN)" #=
+     =#    setup=[TestCases, ForwardDiffWrappers, PspSensitivity] begin
+     using DFTK
+     PspSensitivity.run_test(; architecture=DFTK.CPU(), functionals=r2SCAN(), atol=1e-3)
+ end
+ 
+-@testitem "meta-GGA scfres PSP sensitivity using ForwardDiff (GPU)" tags=[:gpu] #=
++@testitem "scfres PSP sensitivity using ForwardDiff (r2SCAN, GPU)" tags=[:gpu] #=
+     =#    setup=[TestCases, ForwardDiffWrappers, PspSensitivity] begin
+     using DFTK
+     using CUDA
+@@ -86,6 +86,66 @@ end
+     end
+ end
+ 
++@testmodule BandsSensitivity begin
++using DFTK
++using Test
++using LinearAlgebra
++using ..TestCases: silicon
++using ..ForwardDiffWrappers: tagged_derivative
++
++function run_test(; architecture, functionals=LDA(), atol=1e-5)
++    function compute_bands_eigenvalues(ε::T) where {T}
++        psp = load_psp(silicon.psp_gth)
++        pspmod = PspHgh(psp.Zion, convert(T, psp.rloc),
++                        psp.cloc, psp.rp .+ [0, ε], psp.h;
++                        psp.identifier, psp.description)
++        atoms = fill(ElementPsp(silicon.atnum, pspmod), length(silicon.positions))
++        model = model_DFT(Matrix{T}(silicon.lattice), atoms, silicon.positions; functionals)
++        basis = PlaneWaveBasis(model; Ecut=10, kgrid=[2, 2, 2], architecture)
++        scfres = self_consistent_field(basis; tol=1e-10,
++                                       response=ResponseOptions(; tol=1e-10))
++
++        # Generic points, avoiding high-symmetry points
++        kgrid = ExplicitKpoints([[0.1, 0.2, 0.3], [0.4, -0.1, 0.25]])
++        bands = compute_bands(scfres, kgrid; n_bands=6, tol=1e-8)
++        stack(bands.eigenvalues)
++    end
++
++    derivative_ε = let ε = 1e-4
++        (compute_bands_eigenvalues(ε) - compute_bands_eigenvalues(-ε)) / 2ε
++    end
++    derivative_fd = tagged_derivative(compute_bands_eigenvalues, 0.0)
++    @test norm(derivative_fd - derivative_ε) < atol
++end
++end
++
++@testitem "compute_bands PSP sensitivity using ForwardDiff" #=
++    =#    setup=[TestCases, ForwardDiffWrappers, BandsSensitivity] begin
++    using DFTK
++    BandsSensitivity.run_test(; architecture=DFTK.CPU(), functionals=LDA())
++end
++
++@testitem "compute_bands PSP sensitivity using ForwardDiff (r2SCAN)" #=
++    =#    setup=[TestCases, ForwardDiffWrappers, BandsSensitivity] begin
++    using DFTK
++    BandsSensitivity.run_test(; architecture=DFTK.CPU(), functionals=r2SCAN())
++end
++
++@testitem "compute_bands PSP sensitivity using ForwardDiff (GPU)" tags=[:gpu] #=
++    =#    setup=[TestCases, ForwardDiffWrappers, BandsSensitivity] begin
++    using DFTK
++    using CUDA
++    using AMDGPU
++    if CUDA.has_cuda() && CUDA.has_cuda_gpu()
++        BandsSensitivity.run_test(; architecture=DFTK.GPU(CuArray), functionals=LDA())
++    end
++    if AMDGPU.has_rocm_gpu()
++        BandsSensitivity.run_test(; architecture=DFTK.GPU(ROCArray), functionals=LDA())
++    end
++end
++
++
++
+ @testmodule ForceSensitivity begin
+ using DFTK
+ using Test
+@@ -199,7 +259,7 @@ function run_test(; architecture)
+     # Make silicon primal model
+     model = model_DFT(silicon.lattice, silicon.atoms, silicon.positions;
+                       functionals=LDA(), temperature=1e-3, smearing=Smearing.Gaussian())
+-    
++
+     # Make silicon dual model
+     # We need to call the `Tag` constructor to trigger the `ForwardDiff.tagcount`
+     T = typeof(ForwardDiff.Tag(Val(:mytag), Float64))
+@@ -213,7 +273,7 @@ function run_test(; architecture)
+     # Compute scfres with primal and dual basis
+     scfres = self_consistent_field(basis; tol=1e-5)
+     scfres_dual = self_consistent_field(basis_dual; tol=1e-5)
+-    
++
+     # Check that scfres_dual has the same parameters as scfres
+     @test isempty(setdiff(keys(scfres), keys(scfres_dual)))
+ end
+@@ -238,6 +298,47 @@ end
+     end
+ end
+ 
++@testmodule BandsParameterConsistency begin
++using DFTK
++using Test
++using ForwardDiff
++using ..TestCases: silicon
++function run_test(; architecture)
++    # Make silicon primal model
++    model = model_DFT(silicon.lattice, silicon.atoms, silicon.positions;
++                      functionals=LDA(), temperature=1e-3, smearing=Smearing.Gaussian())
++
++    # Make silicon dual model
++    # We need to call the `Tag` constructor to trigger the `ForwardDiff.tagcount`
++    T = typeof(ForwardDiff.Tag(Val(:mytag), Float64))
++    x_dual = ForwardDiff.Dual{T}(1.0, 1.0)
++    model_dual = Model(model; lattice=x_dual * model.lattice)
++
++    # Construct the primal and dual basis
++    basis      = PlaneWaveBasis(model;      Ecut=5, kgrid=(1,1,1), architecture)
++    basis_dual = PlaneWaveBasis(model_dual; Ecut=5, kgrid=(1,1,1), architecture)
++
++    # Compute scfres with primal and dual basis
++    scfres      = self_consistent_field(basis;      tol=1e-5)
++    scfres_dual = self_consistent_field(basis_dual; tol=1e-5)
++
++    # Compute bands with primal and dual
++    kgrid = ExplicitKpoints([[0.1, 0.2, 0.3], [0.4, -0.1, 0.25]])
++    bands      = compute_bands(scfres,      kgrid; n_bands=6)
++    bands_dual = compute_bands(scfres_dual, kgrid; n_bands=6)
++
++    # Keys agree except :ψ
++    @test Set(keys(bands)) == Set((keys(bands_dual)..., :ψ))
++end
++end
++
++@testitem "compute_bands dual has the same keys as primal" tags=[:minimal] #=
++    =#    setup=[TestCases, BandsParameterConsistency] begin
++    using DFTK
++    BandsParameterConsistency.run_test(; architecture=DFTK.CPU())
++end
++
++
+ @testmodule TemperatureSensitivity begin
+ using DFTK
+ using Test
+@@ -287,13 +388,13 @@ end
+     end
+ end
+ 
+-@testitem "meta-GGA ForwardDiff wrt temperature" tags=[:minimal] #=
++@testitem "ForwardDiff wrt temperature (r2SCAN)" tags=[:minimal] #=
+     =#    setup=[ForwardDiffWrappers, TemperatureSensitivity] begin
+     using DFTK
+     TemperatureSensitivity.run_test(; architecture=DFTK.CPU(), functionals=r2SCAN())
+ end
+ 
+-@testitem "meta-GGA ForwardDiff wrt temperature (GPU)" tags=[:gpu] #=
++@testitem "ForwardDiff wrt temperature (r2SCAN, GPU)" tags=[:gpu] #=
+     =#    setup=[ForwardDiffWrappers, TemperatureSensitivity] begin
+     using DFTK
+     using CUDA

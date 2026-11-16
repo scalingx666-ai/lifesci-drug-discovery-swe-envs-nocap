@@ -1,0 +1,174 @@
+diff --git a/reinvent/scoring/compute_scores.py b/reinvent/scoring/compute_scores.py
+index 9e1ba255..104c0124 100644
+--- a/reinvent/scoring/compute_scores.py
++++ b/reinvent/scoring/compute_scores.py
+@@ -101,12 +101,13 @@ def compute_component_scores(
+     if len(smilies_to_score) > 0:
+         _results = scoring_function(smilies_to_score)
+ 
+-        # FIXME: crash and burn because currently we have no way to recover from
+-        #        this e.g. by setting the scores of missing SMILES to NaN
++        # the missing SMILES are not present in the results and will be
++        # backfilled with NaN downstream in compute_transform
+         if len(_results.scores[0]) != len(smilies_to_score):
+-            msg = f"Scoring component {scoring_function} has returned {len(_results.scores[0])} but expected {len(smilies_to_score)}"
+-            logger.critical(msg)
+-            raise RuntimeError(msg)
++            logger.warning(
++                f"Scoring component {scoring_function} has returned {len(_results.scores[0])} but expected {len(smilies_to_score)}. "
++                "Missing scores will be set to NaN."
++            )
+ 
+         component_results = SmilesAssociatedComponentResults(
+             component_results=_results, smiles=index_smiles_to_score
+@@ -169,8 +170,23 @@ def compute_transform(
+         missing_scores = [smiles for smiles in index_smiles if smiles not in component_results.data]
+     else:
+         missing_scores = [smiles for smiles in smilies if smiles not in component_results.data]
++
++    # A scoring component may fail to return a score for some of the input
++    # SMILES (e.g. a fragment that could not be parsed).  Rather than
++    # terminating the whole run, backfill these with NaN (the failure marker,
++    # see ComponentResults docstring) so scoring can continue.
+     if missing_scores:
+-        raise RuntimeError(f"Missing scores for {component_type} for {missing_scores}")
++        logger.warning(
++            f"{component_type}: backfilling {len(missing_scores)} missing scores with NaN"
++        )
++
++        n_endpoints = getattr(scoring_function, "number_of_endpoints", 1)
++
++        for smiles in missing_scores:
++            component_results.update_scores(
++                smiles=[smiles],
++                scores=[(np.nan,) * n_endpoints],
++            )
+ 
+     for scores, transform in zip(
+         component_results.fetch_scores(
+diff --git a/reinvent_plugins/components/component_results.py b/reinvent_plugins/components/component_results.py
+index d08bfb82..cbf7475b 100644
+--- a/reinvent_plugins/components/component_results.py
++++ b/reinvent_plugins/components/component_results.py
+@@ -139,7 +139,18 @@ def fetch_scores(self, smiles: List[str], transpose=False) -> List:
+ 
+         """
+         # note that the input smiles are needed to ensure the list has a consistent order with validity masked in scorer
+-        scores_list = [self[smiles].score for smiles in smiles]  # first dimension is smiles
++        # any missing SMILES get NaN scores so reporters do not crash on incomplete results
++        if self.data:
++            n_endpoints = len(next(iter(self.data.values())).score)
++        else:
++            n_endpoints = 1
++
++        scores_list = []
++        for smile in smiles:
++            if smile in self.data:
++                scores_list.append(self.data[smile].score)
++            else:
++                scores_list.append((np.nan,) * n_endpoints)
+ 
+         if transpose:  # original csv writing and reporting functions need the data in this format
+             scores_list = list(zip(*scores_list))  # first dimension is endpoints
+@@ -162,9 +173,9 @@ def fetch_metadata(self, smiles: List[str], transpose=False) -> List:
+             metadata_collection[metadata_name] = []
+ 
+             for smile in smiles:
+-                smile_metadata = self[smile].metadata
++                smile_metadata = self[smile].metadata if smile in self.data else None
+ 
+-                if metadata_name in smile_metadata.keys():
++                if smile_metadata and metadata_name in smile_metadata.keys():
+                     metadata_collection[metadata_name].append(str(smile_metadata[metadata_name]))
+                 else:
+                     metadata_collection[metadata_name].append(None)
+diff --git a/tests/scoring/unit_tests/test_compute_scores.py b/tests/scoring/unit_tests/test_compute_scores.py
+index cd8e6609..7724da11 100644
+--- a/tests/scoring/unit_tests/test_compute_scores.py
++++ b/tests/scoring/unit_tests/test_compute_scores.py
+@@ -194,3 +194,85 @@ def test_compute_component_scores_with_index_smiles_and_duplicates():
+         "CCOO",
+         "CCCC",
+     }  # cehck all are scored
++
++
++def scoring_function_incomplete(smilies):
++    # returns fewer scores than the number of input SMILES, mimicking a
++    # component that fails to score some of its inputs (e.g. unparseable
++    # fragments).  See issue #335.
++    scores = []
++
++    for smiles in smilies:
++        mol = Chem.MolFromSmiles(smiles)
++
++        if mol is None:
++            continue
++
++        scores.append(Descriptors.MolWt(mol))
++
++    return ComponentResults([np.array(scores, dtype=float)])
++
++
++def test_compute_scores_incomplete_result_backfilled_with_nan():
++    # a component returning fewer scores than inputs must not crash the run
++    # (issue #335); missing (trailing) scores are backfilled with NaN
++    smilies = ["CCC", "CCCC", "not_a_molecule"]
++
++    transform_results = compute_transform(
++        "test",
++        (["test"], scoring_function_incomplete, [None], [1.0]),
++        smilies,
++        {},
++        np.array([True, True, True]),
++    )
++
++    scores = transform_results.component_result.fetch_scores(smilies, transpose=True)[0]
++
++    assert scores[0] == pytest.approx(Descriptors.MolWt(Chem.MolFromSmiles("CCC")))
++    assert scores[1] == pytest.approx(Descriptors.MolWt(Chem.MolFromSmiles("CCCC")))
++    assert np.isnan(scores[2])
++
++
++def test_fetch_scores_returns_nan_for_missing_smiles():
++    component_results = ComponentResults(scores=[np.array([0.5, 0.7])])
++    smiles_associated = SmilesAssociatedComponentResults(component_results, smiles=["A", "B"])
++
++    # "X" was never scored -> NaN, and ordering is preserved (issue #335)
++    scores = smiles_associated.fetch_scores(["A", "X", "B"], transpose=True)[0]
++
++    assert scores[0] == pytest.approx(0.5)
++    assert np.isnan(scores[1])
++    assert scores[2] == pytest.approx(0.7)
++
++
++def test_fetch_metadata_returns_none_for_missing_smiles():
++    component_results = ComponentResults(
++        scores=[np.array([0.5, 0.7])], metadata={"prop": ["a", "b"]}
++    )
++    smiles_associated = SmilesAssociatedComponentResults(component_results, smiles=["A", "B"])
++
++    # "X" was never scored -> None, and ordering is preserved (issue #335)
++    metadata = smiles_associated.fetch_metadata(["A", "X", "B"])
++
++    assert metadata == {"prop": ["a", None, "b"]}
++
++
++def scoring_function_short(smilies):
++    # returns fewer scores than the number of input SMILES regardless of
++    # validity, mimicking a broken component (issue #335)
++    scores = [Descriptors.MolWt(Chem.MolFromSmiles(s)) for s in smilies[:2]]
++    return ComponentResults([np.array(scores, dtype=float)])
++
++
++def test_compute_component_scores_short_result_warns_not_raises(caplog):
++    # a component returning fewer scores than inputs must warn and continue
++    # rather than raise (issue #335); missing scores are backfilled downstream
++    smilies = ["CCC", "CCCC", "CCCN"]
++
++    with caplog.at_level("WARNING"):
++        component_results = compute_component_scores(
++            smilies, scoring_function_short, {}, np.array([True, True, True])
++        )
++
++    assert set(component_results.data.keys()) == {"CCC", "CCCC"}
++    assert any("has returned" in record.message for record in caplog.records)

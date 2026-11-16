@@ -1,0 +1,701 @@
+diff --git a/src/lib/structure/Structure.svelte b/src/lib/structure/Structure.svelte
+index 19b84044e..243e847e4 100644
+--- a/src/lib/structure/Structure.svelte
++++ b/src/lib/structure/Structure.svelte
+@@ -1977,6 +1977,7 @@
+     get_trajectory_active: () => trajectory_active,
+     get_positions: () => get_trajectory_frame_positions,
+     get_strategy: () => (scene_props?.bonding_strategy ?? `electroneg_ratio`) as BondingStrategy,
++    get_show_bonds: () => (scene_props?.show_bonds ?? `always`) as string,
+     get_options: () => (scene_props?.bonding_options ?? {}) as Record<string, number>,
+     set_connectivity: (v) => { trajectory_bond_connectivity_for_frame = v },
+     get_connectivity: () => trajectory_bond_connectivity_for_frame,
+@@ -4316,6 +4317,7 @@
+             {webgl_suspended}
+             {trajectory_frame_positions}
+             {trajectory_frame_forces}
++            {trajectory_step_idx}
+             trajectory_bond_connectivity={trajectory_bond_connectivity_for_frame}
+             {...scene_props}
+             {show_image_atoms}
+diff --git a/src/lib/structure/StructureScene.svelte b/src/lib/structure/StructureScene.svelte
+index 98f1951ce..b95df3a73 100644
+--- a/src/lib/structure/StructureScene.svelte
++++ b/src/lib/structure/StructureScene.svelte
+@@ -527,6 +527,12 @@
+     atom_rotation_angle_deg = 0,
+     // Realtime position overrides for drag/rotate - bypasses structure updates for performance
+     realtime_position_overrides = null as Map<number, Vec3> | null,
++    // Active trajectory frame index (>= 0 when a trajectory is loaded; -1
++    // otherwise). Used as the "we are rendering a trajectory frame" signal for
++    // the slow-path bond effect — variable-N trajectories have no
++    // `trajectory_frame_positions` fast-path, so this is the only reliable
++    // trajectory indicator there.
++    trajectory_step_idx = -1,
+     // Trajectory fast-path: flat Float32Array of positions for current frame
+     trajectory_frame_positions = null as Float32Array | null,
+     // Trajectory fast-path: flat Float32Array of forces (fx,fy,fz) for current frame
+@@ -802,6 +808,10 @@
+     atom_rotation_angle_deg?: number // Current cumulative rotation angle in degrees
+     // Realtime position overrides for drag/rotate - bypasses structure updates for performance
+     realtime_position_overrides?: Map<number, Vec3> | null
++    // Active trajectory frame index (>= 0 when a trajectory is loaded; -1
++    // otherwise). The "rendering a trajectory frame" signal for the slow-path
++    // bond effect — variable-N trajectories have no `trajectory_frame_positions`.
++    trajectory_step_idx?: number
+     // Trajectory fast-path: flat Float32Array of positions (x,y,z triples) for current frame
+     // When set, only position buffers are updated in AtomImpostors and bonds
+     trajectory_frame_positions?: Float32Array | null
+@@ -2294,10 +2304,14 @@
+     scale: bond_scale,
+   })
+   $effect.pre(() => {
++    // `trajectory_step_idx >= 0` is the trajectory-active signal: variable-N
++    // trajectories drive this slow path per frame (no fast-path positions), so
++    // it triggers the extension-only solid_angle -> atom_radii downgrade inside
++    // compute_bond_connectivity. Static structures keep step_idx === -1 → false.
+     compute_bond_connectivity(
+       bond_state, (pairs) => { bond_pairs = pairs },
+       bond_input, show_bonds, lattice, bonding_strategy,
+-      bonding_options_eff, external_dragging,
++      bonding_options_eff, external_dragging, trajectory_step_idx >= 0,
+     )
+   })
+ 
+diff --git a/src/lib/structure/bond-computation-controller.svelte.ts b/src/lib/structure/bond-computation-controller.svelte.ts
+index 2ed4378e7..edb9a27b1 100644
+--- a/src/lib/structure/bond-computation-controller.svelte.ts
++++ b/src/lib/structure/bond-computation-controller.svelte.ts
+@@ -20,8 +20,11 @@ import type { Crystal } from './index'
+ const TRAJ_SYNC_THRESHOLD = 1000
+ 
+ /** Maximum number of trajectory frames retained in the frame-keyed cache.
+- *  LRU-evicted; revisits within the window are O(1). */
+-const TRAJ_FRAME_CACHE_MAX = 32
++ *  LRU-evicted; revisits within the window are O(1). Sized to comfortably
++ *  hold a full typical trajectory (e.g. 316 frames) so that after one pass
++ *  every loop/scrub is a cache hit and triggers no bond recompute. Larger
++ *  trajectories keep their most-recently-used 512 frames. */
++const TRAJ_FRAME_CACHE_MAX = 512
+ 
+ /**
+  * Per-bond stale-distance pre-filter (Layer 3 of trajectory bond fix).
+@@ -34,6 +37,11 @@ const TRAJ_FRAME_CACHE_MAX = 32
+ const STALE_DISTANCE_FACTOR = 1.5
+ const DEFAULT_BOND_TOLERANCE = 1.1
+ 
++/** FIX #E: dev-only one-shot guard so the extension's trajectory
++ *  solid_angle -> atom_radii downgrade logs once per session, not per
++ *  frame. */
++let ext_traj_solid_angle_downgrade_logged = false
++
+ /**
+  * Per-frame bond connectivity cache for variable-topology trajectories.
+  *
+@@ -235,6 +243,13 @@ export function invalidate_bonds_for_recompute(
+  * Called inside `$effect.pre` in the component.
+  *
+  * This updates bond_state in-place and dispatches async computation for large structures.
++ *
++ * @param is_trajectory_frame When true, the caller is rendering a trajectory
++ *   frame (variable-N trajectories drive this slow path per frame because they
++ *   have no `trajectory_frame_positions` fast-path). Only then does the
++ *   extension-only solid_angle -> atom_radii downgrade apply — static
++ *   structures in the extension keep the user's saved solid_angle. Desktop/web
++ *   ignore this flag entirely (the build-time token short-circuits the gate).
+  */
+ export function compute_bond_connectivity(
+   bond_state: ReturnType<typeof create_bond_state>,
+@@ -245,6 +260,7 @@ export function compute_bond_connectivity(
+   bonding_strategy: BondingStrategy,
+   bonding_options: Record<string, unknown>,
+   external_dragging: boolean,
++  is_trajectory_frame: boolean = false,
+ ): void {
+   if (!structure?.sites) {
+     bond_state.bond_connectivity = []
+@@ -269,6 +285,31 @@ export function compute_bond_connectivity(
+     return
+   }
+ 
++  // FIX #E (extension-only, trajectory-only): the VS Code webview WASM runtime
++  // runs solid_angle too slowly for smooth playback. Variable-N trajectories
++  // have no `trajectory_frame_positions` fast-path, so they reach THIS slow
++  // path once per frame (current_structure changes each frame) — running
++  // compute_bonds_sync(solid_angle) on the main thread for ~650 atoms is the
++  // actual jank. Mirror the for-frame downgrade here, but only when the caller
++  // signals a trajectory frame (static structures must keep the user's saved
++  // solid_angle). Gated on the build-time token so desktop/web are
++  // byte-identical; only local params are reassigned, never the saved setting.
++  if (
++    is_trajectory_frame
++    && typeof __CATGO_VSCODE_EXTENSION__ !== `undefined`
++    && __CATGO_VSCODE_EXTENSION__
++    && bonding_strategy === `solid_angle`
++  ) {
++    bonding_strategy = `atom_radii`
++    bonding_options = {}
++    if (import.meta.env?.DEV && !ext_traj_solid_angle_downgrade_logged) {
++      ext_traj_solid_angle_downgrade_logged = true
++      console.log(
++        `[bonds-traj] VS Code extension: solid_angle -> atom_radii for trajectory frames`,
++      )
++    }
++  }
++
+   const sites = structure.sites
+   const strategy_key = `${bonding_strategy}-${JSON.stringify(bonding_options)}`
+ 
+@@ -456,6 +497,28 @@ export function compute_bond_connectivity_for_frame(
+     return bond_state.bond_connectivity
+   }
+ 
++  // FIX #E (extension-only, trajectory-only): the VS Code webview WASM
++  // runtime runs solid_angle too slowly for smooth playback. Transparently
++  // downgrade trajectory-frame bonding to the cheap atom_radii strategy
++  // (its own defaults via {}). Gated on the build-time token so desktop/web
++  // are byte-identical, and confined to this trajectory-only function so
++  // static-structure bonds still honor the user's saved solid_angle. Only
++  // local params are reassigned; the saved setting is never mutated.
++  if (
++    typeof __CATGO_VSCODE_EXTENSION__ !== `undefined`
++    && __CATGO_VSCODE_EXTENSION__
++    && bonding_strategy === `solid_angle`
++  ) {
++    bonding_strategy = `atom_radii`
++    bonding_options = {}
++    if (import.meta.env?.DEV && !ext_traj_solid_angle_downgrade_logged) {
++      ext_traj_solid_angle_downgrade_logged = true
++      console.log(
++        `[bonds-traj] VS Code extension: solid_angle -> atom_radii for trajectory frames`,
++      )
++    }
++  }
++
+   const sites = structure.sites
+   const strategy_key = `${bonding_strategy}-${JSON.stringify(bonding_options)}`
+   const elem_fp = get_element_fingerprint(sites)
+diff --git a/src/lib/structure/trajectory-bond-cache.svelte.ts b/src/lib/structure/trajectory-bond-cache.svelte.ts
+index 99ec228d9..ea7df0387 100644
+--- a/src/lib/structure/trajectory-bond-cache.svelte.ts
++++ b/src/lib/structure/trajectory-bond-cache.svelte.ts
+@@ -223,6 +223,11 @@ export function wire_trajectory_bond_cache(
+      *  false re-fires the effect and re-primes the current frame's bonds
+      *  (cache may be stale: frames advanced under suspension were skipped). */
+     get_suspended?: () => boolean
++    /** Optional. The current show_bonds setting. When 'never', no covalent
++     *  bond connectivity is rendered and trajectory_bond_connectivity_for_frame
++     *  is unused downstream, so the per-frame compute_bonds_async dispatch is
++     *  pure wasted work — the driver treats 'never' like the WebGPU suspend. */
++    get_show_bonds?: () => string
+   },
+ ): void {
+   // Reset cache on actual value changes (not parent-render proxy churn).
+@@ -307,7 +312,13 @@ export function wire_trajectory_bond_cache(
+     const idx = deps.get_step_idx()
+     const pv = deps.get_positions_version?.() ?? 0
+     // Read suspend reactively so toggle-OFF (true→false) re-fires this effect.
+-    const suspended = deps.get_suspended?.() ?? false
++    // Fold show_bonds==='never' into the suspend path: when bonds are hidden the
++    // per-frame compute_bonds_async + build_frame_structure clones are pure waste
++    // (trajectory_bond_connectivity_for_frame is not rendered while never). Reusing
++    // the suspend branch keeps trackers synced AND re-primes the landing frame via
++    // the existing was_suspended resume logic if bonds are later un-hidden.
++    const bonds_hidden = (deps.get_show_bonds?.() ?? `always`) === `never`
++    const suspended = (deps.get_suspended?.() ?? false) || bonds_hidden
+     if (idx < 0) {
+       was_suspended = suspended
+       return
+diff --git a/tests/vitest/trajectory/ext-solid-angle-downgrade.test.ts b/tests/vitest/trajectory/ext-solid-angle-downgrade.test.ts
+new file mode 100644
+index 000000000..5c87da1f1
+--- /dev/null
++++ b/tests/vitest/trajectory/ext-solid-angle-downgrade.test.ts
+@@ -0,0 +1,180 @@
++// Fix #E — extension-only, trajectory-only solid_angle -> atom_radii downgrade.
++//
++// In the VS Code webview the WASM runtime runs solid_angle too slowly for
++// smooth playback, so compute_bond_connectivity_for_frame transparently
++// downgrades trajectory-frame bonding to the cheap atom_radii strategy when the
++// build-time token __CATGO_VSCODE_EXTENSION__ is true. Desktop/web (token
++// undefined) must be byte-identical, and the STATIC bond path (the separate
++// compute_bond_connectivity) must keep honoring the user's saved solid_angle
++// even inside the extension.
++
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('$lib/structure/workers/bond-worker-api', () => ({
++  compute_bonds_sync: vi.fn(() => null),
++  compute_bonds_async: vi.fn(() => Promise.resolve([])),
++  compute_hbonds_worker: vi.fn(() => Promise.resolve([])),
++}))
++
++import {
++  compute_bonds_async,
++  compute_bonds_sync,
++} from '$lib/structure/workers/bond-worker-api'
++import {
++  clear_trajectory_bond_frame_cache,
++  compute_bond_connectivity,
++  compute_bond_connectivity_for_frame,
++  create_bond_state,
++} from '$lib/structure/bond-computation-controller.svelte'
++import type { AnyStructure, BondPair, Site } from '$lib'
++
++const sync_mock = vi.mocked(compute_bonds_sync)
++const async_mock = vi.mocked(compute_bonds_async)
++
++function fake_site(el: string, x: number): Site {
++  return {
++    species: [{ element: el, occu: 1, oxidation_state: 0 }],
++    abc: [0, 0, 0],
++    xyz: [x, 0, 0],
++    label: el,
++    properties: {},
++  } as unknown as Site
++}
++
++function make_structure(n: number): AnyStructure {
++  const sites: Site[] = []
++  for (let i = 0; i < n; i++) sites.push(fake_site(i % 2 === 0 ? 'C' : 'H', i))
++  return { sites } as unknown as AnyStructure
++}
++
++function fake_bond(i: number, j: number): BondPair {
++  return {
++    pos_1: [0, 0, 0],
++    pos_2: [0, 0, 0],
++    site_idx_1: i,
++    site_idx_2: j,
++    bond_length: 1,
++    strength: 1,
++    transform_matrix: new Float32Array(16),
++    jimage: [0, 0, 0],
++  }
++}
++
++beforeEach(() => {
++  clear_trajectory_bond_frame_cache()
++  sync_mock.mockReset()
++  async_mock.mockReset()
++  sync_mock.mockReturnValue([fake_bond(0, 1)])
++  async_mock.mockImplementation(() => new Promise<BondPair[]>(() => {})) // pending
++})
++
++afterEach(() => {
++  delete (globalThis as Record<string, unknown>).__CATGO_VSCODE_EXTENSION__
++})
++
++describe('fix #E — VS Code extension trajectory downgrade', () => {
++  it('downgrades solid_angle -> atom_radii for trajectory frames in the extension', () => {
++    ;(globalThis as Record<string, unknown>).__CATGO_VSCODE_EXTENSION__ = true
++    const st = create_bond_state()
++    const structure = make_structure(4)
++    const frame = new Float32Array(12)
++
++    compute_bond_connectivity_for_frame(st, frame, structure, 'always', null, 'solid_angle', {})
++
++    // Downgraded to the cheap atom_radii, which stays on the sync path.
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('atom_radii')
++    expect(sync_mock.mock.calls[0][2]).toEqual({})
++    expect(async_mock).not.toHaveBeenCalled()
++  })
++
++  it('desktop/web (token undefined) keep solid_angle for trajectory frames', () => {
++    // No token set → typeof guard short-circuits → no downgrade. With the #3
++    // async-routing experiment reverted, solid_angle now runs on the
++    // zero-latency sync path at small N (desktop/web were already smooth there),
++    // byte-identical to the pre-round-1 behavior.
++    const st = create_bond_state()
++    const structure = make_structure(4)
++    const frame = new Float32Array(12)
++
++    compute_bond_connectivity_for_frame(st, frame, structure, 'always', null, 'solid_angle', {})
++
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('solid_angle')
++    expect(async_mock).not.toHaveBeenCalled()
++  })
++
++  it('static (non-trajectory) bonds in the extension still honor solid_angle', () => {
++    ;(globalThis as Record<string, unknown>).__CATGO_VSCODE_EXTENSION__ = true
++    const st = create_bond_state()
++    const structure = make_structure(4)
++
++    compute_bond_connectivity(
++      st,
++      () => {}, // bond_pairs_setter (no-op)
++      structure,
++      'always',
++      null,
++      'solid_angle',
++      {},
++      false,
++    )
++
++    // The static path is a different function/cache; the downgrade must not
++    // reach it — the user's saved solid_angle is preserved.
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('solid_angle')
++  })
++})
++
++// Fix B — the SLOW path (compute_bond_connectivity) is what variable-N
++// trajectories (no constant atom count → no position_cache → no
++// trajectory_frame_positions fast-path) drive once per frame. The same
++// extension-only solid_angle -> atom_radii downgrade must apply there, but ONLY
++// when the caller signals a trajectory frame (is_trajectory_frame=true).
++describe('fix B — slow-path (compute_bond_connectivity) trajectory downgrade', () => {
++  it('extension + is_trajectory_frame=true downgrades solid_angle -> atom_radii (no main-thread solid_angle)', () => {
++    ;(globalThis as Record<string, unknown>).__CATGO_VSCODE_EXTENSION__ = true
++    const st = create_bond_state()
++    const structure = make_structure(4)
++
++    compute_bond_connectivity(
++      st, () => {}, structure, 'always', null, 'solid_angle', {}, false, true,
++    )
++
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('atom_radii')
++    expect(sync_mock.mock.calls[0][2]).toEqual({})
++  })
++
++  it('extension + is_trajectory_frame=false keeps the user solid_angle (static structures)', () => {
++    ;(globalThis as Record<string, unknown>).__CATGO_VSCODE_EXTENSION__ = true
++    const st = create_bond_state()
++    const structure = make_structure(4)
++
++    compute_bond_connectivity(
++      st, () => {}, structure, 'always', null, 'solid_angle', {}, false, false,
++    )
++
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('solid_angle')
++  })
++
++  it('desktop (token undefined) keeps solid_angle for BOTH is_trajectory_frame values', () => {
++    // is_trajectory_frame=true — but no token, so no downgrade.
++    sync_mock.mockClear()
++    compute_bond_connectivity(
++      create_bond_state(), () => {}, make_structure(4), 'always', null, 'solid_angle', {}, false, true,
++    )
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('solid_angle')
++
++    // is_trajectory_frame=false — likewise keeps solid_angle.
++    sync_mock.mockClear()
++    compute_bond_connectivity(
++      create_bond_state(), () => {}, make_structure(5), 'always', null, 'solid_angle', {}, false, false,
++    )
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++    expect(sync_mock.mock.calls[0][1]).toBe('solid_angle')
++  })
++})
+diff --git a/tests/vitest/trajectory/traj-bond-scheduling.test.ts b/tests/vitest/trajectory/traj-bond-scheduling.test.ts
+new file mode 100644
+index 000000000..39c8227d2
+--- /dev/null
++++ b/tests/vitest/trajectory/traj-bond-scheduling.test.ts
+@@ -0,0 +1,152 @@
++// Trajectory bond scheduling + frame-cache sizing (fix #2).
++//
++// #2: the frame-keyed connectivity LRU cache must hold a full typical
++//     trajectory (>32 frames) so loops/scrubs are O(1) hits, not recomputes.
++//
++// Trajectory frames run on the zero-latency sync path for ALL strategies at
++// small N. (A #3 experiment that routed solid_angle to the async worker was
++// reverted: it regressed desktop/web with a one-frame-stale render and was
++// redundant with the extension-only solid_angle -> atom_radii downgrade.) The
++// throttled async dispatch remains the fallback for large structures or when
++// the sync WASM is not yet ready.
++//
++// The worker API is mocked so the routing is observable without WASM.
++
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('$lib/structure/workers/bond-worker-api', () => ({
++  compute_bonds_sync: vi.fn(() => null),
++  compute_bonds_async: vi.fn(() => Promise.resolve([])),
++  compute_hbonds_worker: vi.fn(() => Promise.resolve([])),
++}))
++
++import {
++  compute_bonds_async,
++  compute_bonds_sync,
++} from '$lib/structure/workers/bond-worker-api'
++import {
++  clear_trajectory_bond_frame_cache,
++  compute_bond_connectivity_for_frame,
++  create_bond_state,
++} from '$lib/structure/bond-computation-controller.svelte'
++import type { AnyStructure, BondPair, Site } from '$lib'
++
++const sync_mock = vi.mocked(compute_bonds_sync)
++const async_mock = vi.mocked(compute_bonds_async)
++
++function fake_site(el: string, x: number): Site {
++  return {
++    species: [{ element: el, occu: 1, oxidation_state: 0 }],
++    abc: [0, 0, 0],
++    xyz: [x, 0, 0],
++    label: el,
++    properties: {},
++  } as unknown as Site
++}
++
++// Small, non-periodic structure (no lattice → pbc-less, like the diagnosed file).
++function make_structure(n: number): AnyStructure {
++  const sites: Site[] = []
++  for (let i = 0; i < n; i++) sites.push(fake_site(i % 2 === 0 ? 'C' : 'H', i))
++  return { sites } as unknown as AnyStructure
++}
++
++function make_frame(n: number): Float32Array {
++  const f = new Float32Array(n * 3)
++  for (let i = 0; i < f.length; i++) f[i] = Math.random()
++  return f
++}
++
++function fake_bond(i: number, j: number): BondPair {
++  return {
++    pos_1: [0, 0, 0],
++    pos_2: [0, 0, 0],
++    site_idx_1: i,
++    site_idx_2: j,
++    bond_length: 1,
++    strength: 1,
++    transform_matrix: new Float32Array(16),
++    jimage: [0, 0, 0],
++  }
++}
++
++beforeEach(() => {
++  clear_trajectory_bond_frame_cache()
++  sync_mock.mockReset()
++  async_mock.mockReset()
++  sync_mock.mockReturnValue([fake_bond(0, 1)])
++  async_mock.mockImplementation(() => new Promise<BondPair[]>(() => {})) // pending
++})
++
++describe('fix #2 — trajectory frame cache holds a full trajectory (>32 frames)', () => {
++  it('keeps >32 frames so an early frame is a cache HIT after 64 distinct frames', () => {
++    const st = create_bond_state()
++    const structure = make_structure(4)
++    const frames = Array.from({ length: 64 }, () => make_frame(4))
++
++    const first = frames.map((f) =>
++      compute_bond_connectivity_for_frame(st, f, structure, 'always', null, 'atom_radii', {})
++    )
++    expect(sync_mock).toHaveBeenCalledTimes(64)
++
++    sync_mock.mockClear()
++    // Re-request frame 0. At the old cap of 32 it would have been evicted by the
++    // 63 newer frames (perpetual miss → recompute). At 512 it is still cached.
++    const again = compute_bond_connectivity_for_frame(
++      st, frames[0], structure, 'always', null, 'atom_radii', {},
++    )
++    expect(sync_mock).not.toHaveBeenCalled() // cache hit, no recompute
++    expect(again).toBe(first[0]) // same array reference (the cached connectivity)
++  })
++
++  it('still bounds the cache (eviction past the 512 cap)', () => {
++    const st = create_bond_state()
++    const structure = make_structure(4)
++    const frames = Array.from({ length: 600 }, () => make_frame(4))
++    for (const f of frames) {
++      compute_bond_connectivity_for_frame(st, f, structure, 'always', null, 'atom_radii', {})
++    }
++    sync_mock.mockClear()
++    // frame 0 was inserted first; after 599 newer frames (>512) it is evicted →
++    // miss → one recompute. Proves the LRU eviction still bounds memory.
++    compute_bond_connectivity_for_frame(st, frames[0], structure, 'always', null, 'atom_radii', {})
++    expect(sync_mock).toHaveBeenCalledTimes(1)
++  })
++})
++
++describe('trajectory frames run on the zero-latency sync path at small N', () => {
++  it.each(['atom_radii', 'electroneg_ratio', 'solid_angle'] as const)(
++    'strategy %s uses the sync path (no async worker) for a small frame',
++    (strat) => {
++      const st = create_bond_state()
++      const structure = make_structure(4)
++      const frame = make_frame(4)
++
++      const result = compute_bond_connectivity_for_frame(
++        st, frame, structure, 'always', null, strat, {},
++      )
++
++      // The #3 async routing for solid_angle was reverted: every strategy now
++      // runs synchronously at small N (desktop/web were already smooth there).
++      expect(sync_mock).toHaveBeenCalledTimes(1)
++      expect(sync_mock.mock.calls[0][1]).toBe(strat)
++      expect(async_mock).not.toHaveBeenCalled()
++      expect(result.length).toBe(1)
++    },
++  )
++
++  it('falls back to the throttled async dispatch (latest-wins) when sync WASM is unavailable', () => {
++    const st = create_bond_state()
++    sync_mock.mockReturnValue(null) // WASM not ready → sync path can't resolve
++    const structure = make_structure(4)
++    const frame_a = make_frame(4)
++    const frame_b = make_frame(4)
++
++    compute_bond_connectivity_for_frame(st, frame_a, structure, 'always', null, 'solid_angle', {})
++    compute_bond_connectivity_for_frame(st, frame_b, structure, 'always', null, 'solid_angle', {})
++
++    expect(async_mock).toHaveBeenCalledTimes(1) // only one in-flight dispatch
++    expect(st.traj_in_flight_frame).toBe(frame_a)
++    expect(st.traj_pending_frame).toBe(frame_b)
++  })
++})
+diff --git a/tests/vitest/trajectory/wire-never-gate.test.ts b/tests/vitest/trajectory/wire-never-gate.test.ts
+new file mode 100644
+index 000000000..a5a4b076e
+--- /dev/null
++++ b/tests/vitest/trajectory/wire-never-gate.test.ts
+@@ -0,0 +1,87 @@
++// Fix #4 — never-gate on the trajectory bond driver.
++//
++// wire_trajectory_bond_cache installs a driver $effect that, for every
++// trajectory frame, calls cache.on_frame_change -> compute_bonds_async (+ ±5
++// prefetch) plus per-frame build_frame_structure clones. It was gated only on
++// the WebGPU-suspend flag, so it kept running the heavy solid_angle detector
++// every frame even when bonds are 'never' — yet its output prop is unread while
++// hidden. Fix #4 folds show_bonds==='never' into the suspend path so no per-frame
++// bond compute is dispatched while bonds are hidden, and re-primes on un-hide.
++
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++
++vi.mock('$lib/structure/workers/bond-worker-api', () => ({
++  compute_bonds_sync: vi.fn(() => null),
++  compute_bonds_async: vi.fn(() => Promise.resolve([])),
++  compute_hbonds_worker: vi.fn(() => Promise.resolve([])),
++}))
++
++import { create_trajectory_bond_cache } from '$lib/structure/trajectory-bond-cache.svelte'
++import { make_wire_harness } from './wire-never-harness.svelte'
++import type { AnyStructure, Site } from '$lib'
++
++function make_structure(n: number): AnyStructure {
++  const sites: Site[] = []
++  for (let i = 0; i < n; i++) {
++    sites.push({
++      species: [{ element: i % 2 === 0 ? 'C' : 'H', occu: 1, oxidation_state: 0 }],
++      abc: [0, 0, 0],
++      xyz: [i, 0, 0],
++      label: 'X',
++      properties: {},
++    } as unknown as Site)
++  }
++  return { sites } as unknown as AnyStructure
++}
++
++beforeEach(() => {
++  vi.clearAllMocks()
++})
++
++describe('fix #4 — never-gate', () => {
++  it('does NOT dispatch per-frame bond compute when show_bonds is never', () => {
++    const cache = create_trajectory_bond_cache()
++    const spy = vi.spyOn(cache, 'on_frame_change').mockImplementation(() => {})
++    const h = make_wire_harness(cache, { structure: make_structure(4), show: 'never' })
++    try {
++      h.set_step(1)
++      h.flush()
++      h.set_step(2)
++      h.flush()
++      expect(spy).not.toHaveBeenCalled()
++    } finally {
++      h.stop()
++    }
++  })
++
++  it('DOES dispatch per-frame bond compute when show_bonds is always (regression)', () => {
++    const cache = create_trajectory_bond_cache()
++    const spy = vi.spyOn(cache, 'on_frame_change').mockImplementation(() => {})
++    const h = make_wire_harness(cache, { structure: make_structure(4), show: 'always' })
++    try {
++      h.set_step(1)
++      h.flush()
++      expect(spy).toHaveBeenCalled()
++    } finally {
++      h.stop()
++    }
++  })
++
++  it('re-primes the landing frame after un-hiding bonds (never -> always)', () => {
++    const cache = create_trajectory_bond_cache()
++    const spy = vi.spyOn(cache, 'on_frame_change').mockImplementation(() => {})
++    const h = make_wire_harness(cache, { structure: make_structure(4), show: 'never' })
++    try {
++      h.set_step(1)
++      h.flush()
++      h.set_step(2)
++      h.flush()
++      expect(spy).not.toHaveBeenCalled()
++      h.set_show('always')
++      h.flush()
++      expect(spy).toHaveBeenCalled()
++    } finally {
++      h.stop()
++    }
++  })
++})
+diff --git a/tests/vitest/trajectory/wire-never-harness.svelte.ts b/tests/vitest/trajectory/wire-never-harness.svelte.ts
+new file mode 100644
+index 000000000..2b14b7330
+--- /dev/null
++++ b/tests/vitest/trajectory/wire-never-harness.svelte.ts
+@@ -0,0 +1,50 @@
++// Compiled (runes) harness for the wire_trajectory_bond_cache driver effect.
++//
++// The vitest include glob only collects `*.test.ts`, and the svelte plugin only
++// compiles `*.svelte.ts` — so rune syntax ($state / $effect.root) cannot live in
++// a `.test.ts`. This `.svelte.ts` module IS compiled and is imported by the
++// matching `.test.ts`, which keeps the assertions in a collected test file.
++
++import { flushSync } from 'svelte'
++import {
++  wire_trajectory_bond_cache,
++} from '$lib/structure/trajectory-bond-cache.svelte'
++import type { AnyStructure } from '$lib'
++
++type Cache = Parameters<typeof wire_trajectory_bond_cache>[0]
++
++export function make_wire_harness(
++  cache: Cache,
++  opts: { structure: AnyStructure; show: string },
++) {
++  let step = $state(0)
++  let show = $state(opts.show)
++  const positions_getter = () => new Float32Array(12)
++
++  const stop = $effect.root(() => {
++    wire_trajectory_bond_cache(cache, {
++      get_structure: () => opts.structure,
++      get_base: () => opts.structure,
++      get_step_idx: () => step,
++      get_trajectory_active: () => true,
++      get_positions: () => positions_getter,
++      get_strategy: () => 'solid_angle',
++      get_options: () => ({}),
++      get_show_bonds: () => show,
++      set_connectivity: () => {},
++      get_connectivity: () => null,
++    })
++  })
++  flushSync()
++
++  return {
++    set_step: (v: number) => {
++      step = v
++    },
++    set_show: (v: string) => {
++      show = v
++    },
++    flush: () => flushSync(),
++    stop,
++  }
++}

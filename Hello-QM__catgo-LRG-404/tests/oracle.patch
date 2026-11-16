@@ -1,0 +1,389 @@
+diff --git a/server/catgo/cors_util.py b/server/catgo/cors_util.py
+new file mode 100644
+index 000000000..84054d100
+--- /dev/null
++++ b/server/catgo/cors_util.py
+@@ -0,0 +1,60 @@
++"""CORS header helper for responses that bypass ``CORSMiddleware``.
++
++Starlette runs ``ServerErrorMiddleware`` as the *outermost* layer — above the
++user-installed ``CORSMiddleware``. When an unhandled exception bubbles up, the
++``@app.exception_handler(Exception)`` response is emitted by that outer layer
++and never travels back down through ``CORSMiddleware``, so it ships **without**
++``Access-Control-Allow-Origin``. A browser then discards the body and the
++frontend only sees a generic "Load failed" instead of the real 500 detail.
++
++``apply_cors_headers`` re-attaches the same headers ``CORSMiddleware`` would
++have set, using the identical allow-list + regex, so error responses reach the
++browser intact.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import Pattern, Sequence
++
++from starlette.requests import Request
++from starlette.responses import Response
++
++
++def apply_cors_headers(
++    request: Request,
++    response: Response,
++    allow_origins: Sequence[str],
++    allow_origin_regex: str | Pattern[str] | None,
++) -> Response:
++    """Echo the request ``Origin`` into the response if it is allowed.
++
++    Mirrors Starlette ``CORSMiddleware`` matching: an exact match against
++    ``allow_origins`` or a full match against ``allow_origin_regex``. No-op when
++    the request carries no ``Origin`` (same-origin / non-browser) or the origin
++    is not allowed — never emits a wildcard.
++    """
++    origin = request.headers.get("origin")
++    if not origin:
++        return response
++
++    allowed = origin in allow_origins
++    if not allowed and allow_origin_regex is not None:
++        pattern = (
++            allow_origin_regex
++            if isinstance(allow_origin_regex, re.Pattern)
++            else re.compile(allow_origin_regex)
++        )
++        allowed = pattern.fullmatch(origin) is not None
++
++    if allowed:
++        response.headers["Access-Control-Allow-Origin"] = origin
++        response.headers["Access-Control-Allow-Credentials"] = "true"
++        # Cache key must vary by Origin since the value is request-dependent.
++        existing_vary = response.headers.get("Vary")
++        if existing_vary:
++            if "origin" not in existing_vary.lower():
++                response.headers["Vary"] = f"{existing_vary}, Origin"
++        else:
++            response.headers["Vary"] = "Origin"
++    return response
+diff --git a/server/catgo/io_safe.py b/server/catgo/io_safe.py
+new file mode 100644
+index 000000000..219b44c42
+--- /dev/null
++++ b/server/catgo/io_safe.py
+@@ -0,0 +1,63 @@
++"""Broken-pipe-safe stdout/stderr wrappers.
++
++The desktop app launches this backend as a *sidecar* with stdout/stderr
++connected to pipes the parent owns. If that parent dies but the backend keeps
++running (e.g. the backend is reused across an app restart), the pipe's read end
++closes and any subsequent write raises ``BrokenPipeError: [Errno 32] Broken
++pipe``.
++
++A bare ``print()`` in a request handler would then propagate that error all the
++way out as an HTTP 500 — which is exactly how the workflow ``/run`` endpoint
++started failing with a generic "Load failed" in the WebView. Wrapping the
++streams so writes/flushes swallow the error makes a dead log pipe unable to
++break request handling.
++"""
++
++from __future__ import annotations
++
++import sys
++from typing import Any, TextIO
++
++
++class BrokenPipeSafeStream:
++    """Text stream proxy whose ``write``/``flush`` never raise on a dead pipe.
++
++    All other attribute access (``isatty``, ``fileno``, ``encoding`` …) is
++    delegated to the wrapped stream so the proxy is a drop-in replacement for
++    ``sys.stdout`` / ``sys.stderr`` (uvicorn's ColourizedFormatter calls
++    ``isatty()``, for instance).
++    """
++
++    def __init__(self, stream: TextIO) -> None:
++        self._stream = stream
++
++    def write(self, data: str) -> int:
++        try:
++            return self._stream.write(data)
++        except (BrokenPipeError, OSError, ValueError):
++            # ValueError: write to an already-closed stream.
++            return len(data)
++
++    def flush(self) -> None:
++        try:
++            self._stream.flush()
++        except (BrokenPipeError, OSError, ValueError):
++            pass
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._stream, name)
++
++
++def install_broken_pipe_guard() -> None:
++    """Wrap ``sys.stdout``/``sys.stderr`` so writes survive a broken log pipe.
++
++    Idempotent: a stream that is already wrapped (or ``None``) is left alone.
++    Call this as early as possible — before ``logging.basicConfig`` binds a
++    handler to ``sys.stderr`` — so the configured logger inherits the safe
++    stream too.
++    """
++    for _name in ("stdout", "stderr"):
++        stream = getattr(sys, _name, None)
++        if stream is None or isinstance(stream, BrokenPipeSafeStream):
++            continue
++        setattr(sys, _name, BrokenPipeSafeStream(stream))
+diff --git a/server/catgo/routers/workflow.py b/server/catgo/routers/workflow.py
+index 83e06089e..9dac7424e 100644
+--- a/server/catgo/routers/workflow.py
++++ b/server/catgo/routers/workflow.py
+@@ -686,7 +686,7 @@ def api_classify_workflow(workflow_id: str):
+ @router.post("/{workflow_id}/test-echo")
+ async def api_test_echo(workflow_id: str):
+     """Test endpoint to verify routing works."""
+-    print(f"[TEST] Echo endpoint called", flush=True)
++    logger.debug("Echo endpoint called for workflow %s", workflow_id)
+     return {"test": "ok", "workflow_id": workflow_id}
+ 
+ 
+@@ -698,7 +698,7 @@ def api_run_workflow(workflow_id: str, config: WorkflowRunConfig):
+     2. Apply WorkflowRunConfig to V2 tasks (sessions, job params)
+     3. Submit to V2 engine scanner
+     """
+-    print(f"[DEBUG] api_run_workflow CALLED with workflow_id={workflow_id}", flush=True)
++    logger.debug("api_run_workflow called with workflow_id=%s", workflow_id)
+     try:
+         logger.error(f"[api_run_workflow] STARTING for workflow {workflow_id}, config keys: {list(config.dict().keys())}")
+         try:
+diff --git a/server/main.py b/server/main.py
+index 21bb60b4d..d45ed1d45 100644
+--- a/server/main.py
++++ b/server/main.py
+@@ -23,6 +23,15 @@
+     if sys.stderr is None:
+         sys.stderr = _devnull
+ 
++# The desktop app reuses this sidecar across restarts; if the parent that owns
++# our stdout/stderr pipes dies, any later write raises BrokenPipeError and a
++# bare print() in a request handler would surface as an HTTP 500. Wrap the
++# streams so a dead log pipe can never break request handling. Must run before
++# logging.basicConfig binds a handler to sys.stderr below.
++from catgo.io_safe import install_broken_pipe_guard  # noqa: E402
++
++install_broken_pipe_guard()
++
+ # Configure root logger so workflow engine logs are visible
+ logging.basicConfig(
+     level=logging.INFO,
+@@ -533,16 +542,26 @@ async def __call__(self, scope, receive, send):
+ app.add_middleware(_SSEAwareGZipMiddleware, minimum_size=1000)
+ 
+ 
+-# Global exception handler — ensures unhandled 500s still get CORS headers
+-# (ServerErrorMiddleware is outermost and can bypass CORSMiddleware)
++# Global exception handler — ensures unhandled 500s still get CORS headers.
++# ServerErrorMiddleware is outermost, so this response bypasses CORSMiddleware;
++# we must re-attach the CORS headers by hand or the browser drops the body and
++# the frontend only sees a generic "Load failed" with no real error detail.
++from catgo.cors_util import apply_cors_headers  # noqa: E402
++
++_cors_allow_origin_re = re.compile(_cors_allow_origin_regex)
++
++
+ @app.exception_handler(Exception)
+ async def global_exception_handler(request: Request, exc: Exception):
+     import logging
+     logging.getLogger(__name__).error("Unhandled error: %s", exc, exc_info=True)
+-    return JSONResponse(
++    response = JSONResponse(
+         status_code=500,
+         content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+     )
++    return apply_cors_headers(
++        request, response, _cors_allow_origins, _cors_allow_origin_re
++    )
+ 
+ 
+ # Include essential routers synchronously.
+diff --git a/server/tests/test_cors_util.py b/server/tests/test_cors_util.py
+new file mode 100644
+index 000000000..620db7b74
+--- /dev/null
++++ b/server/tests/test_cors_util.py
+@@ -0,0 +1,91 @@
++"""Unhandled 500s must carry CORS headers, or the browser shows "Load failed".
++
++Regression: a backend 500 (BrokenPipeError in the workflow /run handler) reached
++the WebView without an Access-Control-Allow-Origin header, because the
++@app.exception_handler response is emitted by ServerErrorMiddleware *outside*
++CORSMiddleware. The browser then dropped the body and surfaced only a generic
++"Load failed" with no detail. apply_cors_headers re-attaches the headers.
++"""
++
++import re
++
++from fastapi import FastAPI, Request
++from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import JSONResponse
++from fastapi.testclient import TestClient
++
++from catgo.cors_util import apply_cors_headers
++
++ALLOW_ORIGINS = ["tauri://localhost", "https://tauri.localhost"]
++ORIGIN_REGEX = r"(https?://(localhost|127\.0\.0\.1)(:\d+)?|vscode-webview://[A-Za-z0-9\-]+)"
++
++
++def _req(origin: str | None) -> Request:
++    headers = [(b"origin", origin.encode())] if origin is not None else []
++    return Request({"type": "http", "headers": headers})
++
++
++def _resp() -> JSONResponse:
++    return JSONResponse(status_code=500, content={"detail": "boom"})
++
++
++def test_exact_allowed_origin_is_echoed():
++    out = apply_cors_headers(_req("tauri://localhost"), _resp(), ALLOW_ORIGINS, ORIGIN_REGEX)
++    assert out.headers["access-control-allow-origin"] == "tauri://localhost"
++    assert out.headers["access-control-allow-credentials"] == "true"
++    assert out.headers["vary"] == "Origin"
++
++
++def test_regex_allowed_origin_is_echoed():
++    out = apply_cors_headers(_req("http://localhost:5173"), _resp(), ALLOW_ORIGINS, ORIGIN_REGEX)
++    assert out.headers["access-control-allow-origin"] == "http://localhost:5173"
++
++
++def test_disallowed_origin_gets_no_header():
++    out = apply_cors_headers(_req("https://evil.example"), _resp(), ALLOW_ORIGINS, ORIGIN_REGEX)
++    assert "access-control-allow-origin" not in out.headers
++
++
++def test_no_origin_gets_no_header():
++    out = apply_cors_headers(_req(None), _resp(), ALLOW_ORIGINS, ORIGIN_REGEX)
++    assert "access-control-allow-origin" not in out.headers
++
++
++def test_accepts_precompiled_pattern():
++    pattern = re.compile(ORIGIN_REGEX)
++    out = apply_cors_headers(_req("http://127.0.0.1:8000"), _resp(), ALLOW_ORIGINS, pattern)
++    assert out.headers["access-control-allow-origin"] == "http://127.0.0.1:8000"
++
++
++def _app_with_handler() -> FastAPI:
++    """Minimal app replicating main.py's middleware order + 500 handler."""
++    app = FastAPI()
++    app.add_middleware(
++        CORSMiddleware,
++        allow_origin_regex=ORIGIN_REGEX,
++        allow_origins=ALLOW_ORIGINS,
++        allow_credentials=True,
++        allow_methods=["*"],
++        allow_headers=["*"],
++    )
++    _compiled = re.compile(ORIGIN_REGEX)
++
++    @app.exception_handler(Exception)
++    async def _handler(request: Request, exc: Exception):
++        resp = JSONResponse(status_code=500, content={"detail": str(exc)})
++        return apply_cors_headers(request, resp, ALLOW_ORIGINS, _compiled)
++
++    @app.get("/boom")
++    def _boom():
++        raise RuntimeError("kaboom")
++
++    return app
++
++
++def test_unhandled_500_carries_cors_header_end_to_end():
++    client = TestClient(_app_with_handler(), raise_server_exceptions=False)
++    resp = client.get("/boom", headers={"Origin": "tauri://localhost"})
++    assert resp.status_code == 500
++    # The fix: the browser can now read this response (and its detail).
++    assert resp.headers.get("access-control-allow-origin") == "tauri://localhost"
++    assert resp.json()["detail"] == "kaboom"
+diff --git a/server/tests/test_io_safe.py b/server/tests/test_io_safe.py
+new file mode 100644
+index 000000000..af6599fa7
+--- /dev/null
++++ b/server/tests/test_io_safe.py
+@@ -0,0 +1,79 @@
++"""BrokenPipeSafeStream must not let a dead log pipe break the process.
++
++Regression: the workflow `/run` endpoint 500'd with BrokenPipeError because a
++bare print() wrote to a stdout pipe whose reader (a dead parent app) had gone
++away. The wrapper swallows that error so writes/flushes are always safe.
++"""
++
++import io
++import sys
++
++import pytest
++
++from catgo.io_safe import BrokenPipeSafeStream, install_broken_pipe_guard
++
++
++class _DeadPipe(io.StringIO):
++    """A stream whose write/flush behave like a pipe with a closed reader."""
++
++    def write(self, _data):  # type: ignore[override]
++        raise BrokenPipeError(32, "Broken pipe")
++
++    def flush(self):  # type: ignore[override]
++        raise BrokenPipeError(32, "Broken pipe")
++
++
++def test_write_swallows_broken_pipe():
++    stream = BrokenPipeSafeStream(_DeadPipe())
++    # Must not raise, and reports the full length as written.
++    assert stream.write("hello") == len("hello")
++
++
++def test_flush_swallows_broken_pipe():
++    stream = BrokenPipeSafeStream(_DeadPipe())
++    stream.flush()  # must not raise
++
++
++def test_print_to_wrapped_dead_pipe_does_not_raise():
++    stream = BrokenPipeSafeStream(_DeadPipe())
++    # print() calls write() then flush() — the original 500 trigger.
++    print("debug line", file=stream, flush=True)
++
++
++def test_write_passes_through_when_healthy():
++    backing = io.StringIO()
++    stream = BrokenPipeSafeStream(backing)
++    stream.write("ok")
++    stream.flush()
++    assert backing.getvalue() == "ok"
++
++
++def test_delegates_other_attributes():
++    backing = io.StringIO()
++    stream = BrokenPipeSafeStream(backing)
++    # isatty is what uvicorn's ColourizedFormatter probes; must delegate.
++    assert stream.isatty() is False
++
++
++def test_install_guard_is_idempotent():
++    orig_out, orig_err = sys.stdout, sys.stderr
++    try:
++        install_broken_pipe_guard()
++        wrapped_out = sys.stdout
++        assert isinstance(sys.stdout, BrokenPipeSafeStream)
++        assert isinstance(sys.stderr, BrokenPipeSafeStream)
++        # Second call must not double-wrap.
++        install_broken_pipe_guard()
++        assert sys.stdout is wrapped_out
++    finally:
++        sys.stdout, sys.stderr = orig_out, orig_err
++
++
++def test_install_guard_skips_none_stream():
++    orig_out = sys.stdout
++    try:
++        sys.stdout = None  # type: ignore[assignment]
++        install_broken_pipe_guard()
++        assert sys.stdout is None  # left alone, not wrapped
++    finally:
++        sys.stdout = orig_out

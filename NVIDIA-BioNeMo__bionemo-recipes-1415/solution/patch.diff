@@ -1,0 +1,2463 @@
+diff --git a/bionemo-recipes/models/esm2/src/esm/collator.py b/bionemo-recipes/models/esm2/src/esm/collator.py
+index 5d1cf035f7..43158d3f9b 100644
+--- a/bionemo-recipes/models/esm2/src/esm/collator.py
++++ b/bionemo-recipes/models/esm2/src/esm/collator.py
+@@ -19,7 +19,7 @@
+ """
+ 
+ import logging
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+ import datasets
+@@ -290,17 +290,53 @@ class DataCollatorForContextParallel:
+ 
+     The shards are then typically sent to the ContextParallelDataLoaderWrapper which will scatter them to the
+     appropriate GPUs.
++
++    Note:
++        When used with the ContextParallelDataLoaderWrapper and both context parallelism and tensor parallelism are
++        used, the collator inspects the ordering of the mesh dimensions to determine the layout of the flattened batch.
++
++        If "cp" comes before "tp" in the mesh dimension names (CP row-major), the flattened batch will be:
++        [(cp0, tp0), (cp0, tp1), ..., (cp1, tp0), (cp1, tp1), ...]
++
++        If "tp" comes before "cp" (TP row-major), the flattened batch will be:
++        [(tp0, cp0), (tp0, cp1), ..., (tp1, cp0), (tp1, cp1), ...]
++
++    Args:
++        collator: The collator to use for the batch.
++        device_mesh: The device mesh with named dimensions. Must contain either a "cp" dimension for context parallelism
++            and/or a "tp" dimension for tensor parallelism.
++        qkv_format: The format of the query-key-value (QKV) tensor.
++        is_causal_lm: Whether the collator is for a causal language model. If True, the labels will be shifted before
++            being split into CP shards, and will be returned in the `shift_labels` field.
++
+     """
+ 
+     collator: DataCollator
+-    cp_world_size: int
++    device_mesh: torch.distributed.device_mesh.DeviceMesh
+     qkv_format: str = "thd"
+     is_causal_lm: bool = False
+-    """Whether the collator is for a causal language model.
+ 
+-    If True, the labels will be shifted before being split into CP shards, and will be returned in the `shift_labels`
+-    field.
+-    """
++    # Derived fields, initialized in __post_init__.
++    cp_world_size: int = field(init=False)
++    tp_world_size: int | None = field(init=False)
++    _is_cp_row_major: bool = field(init=False)
++
++    def __post_init__(self):
++        """Initialize the cp_world_size, tp_world_size, and _is_cp_row_major fields based on the device mesh."""
++        dim_names = self.device_mesh.mesh_dim_names
++        if dim_names is None:
++            raise ValueError("device_mesh must have mesh_dim_names")
++
++        self.cp_world_size = self.device_mesh.size(dim_names.index("cp")) if "cp" in dim_names else 1
++        self.tp_world_size = self.device_mesh.size(dim_names.index("tp")) if "tp" in dim_names else None
++
++        # Determine whether CP is the row (outer) dimension of the 2D mesh.
++        # When flattened, the row-major dimension's index changes slowest.
++        # If "cp" comes before "tp" in mesh_dim_names, CP is the row dimension.
++        if "cp" in dim_names and "tp" in dim_names:
++            self._is_cp_row_major = dim_names.index("cp") < dim_names.index("tp")
++        else:
++            self._is_cp_row_major = True
+ 
+     def __call__(self, features) -> list[dict[str, Any]]:
+         """Process batches of data and create shards for each context parallelism rank.
+@@ -348,59 +384,73 @@ def __call__(self, features) -> list[dict[str, Any]]:
+             batch_shard["max_length_k"] = batch_shard["max_length_q"] = max_length * round(max_length / 64)
+             combined_batch.append(batch_shard)
+ 
++        if self.tp_world_size is not None:
++            # Replicate each CP shard for TP ranks. The ordering depends on which dimension forms the rows in the
++            # flattened mesh.
++            if self._is_cp_row_major:
++                # Flattened mesh: [(cp0,tp0), (cp0,tp1), (cp1,tp0), (cp1,tp1)]
++                # Output: [cp0, cp0, cp1, cp1]
++                combined_batch = [batch for batch in combined_batch for _ in range(self.tp_world_size)]
++            else:
++                # Flattened mesh: [(tp0,cp0), (tp0,cp1), (tp1,cp0), (tp1,cp1)]
++                # Output: [cp0, cp1, cp0, cp1]
++                combined_batch = [
++                    combined_batch[cp_rank] for _ in range(self.tp_world_size) for cp_rank in range(self.cp_world_size)
++                ]
++
+         return combined_batch
+ 
+ 
+ class ContextParallelDataLoaderWrapper:
+-    """A dataloader that is aware of context parallelism."""
++    """A dataloader that is aware of context and tensor parallelism."""
+ 
+     def __init__(
+         self,
+         dataloader: torch.utils.data.DataLoader | None,
+-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
++        cp_tp_mesh: torch.distributed.device_mesh.DeviceMesh,
+     ):
+-        """A dataloader wrapper that distributes the data across the context parallelism group.
++        """A dataloader wrapper that distributes the data across the context and tensor parallelism groups.
+ 
+-        This class will get the batch from the dataloader on CP rank 0, and then determine the shards for all the
+-        different CP group members. Then it will scatter the shards to the different CP group members. The shards are
+-        then returned to the caller for the current CP rank.
++        This class materializes a single dataloader for each data parallel mesh rank, and splits / replicates the data
++        from this dataloader across the context and tensor parallelism groups.
+ 
+         Args:
+             dataloader: The dataloader to use.
+-            cp_mesh: The context parallel mesh.
+-            cp_rank: The rank of the current context parallel process.
++            cp_tp_mesh: The context parallel mesh, or a flattened, combined context parallel and tensor parallel mesh.
++                If a flattened mesh is provided, the cp / tp dimensions should be in the order they appeared in the
++                mesh_dim_names as passed to DataCollatorForContextParallel.
+         """
+-        if cp_mesh.get_local_rank() == 0:
++        if cp_tp_mesh.get_local_rank() == 0:
+             assert dataloader is not None, "dataloader must be provided on rank 0"
+             self.dataloader = dataloader
+ 
+         else:
+             assert dataloader is None, "Dataloader on non-rank 0 will not be used"
+ 
+-        self.cp_rank = cp_mesh.get_local_rank()
+-        self.cp_group = cp_mesh.get_group()
+-        self.num_cp_ranks = cp_mesh.size()
++        self.cp_tp_rank = cp_tp_mesh.get_local_rank()
++        self.cp_tp_group = cp_tp_mesh.get_group()
++        self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+             torch.distributed.get_rank() if torch.distributed.is_initialized() else "<not initialized>",
+-            self.cp_rank,
++            self.cp_tp_rank,
+         )
+ 
+     def __iter__(self):
+         """Make the dataloader iterable."""
+-        if self.cp_rank == 0:
++        if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_ranks()
++        batch = self._send_data_to_cp_tp_ranks()
+         return batch
+ 
+-    def _send_data_to_cp_ranks(self):
+-        """Send data to all the CP ranks.
++    def _send_data_to_cp_tp_ranks(self):
++        """Send data to all the CP/TP ranks.
+ 
+         This function will get the batch from the dataloader on CP rank 0, and then determine
+         the shards for all the different CP group members.
+@@ -409,25 +459,30 @@ def _send_data_to_cp_ranks(self):
+         The shards are then combined into a single batch and returned to the caller
+         for the current CP rank.
+ 
++        If tensor parallelism is also being used, the combined batch will look like:
++        combined_batch = [<cp0_shard>, <cp0_shard>, ..., <cp1_shard>, <cp1_shard>, ...]
++        where there are cp_world_size shards, and each shard is replicated tp_world_size times. The ordering of the
++        shards depends on which dimension forms the rows in the flattened mesh.
++
+         Scalability:
+-            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they do not
+-            grow linearly with CP size.
++            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they
++            do not grow linearly with CP size.
+ 
+         Args:
+             None
+ 
+         Returns:
+-            batch: The batch for the current CP rank.
++            batch: The batch for the current CP/TP rank.
+ 
+         """
+         try:
+-            combined_batch = next(self._iterator) if self.cp_rank == 0 else None
++            combined_batch = next(self._iterator) if self.cp_tp_rank == 0 else None
+         except StopIteration as ex:
+             # If we encounter a StopIteration in the dataloader, we want to raise this error on all the CP ranks, so
+             # that the dataloader can be restarted.
+-            combined_batch = [ex] * self.num_cp_ranks
++            combined_batch = [ex] * self.num_cp_tp_ranks
+ 
+-        batch_on_this_rank = _scatter_batch_to_cp_ranks(combined_batch, self.cp_group)
++        batch_on_this_rank = _scatter_batch_to_cp_tp_ranks(combined_batch, self.cp_tp_group)
+ 
+         if isinstance(batch_on_this_rank, StopIteration):
+             raise batch_on_this_rank
+@@ -436,7 +491,7 @@ def _send_data_to_cp_ranks(self):
+ 
+     def state_dict(self):
+         """Get the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return {}
+         elif hasattr(self.dataloader, "state_dict"):
+             return {"dataloader": self.dataloader.state_dict()}
+@@ -449,7 +504,7 @@ def state_dict(self):
+ 
+     def load_state_dict(self, state_dict):
+         """Load the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return
+         elif hasattr(self.dataloader, "load_state_dict"):
+             self.dataloader.load_state_dict(state_dict["dataloader"])
+@@ -463,7 +518,7 @@ def load_state_dict(self, state_dict):
+     @property
+     def num_workers(self):
+         """Get the number of workers of the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return 0
+         else:
+             return self.dataloader.num_workers
+@@ -797,16 +852,25 @@ class BatchType(TypedDict):
+     pad_between_seqs: bool
+ 
+ 
+-def _scatter_batch_to_cp_ranks(
+-    batch: list[BatchType] | list[StopIteration], cp_group: torch.distributed.ProcessGroup | None = None
++def _scatter_batch_to_cp_tp_ranks(
++    all_batches: list[BatchType] | list[StopIteration], cp_tp_group: torch.distributed.ProcessGroup | None = None
+ ) -> BatchType | StopIteration:
+-    """Scatter a batch to all the CP ranks."""
++    """Scatter a batch to all the CP ranks.
++
++    Args:
++        all_batches (list[BatchType] | list[StopIteration]): A list of already-sharded batches to scatter to the CP/TP
++            ranks.
++        cp_tp_group (torch.distributed.ProcessGroup | None): The process group to scatter the batches to.
++
++    Returns:
++        BatchType | StopIteration: The batch on this rank.
++    """
+     scatter_object_output_list = [None]
+     # Note: This does not provide an async_op handle. Thus its blocking.
+     torch.distributed.scatter_object_list(
+         scatter_object_output_list=scatter_object_output_list,
+-        scatter_object_input_list=batch,
+-        group=cp_group,
++        scatter_object_input_list=all_batches,
++        group=cp_tp_group,
+         group_src=0,
+     )
+     return scatter_object_output_list[0]
+diff --git a/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py b/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py
+index d0421eb6eb..295ccc5d75 100644
+--- a/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py
++++ b/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py
+@@ -201,6 +201,36 @@ def get_dummy_data_thd_dp1_nopadding():
+     return batch
+ 
+ 
++class _DummyCollatorMesh:
++    """Dummy device mesh for testing DataCollatorForContextParallel.
++
++    Supports the `.mesh_dim_names` and `.size(dim_name)` interface that the collator needs.
++    """
++
++    def __init__(self, cp_size: int, tp_size: int | None = None, tp_first: bool = False):
++        if tp_size is not None:
++            if tp_first:
++                self._sizes = {"tp": tp_size, "cp": cp_size}
++            else:
++                self._sizes = {"cp": cp_size, "tp": tp_size}
++        else:
++            self._sizes = {"cp": cp_size}
++
++    @property
++    def mesh_dim_names(self):
++        return tuple(self._sizes.keys())
++
++    def size(self, dim=None):
++        if dim is None:
++            result = 1
++            for v in self._sizes.values():
++                result *= v
++            return result
++        if isinstance(dim, int):
++            return list(self._sizes.values())[dim]
++        return self._sizes[dim]
++
++
+ class _DummyLoader:
+     """Minimal iterable that always yields the same object (batch or list)."""
+ 
+@@ -904,7 +934,9 @@ def test_data_collator_for_context_parallel_returns_correct_list_size(tokenizer,
+     )
+ 
+     # Create the context parallel collator
+-    cp_collator = DataCollatorForContextParallel(collator=base_collator, cp_world_size=cp_world_size)
++    cp_collator = DataCollatorForContextParallel(
++        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size)
++    )
+ 
+     # Create test sequences
+     features = [
+@@ -933,7 +965,9 @@ def test_data_collator_for_context_parallel_thd(tokenizer):
+     )
+ 
+     # Create the context parallel collator
+-    cp_collator = DataCollatorForContextParallel(collator=base_collator, cp_world_size=cp_world_size)
++    cp_collator = DataCollatorForContextParallel(
++        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size)
++    )
+ 
+     # Create test sequences
+     features = [
+@@ -971,7 +1005,7 @@ def test_data_collator_for_context_parallel_thd_causal_lm(tokenizer):
+ 
+     # Create the context parallel collator
+     cp_collator = DataCollatorForContextParallel(
+-        collator=base_collator, cp_world_size=cp_world_size, is_causal_lm=True
++        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size), is_causal_lm=True
+     )
+ 
+     # Create test sequences
+@@ -1025,7 +1059,7 @@ def test_data_collator_for_context_parallel_bshd(tokenizer):
+ 
+     # Create the context parallel collator
+     cp_collator = DataCollatorForContextParallel(
+-        collator=base_collator, cp_world_size=cp_world_size, qkv_format="bshd"
++        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size), qkv_format="bshd"
+     )
+ 
+     # Create test sequences
+@@ -1047,3 +1081,123 @@ def test_data_collator_for_context_parallel_bshd(tokenizer):
+         assert set(shard.keys()) == required_keys, (
+             f"CP rank {cp_rank}: expected keys {required_keys}, got {set(shard.keys())}"
+         )
++
++
++def test_data_collator_for_context_parallel_with_tp(tokenizer):
++    """Test that DataCollatorForContextParallel duplicates batches for TP ranks when tp_world_size is set."""
++    cp_world_size = 2
++    tp_world_size = 2
++    divisibility_factor = 2 * cp_world_size
++
++    # Create the wrapped collator that produces padded THD batches
++    base_collator = DataCollatorWithFlattening(
++        collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=0.15),
++        pad_sequences_to_be_divisible_by=divisibility_factor,
++    )
++
++    # Create the context parallel collator with TP
++    cp_collator = DataCollatorForContextParallel(
++        collator=base_collator, device_mesh=_DummyCollatorMesh(cp_size=cp_world_size, tp_size=tp_world_size)
++    )
++
++    # Create test sequences
++    features = [
++        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2]},  # 8 tokens
++        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 17, 2]},  # 9 tokens
++    ]
++
++    # Call the collator
++    result = cp_collator(features)
++
++    # Assert that the result list has length cp_world_size * tp_world_size
++    expected_length = cp_world_size * tp_world_size
++    assert len(result) == expected_length, f"Expected list of size {expected_length}, got {len(result)}"
++
++    # Assert that batches are duplicated for TP ranks
++    # The structure should be: [cp0_tp0, cp0_tp1, cp1_tp0, cp1_tp1]
++    # So consecutive pairs should be identical for the same CP rank
++    for cp_rank in range(cp_world_size):
++        base_idx = cp_rank * tp_world_size
++        for tp_rank in range(1, tp_world_size):
++            # Compare each TP rank's batch with the first TP rank's batch for this CP rank
++            first_batch = result[base_idx]
++            current_batch = result[base_idx + tp_rank]
++
++            # Check that all keys are the same
++            assert set(first_batch.keys()) == set(current_batch.keys()), (
++                f"CP rank {cp_rank}, TP rank {tp_rank}: keys don't match"
++            )
++
++            # Check that tensor values are identical
++            for key in first_batch.keys():
++                if isinstance(first_batch[key], torch.Tensor):
++                    torch.testing.assert_close(
++                        first_batch[key],
++                        current_batch[key],
++                        msg=f"CP rank {cp_rank}, TP rank {tp_rank}: '{key}' tensors don't match",
++                    )
++                else:
++                    assert first_batch[key] == current_batch[key], (
++                        f"CP rank {cp_rank}, TP rank {tp_rank}: '{key}' values don't match"
++                    )
++
++
++def test_data_collator_for_context_parallel_with_tp_first(tokenizer):
++    """Test that DataCollatorForContextParallel produces the correct interleaving when TP is the row dimension.
++
++    With tp_first=True (mesh_dim_names=("tp", "cp")), the flattened mesh is:
++    [(tp0,cp0), (tp0,cp1), (tp1,cp0), (tp1,cp1)]
++
++    So the collator output should be: [cp0, cp1, cp0, cp1] (CP shards interleaved).
++    Compare with the default (CP row-major): [cp0, cp0, cp1, cp1] (CP shards grouped).
++    """
++    cp_world_size = 2
++    tp_world_size = 2
++    divisibility_factor = 2 * cp_world_size
++
++    base_collator = DataCollatorWithFlattening(
++        collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
++        pad_sequences_to_be_divisible_by=divisibility_factor,
++    )
++
++    features = [
++        {"input_ids": [0, 5, 6, 7, 8, 9, 10, 2]},
++        {"input_ids": [0, 11, 12, 13, 14, 15, 16, 17, 2]},
++    ]
++
++    # CP row-major (default): output is [cp0, cp0, cp1, cp1]
++    cp_collator_cp_first = DataCollatorForContextParallel(
++        collator=base_collator,
++        device_mesh=_DummyCollatorMesh(cp_size=cp_world_size, tp_size=tp_world_size, tp_first=False),
++    )
++    result_cp_first = cp_collator_cp_first(features)
++
++    # TP row-major: output is [cp0, cp1, cp0, cp1]
++    cp_collator_tp_first = DataCollatorForContextParallel(
++        collator=base_collator,
++        device_mesh=_DummyCollatorMesh(cp_size=cp_world_size, tp_size=tp_world_size, tp_first=True),
++    )
++    result_tp_first = cp_collator_tp_first(features)
++
++    # Both should have the same total length
++    assert len(result_cp_first) == cp_world_size * tp_world_size
++    assert len(result_tp_first) == cp_world_size * tp_world_size
++
++    # CP row-major: [cp0, cp0, cp1, cp1] — consecutive pairs are identical
++    for key in result_cp_first[0]:
++        if isinstance(result_cp_first[0][key], torch.Tensor):
++            torch.testing.assert_close(result_cp_first[0][key], result_cp_first[1][key])
++            torch.testing.assert_close(result_cp_first[2][key], result_cp_first[3][key])
++
++    # TP row-major: [cp0, cp1, cp0, cp1] — alternating pairs are identical
++    for key in result_tp_first[0]:
++        if isinstance(result_tp_first[0][key], torch.Tensor):
++            torch.testing.assert_close(result_tp_first[0][key], result_tp_first[2][key])
++            torch.testing.assert_close(result_tp_first[1][key], result_tp_first[3][key])
++
++    # Verify the same CP shards exist in both orderings, just in different positions
++    # CP row-major shard at index 0 (cp0) should match TP row-major shard at index 0 (also cp0)
++    for key in result_cp_first[0]:
++        if isinstance(result_cp_first[0][key], torch.Tensor):
++            torch.testing.assert_close(result_cp_first[0][key], result_tp_first[0][key])
++            torch.testing.assert_close(result_cp_first[2][key], result_tp_first[1][key])
+diff --git a/bionemo-recipes/models/esm2/tests/test_cp_dataloader.py b/bionemo-recipes/models/esm2/tests/test_cp_dataloader.py
+new file mode 100644
+index 0000000000..de56ce6ebc
+--- /dev/null
++++ b/bionemo-recipes/models/esm2/tests/test_cp_dataloader.py
+@@ -0,0 +1,1135 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for ContextParallelDataLoaderWrapper using torchrun with CPU-only distributed backend.
++
++These tests verify the data distribution functionality of ContextParallelDataLoaderWrapper
++without requiring GPUs, allowing multi-process testing on CPU-only machines.
++
++The tests use DataCollatorForContextParallel as the collate_fn in a real torch DataLoader,
++testing both THD and BSHD formats, as well as combinations of context parallelism (CP)
++and tensor parallelism (TP).
++
++Test configurations:
++- CP only: Data is sharded across CP ranks
++- TP only: Data is replicated across TP ranks
++- CP + TP: Data is sharded across CP ranks and replicated across TP ranks within each CP group
++"""
++
++import os
++import subprocess
++from dataclasses import dataclass, field
++
++import pytest
++import torch
++from torch.distributed.device_mesh import init_device_mesh
++from torch.utils.data import DataLoader, Dataset
++from transformers import AutoTokenizer, DataCollatorForLanguageModeling
++
++from esm.collator import (
++    ContextParallelDataLoaderWrapper,
++    DataCollatorForContextParallel,
++    DataCollatorWithFlattening,
++)
++
++
++@dataclass(frozen=True)
++class DistributedConfig:
++    """Class to track distributed ranks and handle basic distributed training setup.
++
++    If torch distributed environment variables are not set, we set them to default values for single-process training.
++
++    Attributes:
++        rank: The rank of the process.
++        local_rank: The local rank of the process.
++        world_size: The total number of processes.
++    """
++
++    rank: int = field(default_factory=lambda: int(os.environ.setdefault("RANK", "0")))
++    local_rank: int = field(default_factory=lambda: int(os.environ.setdefault("LOCAL_RANK", "0")))
++    world_size: int = field(default_factory=lambda: int(os.environ.setdefault("WORLD_SIZE", "1")))
++    _master_addr: str = field(default_factory=lambda: os.environ.setdefault("MASTER_ADDR", "localhost"))
++    _master_port: str = field(default_factory=lambda: os.environ.setdefault("MASTER_PORT", "12356"))
++
++    def is_main_process(self) -> bool:
++        """This is the global rank 0 process, to be used for wandb logging, etc."""
++        return self.rank == 0
++
++
++# Test protein sequences of varying lengths
++TEST_PROTEINS = [
++    "MKTAYIAKQRQISFVKSHFSRQLEERLGLLEVL",  # 33 AA
++    "MSHHWGYGKHNGPEHWHKDFPIAKGERFL",  # 30 AA
++    "MLSATEEKLSDYISSLFASVSIINSI",  # 27 AA
++    "MFVFFAGTLVNQDTLNFRDQLNINVVGTVRGIAQ",  # 34 AA
++]
++
++
++class TokenizedProteinDataset(Dataset):
++    """A simple dataset of pre-tokenized protein sequences."""
++
++    def __init__(self, tokenized_sequences: list[dict]):
++        """Initialize the dataset with tokenized sequences.
++
++        Args:
++            tokenized_sequences: List of tokenized sequences (dicts with 'input_ids', etc.)
++        """
++        self.sequences = tokenized_sequences
++
++    def __len__(self):
++        return len(self.sequences)
++
++    def __getitem__(self, idx):
++        return self.sequences[idx]
++
++
++def get_tokenizer():
++    """Get the ESM fast tokenizer."""
++    return AutoTokenizer.from_pretrained("esm_fast_tokenizer")
++
++
++def create_cp_collator_thd(tokenizer, device_mesh):
++    """Create a DataCollatorForContextParallel for THD format.
++
++    Args:
++        tokenizer: The tokenizer to use.
++        device_mesh: The device mesh with named dimensions (must contain "cp").
++
++    Returns:
++        A DataCollatorForContextParallel configured for THD format.
++    """
++    dim_names = device_mesh.mesh_dim_names
++    cp_world_size = device_mesh.size(dim_names.index("cp")) if "cp" in dim_names else 1
++    divisibility_factor = 2 * cp_world_size
++
++    # Create the base THD collator with per-sequence padding for CP
++    base_collator = DataCollatorWithFlattening(
++        collator=DataCollatorForLanguageModeling(
++            tokenizer=tokenizer,
++            mlm=False,  # Disable MLM for deterministic testing
++        ),
++        pad_sequences_to_be_divisible_by=divisibility_factor,
++    )
++
++    return DataCollatorForContextParallel(
++        collator=base_collator,
++        device_mesh=device_mesh,
++        qkv_format="thd",
++    )
++
++
++def create_cp_collator_bshd(tokenizer, device_mesh):
++    """Create a DataCollatorForContextParallel for BSHD format.
++
++    Args:
++        tokenizer: The tokenizer to use.
++        device_mesh: The device mesh with named dimensions (must contain "cp").
++
++    Returns:
++        A DataCollatorForContextParallel configured for BSHD format.
++    """
++    dim_names = device_mesh.mesh_dim_names
++    cp_world_size = device_mesh.size(dim_names.index("cp")) if "cp" in dim_names else 1
++    divisibility_factor = 2 * cp_world_size
++
++    # Create the base BSHD collator with padding
++    base_collator = DataCollatorForLanguageModeling(
++        tokenizer=tokenizer,
++        mlm=False,  # Disable MLM for deterministic testing
++        pad_to_multiple_of=divisibility_factor,
++    )
++
++    return DataCollatorForContextParallel(
++        collator=base_collator,
++        device_mesh=device_mesh,
++        qkv_format="bshd",
++    )
++
++
++def create_dataloader(
++    tokenized_sequences: list[dict],
++    collate_fn,
++    batch_size: int = 2,
++) -> DataLoader:
++    """Create a DataLoader with the given collate function.
++
++    Args:
++        tokenized_sequences: List of tokenized sequences.
++        collate_fn: The collate function (DataCollatorForContextParallel).
++        batch_size: Number of sequences per batch.
++
++    Returns:
++        A PyTorch DataLoader.
++    """
++    dataset = TokenizedProteinDataset(tokenized_sequences)
++    return DataLoader(
++        dataset,
++        batch_size=batch_size,
++        shuffle=False,
++        collate_fn=collate_fn,
++    )
++
++
++# =============================================================================
++# CP-only tests (2 processes)
++# =============================================================================
++
++
++def test_cp_dataloader_wrapper_thd_2_processes():
++    """Test ContextParallelDataLoaderWrapper with THD format and 2 processes (CP only)."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_thd_scatter",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_bshd_2_processes():
++    """Test ContextParallelDataLoaderWrapper with BSHD format and 2 processes (CP only)."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_bshd_scatter",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_stop_iteration_thd():
++    """Test that StopIteration is properly propagated to all CP ranks with THD format."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_stop_iteration_thd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_stop_iteration_bshd():
++    """Test that StopIteration is properly propagated to all CP ranks with BSHD format."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_stop_iteration_bshd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_multiple_batches_thd():
++    """Test ContextParallelDataLoaderWrapper with multiple batches using THD format."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_multiple_batches_thd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_multiple_batches_bshd():
++    """Test ContextParallelDataLoaderWrapper with multiple batches using BSHD format."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_multiple_batches_bshd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++# =============================================================================
++# TP-only tests (2 processes, CP=1, TP=2)
++# Data should be replicated across TP ranks
++# =============================================================================
++
++
++def test_cp_dataloader_wrapper_tp_only_thd():
++    """Test ContextParallelDataLoaderWrapper with TP only (CP=1, TP=2) using THD format.
++
++    Data should be replicated across TP ranks.
++    """
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_tp_only_thd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_tp_only_bshd():
++    """Test ContextParallelDataLoaderWrapper with TP only (CP=1, TP=2) using BSHD format.
++
++    Data should be replicated across TP ranks.
++    """
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        os.path.relpath(__file__),
++        "test_tp_only_bshd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++# =============================================================================
++# CP + TP tests (4 processes, CP=2, TP=2)
++# Data should be sharded across CP ranks and replicated within TP groups
++# =============================================================================
++
++
++def test_cp_dataloader_wrapper_cp_tp_thd():
++    """Test ContextParallelDataLoaderWrapper with CP=2, TP=2 using THD format.
++
++    Data should be sharded across CP ranks and replicated within TP groups.
++    """
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=4",
++        os.path.relpath(__file__),
++        "test_cp_tp_thd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_cp_tp_bshd():
++    """Test ContextParallelDataLoaderWrapper with CP=2, TP=2 using BSHD format.
++
++    Data should be sharded across CP ranks and replicated within TP groups.
++    """
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=4",
++        os.path.relpath(__file__),
++        "test_cp_tp_bshd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++# =============================================================================
++# TP + CP tests (4 processes, TP=2, CP=2, TP is the row dimension)
++# Data should be sharded across CP ranks and replicated within TP groups
++# =============================================================================
++
++
++def test_cp_dataloader_wrapper_tp_cp_thd():
++    """Test ContextParallelDataLoaderWrapper with TP=2, CP=2 using THD format.
++
++    TP is the row dimension (mesh_dim_names=("tp", "cp")).
++    Data should be sharded across CP ranks and replicated within TP groups.
++    """
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=4",
++        os.path.relpath(__file__),
++        "test_tp_cp_thd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++def test_cp_dataloader_wrapper_tp_cp_bshd():
++    """Test ContextParallelDataLoaderWrapper with TP=2, CP=2 using BSHD format.
++
++    TP is the row dimension (mesh_dim_names=("tp", "cp")).
++    Data should be sharded across CP ranks and replicated within TP groups.
++    """
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=4",
++        os.path.relpath(__file__),
++        "test_tp_cp_bshd",
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=60,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"Command failed with exit code {result.returncode}")
++
++
++# =============================================================================
++# Distributed test implementations (CP only)
++# =============================================================================
++
++
++def _run_test_thd_scatter():
++    """Test that THD data is correctly scattered from rank 0 to all CP ranks."""
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    cp_size = dist_config.world_size
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(1, cp_size),
++        mesh_dim_names=("ddp", "cp"),
++    )
++
++    cp_mesh = device_mesh["cp"]
++    cp_rank = cp_mesh.get_local_rank()
++
++    # Create tokenizer and collator
++    tokenizer = get_tokenizer()
++    cp_collator = create_cp_collator_thd(tokenizer, device_mesh=cp_mesh)
++
++    # Tokenize the test proteins
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS[:2]]
++
++    # Create a real DataLoader with DataCollatorForContextParallel as collate_fn (only on rank 0)
++    if cp_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++        # Get expected batch for verification
++        expected_sharded_batches = cp_collator(tokenized_proteins)
++    else:
++        dataloader = None
++        expected_sharded_batches = None
++
++    # Broadcast expected batch to all ranks for verification
++    expected_list = [expected_sharded_batches]
++    torch.distributed.broadcast_object_list(expected_list, src=0)
++    expected_sharded_batches = expected_list[0]
++
++    # Create the wrapper
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=cp_mesh)
++
++    # Iterate and verify
++    iter(wrapper)
++    batch_on_rank = next(wrapper)
++
++    # Verify that this rank received the correct shard
++    expected_batch = expected_sharded_batches[cp_rank]
++
++    torch.testing.assert_close(
++        batch_on_rank["input_ids"],
++        expected_batch["input_ids"],
++        msg=f"Rank {cp_rank}: input_ids mismatch",
++    )
++    torch.testing.assert_close(
++        batch_on_rank["labels"],
++        expected_batch["labels"],
++        msg=f"Rank {cp_rank}: labels mismatch",
++    )
++
++    # Verify THD-specific fields
++    assert "cu_seq_lens_q_padded" in batch_on_rank, f"Rank {cp_rank}: missing cu_seq_lens_q_padded"
++    assert "cu_seq_lens_k_padded" in batch_on_rank, f"Rank {cp_rank}: missing cu_seq_lens_k_padded"
++    assert "pad_between_seqs" in batch_on_rank, f"Rank {cp_rank}: missing pad_between_seqs"
++
++    torch.distributed.destroy_process_group()
++
++
++def _run_test_bshd_scatter():
++    """Test that BSHD data is correctly scattered from rank 0 to all CP ranks."""
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    cp_size = dist_config.world_size
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(1, cp_size),
++        mesh_dim_names=("ddp", "cp"),
++    )
++
++    cp_mesh = device_mesh["cp"]
++    cp_rank = cp_mesh.get_local_rank()
++
++    # Create tokenizer and collator
++    tokenizer = get_tokenizer()
++    cp_collator = create_cp_collator_bshd(tokenizer, device_mesh=cp_mesh)
++
++    # Tokenize the test proteins
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS[:2]]
++
++    # Create a real DataLoader with DataCollatorForContextParallel as collate_fn (only on rank 0)
++    if cp_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++        # Get expected batch for verification
++        expected_sharded_batches = cp_collator(tokenized_proteins)
++    else:
++        dataloader = None
++        expected_sharded_batches = None
++
++    # Broadcast expected batch to all ranks for verification
++    expected_list = [expected_sharded_batches]
++    torch.distributed.broadcast_object_list(expected_list, src=0)
++    expected_sharded_batches = expected_list[0]
++
++    # Create the wrapper
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=cp_mesh)
++
++    # Iterate and verify
++    iter(wrapper)
++    batch_on_rank = next(wrapper)
++
++    # Verify that this rank received the correct shard
++    expected_batch = expected_sharded_batches[cp_rank]
++
++    torch.testing.assert_close(
++        batch_on_rank["input_ids"],
++        expected_batch["input_ids"],
++        msg=f"Rank {cp_rank}: input_ids mismatch",
++    )
++    torch.testing.assert_close(
++        batch_on_rank["labels"],
++        expected_batch["labels"],
++        msg=f"Rank {cp_rank}: labels mismatch",
++    )
++
++    # Verify BSHD format: should NOT have THD-specific fields like cu_seq_lens_q_padded
++    assert "cu_seq_lens_q_padded" not in batch_on_rank, f"Rank {cp_rank}: BSHD should not have cu_seq_lens_q_padded"
++    # BSHD format removes attention_mask
++    assert "attention_mask" not in batch_on_rank, f"Rank {cp_rank}: BSHD should not have attention_mask"
++
++    torch.distributed.destroy_process_group()
++
++
++def _run_test_stop_iteration(qkv_format: str):
++    """Test that StopIteration is properly propagated to all CP ranks.
++
++    Args:
++        qkv_format: Either "thd" or "bshd".
++    """
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    cp_size = dist_config.world_size
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(1, cp_size),
++        mesh_dim_names=("ddp", "cp"),
++    )
++
++    cp_mesh = device_mesh["cp"]
++    cp_rank = cp_mesh.get_local_rank()
++
++    # Create tokenizer and collator
++    tokenizer = get_tokenizer()
++    if qkv_format == "thd":
++        cp_collator = create_cp_collator_thd(tokenizer, device_mesh=cp_mesh)
++    else:
++        cp_collator = create_cp_collator_bshd(tokenizer, device_mesh=cp_mesh)
++
++    # Tokenize the test proteins - use only 2 for a single batch
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS[:2]]
++
++    # Create a real DataLoader (only on rank 0)
++    if cp_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++    else:
++        dataloader = None
++
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=cp_mesh)
++
++    # Get the first (and only) batch
++    iter(wrapper)
++    _ = next(wrapper)
++
++    # The next call should raise StopIteration on all ranks
++    stop_iteration_raised = False
++    try:
++        _ = next(wrapper)
++    except StopIteration:
++        stop_iteration_raised = True
++
++    assert stop_iteration_raised, f"Rank {cp_rank}: StopIteration was not raised"
++
++    # Verify all ranks got StopIteration (use all_reduce to check)
++    stop_count = torch.tensor([1 if stop_iteration_raised else 0], dtype=torch.int32)
++    torch.distributed.all_reduce(stop_count, op=torch.distributed.ReduceOp.SUM)
++
++    assert stop_count.item() == cp_size, f"Not all ranks received StopIteration: {stop_count.item()} vs {cp_size}"
++
++    torch.distributed.destroy_process_group()
++
++
++def _run_test_multiple_batches(qkv_format: str):
++    """Test ContextParallelDataLoaderWrapper with multiple batches.
++
++    Args:
++        qkv_format: Either "thd" or "bshd".
++    """
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    cp_size = dist_config.world_size
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(1, cp_size),
++        mesh_dim_names=("ddp", "cp"),
++    )
++
++    cp_mesh = device_mesh["cp"]
++    cp_rank = cp_mesh.get_local_rank()
++
++    # Create tokenizer and collator
++    tokenizer = get_tokenizer()
++    if qkv_format == "thd":
++        cp_collator = create_cp_collator_thd(tokenizer, device_mesh=cp_mesh)
++    else:
++        cp_collator = create_cp_collator_bshd(tokenizer, device_mesh=cp_mesh)
++
++    # Tokenize all proteins - with batch_size=2, we'll get 2 batches
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS]
++
++    # Create a real DataLoader (only on rank 0)
++    if cp_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++        # Pre-compute expected batches for verification
++        expected_batches = list(dataloader)
++        # Re-create dataloader since we consumed it
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++    else:
++        dataloader = None
++        expected_batches = None
++
++    # Broadcast expected batches to all ranks for verification
++    expected_list = [expected_batches]
++    torch.distributed.broadcast_object_list(expected_list, src=0)
++    expected_batches = expected_list[0]
++
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=cp_mesh)
++
++    # Iterate through all batches
++    received_batches = list(wrapper)
++
++    # Verify we got the correct number of batches
++    num_batches = len(expected_batches)
++    assert len(received_batches) == num_batches, (
++        f"Rank {cp_rank}: Expected {num_batches} batches, got {len(received_batches)}"
++    )
++
++    # Verify each batch has the correct content for this rank
++    for i, batch in enumerate(received_batches):
++        expected_batch = expected_batches[i][cp_rank]
++        torch.testing.assert_close(
++            batch["input_ids"],
++            expected_batch["input_ids"],
++            msg=f"Rank {cp_rank}, Batch {i}: input_ids mismatch",
++        )
++        torch.testing.assert_close(
++            batch["labels"],
++            expected_batch["labels"],
++            msg=f"Rank {cp_rank}, Batch {i}: labels mismatch",
++        )
++
++    torch.distributed.destroy_process_group()
++
++
++# =============================================================================
++# Distributed test implementations (TP only - data replication)
++# =============================================================================
++
++
++def _run_test_tp_only(qkv_format: str):
++    """Test that data is replicated across TP ranks when CP=1.
++
++    Args:
++        qkv_format: Either "thd" or "bshd".
++    """
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    # TP=2, CP=1 configuration
++    tp_size = dist_config.world_size
++
++    # Create a 1D mesh with TP only (no CP dimension)
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(tp_size,),
++        mesh_dim_names=("tp",),
++    )
++
++    # Flatten the CP+TP mesh for the dataloader wrapper
++    flat_rank = device_mesh.get_local_rank()
++
++    # Get individual TP rank (no CP dimension in this mesh)
++    tp_rank = device_mesh.get_local_rank("tp")
++
++    # Create tokenizer and collator with TP replication
++    tokenizer = get_tokenizer()
++    if qkv_format == "thd":
++        cp_collator = create_cp_collator_thd(tokenizer, device_mesh=device_mesh)
++    else:
++        cp_collator = create_cp_collator_bshd(tokenizer, device_mesh=device_mesh)
++
++    # Tokenize the test proteins
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS[:2]]
++
++    # Create a real DataLoader (only on flat rank 0)
++    if flat_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++        # Get expected batch for verification
++        expected_sharded_batches = cp_collator(tokenized_proteins)
++    else:
++        dataloader = None
++        expected_sharded_batches = None
++
++    # Broadcast expected batch to all ranks for verification
++    expected_list = [expected_sharded_batches]
++    torch.distributed.broadcast_object_list(expected_list, src=0)
++    expected_sharded_batches = expected_list[0]
++
++    # Create the wrapper
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=device_mesh)
++
++    # Iterate and verify
++    iter(wrapper)
++    batch_on_rank = next(wrapper)
++
++    # Verify that this rank received the correct shard
++    # With CP=1 and TP=2, shards are: [cp0_tp0, cp0_tp1] = [shard0, shard0]
++    # All TP ranks should get the same data (replicated)
++    expected_batch = expected_sharded_batches[0]
++
++    torch.testing.assert_close(
++        batch_on_rank["input_ids"],
++        expected_batch["input_ids"],
++        msg=f"Flat rank {flat_rank} (tp={tp_rank}): input_ids mismatch",
++    )
++    torch.testing.assert_close(
++        batch_on_rank["labels"],
++        expected_batch["labels"],
++        msg=f"Flat rank {flat_rank} (tp={tp_rank}): labels mismatch",
++    )
++
++    # Verify that all TP ranks within the same CP group have identical data
++    # Gather all batches to rank 0 and verify
++    all_input_ids = [None] * dist_config.world_size
++    torch.distributed.all_gather_object(all_input_ids, batch_on_rank["input_ids"])
++
++    if flat_rank == 0:
++        # All ranks should have the same data since CP=1
++        for i in range(1, len(all_input_ids)):
++            torch.testing.assert_close(
++                all_input_ids[0],
++                all_input_ids[i],
++                msg=f"TP replication failed: rank 0 and rank {i} have different data",
++            )
++
++    torch.distributed.destroy_process_group()
++
++
++# =============================================================================
++# Distributed test implementations (CP + TP combined)
++# =============================================================================
++
++
++def _run_test_cp_tp(qkv_format: str):
++    """Test that data is sharded across CP ranks and replicated across TP ranks.
++
++    With CP=2, TP=2:
++    - 4 total ranks
++    - Mesh shape: (cp=2, tp=2)
++    - Flattened order: [cp0_tp0, cp0_tp1, cp1_tp0, cp1_tp1]
++    - Expected batches: [cp0_shard, cp0_shard, cp1_shard, cp1_shard]
++
++    Args:
++        qkv_format: Either "thd" or "bshd".
++    """
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    # CP=2, TP=2 configuration
++    cp_size = 2
++    tp_size = 2
++
++    # Create a 2D mesh with CP=2, TP=2
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(cp_size, tp_size),
++        mesh_dim_names=("cp", "tp"),
++    )
++
++    # Flatten the CP+TP mesh for the dataloader wrapper
++    cp_tp_mesh = device_mesh[("cp", "tp")]._flatten("cp_tp")
++    flat_rank = cp_tp_mesh.get_local_rank()
++
++    # Get individual CP and TP ranks
++    cp_rank = device_mesh.get_local_rank("cp")
++    tp_rank = device_mesh.get_local_rank("tp")
++
++    # Create tokenizer and collator with TP replication
++    tokenizer = get_tokenizer()
++    if qkv_format == "thd":
++        cp_collator = create_cp_collator_thd(tokenizer, device_mesh=device_mesh)
++    else:
++        cp_collator = create_cp_collator_bshd(tokenizer, device_mesh=device_mesh)
++
++    # Tokenize the test proteins
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS[:2]]
++
++    # Create a real DataLoader (only on flat rank 0)
++    if flat_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++        # Get expected batch for verification
++        expected_sharded_batches = cp_collator(tokenized_proteins)
++    else:
++        dataloader = None
++        expected_sharded_batches = None
++
++    # Broadcast expected batch to all ranks for verification
++    expected_list = [expected_sharded_batches]
++    torch.distributed.broadcast_object_list(expected_list, src=0)
++    expected_sharded_batches = expected_list[0]
++
++    # Create the wrapper
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=cp_tp_mesh)
++
++    # Iterate and verify
++    iter(wrapper)
++    batch_on_rank = next(wrapper)
++
++    # Verify that this rank received the correct shard
++    # With CP=2 and TP=2, shards are: [cp0_tp0, cp0_tp1, cp1_tp0, cp1_tp1]
++    # = [cp0_shard, cp0_shard, cp1_shard, cp1_shard]
++    expected_batch = expected_sharded_batches[flat_rank]
++
++    torch.testing.assert_close(
++        batch_on_rank["input_ids"],
++        expected_batch["input_ids"],
++        msg=f"Flat rank {flat_rank} (cp={cp_rank}, tp={tp_rank}): input_ids mismatch",
++    )
++    torch.testing.assert_close(
++        batch_on_rank["labels"],
++        expected_batch["labels"],
++        msg=f"Flat rank {flat_rank} (cp={cp_rank}, tp={tp_rank}): labels mismatch",
++    )
++
++    # Gather all batches to verify sharding and replication patterns
++    all_input_ids = [None] * dist_config.world_size
++    torch.distributed.all_gather_object(all_input_ids, batch_on_rank["input_ids"])
++
++    if flat_rank == 0:
++        # Verify TP replication: ranks with same CP rank should have identical data
++        # Rank 0 (cp=0, tp=0) should match Rank 1 (cp=0, tp=1)
++        torch.testing.assert_close(
++            all_input_ids[0],
++            all_input_ids[1],
++            msg="TP replication failed: cp=0 ranks have different data",
++        )
++        # Rank 2 (cp=1, tp=0) should match Rank 3 (cp=1, tp=1)
++        torch.testing.assert_close(
++            all_input_ids[2],
++            all_input_ids[3],
++            msg="TP replication failed: cp=1 ranks have different data",
++        )
++
++        # Verify CP sharding: ranks with different CP ranks should have different data
++        # Rank 0 (cp=0) should differ from Rank 2 (cp=1)
++        assert not torch.equal(all_input_ids[0], all_input_ids[2]), (
++            "CP sharding failed: different CP ranks have the same data"
++        )
++
++    torch.distributed.destroy_process_group()
++
++
++# =============================================================================
++# Distributed test implementations (TP + CP combined, TP row-major)
++# =============================================================================
++
++
++def _run_test_tp_cp(qkv_format: str):
++    """Test that data is sharded across CP ranks and replicated across TP ranks with TP as the row dimension.
++
++    With TP=2, CP=2 and mesh_dim_names=("tp", "cp"):
++    - 4 total ranks
++    - Mesh shape: (tp=2, cp=2) — TP is the row dimension
++    - Flattened order: [tp0_cp0, tp0_cp1, tp1_cp0, tp1_cp1]
++    - Expected batches from collator: [cp0_shard, cp1_shard, cp0_shard, cp1_shard]
++
++    Args:
++        qkv_format: Either "thd" or "bshd".
++    """
++    dist_config = DistributedConfig()
++
++    # Initialize distributed with gloo backend (CPU-only)
++    torch.distributed.init_process_group(backend="gloo")
++
++    # TP=2, CP=2 configuration with TP as the row dimension
++    tp_size = 2
++    cp_size = 2
++
++    # Create a 2D mesh with TP as the first (row) dimension
++    device_mesh = init_device_mesh(
++        "cpu",
++        mesh_shape=(tp_size, cp_size),
++        mesh_dim_names=("tp", "cp"),
++    )
++
++    # Flatten the TP+CP mesh for the dataloader wrapper (TP first)
++    cp_tp_mesh = device_mesh[("tp", "cp")]._flatten("tp_cp")
++    flat_rank = cp_tp_mesh.get_local_rank()
++
++    # Get individual CP and TP ranks
++    cp_rank = device_mesh.get_local_rank("cp")
++    tp_rank = device_mesh.get_local_rank("tp")
++
++    # Create tokenizer and collator — pass the 2D mesh so collator reads dimension order
++    tokenizer = get_tokenizer()
++    if qkv_format == "thd":
++        cp_collator = create_cp_collator_thd(tokenizer, device_mesh=device_mesh)
++    else:
++        cp_collator = create_cp_collator_bshd(tokenizer, device_mesh=device_mesh)
++
++    # Tokenize the test proteins
++    tokenized_proteins = [tokenizer(p, add_special_tokens=True) for p in TEST_PROTEINS[:2]]
++
++    # Create a real DataLoader (only on flat rank 0)
++    if flat_rank == 0:
++        dataloader = create_dataloader(tokenized_proteins, collate_fn=cp_collator, batch_size=2)
++        # Get expected batch for verification
++        expected_sharded_batches = cp_collator(tokenized_proteins)
++    else:
++        dataloader = None
++        expected_sharded_batches = None
++
++    # Broadcast expected batch to all ranks for verification
++    expected_list = [expected_sharded_batches]
++    torch.distributed.broadcast_object_list(expected_list, src=0)
++    expected_sharded_batches = expected_list[0]
++
++    # Create the wrapper
++    wrapper = ContextParallelDataLoaderWrapper(dataloader=dataloader, cp_tp_mesh=cp_tp_mesh)
++
++    # Iterate and verify
++    iter(wrapper)
++    batch_on_rank = next(wrapper)
++
++    # Verify that this rank received the correct shard
++    # With TP row-major, flattened order: [tp0_cp0, tp0_cp1, tp1_cp0, tp1_cp1]
++    # Collator output: [cp0_shard, cp1_shard, cp0_shard, cp1_shard]
++    expected_batch = expected_sharded_batches[flat_rank]
++
++    torch.testing.assert_close(
++        batch_on_rank["input_ids"],
++        expected_batch["input_ids"],
++        msg=f"Flat rank {flat_rank} (tp={tp_rank}, cp={cp_rank}): input_ids mismatch",
++    )
++    torch.testing.assert_close(
++        batch_on_rank["labels"],
++        expected_batch["labels"],
++        msg=f"Flat rank {flat_rank} (tp={tp_rank}, cp={cp_rank}): labels mismatch",
++    )
++
++    # Gather all batches to verify sharding and replication patterns
++    all_input_ids = [None] * dist_config.world_size
++    torch.distributed.all_gather_object(all_input_ids, batch_on_rank["input_ids"])
++
++    if flat_rank == 0:
++        # Verify TP replication: ranks with same CP rank but different TP rank should have identical data
++        # With TP row-major flattened: [tp0_cp0(0), tp0_cp1(1), tp1_cp0(2), tp1_cp1(3)]
++        # Rank 0 (tp=0, cp=0) should match Rank 2 (tp=1, cp=0)
++        torch.testing.assert_close(
++            all_input_ids[0],
++            all_input_ids[2],
++            msg="TP replication failed: cp=0 ranks (flat 0 and 2) have different data",
++        )
++        # Rank 1 (tp=0, cp=1) should match Rank 3 (tp=1, cp=1)
++        torch.testing.assert_close(
++            all_input_ids[1],
++            all_input_ids[3],
++            msg="TP replication failed: cp=1 ranks (flat 1 and 3) have different data",
++        )
++
++        # Verify CP sharding: ranks with different CP ranks should have different data
++        # Rank 0 (cp=0) should differ from Rank 1 (cp=1)
++        assert not torch.equal(all_input_ids[0], all_input_ids[1]), (
++            "CP sharding failed: different CP ranks have the same data"
++        )
++
++    torch.distributed.destroy_process_group()
++
++
++if __name__ == "__main__":
++    import sys
++
++    if len(sys.argv) < 2:
++        print("Usage: python test_cp_dataloader.py <test_name>")
++        sys.exit(1)
++
++    test_name = sys.argv[1]
++
++    # CP-only tests
++    if test_name == "test_thd_scatter":
++        _run_test_thd_scatter()
++    elif test_name == "test_bshd_scatter":
++        _run_test_bshd_scatter()
++    elif test_name == "test_stop_iteration_thd":
++        _run_test_stop_iteration(qkv_format="thd")
++    elif test_name == "test_stop_iteration_bshd":
++        _run_test_stop_iteration(qkv_format="bshd")
++    elif test_name == "test_multiple_batches_thd":
++        _run_test_multiple_batches(qkv_format="thd")
++    elif test_name == "test_multiple_batches_bshd":
++        _run_test_multiple_batches(qkv_format="bshd")
++    # TP-only tests
++    elif test_name == "test_tp_only_thd":
++        _run_test_tp_only(qkv_format="thd")
++    elif test_name == "test_tp_only_bshd":
++        _run_test_tp_only(qkv_format="bshd")
++    # CP + TP tests (CP row-major)
++    elif test_name == "test_cp_tp_thd":
++        _run_test_cp_tp(qkv_format="thd")
++    elif test_name == "test_cp_tp_bshd":
++        _run_test_cp_tp(qkv_format="bshd")
++    # TP + CP tests (TP row-major)
++    elif test_name == "test_tp_cp_thd":
++        _run_test_tp_cp(qkv_format="thd")
++    elif test_name == "test_tp_cp_bshd":
++        _run_test_tp_cp(qkv_format="bshd")
++    else:
++        print(f"Unknown test: {test_name}")
++        sys.exit(1)
+diff --git a/bionemo-recipes/models/llama3/collator.py b/bionemo-recipes/models/llama3/collator.py
+index 5d1cf035f7..43158d3f9b 100644
+--- a/bionemo-recipes/models/llama3/collator.py
++++ b/bionemo-recipes/models/llama3/collator.py
+@@ -19,7 +19,7 @@
+ """
+ 
+ import logging
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+ import datasets
+@@ -290,17 +290,53 @@ class DataCollatorForContextParallel:
+ 
+     The shards are then typically sent to the ContextParallelDataLoaderWrapper which will scatter them to the
+     appropriate GPUs.
++
++    Note:
++        When used with the ContextParallelDataLoaderWrapper and both context parallelism and tensor parallelism are
++        used, the collator inspects the ordering of the mesh dimensions to determine the layout of the flattened batch.
++
++        If "cp" comes before "tp" in the mesh dimension names (CP row-major), the flattened batch will be:
++        [(cp0, tp0), (cp0, tp1), ..., (cp1, tp0), (cp1, tp1), ...]
++
++        If "tp" comes before "cp" (TP row-major), the flattened batch will be:
++        [(tp0, cp0), (tp0, cp1), ..., (tp1, cp0), (tp1, cp1), ...]
++
++    Args:
++        collator: The collator to use for the batch.
++        device_mesh: The device mesh with named dimensions. Must contain either a "cp" dimension for context parallelism
++            and/or a "tp" dimension for tensor parallelism.
++        qkv_format: The format of the query-key-value (QKV) tensor.
++        is_causal_lm: Whether the collator is for a causal language model. If True, the labels will be shifted before
++            being split into CP shards, and will be returned in the `shift_labels` field.
++
+     """
+ 
+     collator: DataCollator
+-    cp_world_size: int
++    device_mesh: torch.distributed.device_mesh.DeviceMesh
+     qkv_format: str = "thd"
+     is_causal_lm: bool = False
+-    """Whether the collator is for a causal language model.
+ 
+-    If True, the labels will be shifted before being split into CP shards, and will be returned in the `shift_labels`
+-    field.
+-    """
++    # Derived fields, initialized in __post_init__.
++    cp_world_size: int = field(init=False)
++    tp_world_size: int | None = field(init=False)
++    _is_cp_row_major: bool = field(init=False)
++
++    def __post_init__(self):
++        """Initialize the cp_world_size, tp_world_size, and _is_cp_row_major fields based on the device mesh."""
++        dim_names = self.device_mesh.mesh_dim_names
++        if dim_names is None:
++            raise ValueError("device_mesh must have mesh_dim_names")
++
++        self.cp_world_size = self.device_mesh.size(dim_names.index("cp")) if "cp" in dim_names else 1
++        self.tp_world_size = self.device_mesh.size(dim_names.index("tp")) if "tp" in dim_names else None
++
++        # Determine whether CP is the row (outer) dimension of the 2D mesh.
++        # When flattened, the row-major dimension's index changes slowest.
++        # If "cp" comes before "tp" in mesh_dim_names, CP is the row dimension.
++        if "cp" in dim_names and "tp" in dim_names:
++            self._is_cp_row_major = dim_names.index("cp") < dim_names.index("tp")
++        else:
++            self._is_cp_row_major = True
+ 
+     def __call__(self, features) -> list[dict[str, Any]]:
+         """Process batches of data and create shards for each context parallelism rank.
+@@ -348,59 +384,73 @@ def __call__(self, features) -> list[dict[str, Any]]:
+             batch_shard["max_length_k"] = batch_shard["max_length_q"] = max_length * round(max_length / 64)
+             combined_batch.append(batch_shard)
+ 
++        if self.tp_world_size is not None:
++            # Replicate each CP shard for TP ranks. The ordering depends on which dimension forms the rows in the
++            # flattened mesh.
++            if self._is_cp_row_major:
++                # Flattened mesh: [(cp0,tp0), (cp0,tp1), (cp1,tp0), (cp1,tp1)]
++                # Output: [cp0, cp0, cp1, cp1]
++                combined_batch = [batch for batch in combined_batch for _ in range(self.tp_world_size)]
++            else:
++                # Flattened mesh: [(tp0,cp0), (tp0,cp1), (tp1,cp0), (tp1,cp1)]
++                # Output: [cp0, cp1, cp0, cp1]
++                combined_batch = [
++                    combined_batch[cp_rank] for _ in range(self.tp_world_size) for cp_rank in range(self.cp_world_size)
++                ]
++
+         return combined_batch
+ 
+ 
+ class ContextParallelDataLoaderWrapper:
+-    """A dataloader that is aware of context parallelism."""
++    """A dataloader that is aware of context and tensor parallelism."""
+ 
+     def __init__(
+         self,
+         dataloader: torch.utils.data.DataLoader | None,
+-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
++        cp_tp_mesh: torch.distributed.device_mesh.DeviceMesh,
+     ):
+-        """A dataloader wrapper that distributes the data across the context parallelism group.
++        """A dataloader wrapper that distributes the data across the context and tensor parallelism groups.
+ 
+-        This class will get the batch from the dataloader on CP rank 0, and then determine the shards for all the
+-        different CP group members. Then it will scatter the shards to the different CP group members. The shards are
+-        then returned to the caller for the current CP rank.
++        This class materializes a single dataloader for each data parallel mesh rank, and splits / replicates the data
++        from this dataloader across the context and tensor parallelism groups.
+ 
+         Args:
+             dataloader: The dataloader to use.
+-            cp_mesh: The context parallel mesh.
+-            cp_rank: The rank of the current context parallel process.
++            cp_tp_mesh: The context parallel mesh, or a flattened, combined context parallel and tensor parallel mesh.
++                If a flattened mesh is provided, the cp / tp dimensions should be in the order they appeared in the
++                mesh_dim_names as passed to DataCollatorForContextParallel.
+         """
+-        if cp_mesh.get_local_rank() == 0:
++        if cp_tp_mesh.get_local_rank() == 0:
+             assert dataloader is not None, "dataloader must be provided on rank 0"
+             self.dataloader = dataloader
+ 
+         else:
+             assert dataloader is None, "Dataloader on non-rank 0 will not be used"
+ 
+-        self.cp_rank = cp_mesh.get_local_rank()
+-        self.cp_group = cp_mesh.get_group()
+-        self.num_cp_ranks = cp_mesh.size()
++        self.cp_tp_rank = cp_tp_mesh.get_local_rank()
++        self.cp_tp_group = cp_tp_mesh.get_group()
++        self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+             torch.distributed.get_rank() if torch.distributed.is_initialized() else "<not initialized>",
+-            self.cp_rank,
++            self.cp_tp_rank,
+         )
+ 
+     def __iter__(self):
+         """Make the dataloader iterable."""
+-        if self.cp_rank == 0:
++        if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_ranks()
++        batch = self._send_data_to_cp_tp_ranks()
+         return batch
+ 
+-    def _send_data_to_cp_ranks(self):
+-        """Send data to all the CP ranks.
++    def _send_data_to_cp_tp_ranks(self):
++        """Send data to all the CP/TP ranks.
+ 
+         This function will get the batch from the dataloader on CP rank 0, and then determine
+         the shards for all the different CP group members.
+@@ -409,25 +459,30 @@ def _send_data_to_cp_ranks(self):
+         The shards are then combined into a single batch and returned to the caller
+         for the current CP rank.
+ 
++        If tensor parallelism is also being used, the combined batch will look like:
++        combined_batch = [<cp0_shard>, <cp0_shard>, ..., <cp1_shard>, <cp1_shard>, ...]
++        where there are cp_world_size shards, and each shard is replicated tp_world_size times. The ordering of the
++        shards depends on which dimension forms the rows in the flattened mesh.
++
+         Scalability:
+-            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they do not
+-            grow linearly with CP size.
++            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they
++            do not grow linearly with CP size.
+ 
+         Args:
+             None
+ 
+         Returns:
+-            batch: The batch for the current CP rank.
++            batch: The batch for the current CP/TP rank.
+ 
+         """
+         try:
+-            combined_batch = next(self._iterator) if self.cp_rank == 0 else None
++            combined_batch = next(self._iterator) if self.cp_tp_rank == 0 else None
+         except StopIteration as ex:
+             # If we encounter a StopIteration in the dataloader, we want to raise this error on all the CP ranks, so
+             # that the dataloader can be restarted.
+-            combined_batch = [ex] * self.num_cp_ranks
++            combined_batch = [ex] * self.num_cp_tp_ranks
+ 
+-        batch_on_this_rank = _scatter_batch_to_cp_ranks(combined_batch, self.cp_group)
++        batch_on_this_rank = _scatter_batch_to_cp_tp_ranks(combined_batch, self.cp_tp_group)
+ 
+         if isinstance(batch_on_this_rank, StopIteration):
+             raise batch_on_this_rank
+@@ -436,7 +491,7 @@ def _send_data_to_cp_ranks(self):
+ 
+     def state_dict(self):
+         """Get the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return {}
+         elif hasattr(self.dataloader, "state_dict"):
+             return {"dataloader": self.dataloader.state_dict()}
+@@ -449,7 +504,7 @@ def state_dict(self):
+ 
+     def load_state_dict(self, state_dict):
+         """Load the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return
+         elif hasattr(self.dataloader, "load_state_dict"):
+             self.dataloader.load_state_dict(state_dict["dataloader"])
+@@ -463,7 +518,7 @@ def load_state_dict(self, state_dict):
+     @property
+     def num_workers(self):
+         """Get the number of workers of the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return 0
+         else:
+             return self.dataloader.num_workers
+@@ -797,16 +852,25 @@ class BatchType(TypedDict):
+     pad_between_seqs: bool
+ 
+ 
+-def _scatter_batch_to_cp_ranks(
+-    batch: list[BatchType] | list[StopIteration], cp_group: torch.distributed.ProcessGroup | None = None
++def _scatter_batch_to_cp_tp_ranks(
++    all_batches: list[BatchType] | list[StopIteration], cp_tp_group: torch.distributed.ProcessGroup | None = None
+ ) -> BatchType | StopIteration:
+-    """Scatter a batch to all the CP ranks."""
++    """Scatter a batch to all the CP ranks.
++
++    Args:
++        all_batches (list[BatchType] | list[StopIteration]): A list of already-sharded batches to scatter to the CP/TP
++            ranks.
++        cp_tp_group (torch.distributed.ProcessGroup | None): The process group to scatter the batches to.
++
++    Returns:
++        BatchType | StopIteration: The batch on this rank.
++    """
+     scatter_object_output_list = [None]
+     # Note: This does not provide an async_op handle. Thus its blocking.
+     torch.distributed.scatter_object_list(
+         scatter_object_output_list=scatter_object_output_list,
+-        scatter_object_input_list=batch,
+-        group=cp_group,
++        scatter_object_input_list=all_batches,
++        group=cp_tp_group,
+         group_src=0,
+     )
+     return scatter_object_output_list[0]
+diff --git a/bionemo-recipes/models/llama3/tests/test_cp_bshd.py b/bionemo-recipes/models/llama3/tests/test_cp_bshd.py
+index c91f2c1451..fbd39213fe 100644
+--- a/bionemo-recipes/models/llama3/tests/test_cp_bshd.py
++++ b/bionemo-recipes/models/llama3/tests/test_cp_bshd.py
+@@ -90,7 +90,9 @@ def get_te_model_checkpoint(tmp_path):
+         The path to the saved model checkpoint.
+     """
+     # Use the 1B model for practical testing (8B model requires too much memory)
+-    model_hf = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", dtype=torch.bfloat16)
++    model_hf = AutoModelForCausalLM.from_pretrained(
++        "meta-llama/Llama-3.2-1B-Instruct", revision="c731040f", dtype=torch.bfloat16
++    )
+     model_te = convert_llama_hf_to_te(model_hf, attn_input_format="bshd", self_attn_mask_type="causal")
+     model_te.save_pretrained(tmp_path / "te_model_checkpoint")
+     return tmp_path / "te_model_checkpoint"
+@@ -208,7 +210,7 @@ def test_context_parallel_equivalence_2process(recipe_path: Path, unused_tcp_por
+         model_ckpt = get_te_model_checkpoint(tmp_path)
+ 
+         # Create tokenizer for English text (use the 1B model tokenizer)
+-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
++        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", revision="c731040f")
+         tokenizer.pad_token = tokenizer.eos_token
+         input_data_bshd_dp0 = get_dummy_data_bshd_no_padding(tokenizer=tokenizer, seq_length=64)
+ 
+diff --git a/bionemo-recipes/recipes/esm2_native_te/collator.py b/bionemo-recipes/recipes/esm2_native_te/collator.py
+index 5d1cf035f7..43158d3f9b 100644
+--- a/bionemo-recipes/recipes/esm2_native_te/collator.py
++++ b/bionemo-recipes/recipes/esm2_native_te/collator.py
+@@ -19,7 +19,7 @@
+ """
+ 
+ import logging
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+ import datasets
+@@ -290,17 +290,53 @@ class DataCollatorForContextParallel:
+ 
+     The shards are then typically sent to the ContextParallelDataLoaderWrapper which will scatter them to the
+     appropriate GPUs.
++
++    Note:
++        When used with the ContextParallelDataLoaderWrapper and both context parallelism and tensor parallelism are
++        used, the collator inspects the ordering of the mesh dimensions to determine the layout of the flattened batch.
++
++        If "cp" comes before "tp" in the mesh dimension names (CP row-major), the flattened batch will be:
++        [(cp0, tp0), (cp0, tp1), ..., (cp1, tp0), (cp1, tp1), ...]
++
++        If "tp" comes before "cp" (TP row-major), the flattened batch will be:
++        [(tp0, cp0), (tp0, cp1), ..., (tp1, cp0), (tp1, cp1), ...]
++
++    Args:
++        collator: The collator to use for the batch.
++        device_mesh: The device mesh with named dimensions. Must contain either a "cp" dimension for context parallelism
++            and/or a "tp" dimension for tensor parallelism.
++        qkv_format: The format of the query-key-value (QKV) tensor.
++        is_causal_lm: Whether the collator is for a causal language model. If True, the labels will be shifted before
++            being split into CP shards, and will be returned in the `shift_labels` field.
++
+     """
+ 
+     collator: DataCollator
+-    cp_world_size: int
++    device_mesh: torch.distributed.device_mesh.DeviceMesh
+     qkv_format: str = "thd"
+     is_causal_lm: bool = False
+-    """Whether the collator is for a causal language model.
+ 
+-    If True, the labels will be shifted before being split into CP shards, and will be returned in the `shift_labels`
+-    field.
+-    """
++    # Derived fields, initialized in __post_init__.
++    cp_world_size: int = field(init=False)
++    tp_world_size: int | None = field(init=False)
++    _is_cp_row_major: bool = field(init=False)
++
++    def __post_init__(self):
++        """Initialize the cp_world_size, tp_world_size, and _is_cp_row_major fields based on the device mesh."""
++        dim_names = self.device_mesh.mesh_dim_names
++        if dim_names is None:
++            raise ValueError("device_mesh must have mesh_dim_names")
++
++        self.cp_world_size = self.device_mesh.size(dim_names.index("cp")) if "cp" in dim_names else 1
++        self.tp_world_size = self.device_mesh.size(dim_names.index("tp")) if "tp" in dim_names else None
++
++        # Determine whether CP is the row (outer) dimension of the 2D mesh.
++        # When flattened, the row-major dimension's index changes slowest.
++        # If "cp" comes before "tp" in mesh_dim_names, CP is the row dimension.
++        if "cp" in dim_names and "tp" in dim_names:
++            self._is_cp_row_major = dim_names.index("cp") < dim_names.index("tp")
++        else:
++            self._is_cp_row_major = True
+ 
+     def __call__(self, features) -> list[dict[str, Any]]:
+         """Process batches of data and create shards for each context parallelism rank.
+@@ -348,59 +384,73 @@ def __call__(self, features) -> list[dict[str, Any]]:
+             batch_shard["max_length_k"] = batch_shard["max_length_q"] = max_length * round(max_length / 64)
+             combined_batch.append(batch_shard)
+ 
++        if self.tp_world_size is not None:
++            # Replicate each CP shard for TP ranks. The ordering depends on which dimension forms the rows in the
++            # flattened mesh.
++            if self._is_cp_row_major:
++                # Flattened mesh: [(cp0,tp0), (cp0,tp1), (cp1,tp0), (cp1,tp1)]
++                # Output: [cp0, cp0, cp1, cp1]
++                combined_batch = [batch for batch in combined_batch for _ in range(self.tp_world_size)]
++            else:
++                # Flattened mesh: [(tp0,cp0), (tp0,cp1), (tp1,cp0), (tp1,cp1)]
++                # Output: [cp0, cp1, cp0, cp1]
++                combined_batch = [
++                    combined_batch[cp_rank] for _ in range(self.tp_world_size) for cp_rank in range(self.cp_world_size)
++                ]
++
+         return combined_batch
+ 
+ 
+ class ContextParallelDataLoaderWrapper:
+-    """A dataloader that is aware of context parallelism."""
++    """A dataloader that is aware of context and tensor parallelism."""
+ 
+     def __init__(
+         self,
+         dataloader: torch.utils.data.DataLoader | None,
+-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
++        cp_tp_mesh: torch.distributed.device_mesh.DeviceMesh,
+     ):
+-        """A dataloader wrapper that distributes the data across the context parallelism group.
++        """A dataloader wrapper that distributes the data across the context and tensor parallelism groups.
+ 
+-        This class will get the batch from the dataloader on CP rank 0, and then determine the shards for all the
+-        different CP group members. Then it will scatter the shards to the different CP group members. The shards are
+-        then returned to the caller for the current CP rank.
++        This class materializes a single dataloader for each data parallel mesh rank, and splits / replicates the data
++        from this dataloader across the context and tensor parallelism groups.
+ 
+         Args:
+             dataloader: The dataloader to use.
+-            cp_mesh: The context parallel mesh.
+-            cp_rank: The rank of the current context parallel process.
++            cp_tp_mesh: The context parallel mesh, or a flattened, combined context parallel and tensor parallel mesh.
++                If a flattened mesh is provided, the cp / tp dimensions should be in the order they appeared in the
++                mesh_dim_names as passed to DataCollatorForContextParallel.
+         """
+-        if cp_mesh.get_local_rank() == 0:
++        if cp_tp_mesh.get_local_rank() == 0:
+             assert dataloader is not None, "dataloader must be provided on rank 0"
+             self.dataloader = dataloader
+ 
+         else:
+             assert dataloader is None, "Dataloader on non-rank 0 will not be used"
+ 
+-        self.cp_rank = cp_mesh.get_local_rank()
+-        self.cp_group = cp_mesh.get_group()
+-        self.num_cp_ranks = cp_mesh.size()
++        self.cp_tp_rank = cp_tp_mesh.get_local_rank()
++        self.cp_tp_group = cp_tp_mesh.get_group()
++        self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+             torch.distributed.get_rank() if torch.distributed.is_initialized() else "<not initialized>",
+-            self.cp_rank,
++            self.cp_tp_rank,
+         )
+ 
+     def __iter__(self):
+         """Make the dataloader iterable."""
+-        if self.cp_rank == 0:
++        if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_ranks()
++        batch = self._send_data_to_cp_tp_ranks()
+         return batch
+ 
+-    def _send_data_to_cp_ranks(self):
+-        """Send data to all the CP ranks.
++    def _send_data_to_cp_tp_ranks(self):
++        """Send data to all the CP/TP ranks.
+ 
+         This function will get the batch from the dataloader on CP rank 0, and then determine
+         the shards for all the different CP group members.
+@@ -409,25 +459,30 @@ def _send_data_to_cp_ranks(self):
+         The shards are then combined into a single batch and returned to the caller
+         for the current CP rank.
+ 
++        If tensor parallelism is also being used, the combined batch will look like:
++        combined_batch = [<cp0_shard>, <cp0_shard>, ..., <cp1_shard>, <cp1_shard>, ...]
++        where there are cp_world_size shards, and each shard is replicated tp_world_size times. The ordering of the
++        shards depends on which dimension forms the rows in the flattened mesh.
++
+         Scalability:
+-            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they do not
+-            grow linearly with CP size.
++            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they
++            do not grow linearly with CP size.
+ 
+         Args:
+             None
+ 
+         Returns:
+-            batch: The batch for the current CP rank.
++            batch: The batch for the current CP/TP rank.
+ 
+         """
+         try:
+-            combined_batch = next(self._iterator) if self.cp_rank == 0 else None
++            combined_batch = next(self._iterator) if self.cp_tp_rank == 0 else None
+         except StopIteration as ex:
+             # If we encounter a StopIteration in the dataloader, we want to raise this error on all the CP ranks, so
+             # that the dataloader can be restarted.
+-            combined_batch = [ex] * self.num_cp_ranks
++            combined_batch = [ex] * self.num_cp_tp_ranks
+ 
+-        batch_on_this_rank = _scatter_batch_to_cp_ranks(combined_batch, self.cp_group)
++        batch_on_this_rank = _scatter_batch_to_cp_tp_ranks(combined_batch, self.cp_tp_group)
+ 
+         if isinstance(batch_on_this_rank, StopIteration):
+             raise batch_on_this_rank
+@@ -436,7 +491,7 @@ def _send_data_to_cp_ranks(self):
+ 
+     def state_dict(self):
+         """Get the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return {}
+         elif hasattr(self.dataloader, "state_dict"):
+             return {"dataloader": self.dataloader.state_dict()}
+@@ -449,7 +504,7 @@ def state_dict(self):
+ 
+     def load_state_dict(self, state_dict):
+         """Load the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return
+         elif hasattr(self.dataloader, "load_state_dict"):
+             self.dataloader.load_state_dict(state_dict["dataloader"])
+@@ -463,7 +518,7 @@ def load_state_dict(self, state_dict):
+     @property
+     def num_workers(self):
+         """Get the number of workers of the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return 0
+         else:
+             return self.dataloader.num_workers
+@@ -797,16 +852,25 @@ class BatchType(TypedDict):
+     pad_between_seqs: bool
+ 
+ 
+-def _scatter_batch_to_cp_ranks(
+-    batch: list[BatchType] | list[StopIteration], cp_group: torch.distributed.ProcessGroup | None = None
++def _scatter_batch_to_cp_tp_ranks(
++    all_batches: list[BatchType] | list[StopIteration], cp_tp_group: torch.distributed.ProcessGroup | None = None
+ ) -> BatchType | StopIteration:
+-    """Scatter a batch to all the CP ranks."""
++    """Scatter a batch to all the CP ranks.
++
++    Args:
++        all_batches (list[BatchType] | list[StopIteration]): A list of already-sharded batches to scatter to the CP/TP
++            ranks.
++        cp_tp_group (torch.distributed.ProcessGroup | None): The process group to scatter the batches to.
++
++    Returns:
++        BatchType | StopIteration: The batch on this rank.
++    """
+     scatter_object_output_list = [None]
+     # Note: This does not provide an async_op handle. Thus its blocking.
+     torch.distributed.scatter_object_list(
+         scatter_object_output_list=scatter_object_output_list,
+-        scatter_object_input_list=batch,
+-        group=cp_group,
++        scatter_object_input_list=all_batches,
++        group=cp_tp_group,
+         group_src=0,
+     )
+     return scatter_object_output_list[0]
+diff --git a/bionemo-recipes/recipes/esm2_native_te/dataset.py b/bionemo-recipes/recipes/esm2_native_te/dataset.py
+index c915f30ea8..f1b416306b 100644
+--- a/bionemo-recipes/recipes/esm2_native_te/dataset.py
++++ b/bionemo-recipes/recipes/esm2_native_te/dataset.py
+@@ -257,7 +257,7 @@ def create_cp_dataloader(
+ 
+         train_dataloader.collate_fn = DataCollatorForContextParallel(
+             collator=train_dataloader.collate_fn,
+-            cp_world_size=cp_mesh.size(),
++            device_mesh=cp_mesh,
+         )
+ 
+     else:
+diff --git a/bionemo-recipes/recipes/llama3_native_te/collator.py b/bionemo-recipes/recipes/llama3_native_te/collator.py
+index 5d1cf035f7..43158d3f9b 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/collator.py
++++ b/bionemo-recipes/recipes/llama3_native_te/collator.py
+@@ -19,7 +19,7 @@
+ """
+ 
+ import logging
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+ import datasets
+@@ -290,17 +290,53 @@ class DataCollatorForContextParallel:
+ 
+     The shards are then typically sent to the ContextParallelDataLoaderWrapper which will scatter them to the
+     appropriate GPUs.
++
++    Note:
++        When used with the ContextParallelDataLoaderWrapper and both context parallelism and tensor parallelism are
++        used, the collator inspects the ordering of the mesh dimensions to determine the layout of the flattened batch.
++
++        If "cp" comes before "tp" in the mesh dimension names (CP row-major), the flattened batch will be:
++        [(cp0, tp0), (cp0, tp1), ..., (cp1, tp0), (cp1, tp1), ...]
++
++        If "tp" comes before "cp" (TP row-major), the flattened batch will be:
++        [(tp0, cp0), (tp0, cp1), ..., (tp1, cp0), (tp1, cp1), ...]
++
++    Args:
++        collator: The collator to use for the batch.
++        device_mesh: The device mesh with named dimensions. Must contain either a "cp" dimension for context parallelism
++            and/or a "tp" dimension for tensor parallelism.
++        qkv_format: The format of the query-key-value (QKV) tensor.
++        is_causal_lm: Whether the collator is for a causal language model. If True, the labels will be shifted before
++            being split into CP shards, and will be returned in the `shift_labels` field.
++
+     """
+ 
+     collator: DataCollator
+-    cp_world_size: int
++    device_mesh: torch.distributed.device_mesh.DeviceMesh
+     qkv_format: str = "thd"
+     is_causal_lm: bool = False
+-    """Whether the collator is for a causal language model.
+ 
+-    If True, the labels will be shifted before being split into CP shards, and will be returned in the `shift_labels`
+-    field.
+-    """
++    # Derived fields, initialized in __post_init__.
++    cp_world_size: int = field(init=False)
++    tp_world_size: int | None = field(init=False)
++    _is_cp_row_major: bool = field(init=False)
++
++    def __post_init__(self):
++        """Initialize the cp_world_size, tp_world_size, and _is_cp_row_major fields based on the device mesh."""
++        dim_names = self.device_mesh.mesh_dim_names
++        if dim_names is None:
++            raise ValueError("device_mesh must have mesh_dim_names")
++
++        self.cp_world_size = self.device_mesh.size(dim_names.index("cp")) if "cp" in dim_names else 1
++        self.tp_world_size = self.device_mesh.size(dim_names.index("tp")) if "tp" in dim_names else None
++
++        # Determine whether CP is the row (outer) dimension of the 2D mesh.
++        # When flattened, the row-major dimension's index changes slowest.
++        # If "cp" comes before "tp" in mesh_dim_names, CP is the row dimension.
++        if "cp" in dim_names and "tp" in dim_names:
++            self._is_cp_row_major = dim_names.index("cp") < dim_names.index("tp")
++        else:
++            self._is_cp_row_major = True
+ 
+     def __call__(self, features) -> list[dict[str, Any]]:
+         """Process batches of data and create shards for each context parallelism rank.
+@@ -348,59 +384,73 @@ def __call__(self, features) -> list[dict[str, Any]]:
+             batch_shard["max_length_k"] = batch_shard["max_length_q"] = max_length * round(max_length / 64)
+             combined_batch.append(batch_shard)
+ 
++        if self.tp_world_size is not None:
++            # Replicate each CP shard for TP ranks. The ordering depends on which dimension forms the rows in the
++            # flattened mesh.
++            if self._is_cp_row_major:
++                # Flattened mesh: [(cp0,tp0), (cp0,tp1), (cp1,tp0), (cp1,tp1)]
++                # Output: [cp0, cp0, cp1, cp1]
++                combined_batch = [batch for batch in combined_batch for _ in range(self.tp_world_size)]
++            else:
++                # Flattened mesh: [(tp0,cp0), (tp0,cp1), (tp1,cp0), (tp1,cp1)]
++                # Output: [cp0, cp1, cp0, cp1]
++                combined_batch = [
++                    combined_batch[cp_rank] for _ in range(self.tp_world_size) for cp_rank in range(self.cp_world_size)
++                ]
++
+         return combined_batch
+ 
+ 
+ class ContextParallelDataLoaderWrapper:
+-    """A dataloader that is aware of context parallelism."""
++    """A dataloader that is aware of context and tensor parallelism."""
+ 
+     def __init__(
+         self,
+         dataloader: torch.utils.data.DataLoader | None,
+-        cp_mesh: torch.distributed.device_mesh.DeviceMesh,
++        cp_tp_mesh: torch.distributed.device_mesh.DeviceMesh,
+     ):
+-        """A dataloader wrapper that distributes the data across the context parallelism group.
++        """A dataloader wrapper that distributes the data across the context and tensor parallelism groups.
+ 
+-        This class will get the batch from the dataloader on CP rank 0, and then determine the shards for all the
+-        different CP group members. Then it will scatter the shards to the different CP group members. The shards are
+-        then returned to the caller for the current CP rank.
++        This class materializes a single dataloader for each data parallel mesh rank, and splits / replicates the data
++        from this dataloader across the context and tensor parallelism groups.
+ 
+         Args:
+             dataloader: The dataloader to use.
+-            cp_mesh: The context parallel mesh.
+-            cp_rank: The rank of the current context parallel process.
++            cp_tp_mesh: The context parallel mesh, or a flattened, combined context parallel and tensor parallel mesh.
++                If a flattened mesh is provided, the cp / tp dimensions should be in the order they appeared in the
++                mesh_dim_names as passed to DataCollatorForContextParallel.
+         """
+-        if cp_mesh.get_local_rank() == 0:
++        if cp_tp_mesh.get_local_rank() == 0:
+             assert dataloader is not None, "dataloader must be provided on rank 0"
+             self.dataloader = dataloader
+ 
+         else:
+             assert dataloader is None, "Dataloader on non-rank 0 will not be used"
+ 
+-        self.cp_rank = cp_mesh.get_local_rank()
+-        self.cp_group = cp_mesh.get_group()
+-        self.num_cp_ranks = cp_mesh.size()
++        self.cp_tp_rank = cp_tp_mesh.get_local_rank()
++        self.cp_tp_group = cp_tp_mesh.get_group()
++        self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+             torch.distributed.get_rank() if torch.distributed.is_initialized() else "<not initialized>",
+-            self.cp_rank,
++            self.cp_tp_rank,
+         )
+ 
+     def __iter__(self):
+         """Make the dataloader iterable."""
+-        if self.cp_rank == 0:
++        if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_ranks()
++        batch = self._send_data_to_cp_tp_ranks()
+         return batch
+ 
+-    def _send_data_to_cp_ranks(self):
+-        """Send data to all the CP ranks.
++    def _send_data_to_cp_tp_ranks(self):
++        """Send data to all the CP/TP ranks.
+ 
+         This function will get the batch from the dataloader on CP rank 0, and then determine
+         the shards for all the different CP group members.
+@@ -409,25 +459,30 @@ def _send_data_to_cp_ranks(self):
+         The shards are then combined into a single batch and returned to the caller
+         for the current CP rank.
+ 
++        If tensor parallelism is also being used, the combined batch will look like:
++        combined_batch = [<cp0_shard>, <cp0_shard>, ..., <cp1_shard>, <cp1_shard>, ...]
++        where there are cp_world_size shards, and each shard is replicated tp_world_size times. The ordering of the
++        shards depends on which dimension forms the rows in the flattened mesh.
++
+         Scalability:
+-            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they do not
+-            grow linearly with CP size.
++            Rank 0's work grows linearly with CP size, but the other ranks do not need to store all the shards so they
++            do not grow linearly with CP size.
+ 
+         Args:
+             None
+ 
+         Returns:
+-            batch: The batch for the current CP rank.
++            batch: The batch for the current CP/TP rank.
+ 
+         """
+         try:
+-            combined_batch = next(self._iterator) if self.cp_rank == 0 else None
++            combined_batch = next(self._iterator) if self.cp_tp_rank == 0 else None
+         except StopIteration as ex:
+             # If we encounter a StopIteration in the dataloader, we want to raise this error on all the CP ranks, so
+             # that the dataloader can be restarted.
+-            combined_batch = [ex] * self.num_cp_ranks
++            combined_batch = [ex] * self.num_cp_tp_ranks
+ 
+-        batch_on_this_rank = _scatter_batch_to_cp_ranks(combined_batch, self.cp_group)
++        batch_on_this_rank = _scatter_batch_to_cp_tp_ranks(combined_batch, self.cp_tp_group)
+ 
+         if isinstance(batch_on_this_rank, StopIteration):
+             raise batch_on_this_rank
+@@ -436,7 +491,7 @@ def _send_data_to_cp_ranks(self):
+ 
+     def state_dict(self):
+         """Get the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return {}
+         elif hasattr(self.dataloader, "state_dict"):
+             return {"dataloader": self.dataloader.state_dict()}
+@@ -449,7 +504,7 @@ def state_dict(self):
+ 
+     def load_state_dict(self, state_dict):
+         """Load the state dict by delegating to the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return
+         elif hasattr(self.dataloader, "load_state_dict"):
+             self.dataloader.load_state_dict(state_dict["dataloader"])
+@@ -463,7 +518,7 @@ def load_state_dict(self, state_dict):
+     @property
+     def num_workers(self):
+         """Get the number of workers of the dataloader."""
+-        if self.cp_rank != 0:
++        if self.cp_tp_rank != 0:
+             return 0
+         else:
+             return self.dataloader.num_workers
+@@ -797,16 +852,25 @@ class BatchType(TypedDict):
+     pad_between_seqs: bool
+ 
+ 
+-def _scatter_batch_to_cp_ranks(
+-    batch: list[BatchType] | list[StopIteration], cp_group: torch.distributed.ProcessGroup | None = None
++def _scatter_batch_to_cp_tp_ranks(
++    all_batches: list[BatchType] | list[StopIteration], cp_tp_group: torch.distributed.ProcessGroup | None = None
+ ) -> BatchType | StopIteration:
+-    """Scatter a batch to all the CP ranks."""
++    """Scatter a batch to all the CP ranks.
++
++    Args:
++        all_batches (list[BatchType] | list[StopIteration]): A list of already-sharded batches to scatter to the CP/TP
++            ranks.
++        cp_tp_group (torch.distributed.ProcessGroup | None): The process group to scatter the batches to.
++
++    Returns:
++        BatchType | StopIteration: The batch on this rank.
++    """
+     scatter_object_output_list = [None]
+     # Note: This does not provide an async_op handle. Thus its blocking.
+     torch.distributed.scatter_object_list(
+         scatter_object_output_list=scatter_object_output_list,
+-        scatter_object_input_list=batch,
+-        group=cp_group,
++        scatter_object_input_list=all_batches,
++        group=cp_tp_group,
+         group_src=0,
+     )
+     return scatter_object_output_list[0]
+diff --git a/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py b/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py
+index 6c398af4cd..414fa0418d 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py
++++ b/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py
+@@ -720,7 +720,7 @@ def test_cp_dataloader(tokenizer_path):
+ 
+         train_dataloader.collate_fn = DataCollatorForContextParallel(
+             collator=train_dataloader.collate_fn,
+-            cp_world_size=cp_mesh.size(),
++            device_mesh=cp_mesh,
+             is_causal_lm=True,
+         )
+     else:
+@@ -818,7 +818,7 @@ def test_cp_dataloader_multi_gpu(recipe_path, dataset_path):
+ 
+         train_dataloader.collate_fn = DataCollatorForContextParallel(
+             collator=train_dataloader.collate_fn,
+-            cp_world_size=cp_mesh.size(),
++            device_mesh=cp_mesh,
+             is_causal_lm=True,
+         )
+     else:
+diff --git a/bionemo-recipes/recipes/llama3_native_te/tests/test_train.py b/bionemo-recipes/recipes/llama3_native_te/tests/test_train.py
+index 8562cbe92f..dae01e7603 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/tests/test_train.py
++++ b/bionemo-recipes/recipes/llama3_native_te/tests/test_train.py
+@@ -380,7 +380,7 @@ def test_train_fsdp2_fp8_bshd(tmp_path, recipe_path):
+     """Test that FSDP2 training works with FP8 enabled."""
+     with initialize_config_dir(config_dir=str(recipe_path / "hydra_config"), version_base="1.2"):
+         sanity_config = compose(
+-            config_name="L0_sanity",
++            config_name="L0_sanity_cp",
+             overrides=[
+                 f"+wandb.dir={tmp_path}",
+                 f"checkpoint.ckpt_dir={tmp_path}",
+diff --git a/bionemo-recipes/recipes/llama3_native_te/train_fsdp2_cp.py b/bionemo-recipes/recipes/llama3_native_te/train_fsdp2_cp.py
+index d0a482ed57..0a70bee2a6 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/train_fsdp2_cp.py
++++ b/bionemo-recipes/recipes/llama3_native_te/train_fsdp2_cp.py
+@@ -123,7 +123,7 @@ def main(args: DictConfig) -> float | None:
+ 
+         train_dataloader.collate_fn = DataCollatorForContextParallel(
+             collator=train_dataloader.collate_fn,
+-            cp_world_size=device_mesh["cp"].size(),
++            device_mesh=device_mesh,
+             qkv_format=args.config_kwargs.attn_input_format,
+             is_causal_lm=True,
+         )

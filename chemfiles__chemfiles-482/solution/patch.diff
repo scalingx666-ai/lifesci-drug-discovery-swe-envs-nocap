@@ -1,0 +1,197 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2daf22d22..6125e750f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -29,6 +29,8 @@ This project adheres to [Semantic Versioning](https://semver.org/).
+ - DCD files are now read/written with a custom parser (#453)
+ - Support TPR files up to version 2023 without a warning. Files from future
+   versions are tried to be read but emit a warning
++- Improved reading speed of XTC files by implementing a decoding routine
++  proposed by [libxtc](https://doi.org/10.1186/s13104-021-05536-5)
+ 
+ ### Changes to the C++ API
+ - Per-atom properties are optional, i.e. `Atom::properties` returns an optional property map.
+diff --git a/src/files/XDRFile.cpp b/src/files/XDRFile.cpp
+index 6fa21196c..07c32d239 100644
+--- a/src/files/XDRFile.cpp
++++ b/src/files/XDRFile.cpp
+@@ -250,6 +250,7 @@ static void encodeints(std::vector<char>& buf, DecodeState& state, uint32_t num_
+  *
+  * Extract the number of bits from the array buf and construct an integer
+  * from it. Return that value.
++ * The number of bits must be <32.
+  *
+  */
+ 
+@@ -259,19 +260,18 @@ static T decodebits(const std::vector<char>& buf, DecodeState& state, uint32_t n
+ 
+     size_t cnt = state.count;
+     size_t lastbits = state.lastbits;
+-    // last byte needs 1B headspace for shifting
+     uint32_t lastbyte = state.lastbyte;
+ 
+     uint32_t num = 0;
+     while (num_of_bits >= 8) {
+-        lastbyte = (lastbyte << 8) | (buf[cnt++] & 0xff);
++        lastbyte = (lastbyte << 8) | static_cast<uint8_t>(buf[cnt++]);
+         num |= (lastbyte >> lastbits) << (num_of_bits - 8);
+         num_of_bits -= 8;
+     }
+     if (num_of_bits > 0) {
+         if (lastbits < num_of_bits) {
+             lastbits += 8;
+-            lastbyte = (lastbyte << 8) | (buf[cnt++] & 0xff);
++            lastbyte = (lastbyte << 8) | static_cast<uint8_t>(buf[cnt++]);
+         }
+         lastbits -= num_of_bits;
+         num |= (lastbyte >> lastbits) & mask;
+@@ -286,6 +286,51 @@ static T decodebits(const std::vector<char>& buf, DecodeState& state, uint32_t n
+     return static_cast<T>(num);
+ }
+ 
++template <typename T> class FastTypes;
++
++template <> class FastTypes<uint32_t> {
++  public:
++    using Full = uint_fast32_t;
++    using Half = uint_fast16_t;
++};
++
++template <> class FastTypes<uint64_t> {
++  public:
++    using Full = uint_fast64_t;
++    using Half = uint_fast32_t;
++};
++
++template <typename T>
++static void unpack_from_int(const std::vector<char>& buf, DecodeState& state, uint32_t num_of_bits,
++                            uint32_t sizes[3], span<int32_t> nums) {
++    T v = 0;
++    size_t num_of_bytes = 0;
++    while (num_of_bits >= 8) {
++        const T byte = decodebits<T>(buf, state, 8);
++        v |= byte << (8 * num_of_bytes++);
++        num_of_bits -= 8;
++    }
++    if (num_of_bits > 0) {
++        const T byte = decodebits<T>(buf, state, num_of_bits);
++        v |= byte << (8 * num_of_bytes);
++    }
++
++    using FastType = typename FastTypes<T>::Full;
++    using FastTypeHalf = typename FastTypes<T>::Half;
++
++    const FastType sz = static_cast<FastType>(sizes[2]);
++    const FastTypeHalf sy = static_cast<FastTypeHalf>(sizes[1]);
++    const FastType szy = sz * sy;
++    const FastTypeHalf x1 = v / szy;
++    const FastType q1 = v - x1 * szy;
++    const FastTypeHalf y1 = q1 / sz;
++    const FastTypeHalf z1 = q1 - y1 * sz;
++
++    nums[0] = static_cast<int32_t>(x1);
++    nums[1] = static_cast<int32_t>(y1);
++    nums[2] = static_cast<int32_t>(z1);
++}
++
+ /*
+  * decodeints - decode 'small' integers from the buf array
+  *
+@@ -294,15 +339,29 @@ static T decodebits(const std::vector<char>& buf, DecodeState& state, uint32_t n
+  * with the given `sizes`. You need to specify the total number of bits to be
+  * used from `buf` in `num_of_bits`.
+  *
++ * The function has been extended to use fast integer arithmetic
++ * for sizes <= 64 bit. This technique was proposed by the authors of libxtc.
++ * See https://doi.org/10.1186/s13104-021-05536-5
++ * and https://gitlab.com/impulse_md/libxtc
++ *
+  */
+ 
+ static void decodeints(const std::vector<char>& buf, DecodeState& state, uint32_t num_of_bits,
+                        uint32_t sizes[3], span<int32_t> nums) {
+     assert(nums.size() == 3 && "invalid number of integers to unpack");
++
++    if (num_of_bits <= 32) {
++        unpack_from_int<uint32_t>(buf, state, num_of_bits, sizes, nums);
++        return;
++    } else if (num_of_bits <= 64) {
++        unpack_from_int<uint64_t>(buf, state, num_of_bits, sizes, nums);
++        return;
++    }
++
+     uint8_t bytes[32];
+     bytes[1] = bytes[2] = bytes[3] = 0;
+     size_t num_of_bytes = 0;
+-    while (num_of_bits > 8) {
++    while (num_of_bits >= 8) {
+         bytes[num_of_bytes++] = decodebits<uint8_t>(buf, state, 8);
+         num_of_bits -= 8;
+     }
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 94686130e..03848153d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,5 +1,5 @@
+ # Update this value if you need to update the data file set
+-set(TESTS_DATA_GIT "845124105e4acf05a365d2410d45e78f77c60349")
++set(TESTS_DATA_GIT "2e29a3fe1704bc0f0ea51052a651dc617bc64b74")
+ 
+ if(NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/data/${TESTS_DATA_GIT}")
+     message(STATUS "Downloading test data files")
+@@ -7,7 +7,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/data/${TESTS_DATA_GIT}")
+         "https://github.com/chemfiles/tests-data/archive/${TESTS_DATA_GIT}.tar.gz"
+         "${CMAKE_CURRENT_BINARY_DIR}/${TESTS_DATA_GIT}.tar.gz"
+         SHOW_PROGRESS
+-        EXPECTED_HASH SHA1=581b7e68d530db4f2fe5349d206911fbd349dc4c
++        EXPECTED_HASH SHA1=7833a7181f2d90db22a07e29968574b0f0c503de
+     )
+ 
+     message(STATUS "Unpacking test data files")
+diff --git a/tests/files/xdr-file.cpp b/tests/files/xdr-file.cpp
+index 1dcbec2ff..d0838585e 100644
+--- a/tests/files/xdr-file.cpp
++++ b/tests/files/xdr-file.cpp
+@@ -10,14 +10,14 @@ using namespace chemfiles;
+ 
+ static void write_xdr_file(XDRFile& file) {
+     file.write_gmx_string("Hello!"); // needs 2B padding
+-    const std::vector<float> arrary = {1.234f, -5.123f, 100.232f};
+-    file.write_gmx_compressed_floats(arrary, 1000.0);
++    const std::vector<float> array = {1.234f, -5.123f, 100.232f};
++    file.write_gmx_compressed_floats(array, 1000.0);
+ }
+ 
+ TEST_CASE("XDR files") {
+     SECTION("read") {
+         XDRFile file("data/misc/xdr.bin", File::READ);
+-        CHECK(file.file_size() == 112);
++        CHECK(file.file_size() == 164);
+ 
+         // read some big-endian data types
+         CHECK(file.read_single_i32() == -123);
+@@ -26,17 +26,19 @@ TEST_CASE("XDR files") {
+         CHECK(file.read_single_f32() == -4.567f);
+ 
+         std::vector<double> darr;
+-        darr.resize(3);
++        darr.resize(6);
+         file.read_f64(darr);
+-        const std::vector<double> dexpected = {1.234, -6.234, 105.232};
++        const std::vector<double> dexpected = {1.234,    -6.234,    105.232,
++                                               1034.346, -5056.465, 10054.475};
+         CHECK(darr == dexpected);
+ 
+         auto array = std::vector<float>();
+-        array.resize(3);
++        array.resize(6);
+         file.read_f32(array);
+-        const std::vector<float> expected = {1.234f, -5.123f, 100.232f};
++        const std::vector<float> expected = {1.234f,    -5.123f,    100.232f,
++                                             1034.346f, -5056.465f, 10054.475f};
+         CHECK(array == expected);
+-        array = {0.0, 0.0, 0.0};
++        array = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+ 
+         // read XDR and GROMACS specific data types
+         CHECK(file.read_gmx_string() == "Hello!");

@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Add additional option param to a series of I/O methods
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `20992b8e3f7b`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,370 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 37628224e..d86a4521c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,7 +24,10 @@ and this project adheres to [Pragmatic Versioning](https://github.com/experiment
+ - Entmoot >=2.1.1
+ - Static type checking was migrated from `pyright` to `ty`.
+ - Refactored weighted engineered-feature surrogate mapping to share implementation across weighted sum/mean and molecular weighted sum/mean.
++- Objective bounds validation for `IdentityObjective`-based objectives is now strict (`lower < upper`) to prevent degenerate normalization ranges.
+ 
+ ### Fixed
+ 
+ - Flaky tests in the test pipeline
++- Serialization tests now explicitly assert the expected `DeprecationWarning` for deprecated `FactorialStrategy` specs instead of treating it as an unhandled warning.
++- Added regression coverage for `Domain.model_validate_json(...)` with `tests/test_data/bad_objective_bounds.json` to ensure invalid objective bounds are rejected in JSON payloads.
+diff --git a/bofire/data_models/domain/domain.py b/bofire/data_models/domain/domain.py
+index 1eb63aa52..572546dd7 100644
+--- a/bofire/data_models/domain/domain.py
++++ b/bofire/data_models/domain/domain.py
+@@ -25,6 +25,7 @@
+     Output,
+ )
+ from bofire.data_models.objectives.api import Objective
++from bofire.data_models.types import validate_strictly_increasing
+ 
+ 
+ def is_numeric(s: Union[pd.Series, pd.DataFrame]) -> bool:
+@@ -159,6 +160,28 @@ def validate_constraints(self):
+             c.validate_inputs(self.inputs)
+         return self
+ 
++    @model_validator(mode="after")
++    def validate_objective_bounds(self):
++        """Validate objective bounds for outputs when they are specified.
++
++        For objectives exposing a ``bounds`` attribute, enforce strict ordering
++        so downstream normalization does not use a degenerate range.
++        """
++        for feat in self.outputs.get_by_objective(excludes=[]):
++            objective = feat.objective
++            if objective is None or not hasattr(objective, "bounds"):
++                continue
++            bounds = objective.bounds
++            if bounds is None:
++                continue
++            try:
++                validate_strictly_increasing(bounds)
++            except ValueError as exc:
++                raise ValueError(
++                    f"Invalid objective bounds for output `{feat.key}`: {exc}",
++                ) from exc
++        return self
++
+     def coerce_invalids(self, experiments: pd.DataFrame) -> pd.DataFrame:
+         """Coerces all invalid output measurements to np.nan
+ 
+diff --git a/bofire/data_models/objectives/identity.py b/bofire/data_models/objectives/identity.py
+index b6f9dc5d3..0cd6ec6db 100644
+--- a/bofire/data_models/objectives/identity.py
++++ b/bofire/data_models/objectives/identity.py
+@@ -33,21 +33,22 @@ def upper_bound(self) -> float:
+     @field_validator("bounds")
+     @classmethod
+     def validate_lower_upper(cls, bounds):
+-        """Validation function to ensure that lower bound is always greater the upper bound
++        """Validation function to ensure that lower bound is strictly below upper bound.
++
+ 
+         Args:
+             values (Dict): The attributes of the class
+ 
+         Raises:
+-            ValueError: when a lower bound higher than the upper bound is passed
++            ValueError: when bounds are not strictly increasing.
+ 
+         Returns:
+             Dict: The attributes of the class
+ 
+         """
+-        if bounds[0] > bounds[1]:
++        if bounds[0] >= bounds[1]:
+             raise ValueError(
+-                f"lower bound must be <= upper bound, got {bounds[0]} > {bounds[1]}",
++                f"lower bound must be < upper bound, got {bounds[0]} >= {bounds[1]}",
+             )
+         return bounds
+ 
+diff --git a/bofire/data_models/types.py b/bofire/data_models/types.py
+index d23a2977c..e1533fd73 100644
+--- a/bofire/data_models/types.py
++++ b/bofire/data_models/types.py
+@@ -73,6 +73,25 @@ def validate_monotonically_increasing(sequence: Sequence[float]) -> Sequence[flo
+     return sequence
+ 
+ 
++def validate_strictly_increasing(sequence: Sequence[float]) -> Sequence[float]:
++    """Validate that the sequence is strictly increasing.
++
++    Args:
++        sequence: Sequence of values.
++
++    Raises:
++        ValueError: If lower bound is greater or equal to the upper bound.
++
++    Returns:
++        Validated sequence
++
++    """
++    if len(sequence) > 1:
++        if not all(x < y for x, y in zip(sequence, sequence[1:])):
++            raise ValueError("Sequence is not strictly increasing.")
++    return sequence
++
++
+ FeatureKeys = Annotated[
+     List[str],
+     Field(min_length=2),
+diff --git a/tests/bofire/data_models/domain/test_domain.py b/tests/bofire/data_models/domain/test_domain.py
+index d5d6d4d4a..b78583b9f 100644
+--- a/tests/bofire/data_models/domain/test_domain.py
++++ b/tests/bofire/data_models/domain/test_domain.py
+@@ -1,4 +1,5 @@
+ from math import nan
++from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
+@@ -97,6 +98,40 @@ def test_domain_accepts_single_feature_and_constraint():
+     assert domain_single_input.inputs == Inputs(features=[input_a])
+ 
+ 
++def test_domain_validates_objective_bounds_when_specified():
++    with pytest.raises(
++        ValidationError,
++        match="Invalid objective bounds|lower bound must be < upper bound",
++    ):
++        Domain(
++            inputs=[{"type": "ContinuousInput", "key": "x", "bounds": [0, 1]}],
++            outputs=[
++                {
++                    "type": "ContinuousOutput",
++                    "key": "y",
++                    "objective": {
++                        "type": "MaximizeObjective",
++                        "w": 1.0,
++                        "bounds": [1.0, 1.0],
++                    },
++                }
++            ],
++        )
++
++
++def test_domain_model_validate_json_rejects_bad_objective_bounds():
++    fixture_path = (
++        Path(__file__).resolve().parents[3] / "test_data" / "bad_objective_bounds.json"
++    )
++    payload = fixture_path.read_text(encoding="utf-8")
++
++    with pytest.raises(
++        ValidationError,
++        match="Invalid objective bounds|lower bound must be < upper bound",
++    ):
++        Domain.model_validate_json(payload)
++
++
+ def test_from_lists(input_list, output_list, constraint_list):
+     assert Domain.from_lists(
+         inputs=input_list,
+diff --git a/tests/bofire/data_models/serialization/test_serialization.py b/tests/bofire/data_models/serialization/test_serialization.py
+index 18310c895..b305b7cc5 100644
+--- a/tests/bofire/data_models/serialization/test_serialization.py
++++ b/tests/bofire/data_models/serialization/test_serialization.py
+@@ -1,3 +1,5 @@
++import pytest
++
+ from tests.bofire.data_models.specs.api import Spec
+ 
+ 
+@@ -63,7 +65,14 @@ def test_acquisition_function_should_be_serializable(acquisition_function_spec:
+ 
+ def test_strategy_should_be_serializable(strategy_spec: Spec):
+     spec = strategy_spec.typed_spec()
+-    obj = strategy_spec.cls(**spec)
++    if strategy_spec.cls.__name__ == "FactorialStrategy":
++        with pytest.warns(
++            DeprecationWarning,
++            match="FactorialStrategy is deprecated",
++        ):
++            obj = strategy_spec.cls(**spec)
++    else:
++        obj = strategy_spec.cls(**spec)
+     # TODO: can we unhide the comparison of surrogate_specs?
+     data = {k: v for k, v in obj.model_dump().items() if k != "surrogate_specs"}
+     for k, v in data.items():
+diff --git a/tests/bofire/data_models/specs/objectives.py b/tests/bofire/data_models/specs/objectives.py
+index be61c59da..efe9bb926 100644
+--- a/tests/bofire/data_models/specs/objectives.py
++++ b/tests/bofire/data_models/specs/objectives.py
+@@ -16,6 +16,12 @@
+     objectives.MaximizeObjective,
+     lambda: {"w": 1.0, "bounds": [0.1, 0.9]},
+ )
++specs.add_invalid(
++    objectives.MaximizeObjective,
++    lambda: {"w": 1.0, "bounds": [0.1, 0.1]},
++    error=ValueError,
++    message="lower bound must be < upper bound",
++)
+ specs.add_valid(
+     objectives.MaximizeSigmoidObjective,
+     lambda: {
+@@ -28,6 +34,12 @@
+     objectives.MinimizeObjective,
+     lambda: {"w": 1.0, "bounds": [0.1, 0.9]},
+ )
++specs.add_invalid(
++    objectives.MinimizeObjective,
++    lambda: {"w": 1.0, "bounds": [0.1, 0.1]},
++    error=ValueError,
++    message="lower bound must be < upper bound",
++)
+ 
+ specs.add_valid(
+     objectives.MovingMaximizeSigmoidObjective,
+diff --git a/tests/bofire/data_models/test_types.py b/tests/bofire/data_models/test_types.py
+index a2e0a16c4..55dec97c3 100644
+--- a/tests/bofire/data_models/test_types.py
++++ b/tests/bofire/data_models/test_types.py
+@@ -6,6 +6,7 @@
+     FeatureKeys,
+     make_unique_validator,
+     validate_monotonically_increasing,
++    validate_strictly_increasing,
+ )
+ 
+ 
+@@ -36,3 +37,12 @@ def test_validate_bounds():
+     assert validate_monotonically_increasing((1.0, 2.0)) == (1.0, 2.0)
+     assert validate_monotonically_increasing((1.0, 1.0)) == (1.0, 1.0)
+     assert validate_monotonically_increasing((1.0, 2.0, 3.0)) == (1.0, 2.0, 3.0)
++
++
++def test_validate_strictly_increasing():
++    with pytest.raises(ValueError, match="Sequence is not strictly increasing."):
++        validate_strictly_increasing((2.0, 1.0))
++    with pytest.raises(ValueError, match="Sequence is not strictly increasing."):
++        validate_strictly_increasing((1.0, 1.0))
++    assert validate_strictly_increasing((1.0, 2.0)) == (1.0, 2.0)
++    assert validate_strictly_increasing((1.0, 2.0, 3.0)) == (1.0, 2.0, 3.0)
+diff --git a/tests/test_data/bad_objective_bounds.json b/tests/test_data/bad_objective_bounds.json
+new file mode 100644
+index 000000000..a19e15603
+--- /dev/null
++++ b/tests/test_data/bad_objective_bounds.json
+@@ -0,0 +1,115 @@
++{
++  "type": "Domain",
++  "inputs": {
++    "type": "Inputs",
++    "features": [
++      {
++        "type": "ContinuousInput",
++        "key": "Input_1",
++        "unit": null,
++        "bounds": [
++          0.0,
++          0.2
++        ],
++        "local_relative_bounds": null,
++        "stepsize": null
++      },
++      {
++        "type": "ContinuousInput",
++        "key": "Input_2",
++        "unit": null,
++        "bounds": [
++          0.15,
++          0.35
++        ],
++        "local_relative_bounds": null,
++        "stepsize": null
++      },
++      {
++        "type": "ContinuousInput",
++        "key": "Input_3",
++        "unit": null,
++        "bounds": [
++          0.0,
++          0.19
++        ],
++        "local_relative_bounds": null,
++        "stepsize": null
++      },
++      {
++        "type": "ContinuousInput",
++        "key": "Input_4",
++        "unit": null,
++        "bounds": [
++          0.0,
++          0.34
++        ],
++        "local_relative_bounds": null,
++        "stepsize": null
++      },
++      {
++        "type": "ContinuousInput",
++        "key": "Input_5",
++        "unit": null,
++        "bounds": [
++          0.0,
++          0.4
++        ],
++        "local_relative_bounds": null,
++        "stepsize": null
++      },
++      {
++        "type": "ContinuousInput",
++        "key": "Input_6",
++        "unit": null,
++        "bounds": [
++          0.0,
++          0.38
++        ],
++        "local_relative_bounds": null,
++        "stepsize": null
++      }
++    ]
++  },
++  "outputs": {
++    "type": "Outputs",
++    "features": [
++      {
++        "type": "ContinuousOutput",
++        "key": "Output_1",
++        "unit": null,
++        "objective": {
++          "type": "MinimizeObjective",
++          "w": 1.0,
++          "bounds": [
++            0.0,
++            0.0
++          ]
++        }
++      },
++      {
++        "type": "ContinuousOutput",
++        "key": "Output_2",
++        "unit": null,
++        "objective": {
++          "type": "MaximizeObjective",
++          "w": 1.0,
++          "bounds": [
++            0.0,
++            0.0
++          ]
++        }
++      },
++      {
++        "type": "ContinuousOutput",
++        "key": "Output_3",
++        "unit": null,
++        "objective": null
++      }
++    ]
++  },
++  "constraints": {
++    "type": "Constraints",
++    "constraints": []
++  }
++}

@@ -1,0 +1,833 @@
+diff --git a/polaris/dataset/__init__.py b/polaris/dataset/__init__.py
+index d7c2eac4..2cc4fd9b 100644
+--- a/polaris/dataset/__init__.py
++++ b/polaris/dataset/__init__.py
+@@ -15,4 +15,5 @@
+     "create_dataset_from_file",
+     "create_dataset_from_files",
+     "DatasetV1",
++    "Dataset",
+ ]
+diff --git a/polaris/dataset/_base.py b/polaris/dataset/_base.py
+index e3ae59b0..d246ecfa 100644
+--- a/polaris/dataset/_base.py
++++ b/polaris/dataset/_base.py
+@@ -2,7 +2,9 @@
+ import json
+ from pathlib import Path
+ from typing import Any, MutableMapping
++from uuid import uuid4
+ 
++import fsspec
+ import numpy as np
+ import zarr
+ from loguru import logger
+@@ -21,6 +23,7 @@
+ from polaris.dataset._column import ColumnAnnotation
+ from polaris.dataset.zarr import MemoryMappedDirectoryStore
+ from polaris.dataset.zarr._utils import load_zarr_group_to_memory
++from polaris.utils.constants import DEFAULT_CACHE_DIR
+ from polaris.utils.dict2html import dict2html
+ from polaris.utils.errors import InvalidDatasetError
+ from polaris.utils.types import (
+@@ -58,7 +61,7 @@ class BaseDataset(BaseArtifactModel, abc.ABC):
+         source: The data source, e.g. a DOI, Github repo or URI.
+         license: The dataset license. Polaris only supports some Creative Commons licenses. See [`SupportedLicenseType`][polaris.utils.types.SupportedLicenseType] for accepted ID values.
+         curation_reference: A reference to the curation process, e.g. a DOI, Github repo or URI.
+-        _cache_dir: Where the dataset would be cached if you call the `cache()` method.
++
+     For additional meta-data attributes, see the [`BaseArtifactModel`][polaris._artifact.BaseArtifactModel] class.
+ 
+     Raises:
+@@ -90,7 +93,7 @@ def _validate_adapters(cls, value):
+         return {k: Adapter[v] if isinstance(v, str) else v for k, v in value.items()}
+ 
+     @field_serializer("default_adapters")
+-    def _serialize_adapters(self, value: dict[str, Adapter]):
++    def _serialize_adapters(self, value: dict[str, Adapter]) -> dict[str, str]:
+         """Serializes the adapters"""
+         return {k: v.name for k, v in value.items()}
+ 
+@@ -116,6 +119,18 @@ def _validate_base_dataset_model(self) -> Self:
+ 
+         return self
+ 
++    @model_validator(mode="after")
++    def _ensure_cache_dir_exists(self) -> Self:
++        """
++        Set the default cache dir if none and make sure it exists
++        """
++        if self._cache_dir is None:
++            self._cache_dir = str(Path(DEFAULT_CACHE_DIR) / _CACHE_SUBDIR / str(uuid4()))
++        fs, path = fsspec.url_to_fs(self._cache_dir)
++        fs.mkdirs(path, exist_ok=True)
++
++        return self
++
+     @property
+     def uses_zarr(self) -> bool:
+         """Whether any of the data in this dataset is stored in a Zarr Archive."""
+@@ -215,6 +230,10 @@ def dtypes(self) -> dict[str, np.dtype]:
+         """Return the dtype for each of the columns for the dataset"""
+         raise NotImplementedError
+ 
++    @abc.abstractmethod
++    def should_verify_checksum(self, strategy: ChecksumStrategy) -> bool:
++        raise NotImplementedError
++
+     def load_to_memory(self):
+         """
+         Load data from zarr files to memeory
+@@ -294,15 +313,6 @@ def to_json(
+         """
+         raise NotImplementedError
+ 
+-    def cache(self) -> str:
+-        """Caches the dataset by downloading all additional data for pointer columns to a local directory.
+-
+-        Returns:
+-            The path to the cache directory.
+-        """
+-        self.to_json(self._cache_dir, load_zarr_from_new_location=True)
+-        return self._cache_dir
+-
+     def size(self) -> tuple[int, int]:
+         return self.n_rows, self.n_columns
+ 
+diff --git a/polaris/dataset/_column.py b/polaris/dataset/_column.py
+index 3ece7f96..cb0b81bc 100644
+--- a/polaris/dataset/_column.py
++++ b/polaris/dataset/_column.py
+@@ -1,5 +1,5 @@
+ import enum
+-from typing import Dict, Literal, Optional, TypeAlias
++from typing import Literal, TypeAlias
+ 
+ import numpy as np
+ from numpy.typing import DTypeLike
+@@ -39,8 +39,8 @@ class ColumnAnnotation(BaseModel):
+ 
+     is_pointer: bool = False
+     modality: Modality = Modality.UNKNOWN
+-    description: Optional[str] = None
+-    user_attributes: Dict[str, str] = Field(default_factory=dict)
++    description: str | None = None
++    user_attributes: dict[str, str] = Field(default_factory=dict)
+     dtype: np.dtype | None = None
+     content_type: KnownContentType | str | None = None
+ 
+@@ -66,7 +66,7 @@ def _serialize_modality(self, v: Modality):
+         return v.name
+ 
+     @field_serializer("dtype")
+-    def _serialize_dtype(self, v: Optional[DTypeLike]):
++    def _serialize_dtype(self, v: DTypeLike | None):
+         """Return the dtype as a string, keeping it serializable"""
+         if v is not None:
+             v = v.name
+diff --git a/polaris/dataset/_dataset.py b/polaris/dataset/_dataset.py
+index 6aa8a621..4a9dfb4a 100644
+--- a/polaris/dataset/_dataset.py
++++ b/polaris/dataset/_dataset.py
+@@ -2,7 +2,6 @@
+ from hashlib import md5
+ from pathlib import Path
+ from typing import Any, ClassVar, List, Literal
+-from uuid import uuid4
+ 
+ import fsspec
+ import numpy as np
+@@ -10,20 +9,13 @@
+ import zarr
+ from datamol.utils import fs as dmfs
+ from loguru import logger
+-from pydantic import (
+-    PrivateAttr,
+-    computed_field,
+-    field_serializer,
+-    field_validator,
+-    model_validator,
+-)
++from pydantic import PrivateAttr, computed_field, field_validator, model_validator
+ from typing_extensions import Self
+ 
+ from polaris.dataset._adapters import Adapter
+-from polaris.dataset._base import BaseDataset, _CACHE_SUBDIR
++from polaris.dataset._base import BaseDataset
+ from polaris.dataset.zarr import ZarrFileChecksum, compute_zarr_checksum
+-from polaris.mixins import ChecksumMixin
+-from polaris.utils.constants import DEFAULT_CACHE_DIR
++from polaris.mixins._checksum import ChecksumMixin
+ from polaris.utils.errors import InvalidDatasetError
+ from polaris.utils.types import (
+     AccessType,
+@@ -40,7 +32,7 @@
+ class DatasetV1(BaseDataset, ChecksumMixin):
+     """First version of a Polaris Dataset.
+ 
+-    Stores datapoints in a Pandas DataFrame and implements _pointer columns_ to support the storage of XXL data
++    Stores datapoints in a Pandas DataFrame and implements _pointer columns_ to support the storage of XL data
+     outside the DataFrame in a Zarr archive.
+ 
+     Info: Pointer columns
+@@ -108,42 +100,12 @@ def _validate_v1_dataset_model(self) -> Self:
+ 
+         return self
+ 
+-    @model_validator(mode="after")
+-    def _ensure_cache_dir_exists(self) -> Self:
+-        """
+-        Set the default cache dir if none and make sure it exists
+-        """
+-        if self._cache_dir is None:
+-            dataset_id = self._md5sum if self.has_md5sum else str(uuid4())
+-            self._cache_dir = str(Path(DEFAULT_CACHE_DIR) / _CACHE_SUBDIR / dataset_id)
+-        fs, path = fsspec.url_to_fs(self._cache_dir)
+-        fs.mkdirs(path, exist_ok=True)
+-
+-        return self
+-
+     @field_validator("default_adapters", mode="before")
+     def _validate_adapters(cls, value):
+         """Validate the adapters"""
+         return {k: Adapter[v] if isinstance(v, str) else v for k, v in value.items()}
+ 
+-    @field_serializer("default_adapters")
+-    def _serialize_adapters(self, value: dict[str, Adapter]) -> dict[str, str]:
+-        """Serializes the adapters"""
+-        return {k: v.name for k, v in value.items()}
+-
+-    def should_verify_checksum(self, strategy: ChecksumStrategy) -> bool:
+-        """
+-        Determines whether to verify the checksum of the dataset based on the strategy.
+-        """
+-        match strategy:
+-            case "ignore":
+-                return False
+-            case "verify":
+-                return True
+-            case "verify_unless_zarr":
+-                return not self.uses_zarr
+-
+-    def _compute_checksum(self):
++    def _compute_checksum(self) -> str:
+         """Computes a hash of the dataset.
+ 
+         This is meant to uniquely identify the dataset and can be used to verify the version.
+@@ -329,17 +291,6 @@ def to_json(
+ 
+         return dataset_path
+ 
+-    def cache(self, verify_checksum: bool = False) -> str:
+-        """Cache the dataset to the cache directory.
+-
+-        Args:
+-            verify_checksum: Whether to verify the checksum of the dataset after caching.
+-        """
+-        dst = super().cache()
+-        if verify_checksum:
+-            self.verify_checksum()
+-        return dst
+-
+     def _split_index_from_path(self, path: str) -> tuple[str, int | None]:
+         """
+         Paths can have an additional index appended to them.
+@@ -368,3 +319,31 @@ def __eq__(self, other):
+         if not isinstance(other, DatasetV1):
+             return False
+         return self.md5sum == other.md5sum
++
++    def cache(self, verify_checksum: bool = True) -> str:
++        """Caches the dataset by downloading all additional data for pointer columns to a local directory.
++
++        Args:
++            verify_checksum: Whether to verify the checksum of the dataset after caching.
++
++        Returns:
++            The path to the cache directory.
++        """
++        self.to_json(self._cache_dir, load_zarr_from_new_location=True)
++
++        if verify_checksum:
++            self.verify_checksum()
++
++        return self._cache_dir
++
++    def should_verify_checksum(self, strategy: ChecksumStrategy) -> bool:
++        """
++        Determines whether to verify the checksum of the dataset based on the strategy.
++        """
++        match strategy:
++            case "ignore":
++                return False
++            case "verify":
++                return True
++            case "verify_unless_zarr":
++                return not self.uses_zarr
+diff --git a/polaris/dataset/_subset.py b/polaris/dataset/_subset.py
+index dfb95869..83179b05 100644
+--- a/polaris/dataset/_subset.py
++++ b/polaris/dataset/_subset.py
+@@ -77,7 +77,7 @@ def __init__(
+         self._adapters = adapters
+         self._featurization_fn = featurization_fn
+ 
+-        # Storing all indices in memory can be memory consuming for XXL datasets.
++        # Storing all indices in memory can be memory consuming for XL datasets.
+         # This is why we constrain the iloc to loc mapping to be the identity function for Dataset V2.
+         match self.dataset:
+             case DatasetV1():
+diff --git a/polaris/dataset/zarr/_manifest.py b/polaris/dataset/zarr/_manifest.py
+index b7578ce4..0009ebf0 100644
+--- a/polaris/dataset/zarr/_manifest.py
++++ b/polaris/dataset/zarr/_manifest.py
+@@ -5,10 +5,10 @@
+ import pyarrow.parquet as pq
+ 
+ # PyArrow table schema for the V2 Zarr manifest file
+-ZARR_MANIFEST_SCHEMA = pa.schema([("path", pa.string()), ("checksum", pa.string())])
++ZARR_MANIFEST_SCHEMA = pa.schema([("path", pa.string()), ("md5_checksum", pa.string())])
+ 
+ 
+-def generate_zarr_manifest(zarr_root_path: str, output_dir: str):
++def generate_zarr_manifest(zarr_root_path: str, output_dir: str) -> str:
+     """
+     Entry point function which triggers the creation of a Zarr manifest for a V2 dataset.
+ 
+@@ -25,7 +25,7 @@ def generate_zarr_manifest(zarr_root_path: str, output_dir: str):
+     return zarr_manifest_path
+ 
+ 
+-def recursively_build_manifest(dir_path: str, writer: pq.ParquetWriter, zarr_root_path: str) -> str:
++def recursively_build_manifest(dir_path: str, writer: pq.ParquetWriter, zarr_root_path: str) -> None:
+     """
+     Recursive function that traverses a Zarr archive to build a V2 manifest file.
+ 
+@@ -51,14 +51,14 @@ def recursively_build_manifest(dir_path: str, writer: pq.ParquetWriter, zarr_roo
+                 table = pa.Table.from_pydict(
+                     {
+                         "path": [os.path.relpath(entry.path, zarr_root_path)],
+-                        "checksum": [calculate_file_md5(entry.path)],
++                        "md5_checksum": [calculate_file_md5(entry.path)],
+                     },
+                     schema=ZARR_MANIFEST_SCHEMA,
+                 )
+                 writer.write_table(table)
+ 
+ 
+-def calculate_file_md5(file_path: str):
++def calculate_file_md5(file_path: str) -> str:
+     """Calculates the md5 hash for a file at a given path"""
+ 
+     md5_hash = md5()
+diff --git a/polaris/experimental/_dataset_v2.py b/polaris/experimental/_dataset_v2.py
+index 17f6a893..74e8ba8a 100644
+--- a/polaris/experimental/_dataset_v2.py
++++ b/polaris/experimental/_dataset_v2.py
+@@ -2,7 +2,6 @@
+ import re
+ from pathlib import Path
+ from typing import Any, ClassVar, Literal
+-from uuid import uuid4
+ 
+ import fsspec
+ import numpy as np
+@@ -12,11 +11,10 @@
+ from typing_extensions import Self
+ 
+ from polaris.dataset._adapters import Adapter
+-from polaris.dataset._base import BaseDataset, _CACHE_SUBDIR
++from polaris.dataset._base import BaseDataset
+ from polaris.dataset.zarr._manifest import calculate_file_md5, generate_zarr_manifest
+-from polaris.utils.constants import DEFAULT_CACHE_DIR
+ from polaris.utils.errors import InvalidDatasetError
+-from polaris.utils.types import AccessType, HubOwner, ZarrConflictResolution
++from polaris.utils.types import AccessType, ChecksumStrategy, HubOwner, ZarrConflictResolution
+ 
+ _INDEX_ARRAY_KEY = "__index__"
+ 
+@@ -82,19 +80,6 @@ def _validate_v2_dataset_model(self) -> Self:
+ 
+         return self
+ 
+-    @model_validator(mode="after")
+-    def _ensure_cache_dir_exists(self) -> Self:
+-        """
+-        Set the default cache dir if none and make sure it exists
+-        """
+-        if self._cache_dir is None:
+-            dataset_id = self._zarr_manifest_md5sum if self.has_zarr_manifest_md5sum else str(uuid4())
+-            self._cache_dir = str(Path(DEFAULT_CACHE_DIR) / _CACHE_SUBDIR / dataset_id)
+-        fs, path = fsspec.url_to_fs(self._cache_dir)
+-        fs.mkdirs(path, exist_ok=True)
+-
+-        return self
+-
+     @property
+     def n_rows(self) -> int:
+         """Return all row indices for the dataset"""
+@@ -108,7 +93,7 @@ def rows(self) -> np.ndarray[int]:
+         """Return all row indices for the dataset
+ 
+         Warning: Memory consumption
+-            This feature is added for completeness sake, but when datasets get large could consume a lot of memory.
++            This feature is added for completeness' sake, but it should be noted that large datasets could consume a lot of memory.
+             E.g. storing a billion indices with np.in64 would consume 8GB of memory. Use with caution.
+         """
+         return np.arange(len(self), dtype=int)
+@@ -195,11 +180,14 @@ def get_data(self, row: int, col: str, adapters: dict[str, Adapter] | None = Non
+         return arr
+ 
+     def upload_to_hub(self, access: AccessType = "private", owner: HubOwner | str | None = None):
+-        """Uploads the dataset to the Polaris Hub."""
++        """
++        Uploads the dataset to the Polaris Hub.
++        """
+ 
+-        # NOTE (cwognum):  Leaving this for a later PR, because I want
+-        #  to do it simultaneously with a PR on the Hub side.
+-        raise NotImplementedError
++        from polaris.hub.client import PolarisHubClient
++
++        with PolarisHubClient() as client:
++            client.upload_dataset(self, owner=owner, access=access)
+ 
+     @classmethod
+     def from_json(cls, path: str):
+@@ -238,7 +226,7 @@ def to_json(
+         dataset_path = str(destination / "dataset.json")
+         new_zarr_root_path = str(destination / "data.zarr")
+ 
+-        # Lu: Avoid serilizing and sending None to hub app.
++        # Lu: Avoid serializing and sending None to hub app.
+         serialized = self.model_dump(exclude_none=True)
+         serialized["zarrRootPath"] = new_zarr_root_path
+ 
+@@ -264,7 +252,22 @@ def to_json(
+             json.dump(serialized, f)
+         return dataset_path
+ 
++    def cache(self) -> str:
++        """Caches the dataset by downloading all additional data for pointer columns to a local directory.
++
++        Returns:
++            The path to the cache directory.
++        """
++        self.to_json(self._cache_dir, load_zarr_from_new_location=True)
++        return self._cache_dir
++
+     def _repr_dict_(self) -> dict:
+         """Utility function for pretty-printing to the command line and jupyter notebooks"""
+-        repr_dict = self.model_dump(exclude={"zarr_md5sum_manifest"})
++        repr_dict = self.model_dump()
+         return repr_dict
++
++    def should_verify_checksum(self, strategy: ChecksumStrategy) -> bool:
++        """
++        Determines whether to verify the checksum of the dataset based on the strategy.
++        """
++        return False
+diff --git a/polaris/hub/client.py b/polaris/hub/client.py
+index 05cdc5b3..2235c114 100644
+--- a/polaris/hub/client.py
++++ b/polaris/hub/client.py
+@@ -24,7 +24,9 @@
+ )
+ from polaris.competition import CompetitionSpecification
+ from polaris.dataset import CompetitionDataset, Dataset, DatasetV1
+-from polaris.evaluate import BenchmarkResults, CompetitionPredictions, CompetitionResults
++from polaris.evaluate import BenchmarkResults, CompetitionResults
++from polaris.evaluate._results import CompetitionPredictions
++from polaris.experimental._dataset_v2 import DatasetV2
+ from polaris.hub.external_client import ExternalAuthClient
+ from polaris.hub.oauth import CachedTokenAuth
+ from polaris.hub.settings import PolarisHubSettings
+@@ -484,27 +486,13 @@ def upload_results(
+ 
+     def upload_dataset(
+         self,
+-        dataset: DatasetV1,
++        dataset: DatasetV1 | DatasetV2,
+         access: AccessType = "private",
+         timeout: TimeoutTypes = (10, 200),
+         owner: HubOwner | str | None = None,
+         if_exists: ZarrConflictResolution = "replace",
+     ):
+-        """Wrapper method for uploading standard datasets to Polaris Hub"""
+-        return self._upload_dataset(
+-            dataset, ArtifactSubtype.STANDARD.value, owner, access, timeout, if_exists
+-        )
+-
+-    def _upload_dataset(
+-        self,
+-        dataset: DatasetV1,
+-        artifact_type: ArtifactSubtype,
+-        owner: HubOwner | str,
+-        access: AccessType = "private",
+-        timeout: TimeoutTypes = (10, 200),
+-        if_exists: ZarrConflictResolution = "replace",
+-    ):
+-        """Upload the dataset to the Polaris Hub.
++        """Upload a dataset to the Polaris Hub.
+ 
+         Info: Owner
+             You have to manually specify the owner in the dataset data model. Because the owner could
+@@ -528,23 +516,43 @@ def _upload_dataset(
+             if_exists: Action for handling existing files in the Zarr archive. Options are 'raise' to throw
+                 an error, 'replace' to overwrite, or 'skip' to proceed without altering the existing files.
+         """
++        # Normalize timeout
++        if timeout is None:
++            timeout = self.settings.default_timeout
++
++        # Check if a dataset license was specified prior to upload
++        if not dataset.license:
++            raise InvalidDatasetError(
++                f"\nPlease specify a supported license for this dataset prior to uploading to the Polaris Hub.\nOnly some licenses are supported - {get_args(SupportedLicenseType)}."
++            )
++
++        if isinstance(dataset, DatasetV1):
++            return self._upload_v1_dataset(
++                dataset, ArtifactSubtype.STANDARD.value, timeout, access, owner, if_exists
++            )
++        elif isinstance(dataset, DatasetV2):
++            return self._upload_v2_dataset(dataset, timeout, access, owner, if_exists)
++
++    def _upload_v1_dataset(
++        self,
++        dataset: DatasetV1,
++        artifact_type: ArtifactSubtype,
++        timeout: TimeoutTypes,
++        access: AccessType,
++        owner: HubOwner | str | None,
++        if_exists: ZarrConflictResolution,
++    ):
++        """
++        Upload a V1 dataset to the Polaris Hub.
++        """
++
+         with ProgressIndicator(
+             start_msg="Uploading artifact...",
+             success_msg="Uploaded artifact.",
+             error_msg="Failed to upload dataset.",
+         ) as progress_indicator:
+-            # Check if a dataset license was specified prior to upload
+-            if not dataset.license:
+-                raise InvalidDatasetError(
+-                    f"\nPlease specify a supported license for this dataset prior to uploading to the Polaris Hub.\nOnly some licenses are supported - {get_args(SupportedLicenseType)}."
+-                )
+-
+-            # Normalize timeout
+-            if timeout is None:
+-                timeout = self.settings.default_timeout
+-
+             # Get the serialized data-model
+-            # We exclude the table as it handled separately and we exclude the cache_dir as it is user-specific
++            # We exclude the table as it handled separately
+             dataset.owner = HubOwner.normalize(owner or dataset.owner)
+             dataset_json = dataset.model_dump(exclude={"table"}, exclude_none=True, by_alias=True)
+ 
+@@ -623,6 +631,75 @@ def _upload_dataset(
+ 
+             return response
+ 
++    def _upload_v2_dataset(
++        self,
++        dataset: DatasetV2,
++        timeout: TimeoutTypes,
++        access: AccessType,
++        owner: HubOwner | str | None,
++        if_exists: ZarrConflictResolution,
++    ):
++        """
++        Upload a V2 dataset to the Polaris Hub.
++        """
++
++        with ProgressIndicator(
++            start_msg="Uploading artifact...",
++            success_msg="Uploaded artifact.",
++            error_msg="Failed to upload dataset.",
++        ) as progress_indicator:
++            # Get the serialized data-model
++            dataset.owner = HubOwner.normalize(owner or dataset.owner)
++            dataset_json = dataset.model_dump(exclude_none=True, by_alias=True)
++
++            # Step 1: Upload dataset meta-data
++            url = f"/v2/dataset/{dataset.owner}/{dataset.name}"
++            response = self._base_request_to_hub(
++                url=url,
++                method="PUT",
++                json={
++                    "zarrManifestFileContent": {
++                        "md5Sum": dataset.zarr_manifest_md5sum,
++                    },
++                    "access": access,
++                    **dataset_json,
++                },
++                timeout=timeout,
++            )
++
++            with StorageSession(self, "write", dataset.urn) as storage:
++                # Step 2: Upload the manifest file
++                logger.info("Copying the dataset manifest file to the Hub.")
++                with open(dataset.zarr_manifest_path, "rb") as manifest_file:
++                    storage.set_manifest(manifest_file.read())
++
++                # Step 3: Upload the Zarr archive
++                logger.info("Copying Zarr archive to the Hub. This may take a while.")
++
++                destination = storage.root_store
++
++                # Locally consolidate Zarr archive metadata. Future updates on handling consolidated
++                # metadata based on Zarr developers' recommendations can be tracked at:
++                # https://github.com/zarr-developers/zarr-python/issues/1731
++                zarr.consolidate_metadata(dataset.zarr_root.store.store)
++                zmetadata_content = dataset.zarr_root.store.store[".zmetadata"]
++                destination[".zmetadata"] = zmetadata_content
++
++                # Copy the Zarr archive to the hub
++                zarr.copy_store(
++                    source=dataset.zarr_root.store.store,
++                    dest=destination,
++                    log=logger.debug,
++                    if_exists=if_exists,
++                )
++
++        progress_indicator.update_success_msg(
++            f"Your V2 dataset has been successfully uploaded to the Hub. "
++            f"View it here: {urljoin(self.settings.hub_url, f'datasets/{dataset.owner}/{dataset.name}')}"
++        )
++
++        return response
++
+     def upload_benchmark(
+         self,
+         benchmark: BenchmarkSpecification,
+diff --git a/polaris/hub/oauth.py b/polaris/hub/oauth.py
+index a39e0d22..3a8237bf 100644
+--- a/polaris/hub/oauth.py
++++ b/polaris/hub/oauth.py
+@@ -6,7 +6,7 @@
+ from typing import Any, Literal
+ 
+ from authlib.integrations.httpx_client import OAuth2Auth
+-from pydantic import BaseModel, PositiveInt, computed_field, model_validator
++from pydantic import BaseModel, Field, PositiveInt, computed_field, model_validator
+ from typing_extensions import Self
+ 
+ from polaris.utils.constants import DEFAULT_CACHE_DIR
+@@ -59,7 +59,7 @@ def __init__(
+         super().__init__(token, token_placement, client, cache_dir, filename)
+ 
+ 
+-class StoragePaths(BaseModel):
++class DatasetV1Paths(BaseModel):
+     root: AnyUrlString
+     extension: AnyUrlString | None = None
+ 
+@@ -76,11 +76,26 @@ def relative_extension(self) -> str | None:
+         return None
+ 
+ 
++class DatasetV2Paths(BaseModel):
++    root: AnyUrlString
++    manifest: AnyUrlString
++
++    @computed_field
++    @property
++    def relative_root(self) -> str:
++        return re.sub(r"^\w+://", "", self.root)
++
++    @computed_field
++    @property
++    def relative_manifest(self) -> str:
++        return re.sub(r"^\w+://", "", self.manifest)
++
++
+ class StorageTokenData(BaseModel):
+     key: str
+     secret: str
+     endpoint: HttpUrlString
+-    paths: StoragePaths
++    paths: DatasetV1Paths | DatasetV2Paths = Field(union_mode="smart")
+ 
+ 
+ class HubOAuth2Token(BaseModel):
+diff --git a/polaris/hub/storage.py b/polaris/hub/storage.py
+index 57dde15d..70fb11c2 100644
+--- a/polaris/hub/storage.py
++++ b/polaris/hub/storage.py
+@@ -15,7 +15,7 @@
+ from zarr.context import Context
+ from zarr.storage import Store
+ 
+-from polaris.hub.oauth import HubStorageOAuth2Token, StoragePaths
++from polaris.hub.oauth import DatasetV1Paths, DatasetV2Paths, HubStorageOAuth2Token
+ from polaris.utils.errors import PolarisHubError
+ from polaris.utils.types import ArtifactUrn
+ 
+@@ -370,17 +370,15 @@ def ensure_active_token(self, token: OAuth2Token | None = None) -> bool:
+         return True
+ 
+     @property
+-    def paths(self) -> StoragePaths:
++    def paths(self) -> DatasetV1Paths | DatasetV2Paths:
+         return self.token.extra_data.paths
+ 
+-    def set_root(self, value: bytes | bytearray) -> None:
++    def _set_file(self, path: Path, value: bytes | bytearray) -> None:
+         """
+-        Set a value at the root path.
++        Internal method to upload non-zarr file to the storage backend.
+         """
+         storage_data = self.token.extra_data
+-        path = Path(self.paths.relative_root)
+ 
+-        # Try to be smart about the content type
+         match path.suffix:
+             case ".parquet":
+                 content_type = "application/vnd.apache.parquet"
+@@ -397,12 +395,11 @@ def set_root(self, value: bytes | bytearray) -> None:
+         )
+         store[path.name] = value
+ 
+-    def get_root(self) -> BytesIO:
++    def _get_file(self, path: Path) -> BytesIO:
+         """
+-        Get the value at the root path.
++        Internal method to download non-zarr file from the storage backend.
+         """
+         storage_data = self.token.extra_data
+-        path = Path(self.paths.relative_root)
+ 
+         store = S3Store(
+             path=str(path.parent),
+@@ -411,22 +408,82 @@ def get_root(self) -> BytesIO:
+             token=f"jwt/{self.token.access_token}",
+             endpoint_url=storage_data.endpoint,
+         )
++
+         return BytesIO(store[path.name])
+ 
++    def set_root(self, value: bytes | bytearray) -> None:
++        """
++        Set a value at the root path.
++        """
++        if not isinstance(self.paths, DatasetV1Paths):
++            raise NotImplementedError("Only DatasetV1Paths are supported for setting the root path")
++
++        path = Path(self.paths.relative_root)
++        self._set_file(path, value)
++
++    def get_root(self) -> BytesIO:
++        """
++        Get the value at the root path.
++        """
++        if not isinstance(self.paths, DatasetV1Paths):
++            raise NotImplementedError("Only DatasetV1Paths are supported for getting the root path")
++
++        path = Path(self.paths.relative_root)
++        return self._get_file(path)
++
++    def set_manifest(self, value: bytes | bytearray) -> None:
++        """
++        Set a value at the manifest path.
++        """
++        if not isinstance(self.paths, DatasetV2Paths):
++            raise NotImplementedError("Only DatasetV2Paths are supported for setting the manifest path")
++
++        path = Path(self.paths.relative_manifest)
++        self._set_file(path, value)
++
++    def get_manifest(self) -> BytesIO:
++        """
++        Get the value at the manifest path.
++        """
++        if not isinstance(self.paths, DatasetV2Paths):
++            raise NotImplementedError("Only DatasetV2Paths are supported for getting the manifest path")
++
++        path = Path(self.paths.relative_manifest)
++        return self._get_file(path)
++
+     @property
+     def extension_store(self) -> S3Store | None:
+         """
+         Returns a Zarr store for the extension path, if available, backed by a S3 compatible bucket.
+         """
+         storage_data = self.token.extra_data
+-        return (
+-            S3Store(
+-                path=self.paths.relative_extension,
+-                access_key=storage_data.key,
+-                secret_key=storage_data.secret,
+-                token=f"jwt/{self.token.access_token}",
+-                endpoint_url=storage_data.endpoint,
+-            )
+-            if self.paths.relative_extension
+-            else None
+-        )
++        match storage_data.paths:
++            case DatasetV1Paths() if storage_data.paths.relative_extension:
++                return S3Store(
++                    path=storage_data.paths.relative_extension,
++                    access_key=storage_data.key,
++                    secret_key=storage_data.secret,
++                    token=f"jwt/{self.token.access_token}",
++                    endpoint_url=storage_data.endpoint,
++                )
++            case _:
++                return None
++
++    @property
++    def root_store(self) -> S3Store | None:
++        """
++        Returns a Zarr store for the root path, backed by a S3 compatible bucket.
++        """
++        storage_data = self.token.extra_data
++
++        match storage_data.paths:
++            case DatasetV2Paths():
++                return S3Store(
++                    path=storage_data.paths.relative_root,
++                    access_key=storage_data.key,
++                    secret_key=storage_data.secret,
++                    token=f"jwt/{self.token.access_token}",
++                    endpoint_url=storage_data.endpoint,
++                )
++            case _:
++                return None
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 49774a13..6570fcd7 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -12,11 +12,10 @@
+     SingleTaskBenchmarkSpecification,
+ )
+ from polaris.competition import CompetitionSpecification
+-from polaris.dataset import ColumnAnnotation, CompetitionDataset, DatasetV1
++from polaris.dataset import ColumnAnnotation, CompetitionDataset, DatasetFactory, DatasetV1
++from polaris.dataset.converters import SDFConverter
+ from polaris.experimental._dataset_v2 import DatasetV2
+ from polaris.utils.types import HubOwner
+-from polaris.dataset.converters import SDFConverter
+-from polaris.dataset import DatasetFactory
+ 
+ 
+ def check_version(artifact):
+diff --git a/tests/test_evaluate.py b/tests/test_evaluate.py
+index 68335d93..857e3db0 100644
+--- a/tests/test_evaluate.py
++++ b/tests/test_evaluate.py
+@@ -1,11 +1,10 @@
+ import os
+ 
++import datamol as dm
+ import numpy as np
+ import pandas as pd
+ import pytest
+ 
+-import datamol as dm
+-
+ import polaris as po
+ from polaris.benchmark import (
+     MultiTaskBenchmarkSpecification,

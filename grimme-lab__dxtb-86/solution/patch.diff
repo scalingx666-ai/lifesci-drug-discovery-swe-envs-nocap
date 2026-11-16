@@ -1,0 +1,1102 @@
+diff --git a/src/dxtb/integral/__init__.py b/src/dxtb/integral/__init__.py
+index 347256c0d..eaffa7318 100644
+--- a/src/dxtb/integral/__init__.py
++++ b/src/dxtb/integral/__init__.py
+@@ -4,3 +4,4 @@
+ 
+ from . import mmd
+ from .mmd import overlap
++from .overlap import *
+diff --git a/src/dxtb/integral/mmd.py b/src/dxtb/integral/mmd.py
+index 7516935a2..80c027b02 100644
+--- a/src/dxtb/integral/mmd.py
++++ b/src/dxtb/integral/mmd.py
+@@ -291,9 +291,10 @@ def backward(
+     ),
+     torch.tensor(
+         [
+-            [1, 0, 0],  # px
++            # tblite order: x (+1), y (-1), z (0) in [-1, 0, 1] sorting
+             [0, 1, 0],  # py
+             [0, 0, 1],  # pz
++            [1, 0, 0],  # px
+         ]
+     ),
+     torch.tensor(
+diff --git a/src/dxtb/integral/overlap.py b/src/dxtb/integral/overlap.py
+new file mode 100644
+index 000000000..ab3f234e4
+--- /dev/null
++++ b/src/dxtb/integral/overlap.py
+@@ -0,0 +1,256 @@
++"""
++The GFNn-xTB overlap matrix.
++"""
++
++import torch
++
++from ..basis import Basis, IndexHelper
++from ..integral import mmd
++from ..param import Param, get_elem_angular
++from ..typing import Tensor, TensorLike
++from ..utils import batch, symmetrize, t2int
++
++
++class Overlap(TensorLike):
++    """
++    Overlap from atomic orbitals.
++    """
++
++    numbers: Tensor
++    """Atomic numbers of the atoms in the system."""
++
++    unique: Tensor
++    """Unique species of the system."""
++
++    par: Param
++    """Representation of parametrization of xtb model."""
++
++    ihelp: IndexHelper
++    """Helper class for indexing."""
++
++    def __init__(
++        self,
++        numbers: Tensor,
++        par: Param,
++        ihelp: IndexHelper,
++        device: torch.device | None = None,
++        dtype: torch.dtype | None = None,
++    ):
++        super().__init__(device, dtype)
++        self.numbers = numbers
++        self.unique = torch.unique(numbers)
++        self.par = par
++        self.ihelp = ihelp
++
++    def build(self, positions: Tensor) -> Tensor:
++        """Overlap calculation of unique shells pairs.
++
++        Returns
++        -------
++        Tensor
++            Overlap matrix.
++        """
++
++        def get_overlap(bas: Basis, positions: Tensor, ihelp: IndexHelper) -> Tensor:
++            """Overlap calculation for a single molecule.
++
++            Parameters
++            ----------
++            numbers : Tensor
++                Unique atomic numbers of whole batch.
++            positions : Tensor
++                Positions of single molecule.
++
++            Returns
++            -------
++            Tensor
++                Overlap matrix for single molecule.
++            """
++
++            umap, n_unique_pairs = bas.unique_shell_pairs(ihelp)
++            alphas, coeffs = bas.create_cgtos()
++
++            # spread stuff to orbitals for indexing
++            alpha = batch.index(
++                batch.index(batch.pack(alphas), ihelp.shells_to_ushell),
++                ihelp.orbitals_to_shell,
++            )
++            coeff = batch.index(
++                batch.index(batch.pack(coeffs), ihelp.shells_to_ushell),
++                ihelp.orbitals_to_shell,
++            )
++            positions = batch.index(
++                batch.index(positions, ihelp.shells_to_atom),
++                ihelp.orbitals_to_shell,
++            )
++            ang = ihelp.spread_shell_to_orbital(ihelp.angular)
++
++            # overlap calculation
++            ovlp = torch.zeros(*umap.shape, dtype=self.dtype, device=self.device)
++            for uval in range(n_unique_pairs):
++                pairs = self.get_pairs(umap, uval)
++                first_pair = pairs[0]
++
++                angi, angj = ang[first_pair]
++                norbi = 2 * t2int(angi) + 1
++                norbj = 2 * t2int(angj) + 1
++
++                # collect [0, 0] entry of each subblock
++                upairs = self.get_subblock_start(umap, uval, norbi, norbj)
++
++                # we only require one pair as all have the same basis function
++                alpha_tuple = (
++                    batch.deflate(alpha[first_pair][0]),
++                    batch.deflate(alpha[first_pair][1]),
++                )
++                coeff_tuple = (
++                    batch.deflate(coeff[first_pair][0]),
++                    batch.deflate(coeff[first_pair][1]),
++                )
++                ang_tuple = (angi, angj)
++
++                vec = positions[upairs][:, 0, :] - positions[upairs][:, 1, :]
++                stmp = mmd.overlap(ang_tuple, alpha_tuple, coeff_tuple, -vec)
++
++                # write overlap of unique pair to correct position in full overlap matrix
++                for r, pair in enumerate(upairs):
++                    ovlp[
++                        pair[0] : pair[0] + norbi,
++                        pair[1] : pair[1] + norbj,
++                    ] = stmp[r]
++
++            return ovlp.fill_diagonal_(1.0)
++
++        if self.numbers.ndim > 1:
++            o = []
++            for _batch in range(self.numbers.shape[0]):
++                # unfortunately, we need a new IndexHelper for each batch,
++                # but this is much faster than `get_overlap`
++                nums = batch.deflate(self.numbers[_batch])
++                ihelp = IndexHelper.from_numbers(
++                    nums, get_elem_angular(self.par.element)
++                )
++
++                bas = Basis(
++                    torch.unique(nums),
++                    self.par,
++                    ihelp.unique_angular,
++                    dtype=self.dtype,
++                    device=self.device,
++                )
++
++                o.append(get_overlap(bas, positions[_batch], ihelp))
++
++            overlap = batch.pack(o)
++        else:
++            bas = Basis(
++                self.unique,
++                self.par,
++                self.ihelp.unique_angular,
++                dtype=self.dtype,
++                device=self.device,
++            )
++            overlap = get_overlap(bas, positions, self.ihelp)
++
++        # force symmetry to avoid problems through numerical errors
++        return symmetrize(overlap)
++
++    def get_pairs(self, x: Tensor, i: int) -> Tensor:
++        """Get indices of all unqiue shells pairs with index value `i`.
++
++        Parameters
++        ----------
++        x : Tensor
++            Matrix of unique shell pairs.
++        i : int
++            Value representing all unique shells in the matrix.
++
++        Returns
++        -------
++        Tensor
++            Indices of all unique shells pairs with index value `i` in the matrix.
++        """
++
++        return (x == i).nonzero(as_tuple=False)
++
++    def get_subblock_start(
++        self, umap: Tensor, i: int, norbi: int, norbj: int
++    ) -> Tensor:
++        """
++        Filter out the top-left index of each subblock of unique shell pairs. This makes use of the fact that the pairs are sorted along
++        the rows.
++
++        Example: A "s" and "p" orbital would give the following 4x4 matrix
++        of unique shell pairs:
++        1 2 2 2
++        3 4 4 4
++        3 4 4 4
++        3 4 4 4
++        As the overlap routine gives back tensors of the shape `(norbi, norbj)`,
++        i.e. 1x1, 1x3, 3x1 and 3x3 here, we require only the following four
++        indices from the matrix of unique shell pairs: [0, 0] (1x1), [1, 0]
++        (3x1), [0, 1] (1x3) and [1, 1] (3x3).
++
++
++        Parameters
++        ----------
++        pairs : Tensor
++            Indices of all unique shell pairs of one type (n, 2).
++        norbi : int
++            Number of orbitals per shell.
++        norbj : int
++            Number of orbitals per shell.
++
++        Returns
++        -------
++        Tensor
++            Top-left (i.e. [0, 0]) index of each subblock.
++        """
++
++        # no need to filter out a 1x1 block
++        if norbi == 1 and norbj == 1:
++            return self.get_pairs(umap, i)
++
++        # sorting along rows allows only selecting every `norbj`th pair
++        if norbi == 1:
++            pairs = self.get_pairs(umap, i)
++            return pairs[::norbj]
++
++        if norbj == 1:
++            pairs = self.get_pairs(umap.mT, i)
++
++            # do the same for the transposed pairs, but switch columns
++            return torch.index_select(pairs[::norbi], 1, torch.tensor([1, 0]))
++
++        # more intricate because we can have variation in two dimensions
++        pairs = self.get_pairs(umap, i)
++
++        # remove every `norbj`th pair as before; only second dim is tricky
++        pairs = pairs[::norbj]
++
++        start = 0
++        rest = pairs
++
++        # init with dummy
++        final = torch.tensor([[-1, -1]])
++
++        while True:
++            # get number of blocks in a row by counting the number of
++            # same indices in the first dimension
++            nb = (pairs[:, 0] == pairs[start, 0]).nonzero().flatten().size(0)
++
++            # we need to skip the amount of rows in the block
++            skip = nb * norbi
++
++            # split for the blocks in each row because there can be different numbers of blocks in a row
++            target, rest = torch.split(rest, [skip, rest.size(-2) - skip])
++
++            # select only the top left index of each block
++            final = torch.cat((final, target[:nb]), 0)
++
++            start += skip
++            if start >= pairs.size(-2):
++                break
++
++        # remove dummy
++        return final[1:]
+diff --git a/src/dxtb/scf/iterator.py b/src/dxtb/scf/iterator.py
+index 3d2d05775..e195d9b8a 100644
+--- a/src/dxtb/scf/iterator.py
++++ b/src/dxtb/scf/iterator.py
+@@ -526,7 +526,8 @@ def hamiltonian_to_density(self, hamiltonian: Tensor):
+             _nel = self._data.occupation.sum(-1)
+             if torch.any(torch.abs(nel - _nel.round(decimals=3)) > 1e-4):
+                 raise RuntimeError(
+-                    f"Number of electrons changed during Fermi smearing ({nel} -> {_nel})."
++                    f"Number of electrons changed during Fermi smearing "
++                    f"({nel} -> {_nel})."
+                 )
+ 
+         return torch.einsum(
+diff --git a/src/dxtb/utils/misc.py b/src/dxtb/utils/misc.py
+index ebcc57720..0b0803707 100644
+--- a/src/dxtb/utils/misc.py
++++ b/src/dxtb/utils/misc.py
+@@ -47,3 +47,31 @@ def is_int_list(x: list[Any]) -> TypeGuard[list[int]]:
+ 
+ def symbol2number(sym_list: list[str]) -> Tensor:
+     return torch.flatten(torch.tensor([ATOMIC_NUMBER[s.title()] for s in sym_list]))
++
++
++def symmetrize(x: Tensor) -> Tensor:
++    """
++    Symmetrize a tensor after checking if it is symmetric within a threshold.
++
++    Parameters
++    ----------
++    x : Tensor
++        Tensor to check and symmetrize.
++
++    Returns
++    -------
++    Tensor
++        Symmetrized tensor.
++
++    Raises
++    ------
++    RuntimeError
++        If the tensor is not symmetric within the threshold.
++    """
++    atol = torch.finfo(x.dtype).eps * 10
++    if not torch.allclose(x, x.mT, atol=atol):
++        raise RuntimeError(
++            f"Matrix appears to be not symmetric (atol={atol}, dtype={x.dtype})."
++        )
++
++    return (x + x.mT) / 2
+diff --git a/src/dxtb/xtb/calculator.py b/src/dxtb/xtb/calculator.py
+index c9b9f586b..1c78f71e8 100644
+--- a/src/dxtb/xtb/calculator.py
++++ b/src/dxtb/xtb/calculator.py
+@@ -13,6 +13,7 @@
+ from ..coulomb import new_es2, new_es3
+ from ..data import cov_rad_d3
+ from ..dispersion import Dispersion, new_dispersion
++from ..integral import Overlap
+ from ..interaction import Interaction, InteractionList
+ from ..ncoord import exp_count, get_coordination_number
+ from ..param import Param, get_elem_angular
+@@ -211,6 +212,7 @@ def __init__(
+ 
+         self.ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+         self.hamiltonian = Hamiltonian(numbers, par, self.ihelp, **dd)
++        self.overlap = Overlap(numbers, par, self.ihelp, **dd)
+ 
+         # setup self-consistent contributions
+         es2 = new_es2(numbers, par, **dd) if "es2" not in self.opts["exclude"] else None
+@@ -288,7 +290,7 @@ def singlepoint(
+         if "scf" not in self.opts["exclude"]:
+             # overlap
+             timer.start("overlap")
+-            overlap = self.hamiltonian.overlap(positions)
++            overlap = self.overlap.build(positions)
+             result.overlap = overlap
+             timer.stop("overlap")
+ 
+diff --git a/src/dxtb/xtb/h0.py b/src/dxtb/xtb/h0.py
+index 5d8fa1f72..717997a70 100644
+--- a/src/dxtb/xtb/h0.py
++++ b/src/dxtb/xtb/h0.py
+@@ -4,19 +4,12 @@
+ 
+ import torch
+ 
+-from ..basis import Basis, IndexHelper
++from ..basis import IndexHelper
+ from ..constants import EV2AU
+ from ..data import atomic_rad
+-from ..integral import mmd
+-from ..param import (
+-    Param,
+-    get_elem_angular,
+-    get_elem_param,
+-    get_elem_valence,
+-    get_pair_param,
+-)
++from ..param import Param, get_elem_param, get_elem_valence, get_pair_param
+ from ..typing import Tensor, TensorLike
+-from ..utils import batch, t2int
++from ..utils import symmetrize
+ 
+ PAD = -1
+ """Value used for padding of tensors."""
+@@ -368,147 +361,7 @@ def build(
+         hcore = h * overlap
+ 
+         # force symmetry to avoid problems through numerical errors
+-        return self._symmetrize(hcore)
+-
+-    def overlap(self, positions: Tensor) -> Tensor:
+-        """Overlap calculation of unique shells pairs.
+-
+-        Returns
+-        -------
+-        Tensor
+-            Overlap matrix
+-        """
+-
+-        def get_overlap(bas: Basis, positions: Tensor, ihelp: IndexHelper) -> Tensor:
+-            """Overlap calculation for a single molecule.
+-
+-            Parameters
+-            ----------
+-            numbers : Tensor
+-                Unique atomic numbers of whole batch.
+-            positions : Tensor
+-                Positions of single molecule.
+-
+-            Returns
+-            -------
+-            Tensor
+-                Overlap matrix for single molecule.
+-            """
+-
+-            umap, n_unique_pairs = bas.unique_shell_pairs(ihelp)
+-            alphas, coeffs = bas.create_cgtos()
+-
+-            # spread stuff to orbitals for indexing
+-            alpha = batch.index(
+-                batch.index(batch.pack(alphas), ihelp.shells_to_ushell),
+-                ihelp.orbitals_to_shell,
+-            )
+-            coeff = batch.index(
+-                batch.index(batch.pack(coeffs), ihelp.shells_to_ushell),
+-                ihelp.orbitals_to_shell,
+-            )
+-            positions = batch.index(
+-                batch.index(positions, ihelp.shells_to_atom),
+-                ihelp.orbitals_to_shell,
+-            )
+-            ang = ihelp.spread_shell_to_orbital(ihelp.angular)
+-
+-            # overlap calculation
+-            ovlp = torch.zeros(*umap.shape, dtype=self.dtype, device=self.device)
+-            for uval in range(n_unique_pairs):
+-                pairs = get_pairs(umap, uval)
+-                first_pair = pairs[0]
+-
+-                angi, angj = ang[first_pair]
+-                norbi = 2 * t2int(angi) + 1
+-                norbj = 2 * t2int(angj) + 1
+-
+-                # collect [0, 0] entry of each subblock
+-                upairs = get_subblock_start(umap, uval, norbi, norbj)
+-
+-                # we only require one pair as all have the same basis function
+-                alpha_tuple = (
+-                    batch.deflate(alpha[first_pair][0]),
+-                    batch.deflate(alpha[first_pair][1]),
+-                )
+-                coeff_tuple = (
+-                    batch.deflate(coeff[first_pair][0]),
+-                    batch.deflate(coeff[first_pair][1]),
+-                )
+-                ang_tuple = (angi, angj)
+-
+-                vec = positions[upairs][:, 0, :] - positions[upairs][:, 1, :]
+-                stmp = mmd.overlap(ang_tuple, alpha_tuple, coeff_tuple, -vec)
+-
+-                # write overlap of unique pair to correct position in full overlap matrix
+-                for r, pair in enumerate(upairs):
+-                    ovlp[
+-                        pair[0] : pair[0] + norbi,
+-                        pair[1] : pair[1] + norbj,
+-                    ] = stmp[r]
+-
+-            return ovlp
+-
+-        if self.numbers.ndim > 1:
+-            o = []
+-            for _batch in range(self.numbers.shape[0]):
+-                # unfortunately, we need a new IndexHelper for each batch,
+-                # but this is much faster than `get_overlap`
+-                nums = batch.deflate(self.numbers[_batch])
+-                ihelp = IndexHelper.from_numbers(
+-                    nums, get_elem_angular(self.par.element)
+-                )
+-
+-                bas = Basis(
+-                    torch.unique(nums),
+-                    self.par,
+-                    ihelp.unique_angular,
+-                    dtype=self.dtype,
+-                    device=self.device,
+-                )
+-
+-                o.append(get_overlap(bas, positions[_batch], ihelp))
+-
+-            overlap = batch.pack(o)
+-        else:
+-            bas = Basis(
+-                self.unique,
+-                self.par,
+-                self.ihelp.unique_angular,
+-                dtype=self.dtype,
+-                device=self.device,
+-            )
+-            overlap = get_overlap(bas, positions, self.ihelp)
+-
+-        # force symmetry to avoid problems through numerical errors
+-        return self._symmetrize(overlap)
+-
+-    def _symmetrize(self, x: Tensor) -> Tensor:
+-        """
+-        Symmetrize a tensor after checking if it is symmetric within a threshold.
+-
+-        Parameters
+-        ----------
+-        x : Tensor
+-            Tensor to check and symmetrize.
+-
+-        Returns
+-        -------
+-        Tensor
+-            Symmetrized tensor.
+-
+-        Raises
+-        ------
+-        RuntimeError
+-            If the tensor is not symmetric within the threshold.
+-        """
+-        atol = torch.finfo(self.dtype).eps * 10
+-        if not torch.allclose(x, x.mT, atol=atol):
+-            raise RuntimeError(
+-                f"Matrix appears to be not symmetric (atol={atol}, dtype={self.dtype})."
+-            )
+-
+-        return (x + x.mT) / 2
++        return symmetrize(hcore)
+ 
+     def to(self, device: torch.device) -> "Hamiltonian":
+         """
+@@ -572,106 +425,3 @@ def type(self, dtype: torch.dtype) -> "Hamiltonian":
+             self.ihelp.type(dtype=dtype),
+             dtype=dtype,
+         )
+-
+-
+-# helpers for overlap calculation
+-
+-
+-def get_pairs(x: Tensor, i: int) -> Tensor:
+-    """Get indices of all unqiue shells pairs with index value `i`.
+-
+-    Parameters
+-    ----------
+-    x : Tensor
+-        Matrix of unique shell pairs.
+-    i : int
+-        Value representing all unique shells in the matrix.
+-
+-    Returns
+-    -------
+-    Tensor
+-        Indices of all unique shells pairs with index value `i` in the matrix.
+-    """
+-
+-    return (x == i).nonzero(as_tuple=False)
+-
+-
+-def get_subblock_start(umap: Tensor, i: int, norbi: int, norbj: int) -> Tensor:
+-    """
+-    Filter out the top-left index of each subblock of unique shell pairs.
+-    This makes use of the fact that the pairs are sorted along the rows.
+-
+-    Example: A "s" and "p" orbital would give the following 4x4 matrix
+-    of unique shell pairs:
+-    1 2 2 2
+-    3 4 4 4
+-    3 4 4 4
+-    3 4 4 4
+-    As the overlap routine gives back tensors of the shape `(norbi, norbj)`,
+-    i.e. 1x1, 1x3, 3x1 and 3x3 here, we require only the following four
+-    indices from the matrix of unique shell pairs: [0, 0] (1x1), [1, 0]
+-    (3x1), [0, 1] (1x3) and [1, 1] (3x3).
+-
+-
+-    Parameters
+-    ----------
+-    pairs : Tensor
+-        Indices of all unique shell pairs of one type (n, 2).
+-    norbi : int
+-        Number of orbitals per shell.
+-    norbj : int
+-        Number of orbitals per shell.
+-
+-    Returns
+-    -------
+-    Tensor
+-        Top-left (i.e. [0, 0]) index of each subblock.
+-    """
+-
+-    # no need to filter out a 1x1 block
+-    if norbi == 1 and norbj == 1:
+-        return get_pairs(umap, i)
+-
+-    # sorting along rows allows only selecting every `norbj`th pair
+-    if norbi == 1:
+-        pairs = get_pairs(umap, i)
+-        return pairs[::norbj]
+-
+-    if norbj == 1:
+-        pairs = get_pairs(umap.mT, i)
+-
+-        # do the same for the transposed pairs, but switch columns
+-        return torch.index_select(pairs[::norbi], 1, umap.new_tensor([1, 0]))
+-
+-    # more intricate because we can have variation in two dimensions
+-    pairs = get_pairs(umap, i)
+-
+-    # remove every `norbj`th pair as before; only second dim is tricky
+-    pairs = pairs[::norbj]
+-
+-    start = 0
+-    rest = pairs
+-
+-    # init with dummy
+-    final = umap.new_tensor([[-1, -1]])
+-
+-    while True:
+-        # get number of blocks in a row by counting the number of
+-        # same indices in the first dimension
+-        nb = (pairs[:, 0] == pairs[start, 0]).nonzero().flatten().size(0)
+-
+-        # we need to skip the amount of rows in the block
+-        skip = nb * norbi
+-
+-        # split for the blocks in each row because there can be different numbers of blocks in a row
+-        target, rest = torch.split(rest, [skip, rest.size(-2) - skip])
+-
+-        # select only the top left index of each block
+-        final = torch.cat((final, target[:nb]), 0)
+-
+-        start += skip
+-        if start >= pairs.size(-2):
+-            break
+-
+-    # remove dummy
+-    return final[1:]
+diff --git a/test/test_hamiltonian/h0.npz b/test/test_hamiltonian/h0.npz
+index 236545ede..f6995ff6a 100644
+Binary files a/test/test_hamiltonian/h0.npz and b/test/test_hamiltonian/h0.npz differ
+diff --git a/test/test_hamiltonian/test_h0.py b/test/test_hamiltonian/test_h0.py
+index 2afb4ed3c..1d4c31857 100644
+--- a/test/test_hamiltonian/test_h0.py
++++ b/test/test_hamiltonian/test_h0.py
+@@ -1,5 +1,6 @@
+ """
+ Run tests for building the Hamiltonian matrix.
++References calculated with tblite 0.3.0.
+ """
+ 
+ from math import sqrt
+@@ -9,18 +10,18 @@
+ import torch
+ 
+ from dxtb.basis import IndexHelper
++from dxtb.integral import Overlap
+ from dxtb.ncoord import exp_count, get_coordination_number
+ from dxtb.param import GFN1_XTB as par
+ from dxtb.param import get_elem_angular
+ from dxtb.utils import batch
+ from dxtb.xtb import Hamiltonian
+ 
+-from ..utils import combinations as combis
+ from ..utils import load_from_npz
+ from .samples import samples
+ 
+-small = ["C", "Rn", "H2", "H2_nocn", "LiH", "HLi", "S2", "SiH4", "SiH4_nocn"]
+-large = ["PbH4-BiH3"]  # , "MB16_43_01"]  # , "LYS_xao"]
++small = ["C", "Rn", "H2", "LiH", "HLi", "S2", "SiH4"]
++large = ["PbH4-BiH3", "LYS_xao"]
+ 
+ ref_h0 = np.load("test/test_hamiltonian/h0.npz")
+ 
+@@ -28,16 +29,6 @@
+ @pytest.mark.parametrize("dtype", [torch.float, torch.double])
+ @pytest.mark.parametrize("name", small)
+ def test_single(dtype: torch.dtype, name: str) -> None:
+-    """
+-    Compare against reference calculated with tblite-int:
+-    - H2: fpm run -- H H 0,0,1.4050586229538 --bohr --hamiltonian --method gfn1 --cn 0.91396028097949444,0.91396028097949444
+-    - H2_nocn: fpm run -- H H 0,0,1.4050586229538 --bohr --hamiltonian --method gfn1
+-    - LiH: fpm run -- Li H 0,0,3.0159348779447 --bohr --hamiltonian --method gfn1 --cn 0.98684772035550494,0.98684772035550494
+-    - HLi: fpm run -- H Li 0,0,3.0159348779447 --bohr --hamiltonian --method gfn1 --cn 0.98684772035550494,0.98684772035550494
+-    - S2: fpm run -- S S 0,0,3.60562542949258 --bohr --hamiltonian --method gfn1 --cn 0.99889747382180494,0.99889747382180494
+-    - SiH4: tblite with "use dftd3_ncoord, only: get_coordination_number"
+-    - SiH4_nocn: tblite
+-    """
+     dd = {"dtype": dtype}
+     tol = sqrt(torch.finfo(dtype).eps) * 10
+ 
+@@ -46,20 +37,17 @@ def test_single(dtype: torch.dtype, name: str) -> None:
+     positions = sample["positions"].type(dtype)
+     ref = load_from_npz(ref_h0, name, dtype)
+ 
+-    if "nocn" in name:
+-        cn = None
+-    else:
+-        cn = get_coordination_number(numbers, positions, exp_count)
+-
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+     h0 = Hamiltonian(numbers, par, ihelp, **dd)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
++    assert pytest.approx(s, abs=tol) == s.mT
+ 
+-    h = h0.build(positions, o, cn=cn)
+-    assert torch.allclose(h, h.mT, atol=tol)
+-    assert torch.allclose(h, ref, atol=tol)
++    cn = get_coordination_number(numbers, positions, exp_count)
++    h = h0.build(positions, s, cn=cn)
++    assert pytest.approx(h, abs=tol) == h.mT
++    assert pytest.approx(h, abs=tol) == ref
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float, torch.double])
+@@ -91,16 +79,17 @@ def test_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+         ),
+     )
+ 
+-    cn = get_coordination_number(numbers, positions, exp_count)
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+     h0 = Hamiltonian(numbers, par, ihelp, **dd)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
++    assert pytest.approx(s, abs=tol) == s.mT
+ 
+-    h = h0.build(positions, o, cn=cn)
+-    assert torch.allclose(h, h.mT, atol=tol)
+-    assert torch.allclose(h, ref, atol=tol, rtol=tol)
++    cn = get_coordination_number(numbers, positions, exp_count)
++    h = h0.build(positions, s, cn=cn)
++    assert pytest.approx(h, abs=tol) == h.mT
++    assert pytest.approx(h, abs=tol) == ref
+ 
+ 
+ @pytest.mark.large
+@@ -116,16 +105,17 @@ def test_large(dtype: torch.dtype, name: str) -> None:
+     positions = sample["positions"].type(dtype)
+     ref = load_from_npz(ref_h0, name, dtype)
+ 
+-    cn = get_coordination_number(numbers, positions, exp_count)
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+     h0 = Hamiltonian(numbers, par, ihelp, **dd)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
++    assert pytest.approx(s, abs=tol) == s.mT
+ 
+-    h = h0.build(positions, o, cn=cn)
+-    assert torch.allclose(h, h.mT, atol=tol)
+-    assert torch.allclose(combis(h), combis(ref), atol=tol)
++    cn = get_coordination_number(numbers, positions, exp_count)
++    h = h0.build(positions, s, cn=cn)
++    assert pytest.approx(h, abs=tol) == h.mT
++    assert pytest.approx(h, abs=tol) == ref
+ 
+ 
+ @pytest.mark.large
+@@ -158,15 +148,14 @@ def test_large_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+         )
+     )
+ 
+-    cn = get_coordination_number(numbers, positions, exp_count)
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+     h0 = Hamiltonian(numbers, par, ihelp, **dd)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
++    assert pytest.approx(s, abs=tol) == s.mT
+ 
+-    h = h0.build(positions, o, cn)
+-    assert torch.allclose(h, h.mT, atol=tol)
+-
+-    for _batch in range(numbers.shape[0]):
+-        assert torch.allclose(combis(h[_batch]), combis(ref[_batch]), atol=tol)
++    cn = get_coordination_number(numbers, positions, exp_count)
++    h = h0.build(positions, s, cn=cn)
++    assert pytest.approx(h, abs=tol) == h.mT
++    assert pytest.approx(h, abs=tol) == ref
+diff --git a/test/test_overlap/overlap.npz b/test/test_overlap/overlap.npz
+index 75a8654a7..8fd0e1ad6 100644
+Binary files a/test/test_overlap/overlap.npz and b/test/test_overlap/overlap.npz differ
+diff --git a/test/test_overlap/test_cgto_ortho_data.py b/test/test_overlap/test_cgto_ortho_data.py
+index a0f972688..0bf48ab5a 100644
+--- a/test/test_overlap/test_cgto_ortho_data.py
++++ b/test/test_overlap/test_cgto_ortho_data.py
+@@ -4,7 +4,7 @@
+ 
+ ref_data = {
+     "0-0": torch.tensor([[0.5781]]),
+-    "0-1": torch.tensor([[0.0000], [0.0000], [-0.5193]]),
++    "0-1": torch.tensor([[0.0000], [-0.5193], [0.0000]]),
+     "0-2": torch.tensor(
+         [[3.6897e-01], [0.0000e00], [0.0000e00], [2.9109e-09], [0.0000e00]]
+     ),
+@@ -32,9 +32,9 @@
+             [0.0000e00],
+         ],
+     ),
+-    "1-0": torch.tensor([[0.0000, 0.0000, 0.2900]]),
++    "1-0": torch.tensor([[0.0000, 0.2900, 0.0000]]),
+     "1-1": torch.tensor(
+-        [[0.8354, 0.0000, 0.0000], [0.0000, 0.8354, 0.0000], [0.0000, 0.0000, 0.4773]],
++        [[0.8354, 0.0000, 0.0000], [0.0000, 0.4773, 0.0000], [0.0000, 0.0000, 0.8354]],
+     ),
+     "1-2": torch.tensor(
+         [
+diff --git a/test/test_overlap/test_overlap_atoms.py b/test/test_overlap/test_overlap_atoms.py
+index dd179f5f3..b63dd765c 100644
+--- a/test/test_overlap/test_overlap_atoms.py
++++ b/test/test_overlap/test_overlap_atoms.py
+@@ -1,4 +1,7 @@
+-"""Run tests for overlap."""
++"""
++Run tests for overlap of atoms.
++References calculated with tblite 0.3.0.
++"""
+ 
+ from math import sqrt
+ 
+@@ -7,10 +10,10 @@
+ import torch
+ 
+ from dxtb.basis import IndexHelper
++from dxtb.integral import Overlap
+ from dxtb.param import GFN1_XTB as par
+ from dxtb.param import get_elem_angular
+ from dxtb.utils import batch
+-from dxtb.xtb import Hamiltonian
+ 
+ from ..utils import load_from_npz
+ from .samples import samples
+@@ -23,7 +26,7 @@
+ def test_overlap_single(dtype: torch.dtype, name: str):
+     """Overlap matrix for monoatomic molecule should be unity."""
+     dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 100
++    tol = 1e-05
+ 
+     sample = samples[name]
+     numbers = sample["numbers"]
+@@ -31,10 +34,10 @@ def test_overlap_single(dtype: torch.dtype, name: str):
+     ref = load_from_npz(ref_overlap, name, dtype)
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    hamiltonian = Hamiltonian(numbers, par, ihelp, **dd)
+-    overlap = hamiltonian.overlap(positions)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
+ 
+-    assert torch.allclose(overlap, ref, rtol=tol, atol=tol, equal_nan=False)
++    assert pytest.approx(s, rel=tol, abs=tol) == ref
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float])
+@@ -67,8 +70,8 @@ def test_overlap_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+     )
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    h0 = Hamiltonian(numbers, par, ihelp, **dd)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
+-    assert torch.allclose(o, ref, atol=tol)
++    assert pytest.approx(s, abs=tol) == s.mT
++    assert pytest.approx(s, abs=tol) == ref
+diff --git a/test/test_overlap/test_overlap_molecules.py b/test/test_overlap/test_overlap_molecules.py
+index 62c47b212..3a1608e68 100644
+--- a/test/test_overlap/test_overlap_molecules.py
++++ b/test/test_overlap/test_overlap_molecules.py
+@@ -1,4 +1,7 @@
+-"""Run tests for overlap."""
++"""
++Run tests for overlap of molecules.
++References calculated with tblite 0.3.0.
++"""
+ 
+ from math import sqrt
+ 
+@@ -7,12 +10,11 @@
+ import torch
+ 
+ from dxtb.basis import IndexHelper
++from dxtb.integral import Overlap
+ from dxtb.param import GFN1_XTB as par
+ from dxtb.param import get_elem_angular
+ from dxtb.utils import batch
+-from dxtb.xtb import Hamiltonian
+ 
+-from ..utils import combinations as combis
+ from ..utils import load_from_npz
+ from .samples import samples
+ 
+@@ -23,7 +25,7 @@
+ 
+ @pytest.mark.parametrize("dtype", [torch.float, torch.double])
+ @pytest.mark.parametrize("name", molecules)
+-def test_overlap_single(dtype: torch.dtype, name: str) -> None:
++def test_single(dtype: torch.dtype, name: str) -> None:
+     dd = {"dtype": dtype}
+     tol = sqrt(torch.finfo(dtype).eps) * 10
+ 
+@@ -33,17 +35,17 @@ def test_overlap_single(dtype: torch.dtype, name: str) -> None:
+     ref = load_from_npz(ref_overlap, name, dtype)
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    h0 = Hamiltonian(numbers, par, ihelp, **dd)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
+-    assert torch.allclose(combis(o), combis(ref), atol=tol)
++    assert pytest.approx(s, abs=tol) == s.mT
++    assert pytest.approx(s, abs=tol) == ref
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float])
+ @pytest.mark.parametrize("name1", molecules)
+ @pytest.mark.parametrize("name2", molecules)
+-def test_overlap_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++def test_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+     """Batched version."""
+     dd = {"dtype": dtype}
+     tol = sqrt(torch.finfo(dtype).eps) * 10
+@@ -70,10 +72,8 @@ def test_overlap_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+     )
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    h0 = Hamiltonian(numbers, par, ihelp, **dd)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
+-
+-    for _batch in range(numbers.shape[0]):
+-        assert torch.allclose(combis(o[_batch]), combis(ref[_batch]), atol=tol)
++    assert pytest.approx(s, abs=tol) == s.mT
++    assert pytest.approx(s, abs=tol) == ref
+diff --git a/test/test_overlap/test_overlap_pairs.py b/test/test_overlap/test_overlap_pairs.py
+index ff619728f..9fd25bcf3 100644
+--- a/test/test_overlap/test_overlap_pairs.py
++++ b/test/test_overlap/test_overlap_pairs.py
+@@ -1,17 +1,17 @@
+-"""Run tests for overlap."""
+-
+-from math import sqrt
++"""
++Run tests for overlap of diatomic systems.
++References calculated with tblite 0.3.0.
++"""
+ 
+ import numpy as np
+ import pytest
+ import torch
+ 
+ from dxtb.basis import Basis, IndexHelper, slater
+-from dxtb.integral import mmd
++from dxtb.integral import Overlap, mmd
+ from dxtb.param import GFN1_XTB as par
+ from dxtb.param import get_elem_angular
+ from dxtb.utils import IntegralTransformError, batch
+-from dxtb.xtb import Hamiltonian
+ 
+ from ..utils import load_from_npz
+ from .samples import samples
+@@ -22,14 +22,8 @@
+ @pytest.mark.parametrize("dtype", [torch.float, torch.double])
+ @pytest.mark.parametrize("name", ["HC", "HHe", "SCl"])
+ def test_single(dtype: torch.dtype, name: str):
+-    """
+-    Compare against reference calculated with tblite-int:
+-    - HC: fpm run -- H C 0,0,1.4 --bohr --method gfn1
+-    - HHe: fpm run -- H He 0,0,1.7 --bohr --method gfn1
+-    - SCl: fpm run -- S Cl 0,0,2.1 --bohr --method gfn1
+-    """
+     dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 100
++    tol = 1e-05
+ 
+     sample = samples[name]
+     numbers = sample["numbers"]
+@@ -37,10 +31,10 @@ def test_single(dtype: torch.dtype, name: str):
+     ref = load_from_npz(ref_overlap, name, dtype)
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    hamiltonian = Hamiltonian(numbers, par, ihelp, **dd)
+-    overlap = hamiltonian.overlap(positions)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
+ 
+-    assert torch.allclose(overlap, ref, rtol=tol, atol=tol, equal_nan=False)
++    assert pytest.approx(s, rel=tol, abs=tol) == ref
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float])
+@@ -49,7 +43,7 @@ def test_single(dtype: torch.dtype, name: str):
+ def test_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+     """Batched version."""
+     dd = {"dtype": dtype}
+-    tol = sqrt(torch.finfo(dtype).eps) * 10
++    tol = 1e-05
+ 
+     sample1, sample2 = samples[name1], samples[name2]
+ 
+@@ -73,11 +67,11 @@ def test_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+     )
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+-    h0 = Hamiltonian(numbers, par, ihelp, **dd)
++    overlap = Overlap(numbers, par, ihelp, **dd)
++    s = overlap.build(positions)
+ 
+-    o = h0.overlap(positions)
+-    assert torch.allclose(o, o.mT, atol=tol)
+-    assert torch.allclose(o, ref, atol=tol)
++    assert pytest.approx(s, abs=tol) == s.mT
++    assert pytest.approx(s, abs=tol) == ref
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float, torch.double])
+@@ -111,13 +105,7 @@ def test_overlap_higher_orbitals(dtype: torch.dtype):
+                 vec,
+             )
+ 
+-            assert torch.allclose(
+-                overlap,
+-                ref,
+-                rtol=1e-05,
+-                atol=1e-03,
+-                equal_nan=False,
+-            )
++            assert pytest.approx(overlap, rel=1e-05, abs=1e-03) == ref
+ 
+ 
+ def test_overlap_higher_orbital_fail():
+@@ -174,5 +162,5 @@ def test_sto_ng_batch(ng: int, dtype: torch.dtype):
+ 
+     s = mmd.overlap((l, l), (alpha, alpha), (coeff, coeff), vec)
+ 
+-    assert torch.allclose(s[0, :], s[1, :])
+-    assert torch.allclose(s[0, :], s[2, :])
++    assert pytest.approx(s[0, :]) == s[1, :]
++    assert pytest.approx(s[0, :]) == s[2, :]
+diff --git a/test/utils.py b/test/utils.py
+index d6ff07d66..04017dfcc 100644
+--- a/test/utils.py
++++ b/test/utils.py
+@@ -7,28 +7,6 @@
+ from dxtb.typing import Any, Tensor
+ 
+ 
+-def combinations(x: Tensor, r: int = 2) -> Tensor:
+-    """
+-    Generate all combinations of matrix elements.
+-
+-    This is required for the comparision of overlap and Hmailtonian for
+-    larger systems because these matrices do not coincide with tblite.
+-    This is possibly due to switched indices, which were introduced in
+-    the initial Fortran-to-Python port.
+-
+-    Parameters
+-    ----------
+-    x : Tensor
+-        Matrix to generate combinations from.
+-
+-    Returns
+-    -------
+-    Tensor
+-        Matrix of combinations (n, 2).
+-    """
+-    return torch.combinations(torch.sort(x.flatten())[0], r)
+-
+-
+ def load_from_npz(npzfile: Any, name: str, dtype: torch.dtype) -> Tensor:
+     """Get torch tensor from npz file
+ 

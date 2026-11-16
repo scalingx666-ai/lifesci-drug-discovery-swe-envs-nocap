@@ -1,0 +1,525 @@
+diff --git a/extensions/rust-wasm/bench-bonds.mjs b/extensions/rust-wasm/bench-bonds.mjs
+new file mode 100644
+index 000000000..6589d528e
+--- /dev/null
++++ b/extensions/rust-wasm/bench-bonds.mjs
+@@ -0,0 +1,79 @@
++#!/usr/bin/env node
++// Full-chain benchmark for the typed WASM bond-detection entry
++// (`detect_bonds_radii_typed`): wasm call + BondTable typed-array getters.
++// Mirrors extensions/rust/examples/bench_bonds.rs (27^3 = 19683 atoms,
++// Si/O/Pt zeolite-ish composition, PBC TTT and FFF).
++//
++//   node scripts/build-wasm.mjs          # or: pnpm --dir extensions/rust-wasm build
++//   node extensions/rust-wasm/bench-bonds.mjs
++import { readFile } from 'node:fs/promises'
++
++const N_SIDE = 27
++const SPACING = 2.4
++const A = N_SIDE * SPACING
++const N = N_SIDE * N_SIDE * N_SIDE
++
++function buildSynthetic() {
++  const positions = new Float32Array(N * 3)
++  const atomicNumbers = new Uint8Array(N)
++  let k = 0
++  for (let i = 0; i < N_SIDE; i++) {
++    for (let j = 0; j < N_SIDE; j++) {
++      for (let l = 0; l < N_SIDE; l++) {
++        // Si/O alternation + a few Pt — same recipe as bench_bonds.rs
++        const m = k % 13
++        atomicNumbers[k] = m <= 3 ? 14 : m === 12 ? 78 : 8
++        const jit = (v) => ((v + 0.5 + (0.13 * ((k * (v + 7)) % 7)) / 7) / N_SIDE) * A
++        positions[k * 3] = jit(i)
++        positions[k * 3 + 1] = jit(j)
++        positions[k * 3 + 2] = jit(l)
++        k += 1
++      }
++    }
++  }
++  return { positions, atomicNumbers }
++}
++
++function timeIt(iters, f) {
++  f() // warmup
++  f()
++  const times = []
++  for (let i = 0; i < iters; i++) {
++    const t0 = performance.now()
++    f()
++    times.push(performance.now() - t0)
++  }
++  times.sort((a, b) => a - b)
++  return { min: times[0], median: times[times.length >> 1] }
++}
++
++const pkg = await import('./pkg/ferrox.js')
++const bytes = await readFile(new URL('./pkg/ferrox_bg.wasm', import.meta.url))
++try {
++  await pkg.default({ module_or_path: bytes })
++} catch {
++  await pkg.default(bytes)
++}
++
++const { positions, atomicNumbers } = buildSynthetic()
++const lattice = new Float64Array([A, 0, 0, 0, A, 0, 0, 0, A])
++
++for (const [label, pbc] of [
++  ['pbc TTT', new Uint8Array([1, 1, 1])],
++  ['pbc FFF', new Uint8Array([0, 0, 0])],
++]) {
++  // Full chain: detect call + copying every typed array out of WASM memory.
++  let nBonds = 0
++  const fullChain = () => {
++    const table = pkg.detect_bonds_radii_typed(positions, atomicNumbers, lattice, pbc)
++    nBonds = table.count
++    const out = [table.pairs, table.images, table.lengths, table.strengths]
++    table.free()
++    return out
++  }
++  const t = timeIt(7, fullChain)
++  console.log(
++    `${label}: ${N} atoms -> ${nBonds} bonds | full chain min ${t.min.toFixed(1)}ms / ` +
++      `median ${t.median.toFixed(1)}ms (7 iters)`,
++  )
++}
+diff --git a/extensions/rust-wasm/package.json b/extensions/rust-wasm/package.json
+index 5bd07d8ab..d4380cc11 100644
+--- a/extensions/rust-wasm/package.json
++++ b/extensions/rust-wasm/package.json
+@@ -20,6 +20,7 @@
+     "pkg"
+   ],
+   "scripts": {
+-    "build": "cd ../rust && wasm-pack build --target web --out-dir ../rust-wasm/pkg --features wasm --no-default-features"
++    "build": "cd ../rust && wasm-pack build --target web --out-dir ../rust-wasm/pkg --features wasm --no-default-features",
++    "bench": "node bench-bonds.mjs"
+   }
+ }
+diff --git a/extensions/rust/.cargo/config.toml b/extensions/rust/.cargo/config.toml
+new file mode 100644
+index 000000000..23ccd3a60
+--- /dev/null
++++ b/extensions/rust/.cargo/config.toml
+@@ -0,0 +1,12 @@
++# WASM SIMD128 is on by default for ferrox wasm builds. Every engine shipped
++# since 2023 supports it (Chrome 91+, Firefox 89+, Safari 16.4+/WebKit,
++# Node 16+), and the bond-detection hot loop has an explicit f64x2 path gated
++# on cfg(target_feature = "simd128") (see neighbors.rs::scan_bin_hits) plus a
++# scalar fallback that keeps no-SIMD builds correct.
++#
++# Escape hatch (ancient WebKitGTK etc.): a set RUSTFLAGS env var overrides
++# this table entirely, so `RUSTFLAGS="" wasm-pack build ...` — or
++# `node scripts/build-wasm.mjs --no-simd` — produces a scalar-only module.
++# Native (non-wasm) builds are unaffected.
++[target.wasm32-unknown-unknown]
++rustflags = ["-C", "target-feature=+simd128"]
+diff --git a/extensions/rust/examples/bench_bonds.rs b/extensions/rust/examples/bench_bonds.rs
+index 99baace90..a8b537352 100644
+--- a/extensions/rust/examples/bench_bonds.rs
++++ b/extensions/rust/examples/bench_bonds.rs
+@@ -40,17 +40,33 @@ fn build_synthetic(n_side: usize, spacing: f64, pbc: [bool; 3]) -> Structure {
+     Structure::new(lattice, species, frac)
+ }
+ 
++/// Time `f` with one warmup + `iters` timed runs; returns (min, median) in seconds.
++fn time_it<T>(iters: usize, mut f: impl FnMut() -> T) -> (f64, f64) {
++    let _ = f(); // warmup
++    let mut times: Vec<f64> = (0..iters)
++        .map(|_| {
++            let t0 = Instant::now();
++            let out = f();
++            let dt = t0.elapsed().as_secs_f64();
++            std::hint::black_box(out);
++            dt
++        })
++        .collect();
++    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
++    (times[0], times[times.len() / 2])
++}
++
+ fn bench(label: &str, s: &Structure) {
+     let opts = AtomRadiiOptions::default();
+-    let t0 = Instant::now();
+     let bonds = detect_bonds_atom_radii(s, &opts);
+-    let dt = t0.elapsed();
++    let (min, med) = time_it(5, || detect_bonds_atom_radii(s, &opts));
+     println!(
+-        "{label}: {} atoms, pbc={:?} -> {} bonds in {:.1?}",
++        "{label}: {} atoms, pbc={:?} -> {} bonds | min {:.2}ms / median {:.2}ms (5 iters)",
+         s.num_sites(),
+         s.lattice.pbc,
+         bonds.len(),
+-        dt
++        min * 1e3,
++        med * 1e3,
+     );
+ }
+ 
+@@ -73,20 +89,21 @@ fn main() {
+     // frame; splits the per-call cost into boundary vs compute.
+     let json = ferrox::io::structure_to_pymatgen_json(&s_ppp);
+     println!("structure JSON size: {:.1} MB", json.len() as f64 / 1e6);
+-    let t0 = std::time::Instant::now();
++    let (p_min, p_med) = time_it(5, || ferrox::io::parse_structure_json(&json).expect("parse"));
+     let parsed = ferrox::io::parse_structure_json(&json).expect("parse");
+-    let t_parse = t0.elapsed();
+-    let t1 = std::time::Instant::now();
++    let (d_min, d_med) =
++        time_it(5, || detect_bonds_atom_radii(&parsed, &AtomRadiiOptions::default()));
+     let bonds = detect_bonds_atom_radii(&parsed, &AtomRadiiOptions::default());
+-    let t_detect = t1.elapsed();
+-    let t2 = std::time::Instant::now();
++    let (s_min, s_med) = time_it(5, || serde_json::to_string(&bonds).expect("serialize"));
+     let out = serde_json::to_string(&bonds).expect("serialize");
+-    let t_ser = t2.elapsed();
+     println!(
+-        "wasm-entry replica: parse {:.1?} + detect {:.1?} + serialize {:.1?} ({} bonds, out {:.2} MB)",
+-        t_parse,
+-        t_detect,
+-        t_ser,
++        "wasm-entry replica (min/median of 5): parse {:.2}/{:.2}ms + detect {:.2}/{:.2}ms + serialize {:.2}/{:.2}ms ({} bonds, out {:.2} MB)",
++        p_min * 1e3,
++        p_med * 1e3,
++        d_min * 1e3,
++        d_med * 1e3,
++        s_min * 1e3,
++        s_med * 1e3,
+         bonds.len(),
+         out.len() as f64 / 1e6
+     );
+diff --git a/extensions/rust/src/bonding.rs b/extensions/rust/src/bonding.rs
+index fde8fc0db..e1c40342f 100644
+--- a/extensions/rust/src/bonding.rs
++++ b/extensions/rust/src/bonding.rs
+@@ -169,8 +169,13 @@ pub fn detect_bonds_atom_radii(structure: &Structure, options: &AtomRadiiOptions
+         .map(|sp| ElementProps::from_element(sp.element))
+         .collect();
+ 
+-    // Use neighbor list for efficient spatial queries
+-    let cutoff = options.max_bond_dist;
++    // Use neighbor list for efficient spatial queries. The per-pair bond
++    // bound is (r1 + r2) * scale ≤ 2 * r_max * scale, so the search cutoff
++    // tightens below max_bond_dist without changing any result — at the
++    // default 5 Å max on a typical oxide/metal system this trims the
++    // candidate volume (and the distance evaluations) 3-4x.
++    let max_radius = props.iter().map(|p| p.covalent_radius).fold(0.0, f64::max);
++    let cutoff = options.max_bond_dist.min(2.0 * max_radius * options.scale);
+     let (center_indices, neighbor_indices, image_offsets, distances) =
+         structure.get_neighbor_list(cutoff, 1e-8, true);
+ 
+diff --git a/extensions/rust/src/neighbors.rs b/extensions/rust/src/neighbors.rs
+index 547959e20..1b0476d67 100644
+--- a/extensions/rust/src/neighbors.rs
++++ b/extensions/rust/src/neighbors.rs
+@@ -124,17 +124,30 @@ impl NeighborList {
+ /// - The stencil spans ceil(cutoff / bin_height) bins per axis, so a
+ ///   periodic axis thinner than the cutoff naturally yields multi-image
+ ///   neighbors (|image| ≥ 2) instead of forcing brute force.
++///
++/// Storage is CSR-style: atoms are bucketed per bin with a stable counting
++/// sort and their wrapped Cartesian coordinates are kept in bin-sorted SoA
++/// arrays (`xs`/`ys`/`zs`), so the inner distance loop streams contiguous
++/// memory — cache-friendly, bounds-check-free, and SIMD-vectorizable (see
++/// `scan_bin_hits` for the wasm simd128 f64x2 path).
+ struct CellList {
+-    /// Mapping from bin index to list of atom indices in that bin.
+-    bins: Vec<Vec<usize>>,
++    /// CSR bin offsets into `bin_atoms`/`xs`/`ys`/`zs`; length total_bins + 1.
++    bin_start: Vec<u32>,
++    /// Atom indices sorted by bin (ascending within each bin — the counting
++    /// sort is stable, matching the previous `Vec<Vec<usize>>` push order).
++    bin_atoms: Vec<u32>,
+     /// Number of bins along each axis [nx, ny, nz].
+     n_bins: [usize; 3],
+-    /// Per-atom 3D bin coordinates.
++    /// Per-atom 3D bin coordinates (original atom order).
+     atom_bins: Vec<[usize; 3]>,
+     /// Per-atom integer wrap shift on periodic axes (s = floor(frac)).
+     wrap_shifts: Vec<[i32; 3]>,
+-    /// Cartesian coordinates after wrapping periodic axes — the positions
+-    /// distances are evaluated against.
++    /// Wrapped Cartesian coordinates in bin-sorted slot order, SoA layout —
++    /// the positions distances are evaluated against.
++    xs: Vec<f64>,
++    ys: Vec<f64>,
++    zs: Vec<f64>,
++    /// Wrapped Cartesian per original atom index (center-side lookups).
+     wrapped_cart: Vec<Vector3<f64>>,
+     /// Bin-offset stencil covering the cutoff, including [0,0,0].
+     stencil: Vec<[i32; 3]>,
+@@ -217,10 +230,12 @@ impl CellList {
+         }
+ 
+         let total_bins = n_bins[0] * n_bins[1] * n_bins[2];
+-        let mut bins: Vec<Vec<usize>> = vec![Vec::new(); total_bins];
+         let mut atom_bins = Vec::with_capacity(n_atoms);
+         let mut wrap_shifts = Vec::with_capacity(n_atoms);
+         let mut wrapped_cart = Vec::with_capacity(n_atoms);
++        let mut atom_linear_bin: Vec<u32> = Vec::with_capacity(n_atoms);
++        // bin_start doubles as the counting-sort histogram (offset by one).
++        let mut bin_start = vec![0u32; total_bins + 1];
+ 
+         for frac in frac_coords {
+             let mut wrapped = *frac;
+@@ -242,16 +257,41 @@ impl CellList {
+             }
+             wrapped_cart.push(matrix.transpose() * wrapped);
+             let bin_idx = bin[0] + bin[1] * n_bins[0] + bin[2] * n_bins[0] * n_bins[1];
+-            bins[bin_idx].push(atom_bins.len());
++            atom_linear_bin.push(bin_idx as u32);
++            bin_start[bin_idx + 1] += 1;
+             atom_bins.push(bin);
+             wrap_shifts.push(shift);
+         }
+ 
++        // CSR prefix sum, then a stable counting sort placing atom indices and
++        // their wrapped coordinates (SoA) into bin-sorted slots.
++        for b in 0..total_bins {
++            bin_start[b + 1] += bin_start[b];
++        }
++        let mut cursor: Vec<u32> = bin_start[..total_bins].to_vec();
++        let mut bin_atoms = vec![0u32; n_atoms];
++        let mut xs = vec![0.0f64; n_atoms];
++        let mut ys = vec![0.0f64; n_atoms];
++        let mut zs = vec![0.0f64; n_atoms];
++        for (atom_idx, &b) in atom_linear_bin.iter().enumerate() {
++            let slot = cursor[b as usize] as usize;
++            cursor[b as usize] += 1;
++            bin_atoms[slot] = atom_idx as u32;
++            let cart = wrapped_cart[atom_idx];
++            xs[slot] = cart.x;
++            ys[slot] = cart.y;
++            zs[slot] = cart.z;
++        }
++
+         Self {
+-            bins,
++            bin_start,
++            bin_atoms,
+             n_bins,
+             atom_bins,
+             wrap_shifts,
++            xs,
++            ys,
++            zs,
+             wrapped_cart,
+             stencil,
+             pbc,
+@@ -305,27 +345,117 @@ impl CellList {
+             let offset_cart = (base_image[0] as f64) * lattice_vecs[0]
+                 + (base_image[1] as f64) * lattice_vecs[1]
+                 + (base_image[2] as f64) * lattice_vecs[2];
++            // Fold the image shift into the center once:
++            //   |neighbor + offset − center| == |neighbor − (center − offset)|
++            let cx = center_cart.x - offset_cart.x;
++            let cy = center_cart.y - offset_cart.y;
++            let cz = center_cart.z - offset_cart.z;
++
++            let b = self.bin_index(bin);
++            let start = self.bin_start[b] as usize;
++            let end = self.bin_start[b + 1] as usize;
++            scan_bin_hits(
++                &self.xs[start..end],
++                &self.ys[start..end],
++                &self.zs[start..end],
++                [cx, cy, cz],
++                cutoff_sq,
++                |k, dist_sq| {
++                    let neighbor_idx = self.bin_atoms[start + k] as usize;
++                    // Express the image against the original coordinates:
++                    // wrapped_j + L·m − wrapped_i  ==  orig_j + L·(m − s_j + s_i) − orig_i
++                    let neighbor_shift = self.wrap_shifts[neighbor_idx];
++                    let image = [
++                        base_image[0] - neighbor_shift[0] + center_shift[0],
++                        base_image[1] - neighbor_shift[1] + center_shift[1],
++                        base_image[2] - neighbor_shift[2] + center_shift[2],
++                    ];
++                    let is_self =
++                        center_idx == neighbor_idx && image == [0, 0, 0] && dist_sq < tol_sq;
++                    if !is_self || config.self_interaction {
++                        out.push(center_idx, neighbor_idx, dist_sq.sqrt(), image);
++                    }
++                },
++            );
++        }
++    }
++}
+ 
+-            for &neighbor_idx in &self.bins[self.bin_index(bin)] {
+-                let diff = self.wrapped_cart[neighbor_idx] + offset_cart - center_cart;
+-                let dist_sq = diff.norm_squared();
+-                if dist_sq > cutoff_sq {
+-                    continue;
++/// Invoke `hit(k, dist_sq)` for every slot `k` whose point lies within
++/// `cutoff_sq` of the (offset-folded) `center`, in ascending `k`.
++///
++/// On wasm32 builds compiled with `+simd128` an explicit `f64x2` path
++/// evaluates two candidates per iteration and fast-rejects misses (the common
++/// case) with a single vector compare; the scalar loop keeps no-SIMD wasm
++/// builds and native builds (where rayon owns the parallelism) working
++/// unchanged.
++#[inline]
++fn scan_bin_hits(
++    xs: &[f64],
++    ys: &[f64],
++    zs: &[f64],
++    center: [f64; 3],
++    cutoff_sq: f64,
++    mut hit: impl FnMut(usize, f64),
++) {
++    let [cx, cy, cz] = center;
++    let n = xs.len();
++    debug_assert!(ys.len() == n && zs.len() == n);
++
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        use core::arch::wasm32::*;
++        let cxv = f64x2_splat(cx);
++        let cyv = f64x2_splat(cy);
++        let czv = f64x2_splat(cz);
++        let cutv = f64x2_splat(cutoff_sq);
++        let mut k = 0usize;
++        while k + 2 <= n {
++            // SAFETY: k + 1 < n bounds both lanes; wasm v128_load supports
++            // unaligned addresses (alignment is only a hint in wasm).
++            let d2 = unsafe {
++                let xv = v128_load(xs.as_ptr().add(k) as *const v128);
++                let yv = v128_load(ys.as_ptr().add(k) as *const v128);
++                let zv = v128_load(zs.as_ptr().add(k) as *const v128);
++                let dx = f64x2_sub(xv, cxv);
++                let dy = f64x2_sub(yv, cyv);
++                let dz = f64x2_sub(zv, czv);
++                f64x2_add(
++                    f64x2_add(f64x2_mul(dx, dx), f64x2_mul(dy, dy)),
++                    f64x2_mul(dz, dz),
++                )
++            };
++            if v128_any_true(f64x2_le(d2, cutv)) {
++                let d2a = f64x2_extract_lane::<0>(d2);
++                if d2a <= cutoff_sq {
++                    hit(k, d2a);
+                 }
+-                // Express the image against the original coordinates:
+-                // wrapped_j + L·m − wrapped_i  ==  orig_j + L·(m − s_j + s_i) − orig_i
+-                let neighbor_shift = self.wrap_shifts[neighbor_idx];
+-                let image = [
+-                    base_image[0] - neighbor_shift[0] + center_shift[0],
+-                    base_image[1] - neighbor_shift[1] + center_shift[1],
+-                    base_image[2] - neighbor_shift[2] + center_shift[2],
+-                ];
+-                let is_self =
+-                    center_idx == neighbor_idx && image == [0, 0, 0] && dist_sq < tol_sq;
+-                if !is_self || config.self_interaction {
+-                    out.push(center_idx, neighbor_idx, dist_sq.sqrt(), image);
++                let d2b = f64x2_extract_lane::<1>(d2);
++                if d2b <= cutoff_sq {
++                    hit(k + 1, d2b);
+                 }
+             }
++            k += 2;
++        }
++        if k < n {
++            let dx = xs[k] - cx;
++            let dy = ys[k] - cy;
++            let dz = zs[k] - cz;
++            let d2 = dx * dx + dy * dy + dz * dz;
++            if d2 <= cutoff_sq {
++                hit(k, d2);
++            }
++        }
++    }
++
++    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
++    for (k, ((&x, &y), &z)) in xs.iter().zip(ys).zip(zs).enumerate() {
++        let dx = x - cx;
++        let dy = y - cy;
++        let dz = z - cz;
++        let d2 = dx * dx + dy * dy + dz * dz;
++        if d2 <= cutoff_sq {
++            hit(k, d2);
+         }
+     }
+ }
+@@ -407,19 +537,30 @@ fn build_neighbor_list_celllist(
+ 
+     #[cfg(feature = "rayon")]
+     let result = {
+-        // Parallel processing: each atom computes its neighbors independently
+-        let per_atom_results: Vec<NeighborList> = (0..n_atoms)
++        // Chunked parallelism: one contiguous NeighborList per atom-range
++        // chunk (per-atom tasks spent more on 20k tiny 4-Vec allocations than
++        // on the search itself). Chunks are merged in ascending index order,
++        // so the output ordering is identical to the serial path — bond
++        // tables stay deterministic run to run.
++        let n_threads = rayon::current_num_threads().max(1);
++        let chunk_size = n_atoms.div_ceil(n_threads * 4).max(64);
++        let chunk_starts: Vec<usize> = (0..n_atoms).step_by(chunk_size).collect();
++        let per_chunk: Vec<NeighborList> = chunk_starts
+             .into_par_iter()
+-            .map(|center_idx| {
+-                let mut local_nl = NeighborList::with_capacity(20);
+-                cell_list.neighbors_of(center_idx, lattice_vecs, config, &mut local_nl);
++            .map(|chunk_start| {
++                let chunk_end = (chunk_start + chunk_size).min(n_atoms);
++                let mut local_nl =
++                    NeighborList::with_capacity((chunk_end - chunk_start) * 14);
++                for center_idx in chunk_start..chunk_end {
++                    cell_list.neighbors_of(center_idx, lattice_vecs, config, &mut local_nl);
++                }
+                 local_nl
+             })
+             .collect();
+ 
+-        // Merge all per-atom results
++        // Merge chunk results in order
+         let mut result = NeighborList::with_capacity(estimated_pairs);
+-        for nl in per_atom_results {
++        for nl in per_chunk {
+             result.extend(nl);
+         }
+         result
+diff --git a/scripts/build-wasm.mjs b/scripts/build-wasm.mjs
+index a8340b9b5..ac2a2e2a0 100644
+--- a/scripts/build-wasm.mjs
++++ b/scripts/build-wasm.mjs
+@@ -11,6 +11,12 @@
+  *
+  *   node scripts/build-wasm.mjs              # (re)build all three
+  *   node scripts/build-wasm.mjs --if-missing # build only the ones not yet built
++ *   node scripts/build-wasm.mjs --no-simd    # scalar-only ferrox (ancient WebKit)
++ *
++ * ferrox builds with WASM SIMD128 by default (extensions/rust/.cargo/config.toml
++ * sets `-C target-feature=+simd128`; supported by every engine shipped since
++ * 2023). `--no-simd` — or CATGO_WASM_NO_SIMD=1 — clears RUSTFLAGS for that
++ * build, which overrides the config-file flag and yields a scalar-only module.
+  */
+ import { spawnSync } from 'node:child_process'
+ import { existsSync } from 'node:fs'
+@@ -19,6 +25,8 @@ import { fileURLToPath } from 'node:url'
+ 
+ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+ const IF_MISSING = process.argv.includes('--if-missing')
++const NO_SIMD = process.argv.includes('--no-simd') ||
++  process.env.CATGO_WASM_NO_SIMD === '1'
+ const WIN = process.platform === 'win32'
+ 
+ // Per target: the crate dir, the wasm-pack --out-dir (relative to the crate,
+@@ -32,6 +40,9 @@ const TARGETS = [
+     outDir: '../rust-wasm/pkg',
+     extra: ['--features', 'wasm', '--no-default-features'],
+     sentinel: join(ROOT, 'extensions', 'rust-wasm', 'pkg', 'ferrox_bg.wasm'),
++    // A set (even empty) RUSTFLAGS overrides .cargo/config.toml target
++    // rustflags — this is the documented no-SIMD escape hatch.
++    env: NO_SIMD ? { ...process.env, RUSTFLAGS: '' } : undefined,
+   },
+   {
+     name: 'chgdiff',
+@@ -79,6 +90,7 @@ for (const t of pending) {
+     cwd: t.cwd,
+     stdio: 'inherit',
+     shell: WIN,
++    env: t.env,
+   })
+   if (r.status !== 0) {
+     console.error(`[build-wasm] FAILED: ${t.name} (wasm-pack exited ${r.status})`)

@@ -1,0 +1,1582 @@
+diff --git a/NEWS.md b/NEWS.md
+index 11b237567..8f8e2fd0f 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -32,6 +32,15 @@ the dosing including dose amount and route.
+   stratification.  The table is also built automatically on `PKNCAdata()`
+   construction when no `units` argument is supplied.
+ 
++* `pk.calc.half.life()` now supports Tobit regression for half-life estimation via
++  `hl_method = "tobit"`.  Tobit regression treats BLQ observations as
++  left-censored rather than discarding them, which generally improves half-life
++  accuracy when some measurements are below the LLOQ.  The new `lloq` argument
++  (required for Tobit) accepts a scalar or per-observation vector.  New
++  PKNCA options: `hl_method` (default `"log-linear"`), `tobit_n_points_penalty`
++  (default 0), and `tobit_optim_control`.  New NCA output columns:
++  `tobit_residual`, `adj_tobit_residual`, and `lambda.z.n.points_blq`.
++
+ * `pk.calc.half.life()` now returns also `lambda.z.corrxy`, the correlation between
+   the time and the log-concentration of the lambda z points.
+ * `get_halflife_points()` can now be used on PKNCAdata objects to see which points
+diff --git a/R/PKNCA.options.R b/R/PKNCA.options.R
+index 2765472bd..0ed0a436a 100644
+--- a/R/PKNCA.options.R
++++ b/R/PKNCA.options.R
+@@ -350,6 +350,55 @@
+     }
+     checkmate::assert_logical(x, any.missing = FALSE, len = 1)
+     x
++  },
++
++  hl_method = function(x, default = FALSE, description = FALSE) {
++    choices <- c("log-linear", "tobit")
++    if (description)
++      return(paste(
++        "The method used to calculate the half-life and related parameters.",
++        "Options are:",
++        paste0('"', choices, '"', collapse = ", ")
++      ))
++    if (default)
++      return(choices[1])
++    if (length(x) != 1)
++      stop("hl_method must be a scalar")
++    if (!is.character(x))
++      stop("hl_method must be a character string")
++    x <- match.arg(x, choices)
++    x
++  },
++
++  tobit_n_points_penalty = function(x, default = FALSE, description = FALSE) {
++    if (description)
++      return(paste(
++        "The penalty exponent applied to the number of points when selecting the best",
++        "Tobit regression half-life fit.  The selection criterion is",
++        "tobit_residual * n_points ^ tobit_n_points_penalty, and the window",
++        "minimizing this criterion is selected.  A value of 0 (the default)",
++        "uses the raw Tobit residual with no point-count penalty."))
++    if (default)
++      return(0)
++    if (length(x) != 1)
++      stop("tobit_n_points_penalty must be a scalar")
++    if (is.factor(x) || !is.numeric(x))
++      stop("tobit_n_points_penalty must be numeric (and not a factor)")
++    if (x < 0)
++      stop("tobit_n_points_penalty must be >= 0")
++    x
++  },
++
++  tobit_optim_control = function(x, default = FALSE, description = FALSE) {
++    if (description)
++      return(paste(
++        "A list of control parameters passed to stats::optim() when fitting the",
++        "Tobit regression half-life.  See ?stats::optim for available options."))
++    if (default)
++      return(list())
++    if (!is.list(x))
++      stop("tobit_optim_control must be a list")
++    x
+   }
+ )
+ 
+diff --git a/R/half.life.R b/R/half.life.R
+index ce7770820..6dc8305ca 100644
+--- a/R/half.life.R
++++ b/R/half.life.R
+@@ -1,17 +1,20 @@
+ #' Compute the half-life and associated parameters
+ #'
+ #' The terminal elimination half-life is estimated from the final points in the
+-#' concentration-time curve using semi-log regression (`log(conc)~time`)
+-#' with automated selection of the points for calculation (unless
+-#' `manually.selected.points` is `TRUE`).
++#' concentration-time curve using semi-log regression (`log(conc)~time`, the
++#' `"log-linear"` method) or Tobit regression (`"tobit"` method) with automated
++#' selection of the points for calculation (unless `manually.selected.points` is
++#' `TRUE`).
+ #'
+-#' See the "Half-Life Calculation" vignette for more details on the calculation
+-#' methods used.
++#' See the "Half-Life Calculation" and "Half-Life Calculation with Tobit
++#' Regression" vignettes for more details on the calculation methods.
+ #'
+ #' @details If `manually.selected.points` is `FALSE` (default), the
+ #' half-life is calculated by computing the best fit line for all points at or
+-#' after tmax (based on the value of `allow.tmax.in.half.life`).  The best
+-#' half-life is chosen by the following rules in order:
++#' after tmax (based on the value of `allow.tmax.in.half.life`).
++#'
++#' For `hl_method = "log-linear"`, the best half-life is chosen by the
++#' following rules in order:
+ #'
+ #' \itemize{
+ #'  \item{At least `min.hl.points` points included}
+@@ -20,9 +23,16 @@
+ #'  \item{The one with the most points included}
+ #' }
+ #'
+-#' If `manually.selected.points` is `TRUE`, the `conc`
+-#' and `time` data are used as-is without any form of selection for
+-#' the best-fit half-life.
++#' For `hl_method = "tobit"`, BLQ observations are retained and treated as
++#' left-censored.  The best window is the one minimizing
++#' `tobit_residual * n ^ tobit_n_points_penalty` (default: raw `tobit_residual`)
++#' among windows with `lambda.z > 0` and at least `min.hl.points` above-LLOQ
++#' points.  On ties the largest window (most total points) is preferred.
++#'
++#' If `manually.selected.points` is `TRUE`, the `conc` and `time` data are
++#' used as-is without any form of point selection.  When
++#' `TRUE`, `adj.r.squared.factor`, `min.hl.points`, and
++#' `allow.tmax.in.half.life` are ignored.
+ #'
+ #' @inheritParams assert_conc_time
+ #' @inheritParams choose_interval_method
+@@ -33,15 +43,27 @@
+ #' @param tlast Time of last concentration above the limit of
+ #'   quantification (will be calculated and included in the return data
+ #'   frame if not given)
++#' @param lloq Lower limit of quantification.  A scalar or a vector the same
++#'   length as `conc`.  Required when `hl_method = "tobit"`.
++#' @param hl_method The method used to estimate the half-life.
++#'   `"log-linear"` (default) uses ordinary least-squares regression on
++#'   log-transformed concentrations.  `"tobit"` uses maximum-likelihood Tobit
++#'   regression that properly accounts for BLQ observations.  The global default
++#'   can be changed via `PKNCA.options(hl_method = "tobit")`.
+ #' @param manually.selected.points Have the input points (`conc` and
+ #'   `time`) been manually selected?  The impact of setting this to
+ #'   `TRUE` is that no selection for the best points will be done.  When
+ #'   `TRUE`, this option causes the options of `adj.r.squared.factor`,
+ #'   `min.hl.points`, and `allow.tmax.in.half.life` to be ignored.
+ #' @param min.hl.points The minimum number of points that must be
+-#'   included to calculate the half-life
++#'   included to calculate the half-life.  For `hl_method = "tobit"` this
++#'   counts only above-LLOQ points.
+ #' @param adj.r.squared.factor The allowance in adjusted r-squared for
+-#'   adding another point.
++#'   adding another point (log-linear method only).
++#' @param tobit_n_points_penalty The penalty exponent on the number of points
++#'   for Tobit window selection.  See [PKNCA.options()].
++#' @param tobit_optim_control A list of control parameters passed to
++#'   [stats::optim()] for the Tobit fit.  See [PKNCA.options()].
+ #' @param conc.blq See [clean.conc.blq()]
+ #' @param conc.na See [clean.conc.na()]
+ #' @param check Run [assert_conc_time()],
+@@ -49,24 +71,40 @@
+ #' @param first.tmax See [pk.calc.tmax()].
+ #' @param allow.tmax.in.half.life Allow the concentration point for tmax
+ #'   to be included in the half-life slope calculation.
+-#' @return A data frame with one row and columns for
++#' @return A data frame with one row.  Columns depend on `hl_method`:
++#'
++#'   Columns returned by both methods:
+ #'  \describe{
+ #'   \item{tmax}{Time of maximum observed concentration (only included
+ #'     if not given as an input)}
+ #'   \item{tlast}{Time of last observed concentration above the LOQ (only
+ #'     included if not given as an input)}
+-#'   \item{r.squared}{coefficient of determination}
+-#'   \item{adj.r.squared}{adjusted coefficient of determination}
+ #'   \item{lambda.z}{elimination rate}
+-#'   \item{lambda.z.corrxy}{correlation between time and log-conc half-life points}
+ #'   \item{lambda.z.time.first}{first time for half-life calculation}
+ #'   \item{lambda.z.time.last}{last time for half-life calculation}
+-#'   \item{lambda.z.n.points}{number of points in half-life calculation}
++#'   \item{lambda.z.n.points}{number of points in half-life calculation
++#'     (all points for Tobit, including BLQ)}
+ #'   \item{clast.pred}{Concentration at tlast as predicted by the half-life
+ #'     line}
+ #'   \item{half.life}{half-life}
+-#'   \item{span.ratio}{span ratio [ratio of half-life to time used for
+-#'     half-life calculation}
++#'   \item{span.ratio}{ratio of the above-LLOQ time span to the half-life}
++#'  }
++#'
++#'   Additional columns for `hl_method = "log-linear"`:
++#'  \describe{
++#'   \item{r.squared}{coefficient of determination}
++#'   \item{adj.r.squared}{adjusted coefficient of determination}
++#'   \item{lambda.z.corrxy}{correlation between time and log-conc for the
++#'     half-life points}
++#'  }
++#'
++#'   Additional columns for `hl_method = "tobit"`:
++#'  \describe{
++#'   \item{lambda.z.n.points_blq}{number of BLQ points included in the fit}
++#'   \item{tobit_residual}{estimated residual standard deviation from the
++#'     Tobit fit (on the log-concentration scale)}
++#'   \item{adj_tobit_residual}{adjusted Tobit residual (analogous to
++#'     adjusted r-squared; penalizes smaller windows)}
+ #'  }
+ #' @references
+ #'
+@@ -79,86 +117,134 @@
+ pk.calc.half.life <- function(conc, time, tmax, tlast,
+                               time.dose=NULL,
+                               duration.dose=0,
++                              lloq=NULL,
++                              hl_method=c("log-linear", "tobit"),
+                               manually.selected.points=FALSE,
+                               options=list(),
+                               min.hl.points=NULL,
+                               adj.r.squared.factor=NULL,
++                              tobit_n_points_penalty=NULL,
++                              tobit_optim_control=NULL,
+                               conc.blq=NULL,
+                               conc.na=NULL,
+                               first.tmax=NULL,
+                               allow.tmax.in.half.life=NULL,
+                               check=TRUE) {
+-  # Check inputs
++  # Resolve hl_method: explicit argument takes match.arg; missing uses PKNCA.options
++  if (missing(hl_method)) {
++    hl_method <- PKNCA.choose.option(name = "hl_method", value = NULL, options = options)
++  } else {
++    hl_method <- match.arg(hl_method)
++  }
++  is_tobit <- hl_method == "tobit"
++
++  # Resolve remaining options
+   min.hl.points <-
+-    PKNCA.choose.option(
+-      name="min.hl.points", value=min.hl.points, options=options
+-    )
+-  adj.r.squared.factor <-
+-    PKNCA.choose.option(
+-      name="adj.r.squared.factor", value=adj.r.squared.factor, options=options
+-    )
++    PKNCA.choose.option(name="min.hl.points", value=min.hl.points, options=options)
+   conc.blq <-
+-    PKNCA.choose.option(
+-      name="conc.blq", value=conc.blq, options=options
+-    )
++    PKNCA.choose.option(name="conc.blq", value=conc.blq, options=options)
+   conc.na <-
+-    PKNCA.choose.option(
+-      name="conc.na", value=conc.na, options=options
+-    )
++    PKNCA.choose.option(name="conc.na", value=conc.na, options=options)
+   first.tmax <-
+-    PKNCA.choose.option(
+-      name="first.tmax", value=first.tmax, options=options
+-    )
++    PKNCA.choose.option(name="first.tmax", value=first.tmax, options=options)
+   allow.tmax.in.half.life <-
+-    PKNCA.choose.option(
+-      name="allow.tmax.in.half.life", value=allow.tmax.in.half.life, options=options
+-    )
++    PKNCA.choose.option(name="allow.tmax.in.half.life", value=allow.tmax.in.half.life, options=options)
++  if (!is_tobit) {
++    adj.r.squared.factor <-
++      PKNCA.choose.option(name="adj.r.squared.factor", value=adj.r.squared.factor, options=options)
++  } else {
++    tobit_n_points_penalty <-
++      PKNCA.choose.option(name="tobit_n_points_penalty", value=tobit_n_points_penalty, options=options)
++    tobit_optim_control <-
++      PKNCA.choose.option(name="tobit_optim_control", value=tobit_optim_control, options=options)
++    if (is.null(lloq)) {
++      stop("lloq must be provided when hl_method is 'tobit'")
++    }
++  }
++
++  # --- Data preparation ---
+   if (check) {
+     assert_conc_time(conc = conc, time = time)
+     data <- clean.conc.blq(conc, time, conc.blq=conc.blq, conc.na=conc.na)
+   } else {
+-    data <- data.frame(conc, time)
++    data <- data.frame(conc=conc, time=time)
+   }
++
++  if (is_tobit) {
++    # For Tobit: build a parallel data set keeping BLQ observations.
++    # Only remove NA concentrations/times; do not drop BLQ values.
++    lloq_vec <- if (length(lloq) == 1) rep(as.numeric(lloq), length(conc)) else as.numeric(lloq)
++    keep_tobit <- !is.na(conc) & !is.na(time)
++    data_tobit <- data.frame(
++      conc = as.numeric(conc)[keep_tobit],
++      time = as.numeric(time)[keep_tobit],
++      lloq = lloq_vec[keep_tobit]
++    )
++    data_tobit$mask_blq <- data_tobit$conc < data_tobit$lloq
++    data_tobit$log_lloq  <- log(data_tobit$lloq)
++    data_tobit$log_conc  <- log(data_tobit$conc)  # -Inf for 0; mask_blq governs usage
++    if (!is.null(time.dose)) {
++      end.dose <- as.numeric(time.dose) + as.numeric(duration.dose)
++      if (any(!is.na(end.dose))) {
++        data_tobit <- data_tobit[data_tobit$time > max(end.dose, na.rm = TRUE), ]
++      }
++    }
++  }
++
+   data$log_conc <- log(data$conc)
+   # Filter out points with 0 concentration. as.numeric() to handle units objects
+-  data <- data[as.numeric(data$conc) > 0,]
++  data <- data[as.numeric(data$conc) > 0, ]
+   if (!is.null(time.dose)) {
+-    # If multiple doses are within the interval, consider only the one ending the latest
+     end.dose <- as.numeric(time.dose) + as.numeric(duration.dose)
+     if (any(!is.na(end.dose))) {
+       data <- data[as.numeric(data$time) > max(end.dose, na.rm = TRUE), ]
+     }
+   }
+-  # Prepare the return values
+-  ret <- data.frame(
+-    # Terminal elimination slope
+-    lambda.z=NA,
+-    # R-squared of terminal elimination slope
+-    r.squared=NA,
+-    # Adjusted r-squared of terminal elimination slope
+-    adj.r.squared=NA,
+-    # Correlation between time and log-conc for lambda.z points
+-    lambda.z.corrxy=NA,
+-    # First time point used in the slope estimation (for plotting later)
+-    lambda.z.time.first=NA,
+-    # Last time point used in the slope estimation (for plotting later)
+-    lambda.z.time.last=NA,
+-    # Number of points in the half-life estimate
+-    lambda.z.n.points=NA,
+-    # Concentration at Tlast predicted by the half-life
+-    clast.pred=NA,
+-    # Half-life
+-    half.life=NA,
+-    # T1/2 span ratio
+-    span.ratio=NA)
+-  ret_replacements <-
+-    c("lambda.z", "r.squared", "adj.r.squared", "lambda.z.corrxy", "lambda.z.time.first",
+-      "lambda.z.time.last", "lambda.z.n.points", "clast.pred", "half.life", "span.ratio")
++
++  # Build return skeleton.  Column order must match existing behaviour for the
++  # log-linear method (tests compare whole data frames including column order).
++  if (!is_tobit) {
++    ret <- data.frame(
++      lambda.z            = NA_real_,
++      r.squared           = NA_real_,
++      adj.r.squared       = NA_real_,
++      lambda.z.corrxy     = NA_real_,
++      lambda.z.time.first = NA_real_,
++      lambda.z.time.last  = NA_real_,
++      lambda.z.n.points   = NA_integer_,
++      clast.pred          = NA_real_,
++      half.life           = NA_real_,
++      span.ratio          = NA_real_
++    )
++    ret_replacements <- c(
++      "lambda.z", "r.squared", "adj.r.squared", "lambda.z.corrxy",
++      "lambda.z.time.first", "lambda.z.time.last", "lambda.z.n.points",
++      "clast.pred", "half.life", "span.ratio"
++    )
++  } else {
++    ret <- data.frame(
++      lambda.z              = NA_real_,
++      lambda.z.time.first   = NA_real_,
++      lambda.z.time.last    = NA_real_,
++      lambda.z.n.points     = NA_integer_,
++      lambda.z.n.points_blq = NA_integer_,
++      clast.pred            = NA_real_,
++      half.life             = NA_real_,
++      span.ratio            = NA_real_,
++      tobit_residual        = NA_real_,
++      adj_tobit_residual    = NA_real_
++    )
++    ret_replacements <- c(
++      "lambda.z", "lambda.z.time.first", "lambda.z.time.last",
++      "lambda.z.n.points", "lambda.z.n.points_blq",
++      "clast.pred", "half.life", "span.ratio",
++      "tobit_residual", "adj_tobit_residual"
++    )
++  }
++
++  # tmax and tlast are always derived from the standard (above-LOQ) data
+   if (missing(tmax)) {
+-    ret$tmax <-
+-      pk.calc.tmax(
+-        data$conc, data$time, first.tmax=first.tmax, check=FALSE
+-      )
++    ret$tmax <- pk.calc.tmax(data$conc, data$time, first.tmax=first.tmax, check=FALSE)
+   } else {
+     ret$tmax <- tmax
+   }
+@@ -167,109 +253,188 @@ pk.calc.half.life <- function(conc, time, tmax, tlast,
+   } else {
+     ret$tlast <- tlast
+   }
+-  # Data frame to use for computation of half-life
+-  if (allow.tmax.in.half.life) {
+-    # as.numeric is for units handling
+-    dfK <- data[as.numeric(data$time) >= as.numeric(ret$tmax), ]
+-  } else {
+-    # as.numeric is for units handling
+-    dfK <- data[as.numeric(data$time) > as.numeric(ret$tmax), ]
+-  }
++
+   # When all concentrations are the same (non-zero) value cannot compute half-life (#503)
+   if (isTRUE(stats::sd(data$log_conc[is.finite(data$log_conc)], na.rm = TRUE) == 0)) {
+     attr(ret, "exclude") <- "No point variability in concentrations for half-life calculation"
++    # Drop tmax/tlast inputs before returning
++    if (!missing(tmax)) ret$tmax <- NULL
++    if (!missing(tlast)) ret$tlast <- NULL
+     return(ret)
+   }
+-  if (manually.selected.points) {
+-    if (nrow(data) > 0) {
+-      fit <- fit_half_life(data=data, tlast=ret$tlast)
+-      ret[,ret_replacements] <- fit[,ret_replacements]
+-      if (ret$half.life <= 0) {
+-        attr(ret, "exclude") <- "Negative half-life estimated with manually-selected points"
+-      }
++
++  # ---- Log-linear method ----
++  if (!is_tobit) {
++    # Data frame to use for computation of half-life
++    if (allow.tmax.in.half.life) {
++      dfK <- data[as.numeric(data$time) >= as.numeric(ret$tmax), ]
+     } else {
+-      warning("No data to manually fit for half-life (all concentrations may be 0 or excluded)")
+-      ret <-
+-        structure(
++      dfK <- data[as.numeric(data$time) > as.numeric(ret$tmax), ]
++    }
++
++    if (manually.selected.points) {
++      if (nrow(data) > 0) {
++        fit <- fit_half_life(data=data, tlast=ret$tlast)
++        ret[, ret_replacements] <- fit[, ret_replacements]
++        if (ret$half.life <= 0) {
++          attr(ret, "exclude") <- "Negative half-life estimated with manually-selected points"
++        }
++      } else {
++        warning("No data to manually fit for half-life (all concentrations may be 0 or excluded)")
++        ret <- structure(
+           ret,
+-          exclude="No data to manually fit for half-life (all concentrations may be 0 or excluded)"
++          exclude = "No data to manually fit for half-life (all concentrations may be 0 or excluded)"
+         )
+-    }
+-  } else if (nrow(dfK) >= min.hl.points) {
+-    # If we have enough data to estimate a slope, then
+-    half_lives_for_selection <-
+-      data.frame(
+-        r.squared=-Inf,
+-        adj.r.squared=-Inf,
+-        clast.pred=NA_real_,
+-        lambda.z=-Inf,
+-        lambda.z.n.points=NA_integer_,
+-        lambda.z.time.first=dfK$time,
+-        lambda.z.time.last=NA_real_,
+-        log_conc=dfK$log_conc,
+-        span.ratio=NA_real_,
+-        half.life=NA_real_
+-      )
+-    half_lives_for_selection <-
+-      half_lives_for_selection[order(-half_lives_for_selection$lambda.z.time.first), ]
+-    # Pre-build the two-column data.frame that fit_half_life expects.  The rows
+-    # are already in descending-time order (matching half_lives_for_selection).
+-    # Subsetting a pre-built data.frame avoids constructing a new data.frame on
+-    # every loop iteration.
+-    dfK_for_fit <- data.frame(
+-      log_conc = half_lives_for_selection$log_conc,
+-      time     = half_lives_for_selection$lambda.z.time.first
+-    )
+-    for(i in min.hl.points:nrow(half_lives_for_selection)) {
+-      # Fit the terminal slopes until the adjusted r-squared value
+-      # is not improving (or it only gets worse by a small factor).
+-      fit <- fit_half_life(data=dfK_for_fit[seq_len(i), , drop=FALSE], tlast=ret$tlast)
+-      half_lives_for_selection[i,names(fit)] <- fit
+-    }
+-    # Find the best model
+-    mask_best <-
+-      half_lives_for_selection$lambda.z > 0 &
+-      if (min.hl.points == 2 & nrow(half_lives_for_selection) == 2) {
+-        rlang::warn(
+-          message = "2 points used for half-life calculation",
+-          class = "pknca_halflife_2points"
++      }
++    } else if (nrow(dfK) >= min.hl.points) {
++      half_lives_for_selection <-
++        data.frame(
++          r.squared        = -Inf,
++          adj.r.squared    = -Inf,
++          clast.pred       = NA_real_,
++          lambda.z         = -Inf,
++          lambda.z.n.points = NA_integer_,
++          lambda.z.time.first = dfK$time,
++          lambda.z.time.last  = NA_real_,
++          log_conc         = dfK$log_conc,
++          span.ratio       = NA_real_,
++          half.life        = NA_real_
+         )
+-        TRUE
+-      } else {
+-        half_lives_for_selection$adj.r.squared >
+-          (max(half_lives_for_selection$adj.r.squared, na.rm=TRUE) - adj.r.squared.factor)
++      half_lives_for_selection <-
++        half_lives_for_selection[order(-half_lives_for_selection$lambda.z.time.first), ]
++      dfK_for_fit <- data.frame(
++        log_conc = half_lives_for_selection$log_conc,
++        time     = half_lives_for_selection$lambda.z.time.first
++      )
++      for (i in min.hl.points:nrow(half_lives_for_selection)) {
++        fit <- fit_half_life(data=dfK_for_fit[seq_len(i), , drop=FALSE], tlast=ret$tlast)
++        half_lives_for_selection[i, names(fit)] <- fit
+       }
+-    # Missing values are not the best
+-    mask_best[is.na(mask_best)] <- FALSE
+-    if (sum(mask_best) > 1) {
+-      # If more than one models qualify, choose the one with the
+-      # most points used.
++      # When min.hl.points == 2 and only 2 points are available, all fits with
++      # positive lambda.z are initially selected (TRUE), and the tie-breaking
++      # block below then picks the one with the most points — which is the
++      # intended behavior in this edge case.
+       mask_best <-
+-        (mask_best &
+-           half_lives_for_selection$lambda.z.n.points == max(half_lives_for_selection$lambda.z.n.points[mask_best]))
+-    }
+-    # If the half-life fit, set all associated parameters
+-    if (any(mask_best)) {
+-      # Put in all the computed values
+-      ret[,ret_replacements] <- half_lives_for_selection[mask_best, ret_replacements]
++        half_lives_for_selection$lambda.z > 0 &
++        if (min.hl.points == 2 && nrow(half_lives_for_selection) == 2) {
++          rlang::warn(
++            message = "2 points used for half-life calculation",
++            class = "pknca_halflife_2points"
++          )
++          TRUE
++        } else {
++          half_lives_for_selection$adj.r.squared >
++            (max(half_lives_for_selection$adj.r.squared, na.rm=TRUE) - adj.r.squared.factor)
++        }
++      mask_best[is.na(mask_best)] <- FALSE
++      if (sum(mask_best) > 1) {
++        mask_best <-
++          mask_best &
++          half_lives_for_selection$lambda.z.n.points ==
++            max(half_lives_for_selection$lambda.z.n.points[mask_best])
++      }
++      if (any(mask_best)) {
++        ret[, ret_replacements] <- half_lives_for_selection[mask_best, ret_replacements]
++      }
++    } else {
++      attr(ret, "exclude") <-
++        sprintf(
++          "Too few points for half-life calculation (min.hl.points=%g with only %g points)",
++          min.hl.points, nrow(dfK)
++        )
++      rlang::warn(
++        message = attr(ret, "exclude"),
++        class = "pknca_halflife_too_few_points"
++      )
+     }
++
++  # ---- Tobit method ----
+   } else {
+-    attr(ret, "exclude") <-
+-      sprintf(
+-        "Too few points for half-life calculation (min.hl.points=%g with only %g points)",
+-        min.hl.points, nrow(dfK)
++    # Data frame for Tobit: all non-NA points after tmax (including BLQ),
++    # sorted ascending by time
++    if (allow.tmax.in.half.life) {
++      dfK_all <- data_tobit[data_tobit$time >= ret$tmax, ]
++    } else {
++      dfK_all <- data_tobit[data_tobit$time > ret$tmax, ]
++    }
++    dfK_all <- dfK_all[order(dfK_all$time), ]
++
++    n_above_lloq <- sum(!dfK_all$mask_blq)
++
++    if (manually.selected.points) {
++      # Use data_tobit as-is (all non-NA points, no tmax filter applied again)
++      if (nrow(data_tobit) > 0) {
++        fit <- fit_half_life_tobit(
++          data = data_tobit,
++          tlast = ret$tlast,
++          optim_control = tobit_optim_control
++        )
++        # Only update if all fit columns are present
++        common_cols <- intersect(ret_replacements, names(fit))
++        ret[, common_cols] <- fit[, common_cols]
++        if (!is.na(ret$half.life) && ret$half.life <= 0) {
++          attr(ret, "exclude") <- "Negative half-life estimated with manually-selected points"
++        }
++      } else {
++        warning("No data to manually fit for half-life (all concentrations may be 0 or excluded)")
++        ret <- structure(
++          ret,
++          exclude = "No data to manually fit for half-life (all concentrations may be 0 or excluded)"
++        )
++      }
++    } else if (n_above_lloq >= min.hl.points) {
++      # Identify valid starting indices: those leaving >= min.hl.points above-LLOQ
++      # points from the start through the end of dfK_all.
++      above_lloq_idx <- which(!dfK_all$mask_blq)
++      # The last valid starting row is the one at position
++      # (n_above_lloq - min.hl.points + 1) in above_lloq_idx
++      max_start_row <- above_lloq_idx[n_above_lloq - min.hl.points + 1]
++      n_windows <- max_start_row
++
++      tobit_fits <- vector("list", n_windows)
++      for (j in seq_len(n_windows)) {
++        tobit_fits[[j]] <- fit_half_life_tobit(
++          data = dfK_all[j:nrow(dfK_all), , drop = FALSE],
++          tlast = ret$tlast,
++          optim_control = tobit_optim_control
++        )
++      }
++      all_tobit <- do.call(rbind, tobit_fits)
++
++      # Selection criterion: tobit_residual * n_points ^ penalty
++      selection_criterion <-
++        all_tobit$tobit_residual *
++        (all_tobit$lambda.z.n.points ^ tobit_n_points_penalty)
++      valid <- !is.na(all_tobit$lambda.z) & all_tobit$lambda.z > 0
++      if (any(valid)) {
++        min_crit <- min(selection_criterion[valid], na.rm = TRUE)
++        mask_best <- valid & !is.na(selection_criterion) & selection_criterion <= min_crit
++        if (sum(mask_best) > 1) {
++          # On ties prefer the largest window (smallest j = most total points)
++          mask_best <- mask_best &
++            all_tobit$lambda.z.n.points == max(all_tobit$lambda.z.n.points[mask_best])
++        }
++        if (any(mask_best)) {
++          common_cols <- intersect(ret_replacements, names(all_tobit))
++          ret[, common_cols] <- all_tobit[mask_best, common_cols]
++        }
++      }
++    } else {
++      attr(ret, "exclude") <-
++        sprintf(
++          "Too few above-LLOQ points for Tobit half-life (min.hl.points=%g with only %g above-LLOQ points)",
++          min.hl.points, n_above_lloq
++        )
++      rlang::warn(
++        message = attr(ret, "exclude"),
++        class = "pknca_halflife_too_few_points"
+       )
+-    rlang::warn(
+-      message = attr(ret, "exclude"),
+-      class = "pknca_halflife_too_few_points"
+-    )
++    }
+   }
+ 
+   # Drop the inputs of tmax and tlast, if given.
+-  if (!missing(tmax))
+-    ret$tmax <- NULL
+-  if (!missing(tlast))
+-    ret$tlast <- NULL
++  if (!missing(tmax)) ret$tmax <- NULL
++  if (!missing(tlast)) ret$tlast <- NULL
+   ret
+ }
+ 
+@@ -308,6 +473,154 @@ fit_half_life <- function(data, tlast) {
+   ret
+ }
+ 
++#' Negative log-likelihood for Tobit half-life regression
++#'
++#' Helper function used by `fit_half_life_tobit()` via [stats::optim()].
++#' For observations above the LLOQ, the normal density contributes to the
++#' likelihood.  For censored (BLQ) observations, the normal CDF up to the
++#' LLOQ contributes.
++#'
++#' @param par A 3-element numeric vector: `c(log_c0, lambda_z, log_resid_error)`
++#' @param log_conc Natural log of observed concentration (may be `-Inf` for
++#'   BLQ; those values are not used when `mask_blq` is `TRUE`)
++#' @param time Numeric time vector
++#' @param mask_blq Logical vector; `TRUE` where the observation is below the
++#'   LLOQ
++#' @param log_lloq Natural log of the lower limit of quantification
++#' @return The negative sum of the log-likelihood (a scalar)
++#' @seealso `fit_half_life_tobit()`
++fit_half_life_tobit_LL <- function(par, log_conc, time, mask_blq, log_lloq) {
++  log_c0 <- par[[1]]
++  lambda_z <- par[[2]]
++  resid_error <- exp(par[[3]])
++  est <- log_c0 - lambda_z * time
++  ret <- rep(NA_real_, length(time))
++  if (any(mask_blq)) {
++    ret[mask_blq] <-
++      stats::pnorm(
++        q = log_lloq[mask_blq],
++        mean = est[mask_blq],
++        sd = resid_error,
++        log.p = TRUE
++      )
++  }
++  ret[!mask_blq] <-
++    stats::dnorm(
++      x = log_conc[!mask_blq],
++      mean = est[!mask_blq],
++      sd = resid_error,
++      log = TRUE
++    )
++  -sum(ret)
++}
++
++#' Perform a Tobit half-life fit given the data.  The function fits the data
++#' using maximum likelihood without any point selection or validation.
++#'
++#' @param data The data to fit.  Must have columns named `"log_conc"`,
++#'   `"time"`, `"log_lloq"`, and `"mask_blq"`.  `log_conc` for BLQ
++#'   observations is not used (the likelihood uses `log_lloq` instead).
++#' @param tlast The time of last observed concentration above the lower limit
++#'   of quantification.
++#' @param optim_control A list of control parameters passed to [stats::optim()].
++#' @return A data.frame with one row and columns named `"lambda.z"`,
++#'   `"clast.pred"`, `"lambda.z.time.first"`, `"lambda.z.time.last"`,
++#'   `"lambda.z.n.points"`, `"lambda.z.n.points_blq"`, `"half.life"`,
++#'   `"span.ratio"`, `"tobit_residual"`, and `"adj_tobit_residual"`.
++#'   Returns `NA` for all columns if [stats::optim()] does not converge,
++#'   and emits a warning.
++#' @seealso [pk.calc.half.life()], `fit_half_life_tobit_LL()`
++fit_half_life_tobit <- function(data, tlast, optim_control = list()) {
++  above_lloq_log_conc <- data$log_conc[!data$mask_blq]
++  na_ret <- data.frame(
++    lambda.z = NA_real_,
++    clast.pred = NA_real_,
++    lambda.z.time.first = min(data$time, na.rm = TRUE),
++    lambda.z.time.last = max(data$time, na.rm = TRUE),
++    lambda.z.n.points = nrow(data),
++    lambda.z.n.points_blq = sum(data$mask_blq),
++    half.life = NA_real_,
++    span.ratio = NA_real_,
++    tobit_residual = NA_real_,
++    adj_tobit_residual = NA_real_
++  )
++  # Guard: need at least 2 above-LLOQ points for initial parameter estimation
++  if (length(above_lloq_log_conc) < 2) {
++    rlang::warn(
++      message = "Too few above-LLOQ points for Tobit half-life initial parameter estimation",
++      class = "pknca_tobit_too_few_points"
++    )
++    return(na_ret)
++  }
++  # Guard: all above-LLOQ log-concentrations identical → no fit possible
++  sd_above <- stats::sd(above_lloq_log_conc)
++  if (!is.finite(sd_above) || sd_above == 0) {
++    rlang::warn(
++      message = "No variability in above-LLOQ concentrations for Tobit half-life fit",
++      class = "pknca_tobit_no_variability"
++    )
++    return(na_ret)
++  }
++  init_lambda_z <-
++    -log(2) *
++    diff(range(above_lloq_log_conc)) /
++    diff(range(data$time[!data$mask_blq]))
++  # Protect against degenerate time range (all above-LLOQ at same time)
++  if (!is.finite(init_lambda_z)) init_lambda_z <- 0.1
++  # Merge user control with a higher default maxit to improve convergence
++  # on challenging data (e.g. near-exact profiles or many BLQ points).
++  effective_control <- c(list(maxit = 2000), optim_control)
++  fit <- stats::optim(
++    par = c(
++      log_c0 = max(above_lloq_log_conc),
++      lambda_z = init_lambda_z,
++      log_resid_error = log(sd_above / 5)
++    ),
++    fn = fit_half_life_tobit_LL,
++    log_conc = data$log_conc,
++    time = as.numeric(data$time),
++    mask_blq = data$mask_blq,
++    log_lloq = data$log_lloq,
++    control = effective_control
++  )
++  # code 0 = converged; any other code = failure
++  if (fit$convergence != 0) {
++    rlang::warn(
++      message = paste0(
++        "Tobit half-life optimization did not converge (code ", fit$convergence, ")"
++      ),
++      class = "pknca_tobit_no_convergence"
++    )
++    return(na_ret)
++  }
++  tobit_residual <- exp(fit$par[["log_resid_error"]])
++  # adj_tobit_residual uses only points at or before tlast (analogous to adj.r.squared)
++  n_before_tlast <- sum(as.numeric(data$time) <= as.numeric(tlast))
++  adj_tobit_residual <-
++    if (n_before_tlast > 2) {
++      tobit_residual * (n_before_tlast - 2) / (n_before_tlast - 1)
++    } else {
++      NA_real_
++    }
++  lambda_z <- fit$par[["lambda_z"]]
++  clast_pred <- exp(fit$par[["log_c0"]] - lambda_z * as.numeric(tlast))
++  above_lloq_times <- data$time[!data$mask_blq]
++  ret <- data.frame(
++    lambda.z = lambda_z,
++    clast.pred = clast_pred,
++    lambda.z.time.first = min(data$time, na.rm = TRUE),
++    lambda.z.time.last = max(data$time, na.rm = TRUE),
++    lambda.z.n.points = nrow(data),
++    lambda.z.n.points_blq = sum(data$mask_blq),
++    half.life = log(2) / lambda_z,
++    tobit_residual = tobit_residual,
++    adj_tobit_residual = adj_tobit_residual
++  )
++  # span.ratio uses only above-LLOQ time range (same as reference implementation)
++  ret$span.ratio <- diff(range(as.numeric(above_lloq_times))) / ret$half.life
++  ret
++}
++
+ # Add the column to the interval specification
+ add.interval.col("half.life",
+                  FUN="pk.calc.half.life",
+@@ -439,6 +752,45 @@ PKNCA.set.summary(
+   point=business.geomean,
+   spread=business.geocv
+ )
++add.interval.col("tobit_residual",
++                 FUN=NA,
++                 values=c(FALSE, TRUE),
++                 unit_type="unitless",
++                 pretty_name="Tobit residual SD",
++                 desc="The estimated residual standard deviation (on the log-concentration scale) from the Tobit half-life fit",
++                 depends="half.life")
++PKNCA.set.summary(
++  name="tobit_residual",
++  description="arithmetic mean and standard deviation",
++  point=business.mean,
++  spread=business.sd
++)
++add.interval.col("adj_tobit_residual",
++                 FUN=NA,
++                 values=c(FALSE, TRUE),
++                 unit_type="unitless",
++                 pretty_name="Adjusted Tobit residual SD",
++                 desc="The adjusted Tobit residual standard deviation (analogous to adjusted r-squared; penalizes smaller windows)",
++                 depends="half.life")
++PKNCA.set.summary(
++  name="adj_tobit_residual",
++  description="arithmetic mean and standard deviation",
++  point=business.mean,
++  spread=business.sd
++)
++add.interval.col("lambda.z.n.points_blq",
++                 FUN=NA,
++                 values=c(FALSE, TRUE),
++                 unit_type="count",
++                 pretty_name="Number of BLQ points for lambda_z (Tobit)",
++                 desc="The number of BLQ points included in the Tobit half-life calculation",
++                 depends="half.life")
++PKNCA.set.summary(
++  name="lambda.z.n.points_blq",
++  description="median and range",
++  point=business.median,
++  spread=business.range
++)
+ 
+ #' Determine which concentrations were used for half-life calculation
+ #'
+diff --git a/inst/WORDLIST b/inst/WORDLIST
+index cb3ca8975..09af7b9da 100644
+--- a/inst/WORDLIST
++++ b/inst/WORDLIST
+@@ -78,6 +78,7 @@ Wickham
+ WinNonlin
+ ae
+ amikacin
++amountu
+ analyte
+ analytes
+ assocuated
+@@ -97,8 +98,10 @@ clr
+ cmax
+ cmin
+ conc
++concu
+ ctrough
+ dbplyr
++df
+ doBy
+ doi
+ dosetype
+@@ -118,6 +121,7 @@ https
+ ibute
+ infty
+ interp
++intra
+ intravascular
+ knitr
+ leq
+@@ -158,6 +162,7 @@ thalf
+ theophylline
+ tibble
+ tibbles
++timeu
+ tlast
+ tmax
+ totdose
+diff --git a/man/fit_half_life_tobit.Rd b/man/fit_half_life_tobit.Rd
+new file mode 100644
+index 000000000..2c08c3e4b
+--- /dev/null
++++ b/man/fit_half_life_tobit.Rd
+@@ -0,0 +1,34 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/half.life.R
++\name{fit_half_life_tobit}
++\alias{fit_half_life_tobit}
++\title{Perform a Tobit half-life fit given the data.  The function fits the data
++using maximum likelihood without any point selection or validation.}
++\usage{
++fit_half_life_tobit(data, tlast, optim_control = list())
++}
++\arguments{
++\item{data}{The data to fit.  Must have columns named \code{"log_conc"},
++\code{"time"}, \code{"log_lloq"}, and \code{"mask_blq"}.  \code{log_conc} for BLQ
++observations is not used (the likelihood uses \code{log_lloq} instead).}
++
++\item{tlast}{The time of last observed concentration above the lower limit
++of quantification.}
++
++\item{optim_control}{A list of control parameters passed to \code{\link[stats:optim]{stats::optim()}}.}
++}
++\value{
++A data.frame with one row and columns named \code{"lambda.z"},
++\code{"clast.pred"}, \code{"lambda.z.time.first"}, \code{"lambda.z.time.last"},
++\code{"lambda.z.n.points"}, \code{"lambda.z.n.points_blq"}, \code{"half.life"},
++\code{"span.ratio"}, \code{"tobit_residual"}, and \code{"adj_tobit_residual"}.
++Returns \code{NA} for all columns if \code{\link[stats:optim]{stats::optim()}} does not converge,
++and emits a warning.
++}
++\description{
++Perform a Tobit half-life fit given the data.  The function fits the data
++using maximum likelihood without any point selection or validation.
++}
++\seealso{
++\code{\link[=pk.calc.half.life]{pk.calc.half.life()}}, \code{fit_half_life_tobit_LL()}
++}
+diff --git a/man/fit_half_life_tobit_LL.Rd b/man/fit_half_life_tobit_LL.Rd
+new file mode 100644
+index 000000000..5a10ccb2d
+--- /dev/null
++++ b/man/fit_half_life_tobit_LL.Rd
+@@ -0,0 +1,33 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/half.life.R
++\name{fit_half_life_tobit_LL}
++\alias{fit_half_life_tobit_LL}
++\title{Negative log-likelihood for Tobit half-life regression}
++\usage{
++fit_half_life_tobit_LL(par, log_conc, time, mask_blq, log_lloq)
++}
++\arguments{
++\item{par}{A 3-element numeric vector: \code{c(log_c0, lambda_z, log_resid_error)}}
++
++\item{log_conc}{Natural log of observed concentration (may be \code{-Inf} for
++BLQ; those values are not used when \code{mask_blq} is \code{TRUE})}
++
++\item{time}{Numeric time vector}
++
++\item{mask_blq}{Logical vector; \code{TRUE} where the observation is below the
++LLOQ}
++
++\item{log_lloq}{Natural log of the lower limit of quantification}
++}
++\value{
++The negative sum of the log-likelihood (a scalar)
++}
++\description{
++Helper function used by \code{fit_half_life_tobit()} via \code{\link[stats:optim]{stats::optim()}}.
++For observations above the LLOQ, the normal density contributes to the
++likelihood.  For censored (BLQ) observations, the normal CDF up to the
++LLOQ contributes.
++}
++\seealso{
++\code{fit_half_life_tobit()}
++}
+diff --git a/man/pk.calc.half.life.Rd b/man/pk.calc.half.life.Rd
+index 353cd1ab5..dd9d093d5 100644
+--- a/man/pk.calc.half.life.Rd
++++ b/man/pk.calc.half.life.Rd
+@@ -11,10 +11,14 @@ pk.calc.half.life(
+   tlast,
+   time.dose = NULL,
+   duration.dose = 0,
++  lloq = NULL,
++  hl_method = c("log-linear", "tobit"),
+   manually.selected.points = FALSE,
+   options = list(),
+   min.hl.points = NULL,
+   adj.r.squared.factor = NULL,
++  tobit_n_points_penalty = NULL,
++  tobit_optim_control = NULL,
+   conc.blq = NULL,
+   conc.na = NULL,
+   first.tmax = NULL,
+@@ -41,6 +45,15 @@ length as \code{dose})}
+ interval (typically zero for extravascular and intravascular bolus and
+ nonzero for intravascular infusion)}
+ 
++\item{lloq}{Lower limit of quantification.  A scalar or a vector the same
++length as \code{conc}.  Required when \code{hl_method = "tobit"}.}
++
++\item{hl_method}{The method used to estimate the half-life.
++\code{"log-linear"} (default) uses ordinary least-squares regression on
++log-transformed concentrations.  \code{"tobit"} uses maximum-likelihood Tobit
++regression that properly accounts for BLQ observations.  The global default
++can be changed via \code{PKNCA.options(hl_method = "tobit")}.}
++
+ \item{manually.selected.points}{Have the input points (\code{conc} and
+ \code{time}) been manually selected?  The impact of setting this to
+ \code{TRUE} is that no selection for the best points will be done.  When
+@@ -51,10 +64,17 @@ nonzero for intravascular infusion)}
+ \code{PKNCA.options()})}
+ 
+ \item{min.hl.points}{The minimum number of points that must be
+-included to calculate the half-life}
++included to calculate the half-life.  For \code{hl_method = "tobit"} this
++counts only above-LLOQ points.}
+ 
+ \item{adj.r.squared.factor}{The allowance in adjusted r-squared for
+-adding another point.}
++adding another point (log-linear method only).}
++
++\item{tobit_n_points_penalty}{The penalty exponent on the number of points
++for Tobit window selection.  See \code{\link[=PKNCA.options]{PKNCA.options()}}.}
++
++\item{tobit_optim_control}{A list of control parameters passed to
++\code{\link[stats:optim]{stats::optim()}} for the Tobit fit.  See \code{\link[=PKNCA.options]{PKNCA.options()}}.}
+ 
+ \item{conc.blq}{See \code{\link[=clean.conc.blq]{clean.conc.blq()}}}
+ 
+@@ -69,40 +89,59 @@ to be included in the half-life slope calculation.}
+ \code{\link[=clean.conc.blq]{clean.conc.blq()}}, and \code{\link[=clean.conc.na]{clean.conc.na()}}?}
+ }
+ \value{
+-A data frame with one row and columns for
++A data frame with one row.  Columns depend on \code{hl_method}:
++
++Columns returned by both methods:
+ \describe{
+ \item{tmax}{Time of maximum observed concentration (only included
+ if not given as an input)}
+ \item{tlast}{Time of last observed concentration above the LOQ (only
+ included if not given as an input)}
+-\item{r.squared}{coefficient of determination}
+-\item{adj.r.squared}{adjusted coefficient of determination}
+ \item{lambda.z}{elimination rate}
+-\item{lambda.z.corrxy}{correlation between time and log-conc half-life points}
+ \item{lambda.z.time.first}{first time for half-life calculation}
+ \item{lambda.z.time.last}{last time for half-life calculation}
+-\item{lambda.z.n.points}{number of points in half-life calculation}
++\item{lambda.z.n.points}{number of points in half-life calculation
++(all points for Tobit, including BLQ)}
+ \item{clast.pred}{Concentration at tlast as predicted by the half-life
+ line}
+ \item{half.life}{half-life}
+-\item{span.ratio}{span ratio [ratio of half-life to time used for
+-half-life calculation}
++\item{span.ratio}{ratio of the above-LLOQ time span to the half-life}
++}
++
++Additional columns for \code{hl_method = "log-linear"}:
++\describe{
++\item{r.squared}{coefficient of determination}
++\item{adj.r.squared}{adjusted coefficient of determination}
++\item{lambda.z.corrxy}{correlation between time and log-conc for the
++half-life points}
++}
++
++Additional columns for \code{hl_method = "tobit"}:
++\describe{
++\item{lambda.z.n.points_blq}{number of BLQ points included in the fit}
++\item{tobit_residual}{estimated residual standard deviation from the
++Tobit fit (on the log-concentration scale)}
++\item{adj_tobit_residual}{adjusted Tobit residual (analogous to
++adjusted r-squared; penalizes smaller windows)}
+ }
+ }
+ \description{
+ The terminal elimination half-life is estimated from the final points in the
+-concentration-time curve using semi-log regression (\code{log(conc)~time})
+-with automated selection of the points for calculation (unless
+-\code{manually.selected.points} is \code{TRUE}).
++concentration-time curve using semi-log regression (\code{log(conc)~time}, the
++\code{"log-linear"} method) or Tobit regression (\code{"tobit"} method) with automated
++selection of the points for calculation (unless \code{manually.selected.points} is
++\code{TRUE}).
+ }
+ \details{
+-See the "Half-Life Calculation" vignette for more details on the calculation
+-methods used.
++See the "Half-Life Calculation" and "Half-Life Calculation with Tobit
++Regression" vignettes for more details on the calculation methods.
+ 
+ If \code{manually.selected.points} is \code{FALSE} (default), the
+ half-life is calculated by computing the best fit line for all points at or
+-after tmax (based on the value of \code{allow.tmax.in.half.life}).  The best
+-half-life is chosen by the following rules in order:
++after tmax (based on the value of \code{allow.tmax.in.half.life}).
++
++For \code{hl_method = "log-linear"}, the best half-life is chosen by the
++following rules in order:
+ 
+ \itemize{
+ \item{At least \code{min.hl.points} points included}
+@@ -111,9 +150,16 @@ half-life is chosen by the following rules in order:
+ \item{The one with the most points included}
+ }
+ 
+-If \code{manually.selected.points} is \code{TRUE}, the \code{conc}
+-and \code{time} data are used as-is without any form of selection for
+-the best-fit half-life.
++For \code{hl_method = "tobit"}, BLQ observations are retained and treated as
++left-censored.  The best window is the one minimizing
++\code{tobit_residual * n ^ tobit_n_points_penalty} (default: raw \code{tobit_residual})
++among windows with \code{lambda.z > 0} and at least \code{min.hl.points} above-LLOQ
++points.  On ties the largest window (most total points) is preferred.
++
++If \code{manually.selected.points} is \code{TRUE}, the \code{conc} and \code{time} data are
++used as-is without any form of point selection.  When
++\code{TRUE}, \code{adj.r.squared.factor}, \code{min.hl.points}, and
++\code{allow.tmax.in.half.life} are ignored.
+ }
+ \references{
+ Gabrielsson J, Weiner D.  "Section 2.8.4 Strategies for estimation of
+diff --git a/tests/testthat/test-PKNCA.options.R b/tests/testthat/test-PKNCA.options.R
+index f40b64d31..39e6eb593 100644
+--- a/tests/testthat/test-PKNCA.options.R
++++ b/tests/testthat/test-PKNCA.options.R
+@@ -86,7 +86,10 @@ test_that("PKNCA.options", {
+           cmax = c(FALSE, TRUE)
+         )
+       ),
+-      allow_partial_missing_units = FALSE
++      allow_partial_missing_units = FALSE,
++      hl_method = "log-linear",
++      tobit_n_points_penalty = 0,
++      tobit_optim_control = list()
+     )
+   )
+ 
+diff --git a/tests/testthat/test-half.life.R b/tests/testthat/test-half.life.R
+index afd97d8be..cc7a9c946 100644
+--- a/tests/testthat/test-half.life.R
++++ b/tests/testthat/test-half.life.R
+@@ -523,3 +523,258 @@ test_that("half-life has a exclude message when it cannot be calculated for flat
+     "No point variability in concentrations for half-life calculation"
+   )
+ })
++
++# ---- Tobit half-life tests ----
++
++test_that("fit_half_life_tobit_LL returns correct negative log-likelihood", {
++  # All above-LLOQ: result should match dnorm log-likelihood
++  log_conc <- log(c(1, 0.5, 0.25))
++  time <- c(0, 1, 2)
++  mask_blq <- c(FALSE, FALSE, FALSE)
++  log_lloq <- rep(log(0.01), 3)
++  # par: log_c0 = log(1) = 0, lambda_z = log(2), log_resid_error = log(0.01)
++  par <- c(log_c0 = 0, lambda_z = log(2), log_resid_error = log(0.01))
++  ll <- PKNCA:::fit_half_life_tobit_LL(par, log_conc, time, mask_blq, log_lloq)
++  est <- par[["log_c0"]] - par[["lambda_z"]] * time
++  expected_ll <- -sum(dnorm(log_conc, mean = est, sd = exp(par[["log_resid_error"]]), log = TRUE))
++  expect_equal(ll, expected_ll)
++})
++
++test_that("fit_half_life_tobit_LL handles BLQ observations", {
++  # One BLQ observation: should use pnorm for that point
++  log_conc <- c(log(1), log(0.5), -Inf)  # third is BLQ
++  time <- c(0, 1, 2)
++  lloq_val <- 0.3
++  mask_blq <- c(FALSE, FALSE, TRUE)
++  log_lloq <- rep(log(lloq_val), 3)
++  par <- c(log_c0 = 0, lambda_z = log(2), log_resid_error = log(0.1))
++  ll <- PKNCA:::fit_half_life_tobit_LL(par, log_conc, time, mask_blq, log_lloq)
++  est <- par[["log_c0"]] - par[["lambda_z"]] * time
++  sd_val <- exp(par[["log_resid_error"]])
++  expected_ll <- -(
++    sum(dnorm(log_conc[!mask_blq], mean = est[!mask_blq], sd = sd_val, log = TRUE)) +
++    sum(pnorm(log_lloq[mask_blq], mean = est[mask_blq], sd = sd_val, log.p = TRUE))
++  )
++  expect_equal(ll, expected_ll)
++})
++
++test_that("fit_half_life_tobit recovers known parameters (all above-LLOQ)", {
++  # Exact exponential decay with no noise: half-life should be 1
++  conc <- c(1, 0.5, 0.25, 0.125)
++  time <- c(0, 1, 2, 3)
++  lloq <- rep(0.01, 4)
++  data <- data.frame(
++    log_conc = log(conc),
++    time = time,
++    log_lloq = log(lloq),
++    mask_blq = conc < lloq
++  )
++  result <- PKNCA:::fit_half_life_tobit(data, tlast = 3)
++  expect_equal(result$half.life, 1, tolerance = 0.01)
++  expect_equal(result$lambda.z, log(2), tolerance = 0.01)
++  expect_equal(result$lambda.z.n.points, 4L)
++  expect_equal(result$lambda.z.n.points_blq, 0L)
++  expect_false(is.na(result$tobit_residual))
++  expect_false(is.na(result$adj_tobit_residual))
++})
++
++test_that("fit_half_life_tobit returns NA with warning on too few above-LLOQ points", {
++  data <- data.frame(
++    log_conc = log(c(0.05, 0.03)),
++    time = c(1, 2),
++    log_lloq = log(c(0.1, 0.1)),
++    mask_blq = c(TRUE, TRUE)  # both BLQ
++  )
++  expect_warning(
++    result <- PKNCA:::fit_half_life_tobit(data, tlast = 2),
++    class = "pknca_tobit_too_few_points"
++  )
++  expect_true(is.na(result$lambda.z))
++  expect_true(is.na(result$half.life))
++})
++
++test_that("fit_half_life_tobit returns NA with warning on no variability", {
++  data <- data.frame(
++    log_conc = log(c(1, 1, 1)),
++    time = c(0, 1, 2),
++    log_lloq = log(c(0.1, 0.1, 0.1)),
++    mask_blq = c(FALSE, FALSE, FALSE)
++  )
++  expect_warning(
++    result <- PKNCA:::fit_half_life_tobit(data, tlast = 2),
++    class = "pknca_tobit_no_variability"
++  )
++  expect_true(is.na(result$lambda.z))
++})
++
++test_that("pk.calc.half.life hl_method='tobit' requires lloq", {
++  expect_error(
++    pk.calc.half.life(
++      conc = c(1, 0.5, 0.25),
++      time = c(0, 1, 2),
++      hl_method = "tobit"
++    ),
++    regexp = "lloq must be provided"
++  )
++})
++
++test_that("pk.calc.half.life hl_method='tobit' matches log-linear when no BLQ", {
++  # Slightly noisy data (well above LLOQ) — Tobit and log-linear should agree closely.
++  # Exact exponential data is avoided here because n_points == n_parameters in the
++  # smallest window causes the optimizer's residual to degenerate toward 0.
++  conc <- c(1.02, 0.49, 0.26, 0.123)   # ~2 % noise around exact decay
++  time <- c(0, 1, 2, 3)
++  lloq <- 0.01
++
++  result_ll <- pk.calc.half.life(
++    conc = conc, time = time,
++    hl_method = "log-linear",
++    allow.tmax.in.half.life = TRUE,
++    min.hl.points = 3
++  )
++  result_tobit <- pk.calc.half.life(
++    conc = conc, time = time, lloq = lloq,
++    hl_method = "tobit",
++    allow.tmax.in.half.life = TRUE,
++    min.hl.points = 3
++  )
++  expect_equal(result_tobit$half.life, result_ll$half.life, tolerance = 0.05)
++  expect_equal(result_tobit$lambda.z, result_ll$lambda.z, tolerance = 0.05)
++  # Tobit-specific columns present
++  expect_false(is.na(result_tobit$tobit_residual))
++  expect_false(is.na(result_tobit$lambda.z.n.points_blq))
++  # Log-linear-specific columns absent from Tobit result
++  expect_null(result_tobit$r.squared)
++  expect_null(result_tobit$adj.r.squared)
++  expect_null(result_tobit$lambda.z.corrxy)
++})
++
++test_that("pk.calc.half.life hl_method='tobit' includes BLQ points and improves estimate", {
++  # True half-life = 1.  Without Tobit (log-linear ignores BLQ), only 3 above-LLOQ
++  # points are used and the estimate is less accurate.
++  # With Tobit, the BLQ points provide additional information.
++  conc_true <- c(1, 0.5, 0.25, 0.1, 0.03, 0.009)
++  time <- c(0, 1, 2, 3, 4, 5)
++  lloq <- 0.05
++  conc_obs <- ifelse(conc_true < lloq, 0, conc_true)
++
++  result_ll <- pk.calc.half.life(
++    conc = conc_obs, time = time,
++    hl_method = "log-linear",
++    allow.tmax.in.half.life = TRUE,
++    min.hl.points = 3
++  )
++  result_tobit <- pk.calc.half.life(
++    conc = conc_obs, time = time, lloq = lloq,
++    hl_method = "tobit",
++    allow.tmax.in.half.life = TRUE,
++    min.hl.points = 3
++  )
++  # Tobit should include BLQ points
++  expect_true(result_tobit$lambda.z.n.points_blq > 0)
++  # Both should give a positive half-life
++  expect_true(result_ll$half.life > 0)
++  expect_true(result_tobit$half.life > 0)
++})
++
++test_that("pk.calc.half.life hl_method='tobit' lambda.z.n.points counts all (including BLQ)", {
++  conc_obs <- c(1, 0.5, 0, 0)  # last two are BLQ
++  time <- c(0, 1, 2, 3)
++  lloq <- 0.1
++
++  result <- pk.calc.half.life(
++    conc = conc_obs, time = time, lloq = lloq,
++    hl_method = "tobit",
++    allow.tmax.in.half.life = TRUE,
++    min.hl.points = 2
++  )
++  # lambda.z.n.points should be >= 3 (includes BLQ points)
++  expect_gte(result$lambda.z.n.points, 3L)
++  expect_gte(result$lambda.z.n.points_blq, 1L)
++  expect_equal(result$lambda.z.n.points_blq + (result$lambda.z.n.points - result$lambda.z.n.points_blq),
++               result$lambda.z.n.points)
++})
++
++test_that("pk.calc.half.life hl_method='tobit' warns with too few above-LLOQ points", {
++  conc_obs <- c(1, 0, 0, 0)  # only 1 above LLOQ
++  time <- c(0, 1, 2, 3)
++  lloq <- 0.1
++
++  expect_warning(
++    result <- pk.calc.half.life(
++      conc = conc_obs, time = time, lloq = lloq,
++      hl_method = "tobit",
++      allow.tmax.in.half.life = TRUE,
++      min.hl.points = 3
++    ),
++    class = "pknca_halflife_too_few_points"
++  )
++  expect_true(is.na(result$lambda.z))
++})
++
++test_that("pk.calc.half.life hl_method='tobit' manually.selected.points works", {
++  conc <- c(1, 0.5, 0.25, 0, 0)
++  time <- c(0, 1, 2, 3, 4)
++  lloq <- 0.1
++
++  result <- pk.calc.half.life(
++    conc = conc, time = time, lloq = lloq,
++    hl_method = "tobit",
++    manually.selected.points = TRUE,
++    allow.tmax.in.half.life = TRUE
++  )
++  expect_false(is.na(result$half.life))
++  expect_true(result$half.life > 0)
++  expect_equal(result$lambda.z.n.points_blq, 2L)
++})
++
++test_that("pk.calc.half.life hl_method='tobit' scalar lloq is broadcast correctly", {
++  conc <- c(1, 0.5, 0.25, 0)
++  time <- c(0, 1, 2, 3)
++  # Single scalar lloq should work identically to a vector of the same value
++  result_scalar <- pk.calc.half.life(
++    conc = conc, time = time, lloq = 0.1,
++    hl_method = "tobit", allow.tmax.in.half.life = TRUE, min.hl.points = 2
++  )
++  result_vec <- pk.calc.half.life(
++    conc = conc, time = time, lloq = rep(0.1, 4),
++    hl_method = "tobit", allow.tmax.in.half.life = TRUE, min.hl.points = 2
++  )
++  expect_equal(result_scalar$half.life, result_vec$half.life)
++})
++
++test_that("pk.calc.half.life hl_method='tobit' global option is respected", {
++  withr::with_options(
++    list(),
++    {
++      PKNCA.options(hl_method = "tobit")
++      on.exit(PKNCA.options(default = TRUE))
++      # Use 5 data points with slight noise so all optimisation windows are
++      # overdetermined (more points than parameters) and converge reliably.
++      result <- pk.calc.half.life(
++        conc = c(1.02, 0.49, 0.26, 0.123, 0.064),
++        time = c(0, 1, 2, 3, 4),
++        lloq = 0.01,
++        allow.tmax.in.half.life = TRUE, min.hl.points = 3
++      )
++      expect_false(is.na(result$tobit_residual))
++      expect_null(result$r.squared)
++    }
++  )
++})
++
++test_that("pk.calc.half.life log-linear result is unaffected by Tobit additions", {
++  # Existing log-linear behaviour should be completely unchanged
++  result <- pk.calc.half.life(
++    conc = c(1, 0.5, 0.25),
++    time = c(0, 1, 2),
++    min.hl.points = 3,
++    allow.tmax.in.half.life = TRUE,
++    adj.r.squared.factor = 0.0001
++  )
++  expect_equal(result$half.life, 1)
++  expect_false(is.na(result$r.squared))
++  expect_false(is.na(result$adj.r.squared))
++  expect_null(result$tobit_residual)
++  expect_null(result$lambda.z.n.points_blq)
++})
+diff --git a/vignettes/v06-half-life-calculation-tobit.Rmd b/vignettes/v06-half-life-calculation-tobit.Rmd
+index 4f3ec8c41..6ea07ef16 100644
+--- a/vignettes/v06-half-life-calculation-tobit.Rmd
++++ b/vignettes/v06-half-life-calculation-tobit.Rmd
+@@ -14,7 +14,7 @@ knitr::opts_chunk$set(
+ )
+ ```
+ 
+-```{r setup, include=FALSE}
++```{r setup}
+ library(PKNCA)
+ ```
+ 
+@@ -107,3 +107,149 @@ half-life while least-squares performs slightly better between the theoretical
+ and 2-fold above.  The fact that the Tobit regression cumulative distribution
+ function is closer to 1 across the range of simulations indicates that Tobit
+ regression provides better half-life estimate across a broad range of data.
++
++# Usage
++
++## Basic usage: a single subject
++
++The `hl_method` argument to `pk.calc.half.life()` selects the estimation
++method.  When using `"tobit"`, the `lloq` argument is required and must be
++either a scalar (one LLOQ applied to all observations) or a vector the same
++length as `conc`.
++
++### Example 1: All observations above the LLOQ
++
++When no observations are below the LLOQ, Tobit and log-linear regression
++produce essentially the same answer.
++
++```{r example-no-blq}
++conc_no_blq <- c(10, 5, 2.5, 1.25, 0.625)
++time_points  <- c(0,  1, 2,   3,    4)
++lloq         <- 0.1   # well below all observations
++
++hl_loglinear <- pk.calc.half.life(
++  conc = conc_no_blq,
++  time = time_points,
++  allow.tmax.in.half.life = TRUE
++)
++
++hl_tobit <- pk.calc.half.life(
++  conc = conc_no_blq,
++  time = time_points,
++  lloq = lloq,
++  hl_method = "tobit",
++  allow.tmax.in.half.life = TRUE
++)
++
++cat("Log-linear half-life:", round(hl_loglinear$half.life, 3), "\n")
++cat("Tobit half-life:     ", round(hl_tobit$half.life, 3),    "\n")
++```
++
++Note the columns that are returned:
++
++```{r example-no-blq-cols}
++# Log-linear returns r-squared and related diagnostics
++names(hl_loglinear)
++
++# Tobit returns tobit_residual and BLQ point counts instead
++names(hl_tobit)
++```
++
++### Example 2: BLQ observations before T~last~
++
++When some observations are below the LLOQ, the log-linear method drops them
++entirely.  Tobit regression treats them as left-censored, which can provide a
++better estimate.
++
++```{r example-with-blq}
++lloq <- 1.0
++conc_true  <- c(10, 5, 2.5, 1.25, 0.5, 0.2)
++time_points <- c(0,  1, 2,   3,    4,   5)
++# Observations below the LLOQ are reported as zero
++conc_obs <- ifelse(conc_true < lloq, 0, conc_true)
++
++cat("Observed concentrations:", conc_obs, "\n")
++cat("LLOQ:", lloq, "\n")
++cat("Number of BLQ observations:", sum(conc_obs < lloq), "\n")
++
++hl_loglinear <- pk.calc.half.life(
++  conc = conc_obs,
++  time = time_points,
++  allow.tmax.in.half.life = TRUE
++)
++
++hl_tobit <- pk.calc.half.life(
++  conc = conc_obs,
++  time = time_points,
++  lloq = lloq,
++  hl_method = "tobit",
++  allow.tmax.in.half.life = TRUE
++)
++
++cat("\nLog-linear (drops BLQ):\n")
++cat("  Half-life:      ", round(hl_loglinear$half.life, 3), "\n")
++cat("  Points used:    ", hl_loglinear$lambda.z.n.points, "\n")
++
++cat("\nTobit (includes BLQ as censored):\n")
++cat("  Half-life:      ", round(hl_tobit$half.life, 3), "\n")
++cat("  Total points:   ", hl_tobit$lambda.z.n.points, "\n")
++cat("  BLQ points:     ", hl_tobit$lambda.z.n.points_blq, "\n")
++cat("  Tobit residual: ", round(hl_tobit$tobit_residual, 4), "\n")
++```
++
++## Using the global option
++
++To use Tobit regression for all half-life calculations in a session, set the
++global option.  Calculations that do not explicitly set `hl_method` will then
++use Tobit regression by default.
++
++```{r global-option, eval=FALSE}
++PKNCA.options(hl_method = "tobit")
++
++# Now all pk.calc.half.life() calls default to Tobit
++# Reset to the package default when done:
++PKNCA.options(default = TRUE)
++```
++
++## Full NCA workflow with PKNCAdata
++
++The `lloq` argument can be passed through the interval calculation via the
++`options` list when running a full NCA.
++
++```{r full-nca, eval=FALSE}
++# Suppose d_conc is your concentration data frame with columns
++# subject, time, conc, and your LLOQ is 1.0
++
++o_conc <- PKNCAconc(d_conc, conc ~ time | subject)
++o_dose <- PKNCAdose(d_dose, dose ~ time | subject)
++o_data <- PKNCAdata(
++  o_conc, o_dose,
++  intervals = data.frame(start = 0, end = Inf, half.life = TRUE),
++  options = list(hl_method = "tobit")
++)
++# Note: lloq must be provided per-subject in the concentration data or
++# as a scalar in the options when using the Tobit method in pk.nca().
++```
++
++## Controlling Tobit point selection
++
++The `tobit_n_points_penalty` option controls how the number of points
++influences window selection.  With the default value of 0 the window with the
++smallest Tobit residual is selected.  Positive values penalize larger windows,
++requiring them to have a meaningfully lower residual to be preferred.
++
++```{r penalty-option, eval=FALSE}
++# Penalise larger windows slightly
++PKNCA.options(tobit_n_points_penalty = 0.5)
++PKNCA.options(default = TRUE)  # reset
++```
++
++The `tobit_optim_control` option passes a list of control parameters directly
++to `stats::optim()`.  This is rarely needed but can help when the default
++optimization settings fail to converge for unusual concentration-time profiles.
++
++```{r optim-control, eval=FALSE}
++# Increase the maximum number of iterations
++PKNCA.options(tobit_optim_control = list(maxit = 1000))
++PKNCA.options(default = TRUE)  # reset
++```

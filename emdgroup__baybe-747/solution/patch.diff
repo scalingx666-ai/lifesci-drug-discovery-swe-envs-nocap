@@ -1,0 +1,185 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1aa71621ae..1c301a7370 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+   components, enabling full low-level customization
+ - `EDBO` and `EDBO_SMOOTHED` presets for `GaussianProcessSurrogate`
+ - Interpoint constraints for continuous search spaces
++- `IndexKernel` and `PositiveIndexKernel` classes
+ 
+ ### Breaking Changes
+ - `ContinuousLinearConstraint.to_botorch` now returns a collection of constraint tuples
+diff --git a/baybe/kernels/base.py b/baybe/kernels/base.py
+index 9eea2d2036..8ccc7c75fc 100644
+--- a/baybe/kernels/base.py
++++ b/baybe/kernels/base.py
+@@ -53,7 +53,14 @@ def to_gpytorch(
+         kw = {k: v for k, v in kw.items() if v is not None}
+ 
+         # Get corresponding gpytorch kernel class and its base classes
+-        kernel_cls = getattr(gpytorch.kernels, self.__class__.__name__)
++        try:
++            kernel_cls = getattr(gpytorch.kernels, self.__class__.__name__)
++        except AttributeError:
++            import botorch.models.kernels.positive_index
++
++            kernel_cls = getattr(
++                botorch.models.kernels.positive_index, self.__class__.__name__
++            )
+         base_classes = get_baseclasses(kernel_cls, abstract=True)
+ 
+         # Fetch the necessary gpytorch constructor parameters of the kernel.
+diff --git a/baybe/kernels/basic.py b/baybe/kernels/basic.py
+index 304f9a44be..327c9c89c2 100644
+--- a/baybe/kernels/basic.py
++++ b/baybe/kernels/basic.py
+@@ -215,5 +215,29 @@ class RQKernel(BasicKernel):
+     """An optional initial value for the kernel lengthscale."""
+ 
+ 
++@define(frozen=True)
++class IndexKernel(BasicKernel):
++    """An index kernel for transfer learning across tasks."""
++
++    num_tasks: int = field(validator=[instance_of(int), ge(2)])
++    """The number of tasks."""
++
++    rank: int = field(validator=[instance_of(int), ge(1)])
++    """The rank of the task covariance matrix."""
++
++    @rank.validator
++    def _validate_rank(self, _, rank: int):
++        if rank > self.num_tasks:
++            raise ValueError(
++                f"The rank of the task covariance matrix must be smaller than "
++                f"the number of tasks. Got rank {rank} > {self.num_tasks} tasks."
++            )
++
++
++@define(frozen=True)
++class PositiveIndexKernel(IndexKernel):
++    """A positive index kernel for transfer learning across tasks."""
++
++
+ # Collect leftover original slotted classes processed by `attrs.define`
+ gc.collect()
+diff --git a/baybe/surrogates/gaussian_process/core.py b/baybe/surrogates/gaussian_process/core.py
+index 0c8b81d105..bb2316d95d 100644
+--- a/baybe/surrogates/gaussian_process/core.py
++++ b/baybe/surrogates/gaussian_process/core.py
+@@ -12,6 +12,7 @@
+ from typing_extensions import Self, override
+ 
+ from baybe.kernels.base import Kernel
++from baybe.kernels.basic import IndexKernel
+ from baybe.parameters.base import Parameter
+ from baybe.searchspace.core import SearchSpace
+ from baybe.surrogates.base import Surrogate
+@@ -231,13 +232,12 @@ def _fit(self, train_x: Tensor, train_y: Tensor) -> None:
+                 ard_num_dims=kernel_num_dims,
+                 active_dims=context.numerical_indices,
+             )
+-
+         if context.is_multitask:
+-            task_kernel = gpytorch.kernels.IndexKernel(
++            assert context.task_idx is not None
++            task_kernel = IndexKernel(
+                 num_tasks=context.n_tasks,
+-                active_dims=context.task_idx,
+                 rank=context.n_tasks,  # TODO: make controllable
+-            )
++            ).to_gpytorch(active_dims=[context.task_idx])
+             kernel = kernel * task_kernel
+ 
+         ### Likelihood
+diff --git a/tests/hypothesis_strategies/kernels.py b/tests/hypothesis_strategies/kernels.py
+index 2f2ac87432..6ee8c1203b 100644
+--- a/tests/hypothesis_strategies/kernels.py
++++ b/tests/hypothesis_strategies/kernels.py
+@@ -5,11 +5,13 @@
+ import hypothesis.strategies as st
+ 
+ from baybe.kernels.basic import (
++    IndexKernel,
+     LinearKernel,
+     MaternKernel,
+     PeriodicKernel,
+     PiecewisePolynomialKernel,
+     PolynomialKernel,
++    PositiveIndexKernel,
+     RBFKernel,
+     RFFKernel,
+     RQKernel,
+@@ -89,6 +91,17 @@ class KernelType(Enum):
+ )
+ """A strategy that generates rational quadratic (RQ) kernels."""
+ 
++
++@st.composite
++def index_kernels(draw: st.DrawFn):
++    """A strategy that generates index kernels."""
++    num_tasks = draw(st.integers(min_value=2, max_value=5))
++    rank = draw(st.integers(min_value=1, max_value=num_tasks))
++    if draw(st.booleans()):
++        return PositiveIndexKernel(num_tasks=num_tasks, rank=rank)
++    return IndexKernel(num_tasks=num_tasks, rank=rank)
++
++
+ base_kernels = st.one_of(
+     [
+         matern_kernels,  # on top because it is the default for many use cases
+@@ -96,6 +109,7 @@ class KernelType(Enum):
+         rbf_kernels,
+         rq_kernels,
+         rff_kernels,
++        index_kernels(),
+         piecewise_polynomial_kernels,
+         polynomial_kernels,
+         periodic_kernels,
+diff --git a/tests/test_kernels.py b/tests/test_kernels.py
+index 63b9848112..7d7fc4cf68 100644
+--- a/tests/test_kernels.py
++++ b/tests/test_kernels.py
+@@ -8,6 +8,7 @@
+ from hypothesis import given
+ 
+ from baybe.kernels.base import BasicKernel, Kernel
++from baybe.kernels.basic import IndexKernel
+ from tests.hypothesis_strategies.kernels import kernels
+ 
+ # TODO: Consider deprecating these attribute names to avoid inconsistencies
+@@ -40,12 +41,28 @@ def validate_gpytorch_kernel_components(obj: Any, mapped: Any, **kwargs) -> None
+         # Resolve attribute naming differences
+         mapped_name = _RENAME_DICT.get(name, name)
+ 
+-        # If the attribute does not exist in the GPyTorch version, it must be an
+-        # initial value. Because setting initial values involves going through
+-        # constraint transformations on GPyTorch side (i.e., difference between
+-        # `<attr>` and `raw_<attr>`), the numerical values will not be exact, so
+-        # we check only for approximate matches.
++        # If the attribute does not exist in the GPyTorch version, ...
+         if (mapped_component := getattr(mapped, mapped_name, None)) is None:
++            # ... it must have some special handling on the GPyTorch side
++            # >>>>>
++            # TODO: this will be refactored in #748, which requires changes to the
++            #   test logic anyways
++            if isinstance(obj, IndexKernel) and name == "num_tasks":
++                # Special case for IndexKernel.num_tasks, which is not an actual
++                # attribute of the GPyTorch kernel
++                assert mapped.covar_factor.shape[-2] == component
++                continue
++            elif isinstance(obj, IndexKernel) and name == "rank":
++                # Special case for IndexKernel.rank, which is not an actual attribute of
++                # the GPyTorch kernel
++                assert mapped.covar_factor.shape[-1] == component
++                continue
++            # <<<<<
++
++            # ... or it must be an initial value. Because setting initial values
++            # involves going through constraint transformations on GPyTorch side (i.e.,
++            # difference between `<attr>` and `raw_<attr>`), the numerical values will
++            # not be exact, so we check only for approximate matches.
+             assert name.endswith("_initial_value")
+             assert np.allclose(
+                 component,

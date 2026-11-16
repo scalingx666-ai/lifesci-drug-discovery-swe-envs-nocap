@@ -1,0 +1,632 @@
+diff --git a/src/dxtb/scf/__init__.py b/src/dxtb/scf/__init__.py
+index c2decf990..447b4395c 100644
+--- a/src/dxtb/scf/__init__.py
++++ b/src/dxtb/scf/__init__.py
+@@ -3,4 +3,4 @@
+ """
+ 
+ from .guess import get_guess
+-from .iterator import solve
++from .iterator import solve, get_density
+diff --git a/src/dxtb/scf/iterator.py b/src/dxtb/scf/iterator.py
+index 6aec58771..c0cdf5c22 100644
+--- a/src/dxtb/scf/iterator.py
++++ b/src/dxtb/scf/iterator.py
+@@ -211,11 +211,14 @@ def __call__(self, charges: Tensor | None = None) -> dict[str, Tensor]:
+ 
+         return {
+             "charges": charges,
++            "coefficients": self._data.evecs,
+             "density": self._data.density,
+             "emo": self._data.evals,
+             "energy": energy,
+             "fenergy": fenergy,
+             "hamiltonian": self._data.hamiltonian,
++            "occupation": self._data.occupation,
++            "potential": self.charges_to_potential(charges),
+         }
+ 
+     def scf(self, charges: Tensor) -> Tensor:
+@@ -530,12 +533,7 @@ def hamiltonian_to_density(self, hamiltonian: Tensor):
+                     f"({nel} -> {_nel})."
+                 )
+ 
+-        return torch.einsum(
+-            "...ik,...k,...kj->...ij",
+-            self._data.evecs,
+-            self._data.occupation.sum(-2),
+-            self._data.evecs.mT,
+-        )
++        return get_density(self._data.evecs, self._data.occupation.sum(-2))
+ 
+     def get_overlap(self) -> LinearOperator:
+         """
+@@ -676,3 +674,29 @@ def solve(
+     return SelfConsistentField(
+         interactions, *args, numbers=numbers, ihelp=ihelp, cache=cache, **kwargs
+     )(charges)
++
++
++def get_density(coeffs: Tensor, occ: Tensor, emo: Tensor | None = None) -> Tensor:
++    """
++    Calculate the density matrix from the coefficient vector and the occupation.
++
++    Parameters
++    ----------
++    evecs : Tensor
++        _description_
++    occ : Tensor
++        Occupation numbers (diagonal matrix).
++    emo : Tensor | None, optional
++        Orbital energies for energy weighted density matrix. Defaults to `None`.
++
++    Returns
++    -------
++    Tensor
++        (Energy-weighted) Density matrix.
++    """
++    return torch.einsum(
++        "...ik,...k,...jk->...ij",
++        coeffs,
++        occ if emo is None else occ * emo,
++        coeffs,  # transposed
++    )
+diff --git a/src/dxtb/xtb/calculator.py b/src/dxtb/xtb/calculator.py
+index 1c78f71e8..8363dd108 100644
+--- a/src/dxtb/xtb/calculator.py
++++ b/src/dxtb/xtb/calculator.py
+@@ -30,7 +30,10 @@ class Result(TensorLike):
+     """
+ 
+     charges: Tensor
+-    """Self-consistent orbital-resolved Mulliken partial charges"""
++    """Self-consistent orbital-resolved Mulliken partial charges."""
++
++    coefficients: Tensor
++    """LCAO-MO coefficients (eigenvectors of Fockian)."""
+ 
+     density: Tensor
+     """Density matrix."""
+@@ -56,9 +59,15 @@ class Result(TensorLike):
+     hcore: Tensor
+     """Core Hamiltonian matrix (H0)."""
+ 
++    occupation: Tensor
++    """Orbital occupations."""
++
+     overlap: Tensor
+     """Overlap matrix."""
+ 
++    potential: Tensor
++    """Self-consistent orbital-resolved potential."""
++
+     repulsion: Tensor
+     """Repulsion energy."""
+ 
+@@ -73,6 +82,7 @@ class Result(TensorLike):
+ 
+     __slots__ = [
+         "charges",
++        "coefficients",
+         "density",
+         "dispersion",
+         "emo",
+@@ -81,7 +91,9 @@ class Result(TensorLike):
+         "halogen",
+         "hamiltonian",
+         "hcore",
++        "occupation",
+         "overlap",
++        "potential",
+         "repulsion",
+         "scf",
+         "timer",
+@@ -331,11 +343,14 @@ def singlepoint(
+                 use_potential=True,
+             )
+             result.charges = scf_results["charges"]
++            result.coefficients = scf_results["coefficients"]
+             result.density = scf_results["density"]
+             result.emo = scf_results["emo"]
++            result.fenergy = scf_results["fenergy"]
+             result.hamiltonian = scf_results["hamiltonian"]
++            result.occupation = scf_results["occupation"]
++            result.potential = scf_results["potential"]
+             result.scf += scf_results["energy"]
+-            result.fenergy = scf_results["fenergy"]
+             result.total += scf_results["energy"] + scf_results["fenergy"]
+             timer.stop("scf")
+ 
+diff --git a/src/dxtb/xtb/h0.py b/src/dxtb/xtb/h0.py
+index 717997a70..3cf0b6bad 100644
+--- a/src/dxtb/xtb/h0.py
++++ b/src/dxtb/xtb/h0.py
+@@ -9,7 +9,7 @@
+ from ..data import atomic_rad
+ from ..param import Param, get_elem_param, get_elem_valence, get_pair_param
+ from ..typing import Tensor, TensorLike
+-from ..utils import symmetrize
++from ..utils import real_pairs, symmetrize
+ 
+ PAD = -1
+ """Value used for padding of tensors."""
+@@ -261,25 +261,30 @@ def get_ksh(ushells: Tensor) -> Tensor:
+     def build(
+         self, positions: Tensor, overlap: Tensor, cn: Tensor | None = None
+     ) -> Tensor:
+-        """Build the xTB Hamiltonian
++        """
++        Build the xTB Hamiltonian.
+ 
+         Parameters
+         ----------
++        positions : Tensor
++            Atomic positions of molecular structure.
+         overlap : Tensor
+             Overlap matrix.
+         cn : Tensor | None, optional
+-            Coordination number, by default None
++            Coordination number. Defaults to `None`.
+ 
+         Returns
+         -------
+         Tensor
+-            Hamiltonian
++            Hamiltonian (always symmetric).
+         """
+ 
+-        real = self.numbers != 0
+-        mask = real.unsqueeze(-1) * real.unsqueeze(-2)
+-        real_shell = self.ihelp.spread_atom_to_shell(self.numbers) != 0
+-        mask_shell = real_shell.unsqueeze(-2) * real_shell.unsqueeze(-1)
++        # masks
++        mask_atom_diagonal = real_pairs(self.numbers, diagonal=True)
++        mask_shell = real_pairs(self.ihelp.spread_atom_to_shell(self.numbers))
++        mask_shell_diagonal = self.ihelp.spread_atom_to_shell(
++            mask_atom_diagonal, dim=(-2, -1)
++        )
+ 
+         zero = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+ 
+@@ -304,19 +309,18 @@ def build(
+         )
+         rad = self.ihelp.spread_uspecies_to_atom(self.rad)
+         rr = torch.where(
+-            mask * ~torch.diag_embed(torch.ones_like(real)),
++            mask_atom_diagonal,
+             distances / (rad.unsqueeze(-1) + rad.unsqueeze(-2)),
+             distances.new_tensor(torch.finfo(distances.dtype).eps),
+         )
+-        rr_sh = self.ihelp.spread_atom_to_shell(
++        rr_shell = self.ihelp.spread_atom_to_shell(
+             torch.sqrt(rr),
+             (-2, -1),
+         )
+ 
+         shpoly = self.ihelp.spread_ushell_to_shell(self.shpoly)
+-
+-        var_pi = (1.0 + shpoly.unsqueeze(-1) * rr_sh) * (
+-            1.0 + shpoly.unsqueeze(-2) * rr_sh
++        var_pi = (1.0 + shpoly.unsqueeze(-1) * rr_shell) * (
++            1.0 + shpoly.unsqueeze(-2) * rr_shell
+         )
+ 
+         # --------------------
+@@ -324,7 +328,105 @@ def build(
+         # --------------------
+         en = self.ihelp.spread_uspecies_to_shell(self.en)
+         var_x = torch.where(
++            mask_shell_diagonal,
++            1.0
++            + self.par.hamiltonian.xtb.enscale
++            * torch.pow(en.unsqueeze(-1) - en.unsqueeze(-2), 2.0),
++            zero,
++        )
++
++        # --------------------
++        # Eq.23: K_{AB}^{l,l'}
++        # --------------------
++        kpair = self.ihelp.spread_uspecies_to_shell(self.kpair, dim=(-2, -1))
++        hscale = self.ihelp.spread_ushell_to_shell(self.hscale, dim=(-2, -1))
++        valence = self.ihelp.spread_ushell_to_shell(self.valence)
++
++        var_k = torch.where(
++            valence.unsqueeze(-1) * valence.unsqueeze(-2),
++            hscale * kpair * var_x,
++            hscale,
++        )
++
++        # ------------
++        # Eq.23: H_EHT
++        # ------------
++        var_h = torch.where(
+             mask_shell,
++            0.5 * (selfenergy.unsqueeze(-1) + selfenergy.unsqueeze(-2)),
++            zero,
++        )
++
++        hcore = self.ihelp.spread_shell_to_orbital(
++            torch.where(
++                mask_shell_diagonal,
++                var_pi * var_k * var_h,  # scale only off-diagonals
++                var_h,
++            ),
++            dim=(-2, -1),
++        )
++        h = hcore * overlap
++
++        # force symmetry to avoid problems through numerical errors
++        return symmetrize(h)
++
++    def get_gradient(
++        self,
++        positions: Tensor,
++        overlap: Tensor,
++        doverlap: Tensor,
++        pmat: Tensor,
++        wmat: Tensor,
++        pot: Tensor,
++        cn: Tensor,
++    ) -> tuple[Tensor, Tensor]:
++        """
++        Calculate gradient of the full Hamiltonian with respect ot atomic positions.
++
++        Parameters
++        ----------
++        positions : Tensor
++            Atomic positions of molecular structure.
++        overlap : Tensor
++            Overlap matrix.
++        doverlap : Tensor
++            Derivative of the overlap matrix.
++        pmat : Tensor
++            Density matrix.
++        wmat : Tensor
++            Energy-weighted density.
++        pot : Tensor
++            Self-consistent electrostatic potential.
++        cn : Tensor
++            Coordination number.
++
++        Returns
++        -------
++        tuple[Tensor, Tensor]
++            Derivative of energy with respect to coordination number (first
++            tensor) and atomic positions (second tensor).
++        """
++        # masks
++        mask_atom = real_pairs(self.numbers)
++        mask_atom_diagonal = real_pairs(self.numbers, diagonal=True)
++
++        mask_shell = real_pairs(self.ihelp.spread_atom_to_shell(self.numbers))
++        mask_shell_diagonal = self.ihelp.spread_atom_to_shell(
++            mask_atom_diagonal, dim=(-2, -1)
++        )
++
++        mask_orb_diagonal = self.ihelp.spread_atom_to_orbital(
++            mask_atom_diagonal, dim=(-2, -1)
++        )
++
++        zero = torch.tensor(0.0, device=self.device, dtype=self.dtype)
++
++        # --------------------
++        # Eq.28: X(EN_A, EN_B)
++        # --------------------
++        en = self.ihelp.spread_uspecies_to_shell(self.en)
++        var_x = torch.where(
++            mask_shell_diagonal,
+             1.0
+             + self.par.hamiltonian.xtb.enscale
+             * torch.pow(en.unsqueeze(-1) - en.unsqueeze(-2), 2.0),
+@@ -344,24 +446,136 @@ def build(
+             hscale,
+         )
+ 
++        # ----------------------
++        # Eq.24: PI(R_AB, l, l')
++        # ----------------------
++        distances = torch.cdist(
++            positions, positions, p=2, compute_mode="use_mm_for_euclid_dist"
++        )
++        rad = self.ihelp.spread_uspecies_to_atom(self.rad)
++        rr = torch.where(
++            mask_atom_diagonal,
++            distances / (rad.unsqueeze(-1) + rad.unsqueeze(-2)),
++            distances.new_tensor(torch.finfo(distances.dtype).eps),
++        )
++        rr_shell = self.ihelp.spread_atom_to_shell(
++            torch.sqrt(rr),
++            (-2, -1),
++        )
++
++        shpoly = self.ihelp.spread_ushell_to_shell(self.shpoly)
++        shpoly_a = shpoly.unsqueeze(-1)
++        tmp_a = 1.0 + shpoly_a * rr_shell
++        shpoly_b = shpoly.unsqueeze(-2)
++        tmp_b = 1.0 + shpoly_b * rr_shell
++        var_pi = tmp_a * tmp_b
++
+         # ------------
+         # Eq.23: H_EHT
+         # ------------
++
++        # `kcn` differs from paper (Eq.29) to be consistent with GFN2
++        kcn = self.ihelp.spread_ushell_to_shell(self.kcn)
++        selfenergy = self.ihelp.spread_ushell_to_shell(
++            self.selfenergy
++        ) - kcn * self.ihelp.spread_atom_to_shell(cn)
++
+         var_h = torch.where(
+             mask_shell,
+             0.5 * (selfenergy.unsqueeze(-1) + selfenergy.unsqueeze(-2)),
+             zero,
+         )
+ 
+-        # scale only off-diagonals
+-        mask_shell = mask_shell * ~torch.diag_embed(torch.ones_like(real_shell))
+-        h0 = torch.where(mask_shell, var_pi * var_k * var_h, var_h)
++        hcore = self.ihelp.spread_shell_to_orbital(
++            torch.where(
++                mask_shell_diagonal,
++                var_pi * var_k * var_h,  # scale only off-diagonals
++                var_h,
++            ),
++            dim=(-2, -1),
++        )
+ 
+-        h = self.ihelp.spread_shell_to_orbital(h0, dim=(-2, -1))
+-        hcore = h * overlap
++        # ----------------------------------------------------------------------
++        # Derivative of the electronic energy w.r.t. the atomic positions r
++        # ----------------------------------------------------------------------
++        # dE/dr = dE_EHT/dr * dE_coulomb/dr * dL_constraint/dr
++        #       = [2*P*H - 2*W - P*(V + V^T)] * dS/dr + 2*P*H*S * dPI/dr / PI
++        # ----------------------------------------------------------------------
++
++        # ------------------------------------------------------------
++        # derivative of Eq.24: PI(R_AB, l, l') -> dPI/dr (without rij)
++        # ------------------------------------------------------------
++        distances_shell = self.ihelp.spread_atom_to_shell(distances, (-2, -1))
++        dvar_pi = torch.where(
++            mask_shell_diagonal,
++            (tmp_a * shpoly_b + tmp_b * shpoly_a)
++            * rr_shell
++            * 0.5
++            / torch.pow(distances_shell, 2.0),
++            zero,
++        )
+ 
+-        # force symmetry to avoid problems through numerical errors
+-        return symmetrize(hcore)
++        # xTB Hamiltonian (without overlap, Hcore) times density matrix
++        ph = pmat * hcore
++
++        # E_EHT derivative for scaling function `PI` (2*P*H*S * dPI/dr / PI)
++        dpi = (
++            2
++            * self.ihelp.reduce_orbital_to_shell(ph * overlap, dim=(-2, -1))
++            * dvar_pi
++            / var_pi
++        )
++
++        # factors for all derivatives of the overlap (2*P*H - 2*W - P*(V + V^T))
++        sval = torch.where(
++            mask_orb_diagonal,
++            2 * (ph - wmat) - pmat * (pot.unsqueeze(-1) + pot.unsqueeze(-2)),
++            zero,
++        )
++
++        # distance vector from dR_AB/dr_a (n_batch, atoms_i, atoms_j, 3)
++        rij = torch.where(
++            mask_atom.unsqueeze(-1),
++            positions.unsqueeze(-2) - positions.unsqueeze(-3),
++            positions.new_tensor(0.0),
++        )
++
++        # reduce to atoms
++        sval = self.ihelp.reduce_orbital_to_atom(sval, dim=(-2, -1))
++        dpi = self.ihelp.reduce_shell_to_atom(dpi, dim=(-2, -1))
++
++        # multiplying with `rij` automatically includes the sign change on
++        # switching atoms, which is manually done in the Fortran code
++        # TODO: same must be done for `sval` via the derivative of the
++        # overlap -> currently doverlap=0
++        gradient = sval.unsqueeze(-1) * doverlap + dpi.unsqueeze(-1) * rij
++
++        # ----------------------------------------------------------------------
++        # Derivative of the electronic energy w.r.t. the coordination number
++        # ----------------------------------------------------------------------
++        # E = P * H = P * 0.5 * (H_mm(CN) + H_nn(CN)) * S * F
++        # -> with: H_mm(CN) = se_mm(CN) = selfenergy - kcn * CN
++        #          F = PI(R_AB, l, l') * K_{AB}^{l,l'} * X(EN_A, EN_B)
++        # ----------------------------------------------------------------------
++
++        # `kcn` differs from paper (Eq.29) to be consistent with GFN2
++        dsedcn = -self.ihelp.spread_ushell_to_shell(self.kcn).unsqueeze(-2)
++
++        # avoid symmetric matrix by only passing `dsedcn` vector, which must be
++        # unsqueeze(-2)'d for batched calculations
++        dhdcn = torch.where(
++            mask_shell_diagonal,
++            dsedcn * var_pi * var_k,  # only scale off-diagonals
++            dsedcn,
++        )
++
++        # reduce orbital-resolved `P*S` for mult with shell-resolved `dhdcn`
++        dcn = self.ihelp.reduce_orbital_to_shell(pmat * overlap, dim=(-2, -1)) * dhdcn
++
++        # reduce to atoms and sum for vector (requires non-symmetric matrix)
++        dedcn = self.ihelp.reduce_shell_to_atom(dcn, dim=(-2, -1))
++
++        return dedcn.sum(-2), gradient.sum(-2)
+ 
+     def to(self, device: torch.device) -> "Hamiltonian":
+         """
+diff --git a/test/test_hamiltonian/grad.npz b/test/test_hamiltonian/grad.npz
+new file mode 100644
+index 000000000..017a1311a
+Binary files /dev/null and b/test/test_hamiltonian/grad.npz differ
+diff --git a/test/test_hamiltonian/test_grad.py b/test/test_hamiltonian/test_grad.py
+new file mode 100644
+index 000000000..424d46afa
+--- /dev/null
++++ b/test/test_hamiltonian/test_grad.py
+@@ -0,0 +1,158 @@
++"""
++Run tests for the gradient of the Hamiltonian matrix.
++References calculated with tblite 0.3.0.
++"""
++
++from math import sqrt
++
++import numpy as np
++import pytest
++import torch
++
++from dxtb.ncoord import exp_count, get_coordination_number
++from dxtb.param import GFN1_XTB as par
++from dxtb.utils import batch
++from dxtb.xtb import Calculator
++from dxtb.scf import get_density
++
++from ..utils import load_from_npz
++from .samples import samples
++
++ref_grad = np.load("test/test_hamiltonian/grad.npz")
++
++small = ["H2", "LiH", "S2", "H2O", "CH4", "SiH4"]
++large = ["PbH4-BiH3", "MB16_43_01", "LYS_xao"]
++
++opts = {"verbosity": 0}
++
++
++@pytest.mark.parametrize("dtype", [torch.float, torch.double])
++@pytest.mark.parametrize("name", small)
++def test_no_overlap_single(dtype: torch.dtype, name: str) -> None:
++    no_overlap_single(dtype, name)
++
++
++@pytest.mark.large
++@pytest.mark.parametrize("dtype", [torch.float, torch.double])
++@pytest.mark.parametrize("name", large)
++def test_no_overlap_single_large(dtype: torch.dtype, name: str) -> None:
++    no_overlap_single(dtype, name)
++
++
++def no_overlap_single(dtype: torch.dtype, name: str) -> None:
++    dd = {"dtype": dtype}
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++
++    sample = samples[name]
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++    chrg = torch.tensor(0.0, **dd)
++
++    ref_dedr = load_from_npz(ref_grad, name, dtype)
++    ref_dedcn = load_from_npz(ref_grad, f"{name}_dedcn", dtype)
++
++    calc = Calculator(numbers, par, opts=opts, **dd)
++    result = calc.singlepoint(numbers, positions, chrg)
++
++    # set derivative of overlap to zero
++    doverlap = torch.tensor(0.0, **dd)
++
++    cn = get_coordination_number(numbers, positions, exp_count)
++    wmat = get_density(
++        result.coefficients,
++        result.occupation.sum(-2),
++        emo=result.emo,
++    )
++
++    dedcn, dedr = calc.hamiltonian.get_gradient(
++        positions,
++        result.overlap,
++        doverlap,
++        result.density,
++        wmat,
++        result.potential,
++        cn,
++    )
++
++    assert pytest.approx(dedcn, abs=tol) == ref_dedcn
++    assert pytest.approx(dedr, abs=tol) == ref_dedr
++
++
++@pytest.mark.parametrize("dtype", [torch.float, torch.double])
++@pytest.mark.parametrize("name1", ["LiH"])
++@pytest.mark.parametrize("name2", small)
++def test_no_overlap_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++    no_overlap_batch(dtype, name1, name2)
++
++
++@pytest.mark.large
++@pytest.mark.parametrize("dtype", [torch.float, torch.double])
++@pytest.mark.parametrize("name1", ["LiH"])
++@pytest.mark.parametrize("name2", large)
++def test_no_overlap_batch_large(dtype: torch.dtype, name1: str, name2: str) -> None:
++    no_overlap_batch(dtype, name1, name2)
++
++
++def no_overlap_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
++    dd = {"dtype": dtype}
++    tol = sqrt(torch.finfo(dtype).eps) * 10
++
++    sample1, sample2 = samples[name1], samples[name2]
++
++    numbers = batch.pack(
++        (
++            sample1["numbers"],
++            sample2["numbers"],
++        )
++    )
++    positions = batch.pack(
++        (
++            sample1["positions"].type(dtype),
++            sample2["positions"].type(dtype),
++        )
++    )
++    chrg = batch.pack(
++        (
++            torch.tensor(0.0, **dd),
++            torch.tensor(0.0, **dd),
++        )
++    )
++
++    ref_dedr = batch.pack(
++        (
++            load_from_npz(ref_grad, name1, dtype),
++            load_from_npz(ref_grad, name2, dtype),
++        )
++    )
++    ref_dedcn = batch.pack(
++        (
++            load_from_npz(ref_grad, f"{name1}_dedcn", dtype),
++            load_from_npz(ref_grad, f"{name2}_dedcn", dtype),
++        )
++    )
++
++    calc = Calculator(numbers, par, opts=opts, **dd)
++    result = calc.singlepoint(numbers, positions, chrg)
++
++    # set derivative of overlap to zero
++    doverlap = torch.tensor(0.0, **dd)
++
++    cn = get_coordination_number(numbers, positions, exp_count)
++    wmat = get_density(
++        result.coefficients,
++        result.occupation.sum(-2),
++        emo=result.emo,
++    )
++
++    dedcn, dedr = calc.hamiltonian.get_gradient(
++        positions,
++        result.overlap,
++        doverlap,
++        result.density,
++        wmat,
++        result.potential,
++        cn,
++    )
++
++    assert pytest.approx(dedcn, abs=tol) == ref_dedcn
++    assert pytest.approx(dedr, abs=tol) == ref_dedr

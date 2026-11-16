@@ -1,0 +1,943 @@
+diff --git a/server/catgo/routers/__init__.py b/server/catgo/routers/__init__.py
+index 4bf463b5a..43ace7241 100644
+--- a/server/catgo/routers/__init__.py
++++ b/server/catgo/routers/__init__.py
+@@ -71,6 +71,7 @@
+     "skills_router": "skills",
+     "campaign_router": "campaign",
+     "terminal_bridge_router": "terminal_bridge",
++    "stt_router": "stt",
+ }
+ 
+ __all__ = list(_ROUTERS.keys())
+diff --git a/server/catgo/routers/stt.py b/server/catgo/routers/stt.py
+new file mode 100644
+index 000000000..895e130fd
+--- /dev/null
++++ b/server/catgo/routers/stt.py
+@@ -0,0 +1,271 @@
++"""Local speech-to-text — pluggable native engine.
++
++Desktop/Tauri voice dictation routes audio here instead of running Whisper in
++the webview. On WebKit engines (WebKitGTK on Linux, WKWebView on macOS/iOS —
++every Tauri webview except Windows' Chromium WebView2) the onnxruntime-web WASM
++backend leaks ~0.8 GB of unreclaimable linear memory per inference, so a few
++utterances OOM-kill the WebContent process (blank window). Native inference
++avoids the webview entirely.
++
++Two engines, selected by ``CATGO_STT_ENGINE``:
++
++- ``faster-whisper`` (default): CTranslate2. CPU int8 everywhere, CUDA float16
++  when an NVIDIA GPU is present. Self-contained pip dependency.
++- ``whispercpp``: shells out to a whisper.cpp ``whisper-cli`` binary. Its value
++  is the **Vulkan** backend, which runs on AMD/Intel iGPUs that CTranslate2
++  (CUDA-only) cannot target. Requires a Vulkan-built ``whisper-cli`` and GGML
++  models supplied by the host:
++    CATGO_WHISPERCPP_BIN     path to whisper-cli (default: "whisper-cli" on PATH)
++    CATGO_WHISPERCPP_MODELS  dir of ggml-<size>.bin (default ~/.cache/whisper.cpp/models)
++
++The browser still runs the (tiny) Silero VAD and POSTs each finished segment as
++raw little-endian float32 PCM at 16 kHz. Language post-processing (zh
++Traditional→Simplified) stays on the client.
++"""
++
++import logging
++import os
++import shutil
++import subprocess
++import tempfile
++import wave
++
++import numpy as np
++from fastapi import APIRouter, HTTPException, Query, Request
++from pydantic import BaseModel
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/stt", tags=["stt"])
++
++# ─── Config ──────────────────────────────────────────────────────────────
++_ENGINE = (os.environ.get("CATGO_STT_ENGINE") or "faster-whisper").strip().lower()
++# CPU inference threads. faster-whisper/CTranslate2 defaults to a conservative 4;
++# whisper.cpp uses this for -t too. Overridable via CATGO_STT_CPU_THREADS.
++_CPU_THREADS = int(os.environ.get("CATGO_STT_CPU_THREADS") or min(8, os.cpu_count() or 4))
++_WHISPERCPP_BIN = os.environ.get("CATGO_WHISPERCPP_BIN") or "whisper-cli"
++_WHISPERCPP_MODELS = (
++    os.environ.get("CATGO_WHISPERCPP_MODELS")
++    or os.path.expanduser("~/.cache/whisper.cpp/models")
++)
++
++# Map the client's whisper model ids / aliases to a canonical size name shared by
++# both engines (faster-whisper size and whisper.cpp ggml-<size>.bin).
++_SIZE_ALIASES = {
++    "tiny": "tiny",
++    "tiny.en": "tiny.en",
++    "base": "base",
++    "base.en": "base.en",
++    "small": "small",
++    "small.en": "small.en",
++    "medium": "medium",
++    "medium.en": "medium.en",
++    "large": "large-v3",
++    "large-v2": "large-v2",
++    "large-v3": "large-v3",
++    "large-v3-turbo": "large-v3-turbo",
++    "turbo": "large-v3-turbo",
++}
++
++
++def _resolve_size(model: str) -> str:
++    """Turn a client model id (e.g. 'onnx-community/whisper-base') into a shared
++    size name ('base'). Unknown ids fall back to 'base'."""
++    name = (model or "").split("/")[-1].lower().replace("whisper-", "")
++    return _SIZE_ALIASES.get(name, "base")
++
++
++# ─── faster-whisper engine ───────────────────────────────────────────────
++_model_cache: dict[str, object] = {}
++_device_compute: tuple[str, str] | None = None
++
++
++def _select_device() -> tuple[str, str]:
++    """Probe for a usable CUDA device, else fall back to CPU int8."""
++    try:
++        import ctranslate2
++
++        if ctranslate2.get_cuda_device_count() > 0:
++            return "cuda", "float16"
++    except Exception as exc:  # pragma: no cover - best-effort probe
++        logger.debug("CUDA probe failed, using CPU: %s", exc)
++    return "cpu", "int8"
++
++
++def _build_model(size: str, device: str, compute_type: str):
++    from faster_whisper import WhisperModel
++
++    kwargs: dict = {"device": device, "compute_type": compute_type}
++    if device == "cpu":
++        kwargs["cpu_threads"] = _CPU_THREADS
++    try:
++        return WhisperModel(size, **kwargs)
++    except Exception as exc:
++        # First-run download pulls weights from HuggingFace, frequently blocked
++        # (e.g. mainland China). Retry once via hf-mirror.com unless the user
++        # pinned their own HF_ENDPOINT.
++        if os.environ.get("HF_ENDPOINT"):
++            raise
++        logger.warning(
++            "STT model %s download failed (%s); retrying via hf-mirror.com", size, exc
++        )
++        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
++        return WhisperModel(size, **kwargs)
++
++
++def _get_model(size: str):
++    global _device_compute
++    if _device_compute is None:
++        _device_compute = _select_device()
++        logger.info("STT engine: faster-whisper device=%s compute=%s", *_device_compute)
++    device, compute_type = _device_compute
++    key = f"{size}:{device}"
++    if key not in _model_cache:
++        logger.info(
++            "STT loading model %s (%s/%s, cpu_threads=%s)",
++            size, device, compute_type, _CPU_THREADS if device == "cpu" else "-",
++        )
++        try:
++            _model_cache[key] = _build_model(size, device, compute_type)
++        except Exception as exc:
++            # A CUDA device was detected but the runtime (cuBLAS/cuDNN) is missing
++            # or incompatible — don't 500, fall back to CPU int8 for this and all
++            # subsequent loads.
++            if device != "cuda":
++                raise
++            logger.warning("CUDA STT load failed (%s); falling back to CPU int8", exc)
++            _device_compute = ("cpu", "int8")
++            device, compute_type = _device_compute
++            key = f"{size}:{device}"
++            _model_cache[key] = _build_model(size, device, compute_type)
++    return _model_cache[key]
++
++
++def _transcribe_faster_whisper(audio: np.ndarray, lang: str | None, size: str):
++    whisper = _get_model(size)
++    segments, info = whisper.transcribe(audio, language=lang, beam_size=1, vad_filter=False)
++    text = "".join(seg.text for seg in segments).strip()
++    return text, getattr(info, "language", None)
++
++
++# ─── whisper.cpp (Vulkan) engine ─────────────────────────────────────────
++def _whispercpp_model_path(size: str) -> str:
++    return os.path.join(_WHISPERCPP_MODELS, f"ggml-{size}.bin")
++
++
++def _transcribe_whispercpp(audio: np.ndarray, lang: str | None, size: str):
++    model_path = _whispercpp_model_path(size)
++    if not os.path.exists(model_path):
++        raise HTTPException(
++            status_code=503,
++            detail=f"whisper.cpp model missing: {model_path} "
++            f"(download-ggml-model.sh {size})",
++        )
++
++    # whisper.cpp reads a 16 kHz mono PCM16 WAV file.
++    pcm16 = np.clip(audio * 32767.0, -32768, 32767).astype("<i2")
++    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
++        wav_path = tf.name
++    try:
++        with wave.open(wav_path, "wb") as w:
++            w.setnchannels(1)
++            w.setsampwidth(2)
++            w.setframerate(16000)
++            w.writeframes(pcm16.tobytes())
++
++        cmd = [
++            _WHISPERCPP_BIN, "-m", model_path, "-f", wav_path,
++            "-nt",  # no timestamps → clean text on stdout
++            "-t", str(_CPU_THREADS),
++        ]
++        if lang:
++            cmd += ["-l", lang]
++        try:
++            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
++        except FileNotFoundError:
++            raise HTTPException(
++                status_code=503, detail=f"whisper-cli not found: {_WHISPERCPP_BIN}"
++            )
++        if proc.returncode != 0:
++            logger.error("whisper.cpp failed: %s", proc.stderr[-500:])
++            raise HTTPException(status_code=500, detail="whisper.cpp transcription failed")
++        text = " ".join(line.strip() for line in proc.stdout.splitlines() if line.strip())
++        return text.strip(), lang
++    finally:
++        try:
++            os.unlink(wav_path)
++        except OSError:
++            pass
++
++
++# ─── API ─────────────────────────────────────────────────────────────────
++class STTHealth(BaseModel):
++    available: bool
++    engine: str
++    device: str
++    compute_type: str
++
++
++class STTResult(BaseModel):
++    text: str
++    language: str | None = None
++
++
++@router.get("/health", response_model=STTHealth)
++def health() -> STTHealth:
++    """Report whether native STT is usable, which engine, and on what device.
++    The client uses this to decide between backend STT and the WASM fallback."""
++    if _ENGINE == "whispercpp":
++        ok = bool(shutil.which(_WHISPERCPP_BIN) or os.path.exists(_WHISPERCPP_BIN))
++        return STTHealth(
++            available=ok, engine="whispercpp",
++            device="vulkan/cpu", compute_type="ggml",
++        )
++    try:
++        import faster_whisper  # noqa: F401
++
++        device, compute_type = _select_device()
++        return STTHealth(
++            available=True, engine="faster-whisper",
++            device=device, compute_type=compute_type,
++        )
++    except Exception as exc:
++        logger.info("Native STT unavailable: %s", exc)
++        return STTHealth(
++            available=False, engine="faster-whisper",
++            device="none", compute_type="none",
++        )
++
++
++@router.post("/transcribe", response_model=STTResult)
++async def transcribe(
++    request: Request,
++    language: str = Query("en", description="BCP-47-ish tag; 'auto'/'' = detect"),
++    model: str = Query("base", description="Client model id or size alias"),
++) -> STTResult:
++    """Transcribe a raw float32 PCM (16 kHz mono, little-endian) request body."""
++    raw = await request.body()
++    if not raw:
++        raise HTTPException(status_code=400, detail="empty audio body")
++    if len(raw) % 4 != 0:
++        raise HTTPException(status_code=400, detail="body length not float32-aligned")
++
++    audio = np.frombuffer(raw, dtype="<f4").astype(np.float32)
++    if audio.size == 0:
++        return STTResult(text="", language=None)
++
++    size = _resolve_size(model)
++    lang = None if language in ("", "auto") else language.split("-")[0]
++    try:
++        if _ENGINE == "whispercpp":
++            # whisper.cpp wants a concrete language code; default to English.
++            text, out_lang = _transcribe_whispercpp(audio, lang or "en", size)
++        else:
++            text, out_lang = _transcribe_faster_whisper(audio, lang, size)
++    except HTTPException:
++        raise
++    except Exception as exc:
++        logger.exception("STT transcription failed")
++        raise HTTPException(status_code=500, detail=f"transcription failed: {exc}")
++
++    return STTResult(text=text, language=out_lang)
+diff --git a/server/catgo_server.spec b/server/catgo_server.spec
+index a3dae8237..b269fd48a 100644
+--- a/server/catgo_server.spec
++++ b/server/catgo_server.spec
+@@ -17,7 +17,7 @@ MACE and other ML potentials are excluded to keep the bundle size reasonable.
+ 
+ import sys
+ from pathlib import Path
+-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
++from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs
+ 
+ block_cipher = None
+ 
+@@ -52,10 +52,28 @@ ase_datas = collect_data_files('ase', include_py_files=False)
+ # `/api/mcp/*` endpoints 404.
+ rfc3987_syntax_datas = collect_data_files('rfc3987_syntax')
+ 
++# faster-whisper (CTranslate2) — native STT engine for desktop voice dictation.
++# routers/stt.py imports it LAZILY (inside functions), so PyInstaller's static
++# analysis never sees it; without explicit collection the bundled backend ships
++# no native STT and /api/stt/health reports unavailable, forcing the broken
++# in-webview WASM fallback. Collect the package, its submodules, and the
++# CTranslate2 native shared libs. CPU int8 works on every platform incl. Apple
++# Silicon (no NVIDIA); CUDA uses the user's own cuBLAS/cuDNN (not bundled).
++try:
++    ctranslate2_bins = collect_dynamic_libs('ctranslate2')
++    faster_whisper_datas = collect_data_files('faster_whisper')
++    stt_hiddenimports = (
++        ['faster_whisper', 'ctranslate2', 'tokenizers', 'huggingface_hub']
++        + collect_submodules('ctranslate2')
++        + collect_submodules('faster_whisper')
++    )
++except Exception:
++    ctranslate2_bins, faster_whisper_datas, stt_hiddenimports = [], [], []
++
+ a = Analysis(
+     ['main.py'],
+     pathex=[str(server_dir)],
+-    binaries=[],
++    binaries=ctranslate2_bins,
+     datas=[
+         # Workflow engine definition YAML files
+         ('workflow/engine_defs/*.yaml', 'workflow/engine_defs'),
+@@ -85,8 +103,9 @@ a = Analysis(
+          'extensions/dos-analysis/catgo_dos'),
+         ('../extensions/cohp-analysis/catgo_cohp',
+          'extensions/cohp-analysis/catgo_cohp'),
+-    ] + pymatgen_datas + tblite_datas + ase_datas + rfc3987_syntax_datas,
+-    hiddenimports=catgo_submodules + workflow_submodules + dos_submodules + cohp_submodules + [
++    ] + pymatgen_datas + tblite_datas + ase_datas + rfc3987_syntax_datas
++      + faster_whisper_datas,
++    hiddenimports=catgo_submodules + workflow_submodules + dos_submodules + cohp_submodules + stt_hiddenimports + [
+         # ---------------------------------------------------------------
+         # FastAPI / ASGI stack
+         # ---------------------------------------------------------------
+diff --git a/server/main.py b/server/main.py
+index 9721b9273..21bb60b4d 100644
+--- a/server/main.py
++++ b/server/main.py
+@@ -178,6 +178,7 @@ def _worktree_offset() -> int:
+     "quacc_router",
+     "atomate2_router",
+     "forcefield_router",        # ~76 ms (openbabel)
++    "stt_router",               # faster-whisper (CTranslate2) — heavy import
+ ]
+ 
+ # Light-weight import; plugin_manager.initialize() is the slow part and is
+diff --git a/server/pyproject.toml b/server/pyproject.toml
+index d218e49a0..e2b894608 100644
+--- a/server/pyproject.toml
++++ b/server/pyproject.toml
+@@ -30,6 +30,11 @@ dependencies = [
+     "ase>=3.22.0",
+     "pymatgen>=2024.1.0",
+     "networkx>=2.8",
++    # Native speech-to-text for desktop voice dictation (CTranslate2). Runs
++    # Whisper outside the webview — WebKit webviews (Linux/macOS Tauri) leak
++    # unreclaimable WASM memory per inference and OOM. CPU int8 by default,
++    # CUDA float16 when a GPU is present. See routers/stt.py.
++    "faster-whisper>=1.0.0",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/server/requirements.txt b/server/requirements.txt
+index 949b78742..7f7917542 100644
+--- a/server/requirements.txt
++++ b/server/requirements.txt
+@@ -13,6 +13,11 @@ mcp>=1.0.0
+ # SSH/SFTP for HPC connectivity
+ asyncssh>=2.14.0
+ 
++# Native speech-to-text for desktop voice dictation (CTranslate2 Whisper).
++# Runs outside the webview — WebKit Tauri webviews leak WASM memory per
++# inference and OOM. CPU int8 default, CUDA float16 when a GPU is present.
++faster-whisper>=1.0.0
++
+ # Scientific computing
+ numpy>=1.24.0
+ scipy>=1.10.0
+diff --git a/src/lib/gesture/__tests__/backend-whisper.test.ts b/src/lib/gesture/__tests__/backend-whisper.test.ts
+new file mode 100644
+index 000000000..6e0190188
+--- /dev/null
++++ b/src/lib/gesture/__tests__/backend-whisper.test.ts
+@@ -0,0 +1,111 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
++import type { VoiceEvent } from '$lib/gesture/gesture-types'
++
++// Capture the VAD's speech-end callback so tests can drive transcription
++// without a real microphone / Silero model.
++const vad = vi.hoisted(() => ({
++  on_speech_end: null as ((a: Float32Array) => void) | null,
++  start: vi.fn(),
++  stop: vi.fn(),
++}))
++
++vi.mock('$lib/gesture/vad', () => ({
++  start_vad: vi.fn(async (cfg: { on_speech_end: (a: Float32Array) => void }) => {
++    vad.on_speech_end = cfg.on_speech_end
++    vad.start()
++  }),
++  stop_vad: () => vad.stop(),
++}))
++
++import { BackendWhisperEngine, backend_stt_available } from '../backend-whisper'
++
++const flush = () => new Promise((r) => setTimeout(r, 0))
++
++describe('BackendWhisperEngine', () => {
++  beforeEach(() => {
++    vad.on_speech_end = null
++    vad.start.mockClear()
++    vad.stop.mockClear()
++  })
++  afterEach(() => {
++    vi.unstubAllGlobals()
++  })
++
++  it('POSTs each speech segment to /stt/transcribe and forwards the text', async () => {
++    const fetchMock = vi.fn(async () => ({
++      ok: true,
++      json: async () => ({ text: 'hello world' }),
++    }))
++    vi.stubGlobal('fetch', fetchMock)
++
++    const eng = new BackendWhisperEngine()
++    const events: VoiceEvent[] = []
++    await eng.start((e) => events.push(e), 'en-US', false, undefined, false, 'whisper-base')
++    expect(vad.start).toHaveBeenCalled()
++
++    vad.on_speech_end!(new Float32Array([0.1, 0.2, 0.3]))
++    await flush()
++
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
++    expect(url).toContain('/stt/transcribe')
++    expect(url).toContain('language=en')
++    expect(url).toContain('model=whisper-base')
++    expect(init.method).toBe('POST')
++
++    expect(events).toHaveLength(1)
++    expect(events[0].raw_text).toBe('hello world')
++    expect(events[0].is_final).toBe(true)
++  })
++
++  it('drops empty / whitespace-only transcriptions', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ text: '   ' }) })))
++    const eng = new BackendWhisperEngine()
++    const events: VoiceEvent[] = []
++    await eng.start((e) => events.push(e))
++    vad.on_speech_end!(new Float32Array([0]))
++    await flush()
++    expect(events).toEqual([])
++  })
++
++  it('serializes: a segment arriving mid-request is dropped (no backlog)', async () => {
++    // First request never resolves → the second speech-end must be ignored.
++    const fetchMock = vi.fn(() => new Promise(() => {}))
++    vi.stubGlobal('fetch', fetchMock)
++    const eng = new BackendWhisperEngine()
++    await eng.start(() => {})
++    vad.on_speech_end!(new Float32Array([0.1]))
++    vad.on_speech_end!(new Float32Array([0.2]))
++    await flush()
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++  })
++
++  it('does not throw / inject when the backend errors', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) })))
++    const eng = new BackendWhisperEngine()
++    const events: VoiceEvent[] = []
++    await eng.start((e) => events.push(e))
++    vad.on_speech_end!(new Float32Array([0.1]))
++    await flush()
++    expect(events).toEqual([])
++  })
++})
++
++describe('backend_stt_available', () => {
++  afterEach(() => vi.unstubAllGlobals())
++
++  it('true when /stt/health reports available', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ available: true }) })))
++    expect(await backend_stt_available(true)).toBe(true)
++  })
++
++  it('false when health reports unavailable', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ available: false }) })))
++    expect(await backend_stt_available(true)).toBe(false)
++  })
++
++  it('false when the request throws (no backend)', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('refused') }))
++    expect(await backend_stt_available(true)).toBe(false)
++  })
++})
+diff --git a/src/lib/gesture/backend-whisper.ts b/src/lib/gesture/backend-whisper.ts
+new file mode 100644
+index 000000000..f3a0f9290
+--- /dev/null
++++ b/src/lib/gesture/backend-whisper.ts
+@@ -0,0 +1,171 @@
++/**
++ * Backend Whisper STT engine — transcribes via the native faster-whisper
++ * endpoint instead of running Whisper in the webview.
++ *
++ * WebKit webviews (WebKitGTK on Linux, WKWebView on macOS/iOS — every Tauri
++ * webview except Windows' Chromium WebView2) leak ~0.8 GB of unreclaimable WASM
++ * memory per inference with the in-browser engine, OOM-killing the renderer
++ * (blank window). This engine keeps only the tiny Silero VAD in the browser to
++ * segment speech, then POSTs each finished 16 kHz float32 segment to
++ * `/api/stt/transcribe`, where native CTranslate2 runs it (CPU int8 or CUDA) at
++ * no webview memory cost. Drop-in for LocalWhisperEngine (same VoiceEngineLike
++ * shape); language post-processing (zh Traditional→Simplified) stays in
++ * TerminalVoice, so this engine only forwards raw recognized text.
++ */
++
++import type { VoiceCallback, VoiceErrorCallback } from './voice-engine'
++import { match_command_with_score } from './voice-engine'
++import { start_vad, stop_vad } from './vad'
++import type { AudioPipeline } from './audio-pipeline'
++import { API_BASE } from '$lib/api/config'
++
++export type Accel = `cpu` | `gpu`
++
++/** Probe the native STT endpoint. Cached so each pane's engine doesn't re-hit
++ *  it. Returns false when the backend is absent (static web) or the dependency
++ *  is missing, so the caller can fall back to the in-browser WASM engine. */
++let _availability: Promise<boolean> | null = null
++export function backend_stt_available(force = false): Promise<boolean> {
++  if (force) _availability = null
++  if (!_availability) {
++    _availability = (async () => {
++      try {
++        const resp = await fetch(`${API_BASE}/stt/health`, { method: `GET` })
++        if (!resp.ok) return false
++        const data = await resp.json()
++        return data?.available === true
++      } catch {
++        return false
++      }
++    })()
++  }
++  return _availability
++}
++
++export class BackendWhisperEngine {
++  private callback: VoiceCallback | null = null
++  private error_callback: VoiceErrorCallback | null = null
++  private running = false
++  private language = `en`
++  private ai_enabled = false
++  private model_id = `base`
++  private transcribing = false
++  private pipeline: AudioPipeline | null = null
++
++  get is_supported(): boolean {
++    return typeof navigator !== `undefined`
++      && !!navigator.mediaDevices?.getUserMedia
++  }
++
++  get is_running(): boolean {
++    return this.running
++  }
++
++  async start(
++    callback: VoiceCallback,
++    language = `en-US`,
++    ai_enabled = false,
++    on_error?: VoiceErrorCallback,
++    noise_suppression = false,
++    model_id?: string,
++    _accel: Accel = `cpu`, // backend picks its own device (CUDA/CPU)
++  ): Promise<void> {
++    if (this.running) return
++    this.callback = callback
++    this.error_callback = on_error ?? null
++    this.language = language.split(`-`)[0]
++    this.ai_enabled = ai_enabled
++    this.model_id = model_id ?? `base`
++
++    try {
++      let stream: MediaStream | undefined
++      if (noise_suppression) {
++        try {
++          const { create_audio_pipeline } = await import(`./audio-pipeline`)
++          this.pipeline = await create_audio_pipeline()
++          stream = this.pipeline.stream
++        } catch (err) {
++          console.warn(`[BackendWhisper] Noise suppression failed, using raw mic:`, err)
++        }
++      }
++
++      await start_vad({
++        on_speech_end: (audio: Float32Array) => {
++          this.transcribe_remote(audio)
++        },
++        stream,
++      })
++
++      this.running = true
++      console.info(`[BackendWhisper] Started (lang=${this.language}, native backend STT)`)
++    } catch (err) {
++      console.error(`[BackendWhisper] Failed to start:`, err)
++      this.error_callback?.(err instanceof DOMException ? `not-allowed` : `audio-capture`)
++      throw err
++    }
++  }
++
++  stop(): void {
++    this.running = false
++    stop_vad()
++    if (this.pipeline) {
++      this.pipeline.destroy()
++      this.pipeline = null
++    }
++    this.callback = null
++  }
++
++  set_language(lang: string, ai_enabled = false): void {
++    this.language = lang.split(`-`)[0]
++    this.ai_enabled = ai_enabled
++  }
++
++  set_model(model_id: string): void {
++    this.model_id = model_id
++  }
++
++  private async transcribe_remote(audio: Float32Array): Promise<void> {
++    // Serialize: drop overlapping segments while one request is in flight, so a
++    // slow backend can't queue a backlog of POSTs.
++    if (this.transcribing) return
++    this.transcribing = true
++
++    try {
++      // Copy into a fresh (non-shared) ArrayBuffer: under cross-origin isolation
++      // the VAD's buffer may be a SharedArrayBuffer, which fetch refuses as a body.
++      const pcm = new Float32Array(audio)
++      const lang = encodeURIComponent(this.language || `en`)
++      const model = encodeURIComponent(this.model_id || `base`)
++      const resp = await fetch(
++        `${API_BASE}/stt/transcribe?language=${lang}&model=${model}`,
++        {
++          method: `POST`,
++          headers: { 'Content-Type': `application/octet-stream` },
++          body: pcm.buffer,
++        },
++      )
++      if (!resp.ok) {
++        console.error(`[BackendWhisper] transcribe failed: HTTP ${resp.status}`)
++        return
++      }
++      const data = await resp.json()
++      const text = (data?.text ?? ``).trim()
++      if (!text) return
++
++      const confidence = 0.9
++      const { action, match_score } = match_command_with_score(text, this.ai_enabled, confidence)
++      this.callback?.({
++        action,
++        raw_text: text,
++        confidence,
++        is_final: true,
++        match_score,
++        timestamp: performance.now(),
++      })
++    } catch (err) {
++      console.error(`[BackendWhisper] Transcription failed:`, err)
++    } finally {
++      this.transcribing = false
++    }
++  }
++}
+diff --git a/src/lib/gesture/local-whisper.ts b/src/lib/gesture/local-whisper.ts
+index 006944e76..9a481528e 100644
+--- a/src/lib/gesture/local-whisper.ts
++++ b/src/lib/gesture/local-whisper.ts
+@@ -58,11 +58,22 @@ async function get_pipeline(
+       const isolated = typeof globalThis !== `undefined`
+         && (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
+       const cores = (typeof navigator !== `undefined` && navigator.hardwareConcurrency) || 4
++      // WebKit engines (WebKitGTK on Linux Tauri, WKWebView on macOS/iOS) deadlock
++      // on multi-threaded wasm: the SharedArrayBuffer pthread sync hangs and the
++      // inference call never returns → permanent UI freeze (needs app restart).
++      // Chromium (web, Windows WebView2) and Firefox run multi-threaded fine. The
++      // Chromium UA also contains "AppleWebKit", so a true WebKit engine is one
++      // whose UA has AppleWebKit but NOT Chrome/Chromium/Edg. Force single-thread
++      // there (slower but does not hang).
++      const ua = typeof navigator !== `undefined` ? navigator.userAgent : ``
++      const is_webkit = /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua)
+       // Use most cores but leave ~2 for the audio worklet / VAD / UI, and cap at
+       // 8 — beyond that wasm Whisper is memory-bandwidth bound and thread-sync
+       // overhead eats the gains (16 threads ≠ 2× of 8). Single thread without
+-      // cross-origin isolation (no SharedArrayBuffer).
+-      env.backends.onnx.wasm.numThreads = isolated ? Math.max(1, Math.min(8, cores - 2)) : 1
++      // cross-origin isolation (no SharedArrayBuffer) or on a WebKit engine.
++      env.backends.onnx.wasm.numThreads = (isolated && !is_webkit)
++        ? Math.max(1, Math.min(8, cores - 2))
++        : 1
+       // Load the onnxruntime-web wasm runtime from a CDN pinned to the version
+       // @huggingface/transformers bundles. Without this, the WASM backend (the
+       // fallback when WebGPU is unavailable — e.g. machines without a discrete
+@@ -216,7 +227,8 @@ export class LocalWhisperEngine {
+     // If the resolved model changed, the pipeline will reload on next transcription
+     if (model_changed) {
+       pipeline_promise = null
+-      current_model_id = null
++      current_key = null // reset the cache key so the pipeline rebuilds (was a
++      // ReferenceError: current_model_id is a getter, not the module-level var)
+       console.info(`[LocalWhisper] Language changed, model will reload on next transcription`)
+     }
+   }
+diff --git a/src/lib/gesture/vad.ts b/src/lib/gesture/vad.ts
+index e3f4ca7f9..fe40e7670 100644
+--- a/src/lib/gesture/vad.ts
++++ b/src/lib/gesture/vad.ts
+@@ -26,6 +26,10 @@ export interface VadConfig {
+ let vad_instance: any = null
+ 
+ export async function start_vad(config: VadConfig): Promise<void> {
++  // Tear down any previous instance first — MicVAD holds the mic and a worklet,
++  // so a leaked instance keeps transcribing in parallel (duplicated input). One
++  // mic, one VAD.
++  stop_vad()
+   // Dynamic import to avoid SSR issues
+   const { MicVAD } = await import(`@ricky0123/vad-web`)
+ 
+diff --git a/src/lib/structure/TerminalWindow.svelte b/src/lib/structure/TerminalWindow.svelte
+index dd430b820..998626165 100644
+--- a/src/lib/structure/TerminalWindow.svelte
++++ b/src/lib/structure/TerminalWindow.svelte
+@@ -5,6 +5,7 @@
+   import { TerminalVoice } from './terminal-voice.svelte'
+   import { WHISPER_MODELS } from '$lib/gesture/whisper-models'
+   import { get_active_terminal } from './terminal-registry.svelte'
++  import { backend_stt_available } from '$lib/gesture/backend-whisper'
+   import { fetchConnections, type ConnectionInfo } from '$lib/api/hpc'
+   import { fetchAvailableShells, type ShellInfo } from '$lib/api/pty'
+   import { hpc_session_store, LOCAL_SESSION_ID } from '$lib/hpc-sessions.svelte'
+@@ -185,6 +186,10 @@
+   // uses), with no Enter appended.
+   const voice = new TerminalVoice()
+   let show_voice_menu = $state(false)
++  // Whether native backend STT is reachable — decides if the menu shows the
++  // webview-only Acceleration control or the "native backend" note.
++  let stt_backend = $state(false)
++  $effect(() => { backend_stt_available().then((v) => { stt_backend = v }) })
+ 
+   function toggle_voice() {
+     voice.toggle((text) => { get_active_terminal()?.send_keys(text) })
+@@ -355,16 +360,21 @@
+                 onclick={() => { voice.set_language(l.tag) }}
+               >{l.label}</button>
+             {/each}
+-            <div class="tw-dropdown-divider"></div>
+-            <div class="tw-dropdown-header">Acceleration</div>
+-            {#each [{ a: `cpu`, label: `CPU (稳定)` }, { a: `gpu`, label: `GPU / WebGPU (实验·更快)` }] as opt}
+-              <button
+-                class="tw-dropdown-item"
+-                class:tw-voice-selected={voice.accel === opt.a}
+-                onclick={() => { voice.set_accel(opt.a === `gpu` ? `gpu` : `cpu`) }}
+-              >{opt.label}</button>
+-            {/each}
+-            <div class="tw-dropdown-note">中英混合：选「中文」+ 更大模型。GPU 需浏览器支持 WebGPU,出乱码就切回 CPU</div>
++            {#if stt_backend}
++              <div class="tw-dropdown-divider"></div>
++              <div class="tw-dropdown-note">原生后端转写（设备自动：CPU / CUDA）· 不占内存 · 可放心选更大模型。中英混合选「中文」+ 更大模型</div>
++            {:else}
++              <div class="tw-dropdown-divider"></div>
++              <div class="tw-dropdown-header">Acceleration</div>
++              {#each [{ a: `cpu`, label: `CPU (稳定)` }, { a: `gpu`, label: `GPU / WebGPU (实验·更快)` }] as opt}
++                <button
++                  class="tw-dropdown-item"
++                  class:tw-voice-selected={voice.accel === opt.a}
++                  onclick={() => { voice.set_accel(opt.a === `gpu` ? `gpu` : `cpu`) }}
++                >{opt.label}</button>
++              {/each}
++              <div class="tw-dropdown-note">中英混合：选「中文」+ 更大模型。GPU 需浏览器支持 WebGPU,出乱码就切回 CPU</div>
++            {/if}
+             {#if voice.model_status === `downloading`}
+               <div class="tw-dropdown-note">Downloading… {Math.round(voice.download_progress)}%</div>
+             {:else if voice.model_status === `error` || voice.error}
+diff --git a/src/lib/structure/__tests__/terminal-voice.test.ts b/src/lib/structure/__tests__/terminal-voice.test.ts
+index d5304b2f2..509ce3df3 100644
+--- a/src/lib/structure/__tests__/terminal-voice.test.ts
++++ b/src/lib/structure/__tests__/terminal-voice.test.ts
+@@ -55,6 +55,33 @@ describe('TerminalVoice', () => {
+     expect(tv.recording).toBe(false)
+   })
+ 
++  it('only one voice records at a time — starting a second stops the first', async () => {
++    // Regression: two terminal panes each enabling voice spun up two MicVADs that
++    // both transcribed the same speech, duplicating injected keystrokes. Starting
++    // voice on pane B must stop pane A (single microphone → single voice).
++    const a = make_fake()
++    const b = make_fake()
++    const va = new TerminalVoice(() => a.engine)
++    const vb = new TerminalVoice(() => b.engine)
++
++    await va.toggle(() => {})
++    expect(va.recording).toBe(true)
++
++    await vb.toggle(() => {})
++    expect(vb.recording).toBe(true)
++    // A was taken over → stopped and no longer recording.
++    expect(va.recording).toBe(false)
++    expect(a.engine.stop).toHaveBeenCalled()
++
++    // A no longer receives transcripts; only B injects.
++    const sent: string[] = []
++    await vb.toggle(() => {}) // stop B to reset, then restart capturing
++    await vb.toggle((t) => sent.push(t))
++    b.fire(fake_event(`one`, true))
++    a.fire(fake_event(`one`, true)) // A is dead — must not fire
++    expect(sent).toEqual([`one `])
++  })
++
+   it('reports unsupported when the engine is unsupported', () => {
+     const tv = new TerminalVoice(() => ({ is_supported: false, start: vi.fn(), stop: vi.fn() }))
+     expect(tv.is_supported).toBe(false)
+diff --git a/src/lib/structure/terminal-voice.svelte.ts b/src/lib/structure/terminal-voice.svelte.ts
+index 8c3d589bd..b4eadc40d 100644
+--- a/src/lib/structure/terminal-voice.svelte.ts
++++ b/src/lib/structure/terminal-voice.svelte.ts
+@@ -8,6 +8,7 @@
+  */
+ 
+ import { LocalWhisperEngine, type ModelStatus } from '$lib/gesture/local-whisper'
++import { backend_stt_available, BackendWhisperEngine } from '$lib/gesture/backend-whisper'
+ import { DEFAULT_WHISPER_MODEL_ID } from '$lib/gesture/whisper-models'
+ import type { VoiceEvent } from '$lib/gesture/gesture-types'
+ 
+@@ -31,6 +32,13 @@ const STORAGE_KEY = `catgo-terminal-voice-model`
+ const LANG_KEY = `catgo-terminal-voice-lang`
+ const ACCEL_KEY = `catgo-terminal-voice-accel`
+ 
++// Only one terminal voice may record at a time. There is a single microphone and
++// the VAD + Whisper pipeline is a shared singleton; enabling voice on two panes
++// otherwise spins up two MicVAD instances that BOTH transcribe the same speech
++// and each inject keystrokes → duplicated input. Starting voice on any pane stops
++// it on whichever pane held it before.
++let active_voice: TerminalVoice | null = null
++
+ export class TerminalVoice {
+   recording = $state(false)
+   model_status = $state<ModelStatus>(`idle`)
+@@ -45,7 +53,9 @@ export class TerminalVoice {
+   accel = $state<Accel>(`cpu`)
+   error = $state<string | null>(null)
+ 
+-  private make_engine: () => VoiceEngineLike
++  // Injected factory (tests / explicit override). When absent, the engine is
++  // chosen at start time: native backend STT when reachable, else in-browser WASM.
++  private injected_make?: () => VoiceEngineLike
+   private engine: VoiceEngineLike | null = null
+   // Lazy Traditional→Simplified converter. Whisper's multilingual model emits
+   // Traditional Chinese for Mandarin; convert to Simplified for zh-CN. Loaded
+@@ -60,12 +70,7 @@ export class TerminalVoice {
+   }
+ 
+   constructor(make_engine?: () => VoiceEngineLike) {
+-    this.make_engine = make_engine
+-      ?? (() =>
+-        new LocalWhisperEngine((status, progress) => {
+-          this.model_status = status
+-          if (typeof progress === `number`) this.download_progress = progress
+-        }))
++    this.injected_make = make_engine
+     if (typeof localStorage !== `undefined`) {
+       const saved = localStorage.getItem(STORAGE_KEY)
+       if (saved) this.model_id = saved
+@@ -77,13 +82,33 @@ export class TerminalVoice {
+   }
+ 
+   get is_supported(): boolean {
+-    if (!this.engine) this.engine = this.make_engine()
+-    return this.engine.is_supported
++    if (this.injected_make) {
++      if (!this.engine) this.engine = this.injected_make()
++      return this.engine.is_supported
++    }
++    // Both real engines only need a microphone — don't instantiate one (and
++    // commit to backend-vs-WASM) just to answer the button's disabled state.
++    return typeof navigator !== `undefined`
++      && !!navigator.mediaDevices?.getUserMedia
++  }
++
++  /** Pick the STT engine: native backend (faster-whisper) when the server is
++   *  reachable, else the in-browser WASM engine. Injected factory wins (tests). */
++  private async create_engine(): Promise<VoiceEngineLike> {
++    if (this.injected_make) return this.injected_make()
++    if (await backend_stt_available()) return new BackendWhisperEngine()
++    return new LocalWhisperEngine((status, progress) => {
++      this.model_status = status
++      if (typeof progress === `number`) this.download_progress = progress
++    })
+   }
+ 
+   set_model(id: string): void {
+     this.model_id = id
+     if (typeof localStorage !== `undefined`) localStorage.setItem(STORAGE_KEY, id)
++    // Apply live so a mid-session model switch takes effect on the next utterance
++    // (the backend engine reads model_id per request; no restart needed).
++    ;(this.engine as { set_model?: (id: string) => void } | null)?.set_model?.(id)
+   }
+ 
+   set_language(lang: string): void {
+@@ -105,7 +130,7 @@ export class TerminalVoice {
+       return
+     }
+     this.error = null
+-    if (!this.engine) this.engine = this.make_engine()
++    if (!this.engine) this.engine = await this.create_engine()
+ 
+     const on_event = async (e: VoiceEvent) => {
+       if (!e.is_final) return
+@@ -124,6 +149,10 @@ export class TerminalVoice {
+       this.recording = false
+     }
+ 
++    // Single global voice: stop whichever pane was recording before taking over.
++    if (active_voice && active_voice !== this) active_voice.stop()
++    active_voice = this
++
+     this.recording = true
+     try {
+       await this.engine.start(
+@@ -143,5 +172,6 @@ export class TerminalVoice {
+   stop(): void {
+     this.recording = false
+     this.engine?.stop()
++    if (active_voice === this) active_voice = null
+   }
+ }

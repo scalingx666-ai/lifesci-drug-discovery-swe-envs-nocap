@@ -1,0 +1,143 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 237a57603..e8498f58a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -88,6 +88,7 @@ and this project adheres to [Pragmatic Versioning](https://github.com/experiment
+ - LLM field descriptions report descriptor data uniformly for every feature type: a prefix stating what the feature is and its range or options, then the data — `Categorical, allowed: [...] — descriptors per category: {...} — structure: [...]`, `Continuous, bounds [...] — descriptors: {...} — structure: CCO`. Previously the kind was announced in the prefix (`Categorical with descriptors`, `Continuous molecular (SMILES: CCO)`) and only the two descriptor-carrying classes emitted anything.
+ 
+ ### Fixed
++- `NChooseKConstraint` residual evaluation ignores unrelated experiment metadata and preserves row labels, avoiding object-dtype errors and misalignment when combined with other constraints. ([#855](https://github.com/experimental-design/bofire/issues/855))
+ - `QparegoStrategy` draws independent Chebyshev scalarization weights for each candidate in a batch, instead of reusing one trade-off direction for the whole batch (#849). Baseline predictions and output constraints are shared across candidates.
+ - Sigmoid and target-window objectives use stable sigmoid evaluations, preventing NaN acquisition gradients in saturated regions and preserving small rewards in decreasing tails. ([#853](https://github.com/experimental-design/bofire/issues/853))
+ - Surrogates now reject output types they can't model. Every surrogate's output check was always true (`isinstance(my_type, type(ContinuousOutput))`), so e.g. a `SingleTaskGPSurrogate` or `RandomForestSurrogate` accepted a categorical output, and a `ClassificationMLPEnsemble` a continuous one.
+diff --git a/bofire/data_models/constraints/nchoosek.py b/bofire/data_models/constraints/nchoosek.py
+index 7c3f6e62d..1d885bb13 100644
+--- a/bofire/data_models/constraints/nchoosek.py
++++ b/bofire/data_models/constraints/nchoosek.py
+@@ -89,8 +89,7 @@ def validate_counts(self):
+         return self
+ 
+     def __call__(self, experiments: pd.DataFrame) -> pd.Series:
+-        """Smooth relaxation of NChooseK constraint by countig the number of zeros in a candidate by a sum of
+-        narrow gaussians centered at zero.
++        """Smooth relaxation of NChooseK constraints by counting zeros with narrow gaussians.
+ 
+         Args:
+             experiments (pd.DataFrame): Data to evaluate the constraint on.
+@@ -103,28 +102,27 @@ def __call__(self, experiments: pd.DataFrame) -> pd.Series:
+         def relu(x):
+             return np.maximum(0, x)
+ 
+-        indices = np.array(
+-            [i for i, name in enumerate(experiments.columns) if name in self.features],
+-            dtype=np.int64,
+-        )
+-        experiments_tensor = np.array(experiments.to_numpy())
++        experiments_tensor = experiments[self.features].to_numpy()
+ 
+         max_count_violation = np.zeros(experiments_tensor.shape[0])
+         min_count_violation = np.zeros(experiments_tensor.shape[0])
+ 
+         if self.max_count != len(self.features):
+             max_count_violation = relu(
+-                -1 * narrow_gaussian(x=experiments_tensor[..., indices]).sum(axis=-1)
++                -1 * narrow_gaussian(x=experiments_tensor).sum(axis=-1)
+                 + (len(self.features) - self.max_count),
+             )
+ 
+         if self.min_count > 0:
+             min_count_violation = relu(
+-                narrow_gaussian(x=experiments_tensor[..., indices]).sum(axis=-1)
++                narrow_gaussian(x=experiments_tensor).sum(axis=-1)
+                 - (len(self.features) - self.min_count),
+             )
+ 
+-        return pd.Series(max_count_violation + min_count_violation)
++        return pd.Series(
++            max_count_violation + min_count_violation,
++            index=experiments.index,
++        )
+ 
+     def count_is_valid(self, count: int) -> bool:
+         """True if ``count`` non-zero features satisfies this NChooseK band.
+diff --git a/tests/bofire/data_models/constraints/test_nchoosek.py b/tests/bofire/data_models/constraints/test_nchoosek.py
+index 3b6ada9a2..8add86e5e 100644
+--- a/tests/bofire/data_models/constraints/test_nchoosek.py
++++ b/tests/bofire/data_models/constraints/test_nchoosek.py
+@@ -1,4 +1,14 @@
+-from bofire.data_models.constraints.api import NChooseKConstraint
++import math
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from bofire.data_models.constraints.api import (
++    LinearInequalityConstraint,
++    NChooseKConstraint,
++)
++from bofire.data_models.domain.api import Constraints
+ 
+ 
+ def test_nchoosek_to_description():
+@@ -45,3 +55,60 @@ def test_nchoosek_count_is_valid_none_also_valid():
+     assert c.count_is_valid(0) is True
+     # max_count is still a hard ceiling
+     assert c.count_is_valid(3) is False
++
++
++@pytest.mark.parametrize("min_count,max_count", [(0, 1), (1, 2), (1, 1), (0, 2)])
++def test_nchoosek_residuals_with_experiment_metadata(min_count, max_count):
++    index = pd.Index(["batch-B", "batch-A", "batch-B", "batch-C"], name="experiment")
++    experiments = pd.DataFrame(
++        {
++            "solvent": pd.Categorical(["water", "ethanol", "water", "ethanol"]),
++            "x2": [0.0, 0.0, 0.0, 1.0],
++            "timestamp": pd.date_range("2025-01-01", periods=4),
++            "yield": [0.1, 0.2, 0.3, 0.4],
++            "x1": [0.0, 0.001, 1.0, 1.0],
++        },
++        index=index,
++    )
++    constraint = NChooseKConstraint(
++        features=["x1", "x2"],
++        min_count=min_count,
++        max_count=max_count,
++        none_also_valid=False,
++    )
++    zero_counts = [2.0, 1 + math.exp(-0.5), 1.0, 0.0]
++    expected = pd.Series(
++        [
++            max(0, 2 - max_count - zeros) + max(0, zeros - (2 - min_count))
++            for zeros in zero_counts
++        ],
++        index=index,
++    )
++    pd.testing.assert_series_equal(constraint(experiments), expected, check_dtype=False)
++
++
++def test_nchoosek_residual_alignment_with_other_constraints():
++    experiments = pd.DataFrame(
++        {"x1": [1.0, 0.0], "x2": [1.0, 0.0]},
++        index=pd.Index(["exp-B", "exp-A"], name="experiment"),
++    )
++    constraints = Constraints(
++        constraints=[
++            NChooseKConstraint(
++                features=["x1", "x2"],
++                min_count=1,
++                max_count=1,
++                none_also_valid=False,
++            ),
++            LinearInequalityConstraint(
++                features=["x1", "x2"],
++                coefficients=[1, 1],
++                rhs=1,
++            ),
++        ],
++    )
++    expected = pd.DataFrame(
++        {0: [1.0, 1.0], 1: np.array([1.0, -1.0]) / math.sqrt(2)},
++        index=experiments.index,
++    )
++    pd.testing.assert_frame_equal(constraints(experiments), expected)

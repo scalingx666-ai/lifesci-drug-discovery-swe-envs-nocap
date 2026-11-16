@@ -1,0 +1,202 @@
+diff --git a/src/dxtb/_types.py b/src/dxtb/_types.py
+index 49d6f12e2..509eae856 100644
+--- a/src/dxtb/_types.py
++++ b/src/dxtb/_types.py
+@@ -90,6 +90,10 @@ class TensorLike:
+     """
+     Provide `device` and `dtype` as well as `to()` and `type()` for other
+     classes.
++
++    The selection of `torch.Tensor` variables to change within the class is
++    handled by searching `__slots__`. Hence, if one wants to use this
++    functionality the subclass of `TensorLike` must specify `__slots__`.
+     """
+ 
+     __slots__ = ["__device", "__dtype"]
+diff --git a/src/dxtb/basis/indexhelper.py b/src/dxtb/basis/indexhelper.py
+index 3f5227273..b13a04fe7 100644
+--- a/src/dxtb/basis/indexhelper.py
++++ b/src/dxtb/basis/indexhelper.py
+@@ -660,6 +660,22 @@ def orbitals_per_atom(self) -> Tensor:
+         else:
+             return torch.gather(pad[0], 0, pad[1])
+ 
++    @property
++    def nat(self) -> int:
++        return self.atom_to_unique.shape[-1]
++
++    @property
++    def nsh(self) -> int:
++        return int(self.shells_per_atom.sum(-1).max())
++
++    @property
++    def nao(self) -> int:
++        return int(self.orbitals_per_shell.sum(-1).max())
++
++    @property
++    def nbatch(self) -> int | None:
++        return self.atom_to_unique.ndim if self.batched else None
++
+     @property
+     def allowed_dtypes(self) -> tuple[torch.dtype, ...]:
+         """
+diff --git a/src/dxtb/cli/argparser.py b/src/dxtb/cli/argparser.py
+index cabfc0518..b9150bbf1 100644
+--- a/src/dxtb/cli/argparser.py
++++ b/src/dxtb/cli/argparser.py
+@@ -343,6 +343,11 @@ def parser(name: str = "dxtb", **kwargs: Any) -> argparse.ArgumentParser:
+         default=defaults.XITORCH_FATOL,
+         help="R|Set absolute tolerance for SCF (output).",
+     )
++    p.add_argument(
++        "--detect-anomaly",
++        action="store_true",
++        help=("R|Enable PyTorch's anomaly detection mode."),
++    )
+ 
+     p.add_argument(
+         "--dir",
+diff --git a/src/dxtb/cli/driver.py b/src/dxtb/cli/driver.py
+index 025742f68..c9761d91a 100644
+--- a/src/dxtb/cli/driver.py
++++ b/src/dxtb/cli/driver.py
+@@ -55,6 +55,12 @@ def _set_attr(self, attr: str) -> int:
+     def singlepoint(self) -> Result:
+         args = self.args
+ 
++        if args.detect_anomaly:
++            # pylint: disable=import-outside-toplevel
++            from torch.autograd.anomaly_mode import set_detect_anomaly
++
++            set_detect_anomaly(True)
++
+         timer = Timers()
+         timer.start("setup")
+ 
+diff --git a/src/dxtb/constants/units.py b/src/dxtb/constants/units.py
+index 1d35fbe68..b805d0f80 100644
+--- a/src/dxtb/constants/units.py
++++ b/src/dxtb/constants/units.py
+@@ -16,3 +16,12 @@
+ 
+ CAL2J = 4.184
+ """Factor for conversion from Calorie to Joule"""
++
++C2AU = 1.0 / 1.60217653e-19
++"""Factor for conversion from Coulomb to to atomic units"""
++
++J2AU = 1.0 / 4.3597441775e-18
++"""Factor for conversion from Joule to atomic units"""
++
++VAA2AU = J2AU / (C2AU * AA2AU)
++"""Factor for conversion from  V/Å = J/(C·Å) to atomic units"""
+diff --git a/src/dxtb/interaction/base.py b/src/dxtb/interaction/base.py
+index 3e5b30046..d17982801 100644
+--- a/src/dxtb/interaction/base.py
++++ b/src/dxtb/interaction/base.py
+@@ -9,10 +9,45 @@
+ from .._types import Any, Tensor, TensorLike
+ from ..basis import IndexHelper
+ 
++__all__ = ["Interaction"]
++
+ 
+ class Interaction(TensorLike):
+     """
+     Base class for defining interactions with the charge density.
++
++    Every charge-dependent energy contribution should inherit from this class
++    as it conveniently handles the different resolutions (atom, shell, orbital)
++    required for all subclasses. Depending on the contribution the user must
++    implement a `get_<atom/shell>_<potential/energy/gradient>` method. The
++    methods that are not implemented automatically evaluate to zero. As they
++    are always called in the process of collecting the different resolutions,
++    you must NOT implement them.
++
++    .. warning::
++
++        Never overwrite the `get_potential`, `get_energy` and `get_gradient`
++        methods in the subclass. These methods collect the respective variable
++        for their (internally-handled) evaluation.
++
++    Additionally, a `get_cache` method is required that should precalculate
++    and store all charge-independent variables to avoid repeated calculations
++    during the SCF.
++
++    Note
++    ----
++    The nuclear gradient of the Mulliken charges essentially yields a
++    derivative of the overlap integral. This is handled elsewhere and must
++    not be implemented by the `get_<atom/shell>_gradient` methods.
++
++    Example
++    -------
++    The third-order electrostatics `ES3` of GFN1-xTB contain only atom-resolved
++    parameters. Hence, it only implements `get_atom_energy` and
++    `get_atom_potential` (besides the required `get_cache` method).
++    Since there is not positional dependence (except for the charges, which is
++    handled elsewhere) in the third-order electrostatics, no gradient method
++    must be implemented.
+     """
+ 
+     label: str
+@@ -22,7 +57,8 @@ class Interaction(TensorLike):
+ 
+     class Cache:
+         """
+-        Restart data for individual interactions, extended by subclasses as needed.
++        Restart data for individual interactions, extended by subclasses as
++        needed.
+         """
+ 
+     def __init__(
+diff --git a/test/test_coulomb/test_es3.py b/test/test_coulomb/test_es3.py
+index d6ce69f25..218c95a13 100644
+--- a/test/test_coulomb/test_es3.py
++++ b/test/test_coulomb/test_es3.py
+@@ -31,8 +31,7 @@ def test_single(dtype: torch.dtype, name: str) -> None:
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(GFN1_XTB.element))
+     es = es3.new_es3(numbers, GFN1_XTB, **dd)
+-    if es is None:
+-        assert False
++    assert es is not None
+ 
+     cache = es.get_cache(ihelp=ihelp)
+     e = es.get_atom_energy(qat, cache)
+@@ -68,8 +67,7 @@ def test_batch(dtype: torch.dtype, name1: str, name2: str) -> None:
+ 
+     ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(GFN1_XTB.element))
+     es = es3.new_es3(numbers, GFN1_XTB, **dd)
+-    if es is None:
+-        assert False
++    assert es is not None
+ 
+     cache = es.get_cache(ihelp=ihelp)
+     e = es.get_atom_energy(qat, cache)
+diff --git a/test/test_hamiltonian/test_grad.py b/test/test_hamiltonian/test_grad.py
+index eab6f933a..820d9f973 100644
+--- a/test/test_hamiltonian/test_grad.py
++++ b/test/test_hamiltonian/test_grad.py
+@@ -30,7 +30,7 @@
+ ref_grad = np.load("test/test_hamiltonian/grad.npz")
+ 
+ # lists of test molecules
+-small = ["H2", "LiH", "S2", "H2O", "CH4", "SiH4", "MB16_43_01"]
++small = ["H2", "LiH", "S2", "H2O", "CH4", "SiH4"]
+ large = ["PbH4-BiH3", "MB16_43_01", "LYS_xao"]
+ 
+ # SCF options
+diff --git a/test/test_scf/test_scf.py b/test/test_scf/test_scf.py
+index 73857bdbd..918541b95 100644
+--- a/test/test_scf/test_scf.py
++++ b/test/test_scf/test_scf.py
+@@ -107,7 +107,7 @@ def test_single_large(dtype: torch.dtype, name: str):
+     calc = Calculator(numbers, par, opts=opts, **dd)
+ 
+     result = calc.singlepoint(numbers, positions, charges)
+-    assert pytest.approx(ref, abs=tol) == result.scf.sum(-1).item()
++    assert pytest.approx(ref, abs=tol) == result.scf.sum(-1)
+ 
+ 
+ @pytest.mark.filterwarnings("ignore")

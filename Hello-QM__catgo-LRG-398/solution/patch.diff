@@ -1,0 +1,2672 @@
+diff --git a/src/lib/i18n/en/structure.ts b/src/lib/i18n/en/structure.ts
+index 1ac3418d8..f7148218f 100644
+--- a/src/lib/i18n/en/structure.ts
++++ b/src/lib/i18n/en/structure.ts
+@@ -50,6 +50,7 @@ const structure: Record<string, string> = {
+   thickness: `Thickness`,
+   bond_scale: `Bond scale`,
+   cell_edge_stub_bonds: `Cell-edge stub bonds`,
++  bond_order_perception: `Bond orders`,
+   stub_length: `Stub Length`,
+   clipping: `Clipping`,
+   sphere_clipping: `Sphere Clipping`,
+diff --git a/src/lib/i18n/zh/structure.ts b/src/lib/i18n/zh/structure.ts
+index 1f216eb97..d1e7fd198 100644
+--- a/src/lib/i18n/zh/structure.ts
++++ b/src/lib/i18n/zh/structure.ts
+@@ -50,6 +50,7 @@ const structure: Record<string, string> = {
+   thickness: `粗细`,
+   bond_scale: `键长系数`,
+   cell_edge_stub_bonds: `晶胞边缘短键`,
++  bond_order_perception: `键级`,
+   stub_length: `短键长度`,
+   clipping: `裁剪`,
+   sphere_clipping: `球形裁剪`,
+diff --git a/src/lib/settings/config.ts b/src/lib/settings/config.ts
+index 70b22038d..54b193447 100644
+--- a/src/lib/settings/config.ts
++++ b/src/lib/settings/config.ts
+@@ -144,6 +144,13 @@ export const SETTINGS_CONFIG: SettingsConfig = {
+       value: {},
+       description: `Additional parameters for the bonding strategy`,
+     },
++    bond_order_perception: {
++      value: false,
++      description:
++        `Perceive double/triple/aromatic bond orders across the whole structure ` +
++        `— adsorbates and carbon-based frameworks (graphene/C3N4/h-BN/COF) alike ` +
++        `(metals stay single sticks)`,
++    },
+     bond_scale: {
+       value: 1.15,
+       description:
+diff --git a/src/lib/settings/types.ts b/src/lib/settings/types.ts
+index 4dac19897..888c5b751 100644
+--- a/src/lib/settings/types.ts
++++ b/src/lib/settings/types.ts
+@@ -134,6 +134,11 @@ export interface SettingsConfig {
+     hide_incomplete_bonds: SettingType<boolean>
+     bonding_strategy: SettingType<BondingStrategy>
+     bonding_options: SettingType<Record<string, number>>
++    /** When true, perceive double/triple/aromatic bond orders on small
++     *  organic ADSORBATE fragments and draw them as multi-cylinder bonds
++     *  (the metal slab stays single sticks). Default false → byte-identical
++     *  to the single-cylinder path. */
++    bond_order_perception: SettingType<boolean>
+     bond_scale: SettingType<number>
+     show_hydrogen_bonds: SettingType<boolean>
+     hbond_distance_cutoff: SettingType<number>
+diff --git a/src/lib/structure/StructureControls.svelte b/src/lib/structure/StructureControls.svelte
+index 2195d9455..937678fc2 100644
+--- a/src/lib/structure/StructureControls.svelte
++++ b/src/lib/structure/StructureControls.svelte
+@@ -1041,6 +1041,17 @@
+           />
+         </label>
+       {/if}
++      <label
++        {@attach tooltip({
++          content: SETTINGS_CONFIG.structure.bond_order_perception.description,
++        })}
++      >
++        <input
++          type="checkbox"
++          bind:checked={scene_props.bond_order_perception}
++        />
++        {t('structure.bond_order_perception')}
++      </label>
+     </SettingsSection>
+   {/if}
+ 
+diff --git a/src/lib/structure/StructureScene.svelte b/src/lib/structure/StructureScene.svelte
+index df7de0516..dadedfea0 100644
+--- a/src/lib/structure/StructureScene.svelte
++++ b/src/lib/structure/StructureScene.svelte
+@@ -45,12 +45,14 @@
+     Mesh.prototype.raycast = acceleratedRaycast
+   }
+   import { type BondingStrategy, compute_bond_transform, get_bond_key } from './bonding'
++  import { type AromaticRing, perceive_adsorbate } from './bonding/bond-orders'
+   import { compute_bonds_sync } from './workers/bond-worker-api'
+   import { apply_bond_distance_rules } from './bond-distance-rules'
+   import type { BondKind } from './bonding/bond-manager.svelte'
+   import { BOND_KIND } from './bonding/bond-manager.svelte'
+   import { BondManager } from './bonding/bond-manager.svelte'
+   import BondManagerInstances from './bonding/BondManagerInstances.svelte'
++  import AromaticRingOverlay from './bonding/AromaticRingOverlay.svelte'
+   import {
+     build_image_atom_layout,
+     empty_image_atom_layout,
+@@ -458,6 +460,7 @@
+     show_image_atoms = false,
+     bonding_strategy = DEFAULTS.structure.bonding_strategy,
+     bonding_options = {},
++    bond_order_perception = DEFAULTS.structure.bond_order_perception,
+     bond_scale = DEFAULTS.structure.bond_scale,
+     show_hydrogen_bonds = DEFAULTS.structure.show_hydrogen_bonds,
+     hbond_distance_cutoff = DEFAULTS.structure.hbond_distance_cutoff,
+@@ -711,6 +714,7 @@
+     bond_color?: string
+     bonding_strategy?: BondingStrategy
+     bonding_options?: Record<string, unknown>
++    bond_order_perception?: boolean
+     bond_scale?: number
+     show_hydrogen_bonds?: boolean
+     hbond_distance_cutoff?: number
+@@ -3055,6 +3059,27 @@
+     return result
+   })
+ 
++  // ═══ Adsorbate bond-order perception (default-OFF) ═══
++  // When OFF, return a SHARED empty map and never invoke perceive_* — zero CPU,
++  // and the shadow-sync order pass below is skipped (orders_buffer stays null →
++  // GPU bytes byte-identical to today). When ON, perceive double/triple/aromatic
++  // orders on small organic adsorbate fragments only; the slab stays order 1.
++  // Keyed by get_bond_key(a, b, jimage), matching the shadow-sync diff key.
++  const EMPTY_ORDER_MAP: ReadonlyMap<string, number> = new Map()
++  const EMPTY_RINGS: AromaticRing[] = []
++  // Single perception pass → both the per-bond order map (drives the multi-
++  // cylinder renderer) AND the aromatic rings (drive the dashed-circle
++  // overlay). When OFF, return shared empties; perceive_* never runs (zero
++  // CPU) and the order/overlay paths stay byte-identical to today.
++  let adsorbate_perception = $derived.by(() => {
++    if (!bond_order_perception || !structure) {
++      return { orders: EMPTY_ORDER_MAP, aromatic_rings: EMPTY_RINGS }
++    }
++    return perceive_adsorbate(filtered_bond_pairs, structure)
++  })
++  let adsorbate_bond_orders = $derived(adsorbate_perception.orders)
++  let aromatic_rings = $derived(adsorbate_perception.aromatic_rings)
++
+   // Sync filtered_bond_pairs to parent for box selection
+   $effect(() => {
+     filtered_bond_pairs_out = filtered_bond_pairs
+@@ -3211,6 +3236,42 @@
+       }
+       mgr.add_bonds(add_pairs, add_kinds, add_jimages)
+     }
++
++    // ── Adsorbate bond-order pass (default-OFF) ──────────────────────────
++    // When bond_order_perception is OFF, `adsorbate_bond_orders` is a shared
++    // EMPTY_MAP and perceive_* never runs (zero CPU); we also skip the write
++    // pass entirely so ensure_orders() is never called and orders_buffer stays
++    // null — byte-identical GPU bytes to today. When ON, write each live slot's
++    // perceived order (default 1), keyed by the same get_bond_key the diff uses.
++    const order_map = adsorbate_bond_orders
++    // Run the write pass whenever the buffer is (or needs to be) live — not
++    // only when the new map is non-empty. Once orders_buffer exists
++    // (mgr.has_orders), a transition to an EMPTY map (e.g. the only
++    // double/triple bond relaxed to single during a geo-opt/drag/trajectory
++    // tick) must still re-walk every slot and clear stale 2.0/3.0/1.5 back to
++    // 1; otherwise the instanced renderer keeps drawing a phantom multi-bond.
++    if (order_map.size > 0 || mgr.has_orders) {
++      const n_now = mgr.count
++      const pb = mgr.pairs_buffer
++      const jb = mgr.jimages_buffer
++      mgr.begin_orders_batch()
++      // Lazy first allocation stays gated on a non-empty map; once the buffer
++      // exists the has_orders branch keeps it in sync.
++      if (order_map.size > 0) mgr.ensure_orders()
++      try {
++        for (let slot = 0; slot < n_now; slot++) {
++          const a = pb[slot * 2]
++          const b = pb[slot * 2 + 1]
++          const sjx = jb[slot * 3]
++          const sjy = jb[slot * 3 + 1]
++          const sjz = jb[slot * 3 + 2]
++          const ord = order_map.get(get_bond_key(a, b, [sjx, sjy, sjz])) ?? 1
++          mgr.set_order(slot, ord)
++        }
++      } finally {
++        mgr.commit_orders_batch()
++      }
++    }
+   })
+ 
+   // ═══ AtomManager SoA shadow store ═══
+@@ -5208,10 +5269,18 @@
+           {hide_incomplete_bonds}
+           {image_atom_layout}
+           {partner_drawn_lookup}
++          multibond_enabled={bond_order_perception}
+           {depth_cue_uniforms}
+         />
+       {/if}
+ 
++      <!-- Aromatic ring overlay — one dashed circle inside each aromatic ring.
++           Gated by the SAME bond_order_perception toggle: when OFF,
++           `aromatic_rings` is the shared empty array → nothing drawn. -->
++      {#if show_bulk_atoms && bond_order_perception && aromatic_rings.length > 0}
++        <AromaticRingOverlay rings={aromatic_rings} />
++      {/if}
++
+       <!-- Hydrogen bond rendering (dashed cylinders) -->
+       {#if instanced_hbond_groups.length > 0 && show_bulk_atoms}
+         {#each instanced_hbond_groups as group}
+diff --git a/src/lib/structure/bonding/AromaticRingOverlay.svelte b/src/lib/structure/bonding/AromaticRingOverlay.svelte
+new file mode 100644
+index 000000000..093bd6ceb
+--- /dev/null
++++ b/src/lib/structure/bonding/AromaticRingOverlay.svelte
+@@ -0,0 +1,109 @@
++<!--
++  AromaticRingOverlay — the textbook aromatic depiction.
++
++  For each perceived aromatic ring (benzene, pyridine, ...), draws ONE thin
++  solid ring (a 3D torus tube) inset inside the ring, in the ring plane and
++  centered on the ring centroid. A solid 3D tube reads cleanly against the
++  ball-and-stick bonds (a hairline dashed line looked cheap next to the fat
++  cylinders). The ring's six bonds render as plain single solid sticks (see
++  bond-instanced-renderer.ts) and this single inscribed ring carries the
++  aromaticity.
++
++  Geometry: a shared UNIT torus (ring radius 1, tube `tube_fraction`, in the
++  local XY plane) built ONCE and reused by every ring via a per-ring world
++  transform:
++    - positioned at ring.centroid,
++    - oriented by a quaternion rotating +Z → ring.normal (ring plane),
++    - uniformly scaled to RADIUS_FRACTION × ring.radius so the ring sits a
++      touch inside and reads as inscribed. (Uniform scale also scales the tube,
++      so larger rings get a proportionally thicker tube — visually fine.)
++
++  Material: MeshStandardMaterial (dark), so the ring is lit by the scene
++  headlamp and shades like the bonds — a solid 3D presence, not a flat line.
++
++  Gated entirely by the caller: when bond_order_perception is OFF the caller
++  passes an empty `rings` array → nothing is drawn → byte-identical default.
++-->
++<script lang="ts">
++  import type { AromaticRing } from './bond-orders'
++  import { T } from '@threlte/core'
++  import { untrack } from 'svelte'
++  import { Color, MeshStandardMaterial, Quaternion, TorusGeometry, Vector3 } from 'three'
++
++  let {
++    rings = [],
++    // Inset factor: ring radius = fraction × ring radius. ~0.7 leaves a clear
++    // gap to the ring bonds so the inscribed ring reads cleanly.
++    radius_fraction = 0.7,
++    // Tube radius in unit-ring space (ring radius = 1). 0.05 → a delicate tube,
++    // thinner than the bonds, that still has solid 3D presence.
++    tube_fraction = 0.05,
++    color = `#1a1a1a`,
++    opacity = 1,
++  }: {
++    rings?: AromaticRing[]
++    radius_fraction?: number
++    tube_fraction?: number
++    color?: string
++    opacity?: number
++  } = $props()
++
++  const RADIAL_SEGMENTS = 12
++  const TUBULAR_SEGMENTS = 64
++
++  // Unit torus (ring radius 1, in the local XY plane) built once; reused
++  // (scaled/oriented) by every ring.
++  const unit_torus_geometry = untrack(
++    () => new TorusGeometry(1, tube_fraction, RADIAL_SEGMENTS, TUBULAR_SEGMENTS),
++  )
++
++  const ring_material = untrack(
++    () =>
++      new MeshStandardMaterial({
++        color: new Color(color),
++        roughness: 0.55,
++        metalness: 0,
++        transparent: opacity < 1,
++        opacity,
++      }),
++  )
++
++  $effect(() => {
++    ring_material.color.set(color)
++    ring_material.opacity = opacity
++    ring_material.transparent = opacity < 1
++    ring_material.needsUpdate = true
++  })
++
++  // +Z (the unit ring's plane normal) → each ring's normal, as a quaternion.
++  const Z_AXIS = new Vector3(0, 0, 1)
++  const tmp_normal = new Vector3()
++  const tmp_quat = new Quaternion()
++
++  function ring_quaternion(n: AromaticRing[`normal`]): [number, number, number, number] {
++    tmp_normal.set(n[0], n[1], n[2])
++    if (tmp_normal.lengthSq() < 1e-12) tmp_normal.set(0, 0, 1)
++    else tmp_normal.normalize()
++    tmp_quat.setFromUnitVectors(Z_AXIS, tmp_normal)
++    return [tmp_quat.x, tmp_quat.y, tmp_quat.z, tmp_quat.w]
++  }
++
++  // A stable key per ring so Svelte reuses instances across re-derives.
++  function ring_key(ring: AromaticRing): string {
++    return ring.atom_indices.join(`,`)
++  }
++</script>
++
++{#each rings as ring (ring_key(ring))}
++  {@const r = ring.radius * radius_fraction}
++  <T.Mesh
++    geometry={unit_torus_geometry}
++    material={ring_material}
++    position={ring.centroid}
++    quaternion={ring_quaternion(ring.normal)}
++    scale={r}
++    raycast={null}
++    frustumCulled={false}
++    renderOrder={2}
++  />
++{/each}
+diff --git a/src/lib/structure/bonding/BondManagerInstances.svelte b/src/lib/structure/bonding/BondManagerInstances.svelte
+index 254dfd5a0..00509fa98 100644
+--- a/src/lib/structure/bonding/BondManagerInstances.svelte
++++ b/src/lib/structure/bonding/BondManagerInstances.svelte
+@@ -83,6 +83,13 @@
+      * `null` (default) treats every partner as drawn — Phase 7c behavior.
+      */
+     partner_drawn_lookup?: PartnerDrawnLookup | null
++    /**
++     * Adsorbate bond-order rendering. When true, each logical bond reserves 6
++     * instances (3 lines × 2 halves) and bonds whose perceived order > 1 draw
++     * as multi-cylinder double/triple/aromatic bonds. Default false → the
++     * verbatim single-cylinder (2 instances/bond) path, byte-identical to today.
++     */
++    multibond_enabled?: boolean
+   }
+ 
+   let {
+@@ -104,6 +111,7 @@
+     hide_incomplete_bonds = true,
+     image_atom_layout = null,
+     partner_drawn_lookup = null,
++    multibond_enabled = false,
+   }: Props = $props()
+ 
+   let mesh = $state<InstancedMesh | undefined>()
+@@ -332,6 +340,9 @@
+       // bond_manager.version).
+       () => atom_colors ?? null,
+     )
++    // Apply the multi-bond flag BEFORE the first resync so the initial mesh
++    // layout uses the correct per-slot stride.
++    r.set_multibond(untrack(() => multibond_enabled), untrack(() => bond_radius))
+     renderer = r
+     r.force_full_resync()
+     mark_dirty()
+@@ -358,7 +369,13 @@
+     void image_atom_layout
+     void partner_drawn_lookup
+     void atom_colors
++    // Toggling multi-bond rendering (or changing the base radius used to size
++    // the per-line gap / reduced radius) changes the per-slot instance stride
++    // and geometry, so re-lay-out the whole mesh.
++    const mb = multibond_enabled
++    const br = bond_radius
+     if (!renderer) return
++    renderer.set_multibond(mb, br)
+     renderer.force_full_resync()
+     mark_dirty()
+   })
+diff --git a/src/lib/structure/bonding/bond-instanced-renderer.ts b/src/lib/structure/bonding/bond-instanced-renderer.ts
+index 4757bebb2..3843edea6 100644
+--- a/src/lib/structure/bonding/bond-instanced-renderer.ts
++++ b/src/lib/structure/bonding/bond-instanced-renderer.ts
+@@ -48,10 +48,20 @@
+ import * as THREE from 'three';
+ import type { BondManager } from './bond-manager.svelte';
+ import type { ImageAtomLayout } from './image-atom-layout';
++import { ib_seq, is_aromatic, nb_from_order } from './bond-orders';
+ 
+ const UP_Y = new THREE.Vector3(0, 1, 0);
+ const EMPTY = new Int32Array(0);
+ const ZERO_MATRIX = new THREE.Matrix4().makeScale(0, 0, 0);
++// World-space reference axis for the deterministic (non-aromatic) multi-bond
++// perpendicular. Projecting a FIXED world axis onto the plane ⟂ the bond gives
++// an offset direction that does not swim during camera orbit (matches the
++// projection-switch / atom-rotation lessons). A second axis covers the case
++// where the bond is parallel to the first.
++const PERP_REF_A = new THREE.Vector3(0, 1, 0);
++const PERP_REF_B = new THREE.Vector3(1, 0, 0);
++// ib offset for a single (nb=1) line — centered, no perpendicular shift.
++const ZERO_IB = [0];
+ 
+ /**
+  * Incomplete-edge stub mode (Phase 6 / VESTA Mode 1). When `mode` is true,
+@@ -141,6 +151,37 @@ export class BondInstancedRenderer {
+ 	#v_half_mid_b = new THREE.Vector3();
+ 	#q_rot = new THREE.Quaternion();
+ 	#v_scale = new THREE.Vector3();
++	// Scratch vectors for the multi-bond perpendicular offset.
++	#v_perp = new THREE.Vector3();
++	#v_off = new THREE.Vector3();
++	#v_ref = new THREE.Vector3();
++
++	// Multi-bond (adsorbate bond-order) rendering. When OFF (#multibond_enabled
++	// === false), every slot owns exactly 2 instances (one per half) and the
++	// layout / capacity / update-range math is byte-identical to the legacy
++	// single-cylinder path. When ON, each slot reserves MAX_LINES·2 = 6
++	// instances and draws 2·nb live half-cylinders (nb ∈ {1,2,3}), collapsing
++	// the rest to ZERO_MATRIX. Picking is unaffected (this mesh has
++	// raycast={null} — bond hit-testing uses its own hitbox geometry).
++	#multibond_enabled = false;
++	#bond_radius = 0.15;
++	static readonly MAX_LINES = 3;
++
++	/** Instances reserved per logical bond: 2 (OFF) or MAX_LINES·2 = 6 (ON). */
++	get #stride(): number {
++		return this.#multibond_enabled ? BondInstancedRenderer.MAX_LINES * 2 : 2;
++	}
++
++	/**
++	 * Enable/disable adsorbate multi-bond rendering. Changing the flag bumps the
++	 * per-slot stride, so the caller MUST follow with `force_full_resync()` (the
++	 * BondManagerInstances $effect does). The base bond radius is needed to size
++	 * the per-line gap and reduced cylinder radius.
++	 */
++	set_multibond(enabled: boolean, bond_radius: number): void {
++		this.#multibond_enabled = enabled;
++		this.#bond_radius = bond_radius;
++	}
+ 
+ 	constructor(
+ 		mesh: THREE.InstancedMesh,
+@@ -180,7 +221,8 @@ export class BondInstancedRenderer {
+ 		const matrix_attr = mesh.instanceMatrix;
+ 		const capacity = matrix_attr.count;
+ 		const count = manager.count;
+-		const instance_count = count * 2;
++		const stride = this.#stride;
++		const instance_count = count * stride;
+ 		const layout = this.#get_image_atom_layout ? this.#get_image_atom_layout() : null;
+ 		const decorator_instance_count = layout !== null ? layout.bonds_csr.length * 2 : 0;
+ 		const total_instances = instance_count + decorator_instance_count;
+@@ -203,6 +245,7 @@ export class BondInstancedRenderer {
+ 		const jimages = manager.jimages_buffer;
+ 		const positions = this.#get_positions();
+ 		const opacity = manager.opacity_buffer;
++		const orders = this.#multibond_enabled ? manager.orders_buffer : null;
+ 		const lattice = this.#get_lattice ? this.#get_lattice() : null;
+ 		const stub = this.#get_incomplete_edge ? this.#get_incomplete_edge() : null;
+ 		// Bond colors are sourced directly from the per-atom color buffer in the
+@@ -214,7 +257,7 @@ export class BondInstancedRenderer {
+ 		if (manager.dirty_all) {
+ 			if (count > 0) {
+ 				for (let slot = 0; slot < count; slot++) {
+-					this.#write_slot(slot, pairs, kinds, jimages, positions, lattice, stub, atom_colors, opacity);
++					this.#write_slot(slot, pairs, kinds, jimages, positions, lattice, stub, atom_colors, opacity, orders);
+ 				}
+ 				matrix_attr.addUpdateRange(0, instance_count * 16);
+ 				this.#kind_attr.addUpdateRange(0, instance_count);
+@@ -235,11 +278,11 @@ export class BondInstancedRenderer {
+ 						j++;
+ 					}
+ 					for (let slot = run_start; slot <= run_end; slot++) {
+-						this.#write_slot(slot, pairs, kinds, jimages, positions, lattice, stub, atom_colors, opacity);
++						this.#write_slot(slot, pairs, kinds, jimages, positions, lattice, stub, atom_colors, opacity, orders);
+ 					}
+ 					const slot_len = run_end - run_start + 1;
+-					const inst_start = run_start * 2;
+-					const inst_len = slot_len * 2;
++					const inst_start = run_start * stride;
++					const inst_len = slot_len * stride;
+ 					matrix_attr.addUpdateRange(inst_start * 16, inst_len * 16);
+ 					this.#kind_attr.addUpdateRange(inst_start, inst_len);
+ 					this.#color_start_attr?.addUpdateRange(inst_start * 3, inst_len * 3);
+@@ -284,7 +327,8 @@ export class BondInstancedRenderer {
+ 		const matrix_attr = mesh.instanceMatrix;
+ 		const capacity = matrix_attr.count;
+ 		const count = manager.count;
+-		const instance_count = count * 2;
++		const stride = this.#stride;
++		const instance_count = count * stride;
+ 		const layout = this.#get_image_atom_layout ? this.#get_image_atom_layout() : null;
+ 		const decorator_instance_count = layout !== null ? layout.bonds_csr.length * 2 : 0;
+ 		const total_instances = instance_count + decorator_instance_count;
+@@ -306,13 +350,14 @@ export class BondInstancedRenderer {
+ 		const jimages = manager.jimages_buffer;
+ 		const positions = this.#get_positions();
+ 		const opacity = manager.opacity_buffer;
++		const orders = this.#multibond_enabled ? manager.orders_buffer : null;
+ 		const lattice = this.#get_lattice ? this.#get_lattice() : null;
+ 		const stub = this.#get_incomplete_edge ? this.#get_incomplete_edge() : null;
+ 		const atom_colors = this.#get_atom_colors ? this.#get_atom_colors() : null;
+ 
+ 		if (count > 0) {
+ 			for (let slot = 0; slot < count; slot++) {
+-				this.#write_slot(slot, pairs, kinds, jimages, positions, lattice, stub, atom_colors, opacity);
++				this.#write_slot(slot, pairs, kinds, jimages, positions, lattice, stub, atom_colors, opacity, orders);
+ 			}
+ 			matrix_attr.addUpdateRange(0, instance_count * 16);
+ 			this.#kind_attr.addUpdateRange(0, instance_count);
+@@ -427,20 +472,22 @@ export class BondInstancedRenderer {
+ 		stub: IncompleteEdgeOpts | null,
+ 		atom_colors: Float32Array | null,
+ 		opacity: Float32Array | null,
++		orders: Float32Array | null,
+ 	): void {
++		const stride = this.#stride;
++		const base = slot * stride;
+ 		const a = pairs[slot * 2];
+ 		const b = pairs[slot * 2 + 1];
+ 
+ 		// Render-time safety net: if a bond endpoint index exceeds the current
+ 		// position-buffer's atom count, the upstream cache hasn't caught up to
+ 		// the displayed frame (e.g. a multi-config trajectory tick where atom
+-		// count just shrank). Collapse both halves to zero-scale instead of
+-		// reading past the buffer and emitting a NaN matrix that the GPU draws
+-		// as a long stray cylinder.
++		// count just shrank). Collapse all reserved instances to zero-scale
++		// instead of reading past the buffer and emitting a NaN matrix that the
++		// GPU draws as a long stray cylinder.
+ 		const n_atoms = positions.length / 3;
+ 		if (a >= n_atoms || b >= n_atoms) {
+-			this.#mesh.setMatrixAt(slot * 2, ZERO_MATRIX);
+-			this.#mesh.setMatrixAt(slot * 2 + 1, ZERO_MATRIX);
++			for (let s = 0; s < stride; s++) this.#mesh.setMatrixAt(base + s, ZERO_MATRIX);
+ 			return;
+ 		}
+ 
+@@ -517,6 +564,45 @@ export class BondInstancedRenderer {
+ 		const is_periodic = (dx | dy | dz) !== 0;
+ 		const stub_active = stub !== null && stub.mode && is_periodic;
+ 
++		// Multi-bond line count. Only intra-cell adsorbate bonds with a perceived
++		// order > 1 expand; everything else (slab sticks, cross-cell bonds, OFF
++		// path) stays a single 2-half line. Aromatic (1.3<bo<1.7) ring bonds
++		// render as a SINGLE solid stick (nb=1) — the aromatic circle is drawn
++		// separately by AromaticRingOverlay; true doubles/triples still expand.
++		const order = orders !== null ? orders[slot] : 1;
++		let nb = 1;
++		if (this.#multibond_enabled && !is_periodic && order > 1 && !is_aromatic(order)) {
++			nb = nb_from_order(order, true);
++			if (nb > BondInstancedRenderer.MAX_LINES) nb = BondInstancedRenderer.MAX_LINES;
++			if (nb < 1) nb = 1;
++		}
++
++		// Per-line reduced radius (relative to the base cylinder radius) and
++		// in-plane gap, mirroring catrender bonds.rs gap()=0.6·bw. Implemented as
++		// XZ scale on the unit-radius cylinder geometry.
++		const radius_scale = nb === 1 ? 1.0 : nb === 2 ? 0.62 : 0.5;
++		const gap = 0.6 * this.#bond_radius;
++
++		// Deterministic world-space perpendicular ⟂ v_dir (view-independent so
++		// the lines don't swim during orbit). Project a fixed axis onto the plane
++		// normal to the bond; fall back to a second axis when nearly parallel.
++		if (nb > 1) {
++			let rdx = PERP_REF_A.x, rdy = PERP_REF_A.y, rdz = PERP_REF_A.z;
++			const dotA = Math.abs(this.#v_dir.x * rdx + this.#v_dir.y * rdy + this.#v_dir.z * rdz);
++			if (dotA > 0.9) { rdx = PERP_REF_B.x; rdy = PERP_REF_B.y; rdz = PERP_REF_B.z; }
++			this.#v_ref.set(rdx, rdy, rdz);
++			// p = normalize(ref - (ref·dir)dir)
++			const proj = this.#v_ref.dot(this.#v_dir);
++			this.#v_perp.set(
++				this.#v_ref.x - proj * this.#v_dir.x,
++				this.#v_ref.y - proj * this.#v_dir.y,
++				this.#v_ref.z - proj * this.#v_dir.z,
++			);
++			if (this.#v_perp.lengthSq() < 1e-12) this.#v_perp.set(1, 0, 0);
++			else this.#v_perp.normalize();
++		}
++
++		const ib_offsets = nb === 1 ? ZERO_IB : ib_seq(nb);
+ 
+ 		if (is_periodic) {
+ 			// When hide_incomplete_bonds is on, the cell-internal pass owns
+@@ -535,28 +621,13 @@ export class BondInstancedRenderer {
+ 			// #write_decorators (~L725): both render paths must agree on the
+ 			// hide_incomplete contract or we get half-baked visuals.
+ 			if (stub !== null && stub.hide_incomplete) {
+-				this.#mesh.setMatrixAt(slot * 2, ZERO_MATRIX);
+-				this.#mesh.setMatrixAt(slot * 2 + 1, ZERO_MATRIX);
++				for (let s = 0; s < stride; s++) this.#mesh.setMatrixAt(base + s, ZERO_MATRIX);
+ 				return;
+ 			}
+ 
+ 			// Phase 6 outward-stub rendering — only reached when
+ 			// hide_incomplete_bonds is off (legacy / static-structure use).
+-			// Renders TWO independent stubs, one at each atom's CELL-INTERNAL
+-			// position, pointing toward the cell boundary along the bond
+-			// direction.
+-			//   Half A stub: anchored at pos_a, length = half_length·scale,
+-			//                pointing +v_dir (toward b_eff outside cell).
+-			//   Half B stub: anchored at pos_b (the BASE position, NOT b_eff),
+-			//                length = half_length·scale, pointing -v_dir
+-			//                (toward a_eff_inverse = pos_a + lattice·-jimage,
+-			//                outside the opposite cell boundary). v_dir is the
+-			//                a→b_eff direction; pos_b's stub goes opposite
+-			//                because pos_b's nearest A-image is in the -jimage
+-			//                direction relative to pos_b.
+-			// In Phase 6 stub mode, scale is `stub.scale` (default 0.5);
+-			// otherwise full half_length so paired stubs meet visually at
+-			// the cell edge for a continuous "broken bond" appearance.
++			// Cross-cell bonds stay single-line (nb=1) in v1.
+ 			const stub_scale = stub_active ? stub.scale : 1.0;
+ 			const stub_len = half_length * stub_scale;
+ 			this.#v_scale.set(1, stub_len, 1);
+@@ -569,7 +640,7 @@ export class BondInstancedRenderer {
+ 				az + this.#v_dir.z * half_stub,
+ 			);
+ 			this.#tmp_matrix.compose(this.#v_half_mid_a, this.#q_rot, this.#v_scale);
+-			this.#mesh.setMatrixAt(slot * 2, this.#tmp_matrix);
++			this.#mesh.setMatrixAt(base, this.#tmp_matrix);
+ 
+ 			// Half B stub anchored at the BASE pos_b (cell-internal), pointing
+ 			// in the -v_dir direction (toward atom A's image across the
+@@ -580,46 +651,47 @@ export class BondInstancedRenderer {
+ 				bz_base - this.#v_dir.z * half_stub,
+ 			);
+ 			this.#tmp_matrix.compose(this.#v_half_mid_b, this.#q_rot, this.#v_scale);
+-			this.#mesh.setMatrixAt(slot * 2 + 1, this.#tmp_matrix);
++			this.#mesh.setMatrixAt(base + 1, this.#tmp_matrix);
++			// Collapse any reserved multi-bond instances for this slot.
++			for (let s = 2; s < stride; s++) this.#mesh.setMatrixAt(base + s, ZERO_MATRIX);
+ 		} else {
+-			// Intra-cell bond: classic two-half cylinder meeting at midpoint.
+-			this.#v_scale.set(1, half_length, 1);
++			// Intra-cell bond: classic two-half cylinder(s) meeting at midpoint.
++			// nb lines, each offset ib·gap along the in-plane perpendicular.
++			for (let line = 0; line < nb; line++) {
++				const off = ib_offsets[line] * gap;
++				const ox = this.#v_perp.x * off;
++				const oy = this.#v_perp.y * off;
++				const oz = this.#v_perp.z * off;
++				this.#v_scale.set(radius_scale, half_length, radius_scale);
+ 
+-			this.#v_half_mid_a.set(
+-				(ax + mx) * 0.5,
+-				(ay + my) * 0.5,
+-				(az + mz) * 0.5,
+-			);
+-			this.#tmp_matrix.compose(this.#v_half_mid_a, this.#q_rot, this.#v_scale);
+-			this.#mesh.setMatrixAt(slot * 2, this.#tmp_matrix);
++				this.#v_half_mid_a.set(
++					(ax + mx) * 0.5 + ox,
++					(ay + my) * 0.5 + oy,
++					(az + mz) * 0.5 + oz,
++				);
++				this.#tmp_matrix.compose(this.#v_half_mid_a, this.#q_rot, this.#v_scale);
++				this.#mesh.setMatrixAt(base + line * 2, this.#tmp_matrix);
+ 
+-			this.#v_half_mid_b.set(
+-				(mx + bx) * 0.5,
+-				(my + by) * 0.5,
+-				(mz + bz) * 0.5,
+-			);
+-			this.#tmp_matrix.compose(this.#v_half_mid_b, this.#q_rot, this.#v_scale);
+-			this.#mesh.setMatrixAt(slot * 2 + 1, this.#tmp_matrix);
++				this.#v_half_mid_b.set(
++					(mx + bx) * 0.5 + ox,
++					(my + by) * 0.5 + oy,
++					(mz + bz) * 0.5 + oz,
++				);
++				this.#tmp_matrix.compose(this.#v_half_mid_b, this.#q_rot, this.#v_scale);
++				this.#mesh.setMatrixAt(base + line * 2 + 1, this.#tmp_matrix);
++			}
++			// Collapse unused reserved instances [2·nb .. stride).
++			for (let s = nb * 2; s < stride; s++) this.#mesh.setMatrixAt(base + s, ZERO_MATRIX);
+ 		}
+ 
+-		// Both halves share the kind byte (selection state, dashed HBOND, etc).
++		// Kind / color / opacity, mirrored across every live half-instance.
++		const live = is_periodic ? 2 : nb * 2;
+ 		const kind = kinds[slot];
+-		this.#kind_buf[slot * 2] = kind;
+-		this.#kind_buf[slot * 2 + 1] = kind;
+-
+-		// Per-half solid color: Half A = atom A's color, Half B = atom B's color.
+-		// Both endpoints of each half are set to the same color, so the gradient
+-		// shader's `mix(vColorStart, vColorEnd, vYPosition + 0.5)` renders solid.
+-		// The hard color step at the midpoint between the two halves matches
+-		// crystaltoolkit / VESTA / MP convention — do not blend across halves.
+-		//
+-		// Colors are sourced directly from `atom_colors[a*3..]` and
+-		// `atom_colors[b*3..]` in the same loop as the matrix write, so the
+-		// color and matrix snapshots can never diverge for a given slot. If
+-		// `atom_colors` is null or an endpoint index is out of range (e.g.
+-		// position buffer hasn't caught up to a topology change), skip the
+-		// color write — leaves whatever value was last written, matching the
+-		// pre-refactor "no manager.colors_start_buffer" behavior.
++		for (let s = 0; s < live; s++) this.#kind_buf[base + s] = kind;
++
++		// Per-half solid color: even instances = atom A's color, odd = atom B's.
++		// Both endpoints of each half share the color so the gradient shader
++		// renders solid (hard mid-point color step matches VESTA / MP).
+ 		if (atom_colors !== null && this.#color_start_attr !== null) {
+ 			const ac_len = atom_colors.length;
+ 			const a3 = a * 3;
+@@ -627,29 +699,25 @@ export class BondInstancedRenderer {
+ 			if (a3 + 2 < ac_len && b3 + 2 < ac_len) {
+ 				const cb_start = this.#color_start_attr.array as Float32Array;
+ 				const cb_end = this.#color_end_attr!.array as Float32Array;
+-				const dst_a = (slot * 2) * 3;
+-				const dst_b = (slot * 2 + 1) * 3;
+-
+-				const ar = atom_colors[a3];
+-				const ag = atom_colors[a3 + 1];
+-				const ab = atom_colors[a3 + 2];
+-				const br = atom_colors[b3];
+-				const bg = atom_colors[b3 + 1];
+-				const bb = atom_colors[b3 + 2];
+-
+-				cb_start[dst_a]     = ar; cb_start[dst_a + 1] = ag; cb_start[dst_a + 2] = ab;
+-				cb_end[dst_a]       = ar; cb_end[dst_a + 1]   = ag; cb_end[dst_a + 2]   = ab;
+-				cb_start[dst_b]     = br; cb_start[dst_b + 1] = bg; cb_start[dst_b + 2] = bb;
+-				cb_end[dst_b]       = br; cb_end[dst_b + 1]   = bg; cb_end[dst_b + 2]   = bb;
++				const ar = atom_colors[a3], ag = atom_colors[a3 + 1], ab = atom_colors[a3 + 2];
++				const br = atom_colors[b3], bg = atom_colors[b3 + 1], bb = atom_colors[b3 + 2];
++				for (let s = 0; s < live; s++) {
++					const is_a_half = (s & 1) === 0;
++					const dst = (base + s) * 3;
++					const cr = is_a_half ? ar : br;
++					const cg = is_a_half ? ag : bg;
++					const cbv = is_a_half ? ab : bb;
++					cb_start[dst] = cr; cb_start[dst + 1] = cg; cb_start[dst + 2] = cbv;
++					cb_end[dst] = cr; cb_end[dst + 1] = cg; cb_end[dst + 2] = cbv;
++				}
+ 			}
+ 		}
+ 
+-		// Both halves share opacity — selection / fade is slot-level.
++		// All live halves share opacity — selection / fade is slot-level.
+ 		if (opacity !== null && this.#opacity_attr !== null) {
+ 			const buf = this.#opacity_attr.array as Float32Array;
+ 			const op = opacity[slot];
+-			buf[slot * 2] = op;
+-			buf[slot * 2 + 1] = op;
++			for (let s = 0; s < live; s++) buf[base + s] = op;
+ 		}
+ 	}
+ 
+diff --git a/src/lib/structure/bonding/bond-manager.svelte.ts b/src/lib/structure/bonding/bond-manager.svelte.ts
+index 3718ab4af..697462a33 100644
+--- a/src/lib/structure/bonding/bond-manager.svelte.ts
++++ b/src/lib/structure/bonding/bond-manager.svelte.ts
+@@ -67,6 +67,13 @@ export class BondManager {
+ 	#opacity_batch_depth = 0;
+ 	#opacity_batch_changed = false;
+ 
++	// Optional per-bond order channel (1 float per bond, default 1.0). Lazy:
++	// the buffer stays null until ensure_orders() runs, so the default-OFF
++	// path pays zero memory cost and orders_buffer returns null.
++	#orders_buffer: Float32Array | null = null;
++	#orders_batch_depth = 0;
++	#orders_batch_changed = false;
++
+ 	constructor(initial_capacity: number = INITIAL_CAPACITY) {
+ 		const cap = Math.max(1, initial_capacity | 0);
+ 		this.#capacity = cap;
+@@ -174,6 +181,12 @@ export class BondManager {
+ 			new_opacity.set(this.#opacity_buffer.subarray(0, this.#count));
+ 			this.#opacity_buffer = new_opacity;
+ 		}
++		if (this.#orders_buffer !== null) {
++			const new_orders = new Float32Array(new_cap);
++			new_orders.fill(1);
++			new_orders.set(this.#orders_buffer.subarray(0, this.#count));
++			this.#orders_buffer = new_orders;
++		}
+ 		this.#capacity = new_cap;
+ 	}
+ 
+@@ -212,6 +225,12 @@ export class BondManager {
+ 			new_opacity.set(this.#opacity_buffer.subarray(0, this.#count));
+ 			this.#opacity_buffer = new_opacity;
+ 		}
++		if (this.#orders_buffer !== null) {
++			const new_orders = new Float32Array(target);
++			new_orders.fill(1);
++			new_orders.set(this.#orders_buffer.subarray(0, this.#count));
++			this.#orders_buffer = new_orders;
++		}
+ 		this.#capacity = target;
+ 		this.#dirty_all = true;
+ 		this.#dirty_slots.clear();
+@@ -434,6 +453,9 @@ export class BondManager {
+ 			if (this.#opacity_buffer !== null) {
+ 				this.#opacity_buffer[slot] = this.#opacity_buffer[last];
+ 			}
++			if (this.#orders_buffer !== null) {
++				this.#orders_buffer[slot] = this.#orders_buffer[last];
++			}
+ 			this.#touch(slot);
+ 		}
+ 		this.#count = last;
+@@ -475,6 +497,9 @@ export class BondManager {
+ 				if (this.#opacity_buffer !== null) {
+ 					this.#opacity_buffer[s] = this.#opacity_buffer[last];
+ 				}
++				if (this.#orders_buffer !== null) {
++					this.#orders_buffer[s] = this.#orders_buffer[last];
++				}
+ 				this.#touch(s);
+ 			}
+ 			this.#count = last;
+@@ -525,6 +550,9 @@ export class BondManager {
+ 				if (this.#opacity_buffer !== null) {
+ 					this.#opacity_buffer[write] = this.#opacity_buffer[read];
+ 				}
++				if (this.#orders_buffer !== null) {
++					this.#orders_buffer[write] = this.#orders_buffer[read];
++				}
+ 				if (first_change === -1) first_change = write;
+ 				last_change = read;
+ 			}
+@@ -592,6 +620,7 @@ export class BondManager {
+ 		const colors_start = this.#colors_start;
+ 		const colors_end = this.#colors_end;
+ 		const opacity = this.#opacity_buffer;
++		const orders = this.#orders_buffer;
+ 		let write = 0;
+ 		let first_change = -1;
+ 		let last_change = -1;
+@@ -630,6 +659,9 @@ export class BondManager {
+ 					if (opacity !== null) {
+ 						opacity[write] = opacity[read];
+ 					}
++					if (orders !== null) {
++						orders[write] = orders[read];
++					}
+ 					jimages[write * 3] = jimages[read * 3];
+ 					jimages[write * 3 + 1] = jimages[read * 3 + 1];
+ 					jimages[write * 3 + 2] = jimages[read * 3 + 2];
+@@ -898,6 +930,81 @@ export class BondManager {
+ 		}
+ 	}
+ 
++	// -----------------------------------------------------------------
++	// Optional per-bond order (1 float per bond). Same lazy pattern as
++	// opacity: the buffer stays null until ensure_orders() runs, so the
++	// default-OFF path pays zero memory cost and orders_buffer returns null.
++	// Default value for every allocated slot is 1.0 (single bond).
++	// -----------------------------------------------------------------
++
++	/** True once the order buffer has been allocated. */
++	get has_orders(): boolean {
++		return this.#orders_buffer !== null;
++	}
++
++	/** Backing order buffer; valid range [0, count). Null if never initialized. */
++	get orders_buffer(): Float32Array | null {
++		return this.#orders_buffer;
++	}
++
++	/** Read one bond's order; 1.0 when the buffer is unallocated or out of range. */
++	get_order(slot: number): number {
++		if (this.#orders_buffer === null || slot < 0 || slot >= this.#count) return 1;
++		return this.#orders_buffer[slot];
++	}
++
++	/**
++	 * Allocate the order buffer if not yet allocated. Idempotent.
++	 * Initial value is 1.0 for every slot. When first allocated with live
++	 * bonds, marks all live slots dirty.
++	 */
++	ensure_orders(): void {
++		if (this.#orders_buffer !== null) return;
++		this.#orders_buffer = new Float32Array(this.#capacity);
++		this.#orders_buffer.fill(1);
++		if (this.#count > 0) {
++			this.#touch_range(0, this.#count - 1);
++			if (this.#orders_batch_depth > 0) {
++				this.#orders_batch_changed = true;
++			} else {
++				this.#version++;
++			}
++		}
++	}
++
++	/**
++	 * Write one bond's order. Lazy-allocates the buffer if needed.
++	 * No-op when slot out of range OR value matches stored value.
++	 */
++	set_order(slot: number, value: number): void {
++		if (slot < 0 || slot >= this.#count) return;
++		if (this.#orders_buffer === null) this.ensure_orders();
++		const buf = this.#orders_buffer!;
++		if (buf[slot] === value) return;
++		buf[slot] = value;
++		this.#touch(slot);
++		if (this.#orders_batch_depth > 0) {
++			this.#orders_batch_changed = true;
++		} else {
++			this.#version++;
++		}
++	}
++
++	/** Begin a batched order update (see begin_opacity_batch). */
++	begin_orders_batch(): void {
++		this.#orders_batch_depth++;
++	}
++
++	/** End a batched order update (see commit_opacity_batch). */
++	commit_orders_batch(): void {
++		if (this.#orders_batch_depth === 0) return;
++		this.#orders_batch_depth--;
++		if (this.#orders_batch_depth === 0 && this.#orders_batch_changed) {
++			this.#orders_batch_changed = false;
++			this.#version++;
++		}
++	}
++
+ 	/**
+ 	 * Replace all AUTO bonds with a fresh set. `pairs_src` must contain
+ 	 * at least `2 * n_bonds` entries; new bonds are all tagged AUTO.
+@@ -955,6 +1062,9 @@ export class BondManager {
+ 				if (this.#opacity_buffer !== null) {
+ 					this.#opacity_buffer[write] = this.#opacity_buffer[read];
+ 				}
++				if (this.#orders_buffer !== null) {
++					this.#orders_buffer[write] = this.#orders_buffer[read];
++				}
+ 				if (first_change === -1) first_change = write;
+ 				last_change = read;
+ 			}
+diff --git a/src/lib/structure/bonding/bond-orders.ts b/src/lib/structure/bonding/bond-orders.ts
+new file mode 100644
+index 000000000..c2953e968
+--- /dev/null
++++ b/src/lib/structure/bonding/bond-orders.ts
+@@ -0,0 +1,919 @@
++// Whole-structure bond-order perception — RDKit-free valence heuristic.
++//
++// A 1:1 TS port of atomcanvas' heuristics.py (ValencePropagator +
++// EnhancedAromaticityDetector + SpecialStructureDetector), run per ORGANIC
++// CONNECTED COMPONENT. RDKit/xyz2mol is unusable on CatGo systems (metal,
++// periodic, no defined total charge), so we run a lightweight valence
++// heuristic on each extracted organic component instead. Components range
++// from a small adsorbate (CO / formate / benzene) to an extended periodic
++// framework (graphene / C3N4 / h-BN / COF) that bonds to its own PBC image —
++// ALL are perceived. Metals are excluded by the component extraction, so a
++// Pt slab still gets only single sticks (no fake orders).
++//
++// Bond vectors are minimum-image-corrected via lattice·jimage so the
++// carbonyl / length-table distance tests stay correct on a cross-cell
++// component. Aromatic rings are detected in (atom, accumulated-image) space so
++// every hexagon of a periodic sheet — closing through cross-cell bonds — is
++// found, with its plane geometry computed from MIC-UNWRAPPED image positions.
++// The best-fit-plane normal reuses get_principal_axes (Jacobi) from
++// structure/index.ts — no new linalg dependency.
++//
++// Output orders snap to {1, 1.5, 2, 3}, keyed by the SAME get_bond_key the
++// shadow-sync uses, so the result map is directly indexable by global bond
++// identity. Bonds absent from the map render as order 1.
++//
++// Pure, headless, no wasm, no network.
++
++import type { Matrix3x3, Vec3 } from '$lib/math'
++import {
++  mat3x3_vec3_multiply,
++  matrix_inverse_3x3,
++  transpose_3x3_matrix,
++} from '$lib/math'
++import type { AnyStructure, BondPair, Site } from '$lib/structure'
++import { get_principal_axes } from '$lib/structure'
++import { get_bond_key } from '$lib/structure/bonding'
++import {
++  type Fragment,
++  isolate_adsorbate_fragments,
++} from '$lib/structure/bonding/fragment'
++
++// ---------------------------------------------------------------------------
++// Ported tables (heuristics.py:9-44)
++// ---------------------------------------------------------------------------
++
++// Valence electrons / typical bonding capacity, sorted by preference.
++const VALENCE_TABLE: Record<string, number[]> = {
++  H: [1],
++  He: [0],
++  Li: [1],
++  Be: [2],
++  B: [3],
++  C: [4, 2],
++  N: [3, 4, 2],
++  O: [2, 1],
++  F: [1],
++  Ne: [0],
++  Na: [1],
++  Mg: [2],
++  Al: [3],
++  Si: [4],
++  P: [3, 5],
++  S: [2, 4, 6],
++  Cl: [1, 3, 5, 7],
++  Ar: [0],
++  K: [1],
++  Ca: [2],
++  Ga: [3],
++  Ge: [4],
++  As: [3, 5],
++  Se: [2, 4, 6],
++  Br: [1, 3, 5, 7],
++  Kr: [0],
++  I: [1, 3, 5, 7],
++  Xe: [0, 2, 4, 6, 8],
++}
++
++// Bond-length table: pair-key -> {order: length(Å)}.
++const BOND_LENGTH_TABLE: Record<string, Array<[number, number]>> = {
++  'C|C': [[1.0, 1.54], [1.5, 1.40], [2.0, 1.34], [3.0, 1.20]],
++  'C|N': [[1.0, 1.47], [1.5, 1.34], [2.0, 1.28], [3.0, 1.16]],
++  'C|O': [[1.0, 1.43], [1.5, 1.28], [2.0, 1.22]],
++  'N|N': [[1.0, 1.45], [2.0, 1.25], [3.0, 1.10]],
++  'N|O': [[1.0, 1.40], [1.5, 1.30], [2.0, 1.20]],
++  'O|O': [[1.0, 1.48], [2.0, 1.21]],
++  'S|O': [[1.0, 1.58], [2.0, 1.43]],
++  'P|O': [[1.0, 1.60], [2.0, 1.50]],
++  'S|S': [[1.0, 2.05], [2.0, 1.89]],
++}
++
++function length_table_key(a: string, b: string): string {
++  return a <= b ? `${a}|${b}` : `${b}|${a}`
++}
++
++// Aromatic rings are essentially flat; saturated chair rings pucker well
++// beyond this tolerance (Å).
++const AROMATIC_PLANARITY_TOL = 0.1
++
++// ---------------------------------------------------------------------------
++// Aromatic-ring overlay descriptor
++// ---------------------------------------------------------------------------
++
++/**
++ * One detected aromatic ring, in world (Cartesian) coordinates, ready for the
++ * dashed-circle overlay. `atom_indices` are the ordered GLOBAL site indices
++ * forming the cycle; `centroid` / `normal` / `radius` describe the best-fit
++ * ring plane (normal is unit length, radius is the mean centroid→atom
++ * distance). All positions are MIC-unwrapped so a cross-cell ring is laid out
++ * as a single contiguous loop rather than split across the periodic boundary.
++ * For PERIODIC structures the `centroid` is then translated by an integer
++ * lattice vector back into the unit cell so a boundary-straddling hexagon's
++ * torus sits on the in-cell atoms (no floaters); `normal`/`radius` are
++ * unchanged. Molecules (no lattice) keep their centroid exactly as is.
++ */
++export type AromaticRing = {
++  atom_indices: number[]
++  centroid: [number, number, number]
++  normal: [number, number, number]
++  radius: number
++}
++
++// ---------------------------------------------------------------------------
++// catrender parity helpers (bonds.rs:128-180) — exported for the renderer & tests
++// ---------------------------------------------------------------------------
++
++/** Python round() — round-half-to-even (banker's rounding). */
++export function round_half_even(x: number): number {
++  const f = Math.floor(x)
++  const diff = x - f
++  if (diff < 0.5) return f
++  if (diff > 0.5) return f + 1
++  // exactly .5 → round to even
++  return f % 2 === 0 ? f : f + 1
++}
++
++/** nb = max(1, round_half_even(bo)); disabled collapses to a single stick. */
++export function nb_from_order(bo: number, bond_orders: boolean): number {
++  const b = bond_orders ? bo : 1.0
++  const nb = round_half_even(b)
++  return Math.max(1, nb)
++}
++
++/** Multi-bond offset index sequence range(-nb+1, nb, 2). */
++export function ib_seq(nb: number): number[] {
++  const v: number[] = []
++  for (let i = -nb + 1; i < nb; i += 2) v.push(i)
++  return v
++}
++
++/** Aromatic window 1.3 < bo < 1.7 (bonds.rs:178). */
++export function is_aromatic(bo: number): boolean {
++  return 1.3 < bo && bo < 1.7
++}
++
++// ---------------------------------------------------------------------------
++// Geometry helpers
++// ---------------------------------------------------------------------------
++
++function sub(a: Vec3, b: Vec3): Vec3 {
++  return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
++}
++
++function norm(v: Vec3): number {
++  return Math.hypot(v[0], v[1], v[2])
++}
++
++function dot(a: Vec3, b: Vec3): number {
++  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
++}
++
++// MIC-corrected vector center→neighbor: r = pos_n + lattice·jimage - pos_c
++// (same convention as bond-instanced-renderer.ts #write_slot / atom-graph.ts).
++function mic_vector(
++  pos_c: Vec3,
++  pos_n: Vec3,
++  jimage: [number, number, number],
++  lattice: Matrix3x3 | null,
++): Vec3 {
++  let nx = pos_n[0]
++  let ny = pos_n[1]
++  let nz = pos_n[2]
++  if (lattice && (jimage[0] || jimage[1] || jimage[2])) {
++    // rows of the lattice matrix are the lattice vectors a, b, c
++    for (let k = 0; k < 3; k++) {
++      nx += jimage[k] * lattice[k][0]
++      ny += jimage[k] * lattice[k][1]
++      nz += jimage[k] * lattice[k][2]
++    }
++  }
++  return [nx - pos_c[0], ny - pos_c[1], nz - pos_c[2]]
++}
++
++// ---------------------------------------------------------------------------
++// Compact per-fragment graph
++// ---------------------------------------------------------------------------
++
++type LocalGraph = {
++  n: number
++  symbols: string[]
++  positions: Vec3[]
++  // adjacency: for each local atom, list of {nb_local, jimage(center→nb), edge_idx}
++  adj: Array<Array<{ nb: number; jimage: [number, number, number]; edge: number }>>
++  // edges in declaration order: [a_local, b_local, jimage(a→b)]
++  edges: Array<{ a: number; b: number; jimage: [number, number, number] }>
++}
++
++function build_local_graph(
++  fragment: Fragment,
++  sites: Site[],
++  lattice: Matrix3x3 | null,
++): LocalGraph {
++  const n = fragment.site_indices.length
++  const symbols: string[] = new Array(n)
++  const positions: Vec3[] = new Array(n)
++  for (let i = 0; i < n; i++) {
++    const g = fragment.site_indices[i]
++    const site = sites[g]
++    const species = site?.species ?? []
++    let best = species[0]
++    for (const s of species) if (s && s.occu > (best?.occu ?? -1)) best = s
++    symbols[i] = best?.element ?? `X`
++    positions[i] = (site?.xyz ?? [0, 0, 0]) as Vec3
++  }
++  const adj: LocalGraph['adj'] = Array.from({ length: n }, () => [])
++  const edges: LocalGraph['edges'] = []
++  fragment.local_bonds.forEach((e, idx) => {
++    const a = e.a_local
++    const b = e.b_local
++    const j = e.jimage
++    edges.push({ a, b, jimage: j })
++    adj[a].push({ nb: b, jimage: j, edge: idx })
++    // reverse edge: center b → a uses the negated translation
++    adj[b].push({
++      nb: a,
++      jimage: [-j[0], -j[1], -j[2]] as [number, number, number],
++      edge: idx,
++    })
++  })
++  void lattice
++  return { n, symbols, positions, adj, edges }
++}
++
++// Canonical local bond key (min,max) for the bond_orders map.
++function lkey(u: number, v: number): string {
++  return u < v ? `${u}-${v}` : `${v}-${u}`
++}
++
++// ---------------------------------------------------------------------------
++// Aromaticity / special-structure / planarity detectors (ported)
++// ---------------------------------------------------------------------------
++
++function is_sp2_atom(g: LocalGraph, idx: number, lattice: Matrix3x3 | null): boolean {
++  const sym = g.symbols[idx]
++  if (sym !== `C` && sym !== `N` && sym !== `B`) return false
++  const neighbors = g.adj[idx]
++  if (!(neighbors.length >= 1 && neighbors.length <= 4)) return false
++
++  let network_nb = 0
++  for (const { nb } of neighbors) {
++    const s = g.symbols[nb]
++    if (s === `C` || s === `N` || s === `B`) network_nb++
++  }
++  if (network_nb < 1) return false
++
++  const p_c = g.positions[idx]
++  const vectors: Vec3[] = []
++  for (const { nb, jimage } of neighbors) {
++    const vec = mic_vector(p_c, g.positions[nb], jimage, lattice)
++    const nrm = norm(vec)
++    if (nrm < 1e-4) return false
++    vectors.push([vec[0] / nrm, vec[1] / nrm, vec[2] / nrm])
++  }
++  if (vectors.length > 3) return false
++  if (vectors.length < 3) return vectors.length >= 1
++
++  // 3-coordinate: planarity via sum of the three pairwise angles > 350°.
++  let angle_sum = 0
++  for (let i = 0; i < 3; i++) {
++    const v1 = vectors[i]
++    const v2 = vectors[(i + 1) % 3]
++    const d = Math.max(-1, Math.min(1, dot(v1, v2)))
++    angle_sum += (Math.acos(d) * 180) / Math.PI
++  }
++  return angle_sum > 350.0
++}
++
++// One ordered ring as a cyclic walk in (atom, accumulated-image) space. Each
++// member carries the lattice translation (jimage) of that atom RELATIVE to
++// member[0], so a ring is well defined even when it closes through a PBC image
++// (graphene/C3N4 hexagons) — including the degenerate case where the same
++// atom index appears twice at different images (a hexagon in a tiny periodic
++// cell). `atoms[i]` is a local atom index; `images[i]` is its [da,db,dc].
++type Ring = {
++  atoms: number[]
++  images: Array<[number, number, number]>
++}
++
++const j_add = (
++  a: [number, number, number],
++  b: [number, number, number],
++): [number, number, number] => [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
++
++// Cartesian position of a ring member: raw xyz + lattice·image.
++function ring_member_pos(
++  g: LocalGraph,
++  atom: number,
++  image: [number, number, number],
++  lattice: Matrix3x3 | null,
++): Vec3 {
++  const p = g.positions[atom]
++  if (!lattice || (!image[0] && !image[1] && !image[2])) {
++    return [p[0], p[1], p[2]]
++  }
++  let x = p[0]
++  let y = p[1]
++  let z = p[2]
++  for (let k = 0; k < 3; k++) {
++    x += image[k] * lattice[k][0]
++    y += image[k] * lattice[k][1]
++    z += image[k] * lattice[k][2]
++  }
++  return [x, y, z]
++}
++
++// Max out-of-plane deviation (Å) of ring atoms from their best-fit plane.
++// Plane normal = smallest-eigenvalue eigenvector of the covariance matrix,
++// obtained from get_principal_axes (sorted descending → last row is normal).
++// Uses MIC-UNWRAPPED member positions so a cross-cell ring is laid flat.
++function ring_max_plane_deviation(
++  g: LocalGraph,
++  ring: Ring,
++  lattice: Matrix3x3 | null,
++): number {
++  const pts = ring.atoms.map((a, i) => ring_member_pos(g, a, ring.images[i], lattice))
++  const c: Vec3 = [0, 0, 0]
++  for (const p of pts) {
++    c[0] += p[0]
++    c[1] += p[1]
++    c[2] += p[2]
++  }
++  c[0] /= pts.length
++  c[1] /= pts.length
++  c[2] /= pts.length
++  const centered = pts.map((p) => sub(p, c))
++  // covariance (3x3)
++  const cov = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
++  for (const v of centered) {
++    for (let a = 0; a < 3; a++) {
++      for (let b = 0; b < 3; b++) cov[a][b] += v[a] * v[b]
++    }
++  }
++  const axes = get_principal_axes(cov)
++  const normal = axes[axes.length - 1] as unknown as Vec3 // smallest-eigenvalue dir
++  let max_dev = 0
++  for (const v of centered) max_dev = Math.max(max_dev, Math.abs(dot(v, normal)))
++  return max_dev
++}
++
++function is_planar_ring(g: LocalGraph, ring: Ring, lattice: Matrix3x3 | null): boolean {
++  if (ring.atoms.length < 3) return false
++  return ring_max_plane_deviation(g, ring, lattice) <= AROMATIC_PLANARITY_TOL
++}
++
++// MIC-unwrapped Cartesian positions for an ordered ring. Each member's
++// accumulated image is already known, so a cross-cell ring is laid out as one
++// contiguous loop instead of jumping across the periodic boundary.
++function unwrap_ring_positions(
++  g: LocalGraph,
++  ring: Ring,
++  lattice: Matrix3x3 | null,
++): Vec3[] | null {
++  const n = ring.atoms.length
++  if (n < 3) return null
++  return ring.atoms.map((a, i) => ring_member_pos(g, a, ring.images[i], lattice))
++}
++
++// Wrap a Cartesian point back into the unit cell along every periodic axis.
++// A periodic aromatic hexagon is laid out from MIC-UNWRAPPED image positions,
++// so a hexagon straddling the cell boundary gets a centroid OUTSIDE the drawn
++// cell — the torus would float in empty space while the in-cell copy (same
++// hexagon via PBC) has the bonds but no ring. Translating the centroid by an
++// integer lattice vector is geometrically exact (the hexagon is periodic), so
++// the normal / radius are untouched and planarity is preserved. We go through
++// fractional space using the SAME lattice convention as the MIC code (rows of
++// `lattice` are the lattice vectors a, b, c → cart = Σ_i f_i · lattice[i],
++// i.e. cart = transpose(lattice)·frac), wrap each fractional component into
++// [0, 1) (f -= floor(f)), then map back. Non-periodic structures (lattice ===
++// null) are returned unchanged — molecules like benzene must not move.
++function wrap_centroid_into_cell(c: Vec3, lattice: Matrix3x3 | null): Vec3 {
++  if (!lattice) return c
++  // cart = transpose(lattice)·frac  ⇒  frac = inv(transpose(lattice))·cart
++  const lat_t = transpose_3x3_matrix(lattice)
++  const frac = mat3x3_vec3_multiply(matrix_inverse_3x3(lat_t), c)
++  const wrapped: Vec3 = [
++    frac[0] - Math.floor(frac[0]),
++    frac[1] - Math.floor(frac[1]),
++    frac[2] - Math.floor(frac[2]),
++  ]
++  return mat3x3_vec3_multiply(lat_t, wrapped)
++}
++
++// Compute the best-fit-plane geometry of a set of (already MIC-unwrapped) ring
++// points: centroid, unit normal (smallest-eigenvalue eigenvector of the
++// covariance), and mean centroid→atom radius. Reuses get_principal_axes — no
++// new linalg dependency. For PERIODIC structures the centroid is wrapped back
++// into the unit cell (by an integer lattice vector — orientation/size are
++// unchanged) so a boundary-straddling hexagon's ring lands on the in-cell
++// atoms instead of floating outside the drawn cell.
++function ring_plane_geometry(
++  pts: Vec3[],
++  lattice: Matrix3x3 | null,
++): { centroid: Vec3; normal: Vec3; radius: number } {
++  const c: Vec3 = [0, 0, 0]
++  for (const p of pts) {
++    c[0] += p[0]
++    c[1] += p[1]
++    c[2] += p[2]
++  }
++  c[0] /= pts.length
++  c[1] /= pts.length
++  c[2] /= pts.length
++
++  const centered = pts.map((p) => sub(p, c))
++  const cov = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
++  for (const v of centered) {
++    for (let a = 0; a < 3; a++) {
++      for (let b = 0; b < 3; b++) cov[a][b] += v[a] * v[b]
++    }
++  }
++  const axes = get_principal_axes(cov)
++  const nax = axes[axes.length - 1] as unknown as Vec3 // smallest-eigenvalue dir
++  const nl = norm(nax) || 1
++  const normal: Vec3 = [nax[0] / nl, nax[1] / nl, nax[2] / nl]
++
++  let radius = 0
++  for (const v of centered) radius += norm(v)
++  radius /= pts.length
++
++  // Only the centroid is translated into the cell; the normal (translation-
++  // invariant) and the radius (computed from the unwrapped centered points)
++  // are untouched, so the ring keeps its exact plane, orientation and size.
++  return { centroid: wrap_centroid_into_cell(c, lattice), normal, radius }
++}
++
++// Canonical dedup key for a ring, INVARIANT under lattice translation and
++// walk-direction/start rotation. Two hexagons that are the same hexagon modulo
++// a PBC translation (a graphene sheet draws the "same" hexagon at every image)
++// collapse to ONE key → one torus per distinct hexagon. We re-reference all
++// member images to the LEXICOGRAPHICALLY SMALLEST (atom, image) member, sort
++// the resulting (atom, Δimage) tuples, and join. The smallest-member anchor is
++// canonical regardless of which atom the DFS happened to start from.
++function ring_key(ring: Ring): string {
++  const members = ring.atoms.map((a, i) => ({ atom: a, img: ring.images[i] }))
++  // pick the lexicographically smallest (atom, image) member as the anchor
++  let anchor = members[0]
++  for (const m of members) {
++    if (
++      m.atom < anchor.atom ||
++      (m.atom === anchor.atom &&
++        (m.img[0] < anchor.img[0] ||
++          (m.img[0] === anchor.img[0] &&
++            (m.img[1] < anchor.img[1] ||
++              (m.img[1] === anchor.img[1] && m.img[2] < anchor.img[2])))))
++    ) {
++      anchor = m
++    }
++  }
++  const rel = members
++    .map((m) =>
++      [
++        m.atom,
++        m.img[0] - anchor.img[0],
++        m.img[1] - anchor.img[1],
++        m.img[2] - anchor.img[2],
++      ] as [number, number, number, number]
++    )
++    .sort((p, q) =>
++      p[0] - q[0] || p[1] - q[1] || p[2] - q[2] || p[3] - q[3]
++    )
++  return rel.map((r) => r.join(`,`)).join(`|`)
++}
++
++// Detect small rings (size <= max_size) without a graph lib — DFS cycle search
++// in (atom, accumulated-image) space so rings that close through a PBC image
++// (graphene / C3N4 hexagons in a small periodic cell) are found, even when the
++// same atom index recurs at a different image. A ring closes when the walk
++// returns to the START atom at the ZERO accumulated image (a true polygon, not
++// a strand that merely lands on the same atom in a neighbouring cell).
++// Deduped by ring_key so each distinct hexagon (modulo lattice translation)
++// appears once.
++function detect_small_rings(g: LocalGraph, max_size = 6): Ring[] {
++  const found = new Map<string, Ring>()
++  const ZERO: [number, number, number] = [0, 0, 0]
++
++  function dfs(
++    start: number,
++    current: number,
++    cur_img: [number, number, number],
++    atoms: number[],
++    images: Array<[number, number, number]>,
++    depth: number,
++  ) {
++    if (depth > max_size) return
++    for (const e of g.adj[current]) {
++      const next = e.nb
++      const next_img = j_add(cur_img, e.jimage)
++      const at_zero = next_img[0] === 0 && next_img[1] === 0 && next_img[2] === 0
++      // a ring closes ONLY when we return to the start atom at its ORIGINAL
++      // (zero) image, after ≥3 members → a real polygon.
++      if (next === start && at_zero) {
++        if (atoms.length >= 3) {
++          const ring: Ring = { atoms: [...atoms], images: [...images] }
++          found.set(ring_key(ring), ring)
++        }
++        continue
++      }
++      // The start atom at a NON-zero image is a DISTINCT node in (atom, image)
++      // space — a graphene/C3N4 hexagon in a small periodic cell passes THROUGH
++      // the start atom at other images — so we must be able to walk through it.
++      // skip only if this exact (atom, image) node is already on the path.
++      let seen = false
++      for (let k = 0; k < atoms.length; k++) {
++        if (
++          atoms[k] === next && images[k][0] === next_img[0] &&
++          images[k][1] === next_img[1] && images[k][2] === next_img[2]
++        ) {
++          seen = true
++          break
++        }
++      }
++      if (seen) continue
++      // only walk to atoms >= start to bound each cycle & avoid re-discovery
++      if (next < start) continue
++      dfs(start, next, next_img, [...atoms, next], [...images, next_img], depth + 1)
++    }
++  }
++
++  for (let s = 0; s < g.n; s++) dfs(s, s, ZERO, [s], [ZERO], 1)
++  return [...found.values()].filter((r) => r.atoms.length <= max_size)
++}
++
++// sp2-network bonds (graphene/h-BN) → 1.5; benzene fallback for planar pure-C
++// 6-rings. Returns a set of local bond keys.
++function detect_sp2_network(g: LocalGraph, lattice: Matrix3x3 | null): Set<string> {
++  const sp2_temp = new Set<number>()
++  for (let i = 0; i < g.n; i++) if (is_sp2_atom(g, i, lattice)) sp2_temp.add(i)
++
++  const sp2_atoms = new Set<number>()
++  for (const i of sp2_temp) {
++    const sp2_neighbors = g.adj[i].filter((e) => sp2_temp.has(e.nb))
++    if (sp2_neighbors.length >= 2) sp2_atoms.add(i)
++  }
++
++  if (sp2_atoms.size === 0) {
++    const rings = detect_small_rings(g, 6)
++    for (const ring of rings) {
++      if (
++        ring.atoms.length === 6 && ring.atoms.every((i) => g.symbols[i] === `C`)
++      ) {
++        if (is_planar_ring(g, ring, lattice)) {
++          for (const i of ring.atoms) sp2_atoms.add(i)
++        }
++      }
++    }
++  }
++
++  const network_bonds = new Set<string>()
++  for (const e of g.edges) {
++    if (sp2_atoms.has(e.a) && sp2_atoms.has(e.b)) network_bonds.add(lkey(e.a, e.b))
++  }
++  return network_bonds
++}
++
++// Detect borane B-H-B 3c-2e bridges → 0.5. Returns [B1,H,B2] local triples.
++function detect_borane_bridges(
++  g: LocalGraph,
++  lattice: Matrix3x3 | null,
++): Array<[number, number, number]> {
++  const bridges: Array<[number, number, number]> = []
++  for (let i = 0; i < g.n; i++) {
++    if (g.symbols[i] !== `H`) continue
++    const b_neighbors = g.adj[i].filter((e) => g.symbols[e.nb] === `B`)
++    if (b_neighbors.length !== 2) continue
++    const [n1, n2] = b_neighbors
++    const v1 = mic_vector(g.positions[i], g.positions[n1.nb], n1.jimage, lattice)
++    const v2 = mic_vector(g.positions[i], g.positions[n2.nb], n2.jimage, lattice)
++    const d = dot(v1, v2) / (norm(v1) * norm(v2))
++    const angle = (Math.acos(Math.max(-1, Math.min(1, d))) * 180) / Math.PI
++    if (angle > 70 && angle < 110) bridges.push([n1.nb, i, n2.nb])
++  }
++  return bridges
++}
++
++// Detect terminal carbonyl C=O (coord-1 O bonded to C, 1.15<d<1.35) → 2.0.
++function detect_carbonyls(
++  g: LocalGraph,
++  lattice: Matrix3x3 | null,
++): Array<[number, number]> {
++  const carbonyls: Array<[number, number]> = []
++  for (let i = 0; i < g.n; i++) {
++    if (g.symbols[i] !== `O` || g.adj[i].length !== 1) continue
++    const { nb, jimage } = g.adj[i][0]
++    if (g.symbols[nb] !== `C`) continue
++    const d = norm(mic_vector(g.positions[i], g.positions[nb], jimage, lattice))
++    if (d > 1.15 && d < 1.35) carbonyls.push([nb, i]) // (C, O)
++  }
++  return carbonyls
++}
++
++// ---------------------------------------------------------------------------
++// Valence propagator (heuristics.py:248-409)
++// ---------------------------------------------------------------------------
++
++function guess_order_by_length(
++  g: LocalGraph,
++  u: number,
++  v: number,
++  length: number,
++): number {
++  const key = length_table_key(g.symbols[u], g.symbols[v])
++  const candidates = BOND_LENGTH_TABLE[key]
++  if (!candidates) return 1.0
++  let best_order = 1.0
++  let min_diff = Infinity
++  for (const [order, ref_len] of candidates) {
++    const diff = Math.abs(length - ref_len)
++    if (diff < min_diff) {
++      min_diff = diff
++      best_order = order
++    }
++  }
++  return best_order
++}
++
++/** A detected aromatic ring in a fragment's LOCAL index space + geometry. */
++type LocalAromaticRing = {
++  local_indices: number[]
++  centroid: Vec3
++  normal: Vec3
++  radius: number
++}
++
++/**
++ * Perceive bond orders for one fragment.
++ * @returns Map<localBondKey, order> where order ∈ {1, 1.5, 2, 3}.
++ */
++export function perceive_fragment_orders(
++  fragment: Fragment,
++  sites: Site[],
++  lattice: Matrix3x3 | null,
++): Map<string, number> {
++  return perceive_fragment(fragment, sites, lattice).orders
++}
++
++/**
++ * Internal: perceive both per-bond orders AND aromatic rings for one fragment.
++ * The public `perceive_fragment_orders` keeps its Map-only signature by
++ * projecting `.orders`.
++ */
++function perceive_fragment(
++  fragment: Fragment,
++  sites: Site[],
++  lattice: Matrix3x3 | null,
++): { orders: Map<string, number>; rings: LocalAromaticRing[] } {
++  const g = build_local_graph(fragment, sites, lattice)
++  const bond_orders = new Map<string, number>()
++  const valence_used = new Array<number>(g.n).fill(0)
++
++  // valence targets w/ hypervalency bump
++  const valence_target = new Array<number>(g.n).fill(0)
++  const coordination = g.adj.map((a) => a.length)
++  for (let i = 0; i < g.n; i++) {
++    const pref = VALENCE_TABLE[g.symbols[i]] ?? [0]
++    let target = pref[0]
++    if (pref.length > 1 && coordination[i] > pref[0]) {
++      for (const vv of pref) {
++        if (vv >= coordination[i]) {
++          target = vv
++          break
++        }
++      }
++    }
++    valence_target[i] = target
++  }
++
++  const setBond = (u: number, v: number, order: number) => {
++    bond_orders.set(lkey(u, v), order)
++  }
++
++  // 0. seed special detectors
++  for (const k of detect_sp2_network(g, lattice)) {
++    bond_orders.set(k, 1.5)
++    const [a, b] = k.split(`-`).map(Number)
++    valence_used[a] += 1.5
++    valence_used[b] += 1.5
++  }
++  for (const [b1, h, b2] of detect_borane_bridges(g, lattice)) {
++    if (!bond_orders.has(lkey(b1, h))) {
++      setBond(b1, h, 0.5)
++      valence_used[b1] += 0.5
++      valence_used[h] += 0.5
++    }
++    if (!bond_orders.has(lkey(h, b2))) {
++      setBond(h, b2, 0.5)
++      valence_used[b2] += 0.5
++      valence_used[h] += 0.5
++    }
++  }
++  // Terminal multiple-bond diatomics that valence alone under-counts: a
++  // coordination-1 C triple-bonded to a coordination-1 O or N (free CO / CN
++  // adsorbate end), or N≡N, at a short distance → order 3. This is the case
++  // that carries the binding atom's dangling valence to the free end. Runs
++  // BEFORE the carbonyl pass so a short free C≡O end is not mis-seeded as a
++  // C=O carbonyl double.
++  for (const e of g.edges) {
++    if (bond_orders.has(lkey(e.a, e.b))) continue
++    const sa = g.symbols[e.a]
++    const sb = g.symbols[e.b]
++    if (coordination[e.a] !== 1 || coordination[e.b] !== 1) continue
++    const pair = new Set([sa, sb])
++    const d = norm(mic_vector(g.positions[e.a], g.positions[e.b], e.jimage, lattice))
++    const triple = (pair.has(`C`) && pair.has(`O`) && d < 1.20) ||
++      (pair.has(`C`) && pair.has(`N`) && d < 1.22) ||
++      (sa === `N` && sb === `N` && d < 1.18)
++    if (triple) {
++      bond_orders.set(lkey(e.a, e.b), 3.0)
++      valence_used[e.a] += 3.0
++      valence_used[e.b] += 3.0
++    }
++  }
++
++  // Carbonyls / carboxylates. A carbon carrying TWO terminal carbonyl-range
++  // oxygens is a carboxylate / carboxylate-like group: by resonance BOTH C-O
++  // bonds are equivalent (~1.5), not one C=O + one C-O. A lone terminal
++  // carbonyl O → a full C=O double (2.0).
++  const carbonyls = detect_carbonyls(g, lattice)
++  const carbonyl_by_c = new Map<number, number[]>()
++  for (const [c, o] of carbonyls) {
++    if (bond_orders.has(lkey(c, o))) continue // already a free C≡O end
++    if (!carbonyl_by_c.has(c)) carbonyl_by_c.set(c, [])
++    carbonyl_by_c.get(c)!.push(o)
++  }
++  for (const [c, oxygens] of carbonyl_by_c) {
++    // Carboxylate resonance (1.5/1.5) applies ONLY to a true carboxylate
++    // (formate / COOH): the carbon carries ≥2 carbonyl-range O AND at least
++    // one OTHER neighbour (H or a different substituent). A bare CO2 carbon
++    // (exactly its two terminal O, nothing else → coordination == #oxygens)
++    // must instead fall through to two independent C=O doubles (2.0/2.0).
++    const resonant = oxygens.length >= 2 && coordination[c] > oxygens.length
++    for (const o of oxygens) {
++      const key = lkey(c, o)
++      if (bond_orders.has(key)) continue
++      const order = resonant ? 1.5 : 2.0
++      bond_orders.set(key, order)
++      valence_used[c] += order
++      valence_used[o] += order
++    }
++  }
++
++  // 1. terminal (coordination-1) seed queue
++  const queue: number[] = []
++  for (let i = 0; i < g.n; i++) if (coordination[i] === 1) queue.push(i)
++
++  // 2. BFS propagation
++  while (queue.length) {
++    const current = queue.shift()!
++    const unassigned: number[] = []
++    for (const { nb } of g.adj[current]) {
++      if (!bond_orders.has(lkey(current, nb))) unassigned.push(nb)
++    }
++    if (unassigned.length !== 1) continue
++
++    const nb = unassigned[0]
++    const remaining = valence_target[current] - valence_used[current]
++    // Cap by the neighbor's own remaining capacity so a high-valence terminal
++    // (O target 2) can't force a multiple bond onto a saturated partner
++    // (H max 1 → O-H stays single). max_valence = top valence preference.
++    const nb_pref = VALENCE_TABLE[g.symbols[nb]] ?? [1]
++    const nb_capacity = Math.max(1, (nb_pref[0] ?? 1) - valence_used[nb])
++    const order = Math.max(1.0, Math.min(3.0, Math.min(remaining, nb_capacity)))
++    setBond(current, nb, order)
++    valence_used[current] += order
++    valence_used[nb] += order
++    queue.push(nb)
++  }
++
++  // 3. post-process: remaining unassigned via length table
++  for (const e of g.edges) {
++    const key = lkey(e.a, e.b)
++    if (bond_orders.has(key)) continue
++    const length = norm(mic_vector(g.positions[e.a], g.positions[e.b], e.jimage, lattice))
++    bond_orders.set(key, guess_order_by_length(g, e.a, e.b, length))
++  }
++
++  // snap orders to {1, 1.5, 2, 3}
++  for (const [k, v] of bond_orders) bond_orders.set(k, snap_order(v))
++
++  const rings = detect_aromatic_rings(g, bond_orders, lattice)
++  return { orders: bond_orders, rings }
++}
++
++// Detect aromatic rings for the dashed-circle overlay: a small cycle (3..6
++// atoms) is aromatic iff EVERY consecutive ring bond carries a 1.5 order in
++// the snapped order map AND the ring is planar. Returns each ring with its
++// MIC-unwrapped plane geometry (centroid / unit normal / mean radius), in
++// LOCAL index space. Non-ring 1.5 bonds (e.g. an open carboxylate resonance
++// pair) are deliberately ignored here — only true rings get a circle.
++function detect_aromatic_rings(
++  g: LocalGraph,
++  bond_orders: Map<string, number>,
++  lattice: Matrix3x3 | null,
++): LocalAromaticRing[] {
++  const out: LocalAromaticRing[] = []
++  const rings = detect_small_rings(g, 6)
++  for (const ring of rings) {
++    if (ring.atoms.length < 3) continue
++    // every consecutive ring bond must be aromatic (1.5). The order map is
++    // keyed by the local atom pair (jimage-agnostic), which is correct: a
++    // graphene C-C bond and its cross-cell image share one order entry.
++    let all_aromatic = true
++    for (let i = 0; i < ring.atoms.length; i++) {
++      const u = ring.atoms[i]
++      const v = ring.atoms[(i + 1) % ring.atoms.length]
++      if (bond_orders.get(lkey(u, v)) !== 1.5) {
++        all_aromatic = false
++        break
++      }
++    }
++    if (!all_aromatic) continue
++    if (!is_planar_ring(g, ring, lattice)) continue
++    const pts = unwrap_ring_positions(g, ring, lattice)
++    if (pts === null) continue
++    const { centroid, normal, radius } = ring_plane_geometry(pts, lattice)
++    out.push({ local_indices: [...ring.atoms], centroid, normal, radius })
++  }
++  return out
++}
++
++function snap_order(o: number): number {
++  if (is_aromatic(o)) return 1.5
++  if (o <= 1.25) return 1
++  if (o < 1.75) return 1.5
++  if (o < 2.5) return 2
++  return 3
++}
++
++// ---------------------------------------------------------------------------
++// Public entry — keyed by the shadow-sync's global get_bond_key
++// ---------------------------------------------------------------------------
++
++function lattice_of(structure: AnyStructure): Matrix3x3 | null {
++  const lat = (structure as { lattice?: { matrix?: Matrix3x3 } }).lattice
++  return lat?.matrix ?? null
++}
++
++/**
++ * Combined perception result for a structure:
++ *  - `orders`: per-bond order map keyed by get_bond_key(a, b, jimage). Bonds
++ *    absent from the map = order 1 (slab sticks, binding bonds, single bonds).
++ *  - `aromatic_rings`: one descriptor per detected aromatic ring (global atom
++ *    indices + world-space plane geometry) for the dashed-circle overlay.
++ */
++export type AdsorbatePerception = {
++  orders: Map<string, number>
++  aromatic_rings: AromaticRing[]
++}
++
++/**
++ * Perceive double/triple/aromatic orders AND aromatic rings across the WHOLE
++ * structure — every organic connected component (small adsorbate, large or
++ * periodic-spanning framework alike). Metals are excluded by the component
++ * extraction, so a metal slab keeps single sticks. The order map is keyed by
++ * the SAME get_bond_key(a, b, jimage) the shadow-sync uses. Aromatic rings —
++ * including every hexagon of a periodic sheet, deduped to one per distinct
++ * hexagon — carry the GLOBAL site indices + a MIC-unwrapped best-fit plane
++ * (centroid/normal/radius) for the inner solid-torus ring.
++ */
++export function perceive_adsorbate(
++  filtered_bond_pairs: BondPair[],
++  structure: AnyStructure,
++): AdsorbatePerception {
++  const orders = new Map<string, number>()
++  const aromatic_rings: AromaticRing[] = []
++  if (!structure || !Array.isArray(filtered_bond_pairs)) {
++    return { orders, aromatic_rings }
++  }
++  const sites = structure.sites ?? []
++  const lattice = lattice_of(structure)
++
++  const fragments = isolate_adsorbate_fragments(filtered_bond_pairs, sites, lattice)
++  for (const fragment of fragments) {
++    const { orders: local_orders, rings } = perceive_fragment(fragment, sites, lattice)
++    for (const e of fragment.local_bonds) {
++      const order = local_orders.get(lkey(e.a_local, e.b_local))
++      if (order === undefined || order === 1) continue // order-1 stays implicit
++      orders.set(get_bond_key(e.a_global, e.b_global, e.jimage), order)
++    }
++    // map each ring's local indices back to global site indices
++    for (const ring of rings) {
++      aromatic_rings.push({
++        atom_indices: ring.local_indices.map((li) => fragment.site_indices[li]),
++        centroid: [ring.centroid[0], ring.centroid[1], ring.centroid[2]],
++        normal: [ring.normal[0], ring.normal[1], ring.normal[2]],
++        radius: ring.radius,
++      })
++    }
++  }
++  return { orders, aromatic_rings }
++}
++
++/**
++ * Backward-compatible thin wrapper: perceive only the per-bond order map.
++ * Prefer `perceive_adsorbate` when the aromatic-ring overlay is also needed.
++ */
++export function perceive_adsorbate_orders(
++  filtered_bond_pairs: BondPair[],
++  structure: AnyStructure,
++): Map<string, number> {
++  return perceive_adsorbate(filtered_bond_pairs, structure).orders
++}
+diff --git a/src/lib/structure/bonding/fragment.ts b/src/lib/structure/bonding/fragment.ts
+new file mode 100644
+index 000000000..ad8f9471a
+--- /dev/null
++++ b/src/lib/structure/bonding/fragment.ts
+@@ -0,0 +1,212 @@
++// Organic connected-component isolation for whole-structure bond-order
++// perception.
++//
++// CatGo structures range from a METAL SLAB + a small ORGANIC ADSORBATE
++// (CO, OH, COOH, formate, CH3, benzene, ...) to extended CARBON-BASED
++// FRAMEWORKS (graphene, C3N4, h-BN, COF). We perceive bond orders EVERYWHERE
++// there is organic conjugation — including periodic sheets that bond to their
++// own PBC image — and never invent orders on metals. The organic-vs-metal
++// distinction lives entirely in PERCEPTION (metals can't be aromatic; the
++// valence heuristic only assigns multiple orders to organic SP2 / carbonyl /
++// etc.), so a Pt slab still gets only single sticks.
++//
++// This module walks the SAME live bond-pair graph the viewer draws (the
++// `filtered_bond_pairs` consumed by the shadow-sync effect) — it does NOT
++// re-detect bonds — so the components match exactly what is rendered. Each
++// component is a connected cluster of ORGANIC-ORGANIC edges only:
++// metal-adsorbate binding bonds (C-Pt, O-Pt, H-Pt) are deliberately cut so
++// the binding bond never pulls slab atoms into the component, and the binding
++// atom keeps its dangling valence (which the propagator reads to drive the
++// correct C≡O / C=O on the free end). Cross-cell organic edges (jimage != 0)
++// are KEPT, so a periodic sheet is one component closing through its own
++// image rather than being split at the cell boundary.
++//
++// Pure, headless, no wasm, no network.
++
++import type { Matrix3x3 } from '$lib/math'
++import { element_data } from '$lib/element'
++import type { BondPair, Site } from '$lib/structure'
++
++// Adsorbate-chemistry element set (mirrors heuristics.py VALENCE_TABLE
++// coverage). B and Si are intentionally ORGANIC here (boranes / silanes are
++// valid adsorbates); B-metal / Si-metal contacts are cut on the metal side.
++export const ORGANIC_SET: ReadonlySet<string> = new Set([
++  `H`,
++  `B`,
++  `C`,
++  `N`,
++  `O`,
++  `F`,
++  `Si`,
++  `P`,
++  `S`,
++  `Se`,
++  `Cl`,
++  `Br`,
++  `I`,
++])
++
++export type OrganicEdge = {
++  a_local: number
++  b_local: number
++  a_global: number
++  b_global: number
++  jimage: [number, number, number]
++}
++
++export type OrganicComponent = {
++  // Global site indices that make up this organic component.
++  site_indices: number[]
++  // Intra-component organic-organic bonds, in a compact [0..n) local index space.
++  local_bonds: OrganicEdge[]
++  // global site index -> local index within this component
++  global_to_local: Map<number, number>
++}
++
++// Backward-compatible aliases. The perception layer + tests import these
++// names; the concept is now a neutral "organic component" (an extended
++// framework is just a large, periodic-spanning one) rather than an
++// "adsorbate fragment", but renaming the exported types would churn callers.
++export type FragmentEdge = OrganicEdge
++export type Fragment = OrganicComponent
++
++const metal_lookup = new Map(
++  element_data.map((el) => [el.symbol as string, el.metal === true]),
++)
++
++function element_of(site: Site | undefined): string | undefined {
++  if (!site) return undefined
++  // majority species (handles fractional occupancy / disordered sites)
++  const species = site.species ?? []
++  if (species.length === 0) return undefined
++  let best = species[0]
++  for (const s of species) if (s.occu > best.occu) best = s
++  return best.element
++}
++
++// An atom is ORGANIC iff its element is in ORGANIC_SET. Everything else
++// (true metals by element_data.metal===true, or unknown) is FRAMEWORK.
++function is_organic_element(el: string | undefined): boolean {
++  if (el === undefined) return false
++  return ORGANIC_SET.has(el)
++}
++
++// True metal (slab) test — robust framework classifier for the metal-side cut.
++// Keyed on element_data.metal===true so metalloids (B, Si) handled as organic
++// are not misclassified as framework.
++export function is_framework_metal(el: string | undefined): boolean {
++  if (el === undefined) return false
++  if (ORGANIC_SET.has(el)) return false
++  return metal_lookup.get(el) === true
++}
++
++/**
++ * Isolate organic connected components from the live bond-pair graph.
++ *
++ * EVERY organic connected component is returned — including extended,
++ * periodic-spanning frameworks (graphene / C3N4 / h-BN / COF). There is NO
++ * exclude-as-slab size/periodicity filter: a graphene sheet that bonds to its
++ * own PBC image is a single component and is perceived in full. Metal atoms
++ * and metal-adsorbate bonds are never in any component (the organic-vs-metal
++ * line lives here; metals never receive multiple orders).
++ *
++ * @param filtered_bond_pairs the same intra-cell + cross-cell BondPair[] the
++ *   viewer's shadow-sync consumes (carries site_idx_1/2 + jimage).
++ * @param sites              structure.sites (for element classification).
++ * @param _lattice           3x3 lattice matrix (rows = a,b,c) or null for a
++ *   gas-phase molecule. Unused here (cross-cell edges carry their own jimage);
++ *   the perception layer uses it for MIC geometry.
++ * @returns one OrganicComponent per organic connected component.
++ */
++export function isolate_adsorbate_fragments(
++  filtered_bond_pairs: BondPair[],
++  sites: Site[],
++  _lattice: Matrix3x3 | null,
++): OrganicComponent[] {
++  if (!Array.isArray(filtered_bond_pairs) || filtered_bond_pairs.length === 0) {
++    return []
++  }
++  const n = sites.length
++
++  // 1. organic mask over all sites
++  const organic = new Array<boolean>(n)
++  for (let i = 0; i < n; i++) organic[i] = is_organic_element(element_of(sites[i]))
++
++  // 2. organic-organic-only adjacency (cuts metal-adsorbate bonds). Keep the
++  //    full edge (with jimage) so cross-cell organic bonds stay in-component.
++  const adj = new Map<number, OrganicEdge[]>()
++  const edges: OrganicEdge[] = []
++  for (const bp of filtered_bond_pairs) {
++    const a = bp.site_idx_1
++    const b = bp.site_idx_2
++    if (a < 0 || b < 0 || a >= n || b >= n) continue // out-of-range guard
++    if (!organic[a] || !organic[b]) continue // an edge is kept iff BOTH ends organic
++    const jimage = (bp.jimage ?? [0, 0, 0]) as [number, number, number]
++    const edge: OrganicEdge = {
++      a_local: -1,
++      b_local: -1,
++      a_global: a,
++      b_global: b,
++      jimage,
++    }
++    edges.push(edge)
++    if (!adj.has(a)) adj.set(a, [])
++    if (!adj.has(b)) adj.set(b, [])
++    adj.get(a)!.push(edge)
++    adj.get(b)!.push(edge)
++  }
++  if (edges.length === 0) return []
++
++  // 3. connected components over the organic-only adjacency (DFS)
++  const comp_of = new Map<number, number>()
++  let n_comp = 0
++  for (const start of adj.keys()) {
++    if (comp_of.has(start)) continue
++    const cid = n_comp++
++    const stack = [start]
++    comp_of.set(start, cid)
++    while (stack.length) {
++      const u = stack.pop()!
++      for (const e of adj.get(u) ?? []) {
++        const v = e.a_global === u ? e.b_global : e.a_global
++        if (!comp_of.has(v)) {
++          comp_of.set(v, cid)
++          stack.push(v)
++        }
++      }
++    }
++  }
++
++  // group atoms + edges per component
++  const comp_atoms: number[][] = Array.from({ length: n_comp }, () => [])
++  const comp_edges: OrganicEdge[][] = Array.from({ length: n_comp }, () => [])
++  for (const [atom, cid] of comp_of) comp_atoms[cid].push(atom)
++  for (const e of edges) {
++    const cid = comp_of.get(e.a_global)!
++    comp_edges[cid].push(e)
++  }
++
++  // 4. remap each component to a local [0..n) index space. NO exclude-as-slab
++  //    filter: every organic component (small adsorbate, large framework,
++  //    periodic-spanning sheet alike) is perceived.
++  const components: OrganicComponent[] = []
++  for (let cid = 0; cid < n_comp; cid++) {
++    const atoms = comp_atoms[cid]
++
++    atoms.sort((p, q) => p - q) // deterministic local order
++    const global_to_local = new Map<number, number>()
++    atoms.forEach((g, i) => global_to_local.set(g, i))
++
++    const local_bonds: OrganicEdge[] = comp_edges[cid].map((e) => ({
++      a_local: global_to_local.get(e.a_global)!,
++      b_local: global_to_local.get(e.b_global)!,
++      a_global: e.a_global,
++      b_global: e.b_global,
++      jimage: e.jimage,
++    }))
++
++    components.push({ site_indices: atoms, local_bonds, global_to_local })
++  }
++
++  return components
++}
+diff --git a/src/lib/structure/index.ts b/src/lib/structure/index.ts
+index 4b3554eb3..e2be21180 100644
+--- a/src/lib/structure/index.ts
++++ b/src/lib/structure/index.ts
+@@ -150,6 +150,13 @@ export type BondPair = {
+    * if it is the zero vector (molecules, intra-cell bonds, manual bonds).
+    */
+   jimage: [number, number, number]
++  /**
++   * Perceived bond order for adsorbate fragments: 1 (single, default), 1.5
++   * (aromatic), 2 (double), 3 (triple). Purely additive — only the multi-bond
++   * instanced renderer reads it, and only when `bond_order_perception` is on.
++   * Absent / 1 renders as a plain single stick, byte-identical to today.
++   */
++  order?: number
+ }
+ 
+ // Topology-only hydrogen bond data (no positions or transforms).
+diff --git a/tests/vitest/structure/bond-orders.test.ts b/tests/vitest/structure/bond-orders.test.ts
+new file mode 100644
+index 000000000..9388e9995
+--- /dev/null
++++ b/tests/vitest/structure/bond-orders.test.ts
+@@ -0,0 +1,581 @@
++// Headless unit tests for adsorbate bond-order perception.
++//
++// STEP 1 (TDD): these are written against the public API of two pure modules
++// that do not exist yet — they must fail to compile/run until the modules in
++// src/lib/structure/bonding/{fragment,bond-orders}.ts are implemented (STEP 2).
++//
++// DOMAIN: CatGo structures are a metal slab + a small organic adsorbate. Bond
++// orders must be perceived ONLY on the extracted molecular fragment; the slab
++// stays single sticks, and metal-adsorbate binding bonds are never ordered.
++
++import type { BondPair, ElementSymbol, Vec3 } from '$lib'
++import type { Matrix3x3 } from '$lib/math'
++import type { PymatgenStructure, Site } from '$lib/structure'
++import { get_bond_key } from '$lib/structure/bonding'
++import { isolate_adsorbate_fragments } from '$lib/structure/bonding/fragment'
++import {
++  ib_seq,
++  is_aromatic,
++  nb_from_order,
++  perceive_adsorbate,
++  perceive_adsorbate_orders,
++  round_half_even,
++} from '$lib/structure/bonding/bond-orders'
++import { describe, expect, test } from 'vitest'
++
++// --- test helpers -----------------------------------------------------------
++
++function make_site(xyz: Vec3, element: string): Site {
++  return {
++    xyz,
++    abc: [0, 0, 0],
++    species: [{ element: element as ElementSymbol, occu: 1, oxidation_state: 0 }],
++    label: element,
++    properties: {},
++  }
++}
++
++function dist(a: Vec3, b: Vec3): number {
++  return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2])
++}
++
++// Minimal 3x3 linalg for asserting a Cartesian centroid lands inside the cell.
++function transpose3(m: Matrix3x3): Matrix3x3 {
++  return [
++    [m[0][0], m[1][0], m[2][0]],
++    [m[0][1], m[1][1], m[2][1]],
++    [m[0][2], m[1][2], m[2][2]],
++  ]
++}
++
++function mat_vec3(m: Matrix3x3, v: Vec3): Vec3 {
++  return [
++    m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
++    m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
++    m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
++  ]
++}
++
++function invert3(m: Matrix3x3): Matrix3x3 {
++  const [a, b, c] = m[0]
++  const [d, e, f] = m[1]
++  const [g, h, i] = m[2]
++  const det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
++  const inv = 1 / det
++  return [
++    [(e * i - f * h) * inv, (c * h - b * i) * inv, (b * f - c * e) * inv],
++    [(f * g - d * i) * inv, (a * i - c * g) * inv, (c * d - a * f) * inv],
++    [(d * h - e * g) * inv, (b * g - a * h) * inv, (a * e - b * d) * inv],
++  ]
++}
++
++// Build a BondPair from two site indices, reading positions from `sites`.
++// jimage defaults to the intra-cell [0,0,0].
++function bond(
++  sites: Site[],
++  i: number,
++  j: number,
++  jimage: [number, number, number] = [0, 0, 0],
++): BondPair {
++  return {
++    pos_1: sites[i].xyz,
++    pos_2: sites[j].xyz,
++    site_idx_1: i,
++    site_idx_2: j,
++    bond_length: dist(sites[i].xyz, sites[j].xyz),
++    strength: 1,
++    transform_matrix: new Float32Array(16),
++    jimage,
++  }
++}
++
++const NO_LATTICE: Matrix3x3 | null = null
++
++function as_structure(
++  sites: Site[],
++  lattice: Matrix3x3 | null = null,
++): PymatgenStructure {
++  const base = { sites, charge: 0 }
++  if (lattice === null) {
++    // a molecule has no lattice; cast for the test (perceive_* tolerates it)
++    return base as unknown as PymatgenStructure
++  }
++  return {
++    ...base,
++    lattice: {
++      matrix: lattice,
++      pbc: [true, true, true],
++      a: lattice[0][0],
++      b: lattice[1][1],
++      c: lattice[2][2],
++      alpha: 90,
++      beta: 90,
++      gamma: 90,
++      volume: lattice[0][0] * lattice[1][1] * lattice[2][2],
++    },
++  }
++}
++
++// Primitive 2-atom graphene cell, with the three nearest-neighbour C-C bonds
++// expressed as cross-cell BondPairs (so every C-C bond and every hexagon
++// closes through a PBC image). A=(0,0,0); B=(1.23, 0.7101, 0); a1=(2.46,0,0),
++// a2=(1.23, 2.1304, 0). A's neighbours are B at images [0,0,0], [-1,0,0],
++// [0,-1,0] — all at the graphene bond length ~1.42 Å.
++function graphene_primitive(): {
++  sites: Site[]
++  pairs: BondPair[]
++  lattice: Matrix3x3
++} {
++  const lattice: Matrix3x3 = [[2.46, 0, 0], [1.23, 2.1304, 0], [0, 0, 20]]
++  const sites = [
++    make_site([0, 0, 0], `C`), // 0 = A
++    make_site([1.23, 0.7101, 0], `C`), // 1 = B
++  ]
++  // A(0) bonds to B(1) in cells [0,0,0], [-1,0,0], [0,-1,0]
++  const pairs: BondPair[] = [
++    bond(sites, 0, 1, [0, 0, 0]),
++    bond(sites, 0, 1, [-1, 0, 0]),
++    bond(sites, 0, 1, [0, -1, 0]),
++  ]
++  return { sites, pairs, lattice }
++}
++
++// Order lookup for a bond, keyed exactly like the renderer's shadow-sync.
++function order_of(
++  orders: Map<string, number>,
++  i: number,
++  j: number,
++  jimage: [number, number, number] = [0, 0, 0],
++): number {
++  return orders.get(get_bond_key(i, j, jimage)) ?? 1
++}
++
++// --- catrender parity (nb_from_order / ib_seq / aromatic window) ------------
++
++describe(`catrender parity helpers`, () => {
++  test(`round_half_even (banker's rounding)`, () => {
++    expect(round_half_even(0.5)).toBe(0)
++    expect(round_half_even(1.5)).toBe(2)
++    expect(round_half_even(2.5)).toBe(2)
++    expect(round_half_even(3.5)).toBe(4)
++    expect(round_half_even(2.4)).toBe(2)
++    expect(round_half_even(2.6)).toBe(3)
++  })
++
++  test(`nb_from_order = max(1, round_half_even(bo)) when enabled`, () => {
++    expect(nb_from_order(1.0, true)).toBe(1)
++    expect(nb_from_order(1.5, true)).toBe(2) // round half→even
++    expect(nb_from_order(2.0, true)).toBe(2)
++    expect(nb_from_order(3.0, true)).toBe(3)
++    // disabled collapses everything to a single stick
++    expect(nb_from_order(3.0, false)).toBe(1)
++  })
++
++  test(`ib_seq = range(-nb+1, nb, 2)`, () => {
++    expect(ib_seq(1)).toEqual([0])
++    expect(ib_seq(2)).toEqual([-1, 1])
++    expect(ib_seq(3)).toEqual([-2, 0, 2])
++  })
++
++  test(`aromatic window 1.3 < bo < 1.7`, () => {
++    expect(is_aromatic(1.5)).toBe(true)
++    expect(is_aromatic(1.3)).toBe(false)
++    expect(is_aromatic(1.7)).toBe(false)
++    expect(is_aromatic(2.0)).toBe(false)
++  })
++})
++
++// --- perception on isolated gas-phase fragments -----------------------------
++
++describe(`perceive_adsorbate_orders — gas-phase molecules`, () => {
++  test(`CO is a triple bond`, () => {
++    const sites = [
++      make_site([0, 0, 0], `C`),
++      make_site([1.13, 0, 0], `O`),
++    ]
++    const pairs = [bond(sites, 0, 1)]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    expect(order_of(orders, 0, 1)).toBe(3)
++  })
++
++  test(`OH is a single bond`, () => {
++    const sites = [
++      make_site([0, 0, 0], `O`),
++      make_site([0.97, 0, 0], `H`),
++    ]
++    const pairs = [bond(sites, 0, 1)]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    expect(order_of(orders, 0, 1)).toBe(1)
++  })
++
++  test(`CH3 — all C-H single bonds`, () => {
++    // pyramidal-ish methyl
++    const sites = [
++      make_site([0, 0, 0], `C`),
++      make_site([1.09, 0, 0], `H`),
++      make_site([-0.36, 1.03, 0], `H`),
++      make_site([-0.36, -0.51, 0.89], `H`),
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 0, 2), bond(sites, 0, 3)]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    expect(order_of(orders, 0, 1)).toBe(1)
++    expect(order_of(orders, 0, 2)).toBe(1)
++    expect(order_of(orders, 0, 3)).toBe(1)
++  })
++
++  test(`formate HCOO — one C=O (~2) and one resonant C-O (~1.5)`, () => {
++    // C at origin; two oxygens at carboxylate-ish lengths; one H on C.
++    // O1 short (carbonyl-ish 1.25), O2 longer (1.30) — both terminal.
++    const sites = [
++      make_site([0, 0, 0], `C`), // 0
++      make_site([1.10, 0, 0], `H`), // 1
++      make_site([-0.70, 1.05, 0], `O`), // 2  ~1.26 Å
++      make_site([-0.70, -1.10, 0], `O`), // 3  ~1.30 Å
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 0, 2), bond(sites, 0, 3)]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    // C-H stays single
++    expect(order_of(orders, 0, 1)).toBe(1)
++    // the two C-O orders: one double (carbonyl) + one resonant/single.
++    const co1 = order_of(orders, 0, 2)
++    const co2 = order_of(orders, 0, 3)
++    const co_orders = [co1, co2].sort((a, b) => a - b)
++    // at least one C=O perceived (order >= 2 once)
++    expect(co_orders[1]).toBeGreaterThanOrEqual(1.5)
++    // not both triple — carboxylate carbon can't carry two triples
++    expect(co_orders[1]).toBeLessThanOrEqual(2)
++    // the lower of the two is a single/resonant C-O
++    expect(co_orders[0]).toBeGreaterThanOrEqual(1)
++    expect(co_orders[0]).toBeLessThanOrEqual(1.5)
++  })
++
++  test(`CO2 (O=C=O) — two clean C=O doubles, not carboxylate resonance`, () => {
++    // linear CO2, C-O ~1.16 Å each. The carbon has ONLY the two terminal
++    // oxygens as neighbours (no H / other substituent), so the carboxylate
++    // resonance rule must NOT fire — both bonds are full doubles.
++    const sites = [
++      make_site([0, 0, 0], `C`), // 0
++      make_site([1.16, 0, 0], `O`), // 1
++      make_site([-1.16, 0, 0], `O`), // 2
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 0, 2)]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    expect(order_of(orders, 0, 1)).toBe(2.0)
++    expect(order_of(orders, 0, 2)).toBe(2.0)
++  })
++
++  test(`formate HCOO- regression — carboxylate carbon stays resonant 1.5/1.5`, () => {
++    // C bonded to two carbonyl-range O + one H → true carboxylate: the carbon
++    // bears a non-carbonyl neighbour (H), so resonance DOES apply → 1.5/1.5.
++    const sites = [
++      make_site([0, 0, 0], `C`), // 0
++      make_site([1.10, 0, 0], `H`), // 1
++      make_site([-0.70, 1.05, 0], `O`), // 2  ~1.26 Å
++      make_site([-0.70, -1.05, 0], `O`), // 3  ~1.26 Å
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 0, 2), bond(sites, 0, 3)]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    expect(order_of(orders, 0, 1)).toBe(1) // C-H single
++    expect(order_of(orders, 0, 2)).toBe(1.5) // resonant C-O
++    expect(order_of(orders, 0, 3)).toBe(1.5) // resonant C-O
++  })
++
++  test(`formic acid HCOOH — carbonyl C=O double, hydroxyl C-O single`, () => {
++    // C(0)=O(2) carbonyl ~1.21; C(0)-O(3)-H(4) hydroxyl ~1.34; H(1) on C.
++    const sites = [
++      make_site([0, 0, 0], `C`), // 0
++      make_site([1.09, 0, 0], `H`), // 1
++      make_site([-0.60, 1.05, 0], `O`), // 2 carbonyl, terminal ~1.21
++      make_site([-0.65, -1.18, 0], `O`), // 3 hydroxyl ~1.35
++      make_site([0.10, -1.85, 0], `H`), // 4 on O3
++    ]
++    const pairs = [
++      bond(sites, 0, 1),
++      bond(sites, 0, 2),
++      bond(sites, 0, 3),
++      bond(sites, 3, 4),
++    ]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, NO_LATTICE))
++    expect(order_of(orders, 0, 1)).toBe(1) // C-H
++    expect(order_of(orders, 0, 2)).toBe(2) // carbonyl C=O (terminal O)
++    expect(order_of(orders, 0, 3)).toBe(1) // hydroxyl C-O
++    expect(order_of(orders, 3, 4)).toBe(1) // O-H
++  })
++
++  test(`benzene — all six ring bonds aromatic (1.5, within window)`, () => {
++    // planar hexagon, C-C ~1.39, plus 6 C-H spokes
++    const R = 1.39
++    const ring: Site[] = []
++    for (let k = 0; k < 6; k++) {
++      const a = (Math.PI / 3) * k
++      ring.push(make_site([R * Math.cos(a), R * Math.sin(a), 0], `C`))
++    }
++    const hs: Site[] = []
++    const Rh = R + 1.08
++    for (let k = 0; k < 6; k++) {
++      const a = (Math.PI / 3) * k
++      hs.push(make_site([Rh * Math.cos(a), Rh * Math.sin(a), 0], `H`))
++    }
++    const sites = [...ring, ...hs] // 0..5 ring, 6..11 H
++    const pairs: BondPair[] = []
++    for (let k = 0; k < 6; k++) pairs.push(bond(sites, k, (k + 1) % 6)) // ring
++    for (let k = 0; k < 6; k++) pairs.push(bond(sites, k, 6 + k)) // C-H
++    const { orders, aromatic_rings } = perceive_adsorbate(
++      pairs,
++      as_structure(sites, NO_LATTICE),
++    )
++    for (let k = 0; k < 6; k++) {
++      const o = order_of(orders, k, (k + 1) % 6)
++      expect(is_aromatic(o)).toBe(true)
++      expect(o).toBeCloseTo(1.5, 5)
++    }
++    // C-H spokes single
++    for (let k = 0; k < 6; k++) expect(order_of(orders, k, 6 + k)).toBe(1)
++
++    // Exactly ONE aromatic ring, the six ring carbons (global indices 0..5).
++    expect(aromatic_rings.length).toBe(1)
++    const aring = aromatic_rings[0]
++    expect(new Set(aring.atom_indices)).toEqual(new Set([0, 1, 2, 3, 4, 5]))
++    expect(aring.atom_indices.length).toBe(6)
++    // Centroid at the hexagon center (origin), within a tight tolerance.
++    expect(aring.centroid[0]).toBeCloseTo(0, 5)
++    expect(aring.centroid[1]).toBeCloseTo(0, 5)
++    expect(aring.centroid[2]).toBeCloseTo(0, 5)
++    // Ring lies in the XY plane → normal is ±Z (unit length).
++    const nlen = Math.hypot(aring.normal[0], aring.normal[1], aring.normal[2])
++    expect(nlen).toBeCloseTo(1, 6)
++    expect(Math.abs(aring.normal[2])).toBeCloseTo(1, 5)
++    expect(Math.abs(aring.normal[0])).toBeLessThan(1e-5)
++    expect(Math.abs(aring.normal[1])).toBeLessThan(1e-5)
++    // Mean centroid→atom radius is the hexagon circumradius R (=1.39 Å).
++    expect(aring.radius).toBeCloseTo(R, 5)
++  })
++
++  test(`CO2 — no aromatic rings (two clean doubles, no cycle)`, () => {
++    const sites = [
++      make_site([0, 0, 0], `C`),
++      make_site([1.16, 0, 0], `O`),
++      make_site([-1.16, 0, 0], `O`),
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 0, 2)]
++    const { orders, aromatic_rings } = perceive_adsorbate(
++      pairs,
++      as_structure(sites, NO_LATTICE),
++    )
++    expect(order_of(orders, 0, 1)).toBe(2.0)
++    expect(order_of(orders, 0, 2)).toBe(2.0)
++    expect(aromatic_rings.length).toBe(0) // no ring → no dashed circle
++  })
++
++  test(`formate — resonant 1.5/1.5 but NO ring (open chain → no circle)`, () => {
++    // The carboxylate resonance gives two 1.5 C-O orders, but there is no
++    // cycle, so the overlay must NOT manufacture a phantom aromatic ring.
++    const sites = [
++      make_site([0, 0, 0], `C`),
++      make_site([1.10, 0, 0], `H`),
++      make_site([-0.70, 1.05, 0], `O`),
++      make_site([-0.70, -1.05, 0], `O`),
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 0, 2), bond(sites, 0, 3)]
++    const { aromatic_rings } = perceive_adsorbate(pairs, as_structure(sites, NO_LATTICE))
++    expect(aromatic_rings.length).toBe(0)
++  })
++})
++
++// --- fragment extraction ----------------------------------------------------
++
++describe(`isolate_adsorbate_fragments`, () => {
++  const lattice: Matrix3x3 = [[12, 0, 0], [0, 12, 0], [0, 0, 20]]
++
++  test(`CO adsorbate on a small Pt cluster extracts only C,O (metal excluded)`, () => {
++    // 4 Pt atoms forming a tiny cluster near z=0; C bound on top, O above C.
++    const sites = [
++      make_site([0, 0, 0], `Pt`), // 0
++      make_site([2.7, 0, 0], `Pt`), // 1
++      make_site([1.35, 2.3, 0], `Pt`), // 2
++      make_site([1.35, 0.8, 2.2], `Pt`), // 3
++      make_site([1.35, 0.8, 4.1], `C`), // 4  C bound to Pt3
++      make_site([1.35, 0.8, 5.25], `O`), // 5  O above C (~1.15)
++    ]
++    const pairs = [
++      bond(sites, 0, 1), // Pt-Pt
++      bond(sites, 0, 2),
++      bond(sites, 1, 2),
++      bond(sites, 0, 3),
++      bond(sites, 1, 3),
++      bond(sites, 2, 3),
++      bond(sites, 3, 4), // Pt-C binding bond (metal-adsorbate, must be cut)
++      bond(sites, 4, 5), // C-O adsorbate bond
++    ]
++    const frags = isolate_adsorbate_fragments(pairs, sites, lattice)
++    expect(frags.length).toBe(1)
++    const f = frags[0]
++    expect(new Set(f.site_indices)).toEqual(new Set([4, 5]))
++    // exactly the one organic-organic edge, no Pt-C
++    expect(f.local_bonds.length).toBe(1)
++    const e = f.local_bonds[0]
++    expect(new Set([e.a_global, e.b_global])).toEqual(new Set([4, 5]))
++
++    // and order perception leaves Pt-C at 1, gives C-O triple
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, lattice))
++    expect(order_of(orders, 3, 4)).toBe(1) // Pt-C binding stays single stick
++    expect(order_of(orders, 4, 5)).toBe(3) // free C-O end → triple
++  })
++
++  test(`two separate adsorbates → two fragments`, () => {
++    // an OH and a CO far apart, both on the same (implicit) slab
++    const sites = [
++      make_site([0, 0, 0], `O`), // 0
++      make_site([0.97, 0, 0], `H`), // 1
++      make_site([6, 6, 0], `C`), // 2
++      make_site([6, 6, 1.13], `O`), // 3
++    ]
++    const pairs = [bond(sites, 0, 1), bond(sites, 2, 3)]
++    const frags = isolate_adsorbate_fragments(pairs, sites, lattice)
++    expect(frags.length).toBe(2)
++    const sets = frags.map((f) => new Set(f.site_indices))
++    expect(sets).toContainEqual(new Set([0, 1]))
++    expect(sets).toContainEqual(new Set([2, 3]))
++  })
++
++  test(`gas-phase molecule (no lattice) → one whole fragment`, () => {
++    const sites = [
++      make_site([0, 0, 0], `C`),
++      make_site([1.13, 0, 0], `O`),
++    ]
++    const pairs = [bond(sites, 0, 1)]
++    const frags = isolate_adsorbate_fragments(pairs, sites, null)
++    expect(frags.length).toBe(1)
++    expect(new Set(frags[0].site_indices)).toEqual(new Set([0, 1]))
++  })
++
++  test(`periodic graphene sheet — perceived (NOT excluded), one component`, () => {
++    // Primitive 2-atom graphene cell. Both carbons + every hexagon close
++    // THROUGH cross-cell (jimage != 0) bonds. The exclude-as-slab filter is
++    // gone, so this periodic sheet is a single organic component, not dropped.
++    const { sites, pairs, lattice } = graphene_primitive()
++    const frags = isolate_adsorbate_fragments(pairs, sites, lattice)
++    expect(frags.length).toBe(1) // one connected sheet, perceived
++    expect(new Set(frags[0].site_indices)).toEqual(new Set([0, 1]))
++  })
++})
++
++// --- periodic frameworks (graphene / C3N4 / h-BN / COF) ---------------------
++
++describe(`perceive_adsorbate — periodic carbon frameworks`, () => {
++  test(`graphene — every ring C-C bond aromatic 1.5 (cross-cell perceived)`, () => {
++    const { sites, pairs, lattice } = graphene_primitive()
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, lattice))
++    // all three C-C bonds (each a cross-cell image) are sp2-network → 1.5
++    expect(order_of(orders, 0, 1, [0, 0, 0])).toBe(1.5)
++    expect(order_of(orders, 0, 1, [-1, 0, 0])).toBe(1.5)
++    expect(order_of(orders, 0, 1, [0, -1, 0])).toBe(1.5)
++  })
++
++  test(`graphene — hexagonal aromatic ring detected via cross-cell traversal`, () => {
++    const { sites, pairs, lattice } = graphene_primitive()
++    const { aromatic_rings } = perceive_adsorbate(pairs, as_structure(sites, lattice))
++    // at least one hexagon found; periodic duplicates of the SAME hexagon
++    // (modulo a lattice translation) are deduped to a single torus.
++    expect(aromatic_rings.length).toBeGreaterThanOrEqual(1)
++    const hex = aromatic_rings.find((r) => r.atom_indices.length === 6)
++    expect(hex).toBeDefined()
++    // ring lies in the z=0 plane → unit normal is ±Z
++    const n = hex!.normal
++    expect(Math.hypot(n[0], n[1], n[2])).toBeCloseTo(1, 6)
++    expect(Math.abs(n[2])).toBeCloseTo(1, 5)
++    // graphene hexagon circumradius = C-C bond length ~1.42 Å (MIC-unwrapped)
++    expect(hex!.radius).toBeGreaterThan(1.3)
++    expect(hex!.radius).toBeLessThan(1.55)
++  })
++
++  test(`graphene — periodic ring centroids are WRAPPED into the unit cell`, () => {
++    // A graphene hexagon straddles the cell boundary: its MIC-unwrapped
++    // centroid lands OUTSIDE the drawn cell, so the torus would float in empty
++    // space while the in-cell hexagon (same hexagon via PBC) has the bonds but
++    // no ring. The fix translates each periodic ring centroid by an integer
++    // lattice vector so it lands inside the cell. Assert: every aromatic ring's
++    // fractional centroid is within [0, 1) on the in-plane (a, b) axes.
++    const { sites, pairs, lattice } = graphene_primitive()
++    const { aromatic_rings } = perceive_adsorbate(pairs, as_structure(sites, lattice))
++    expect(aromatic_rings.length).toBeGreaterThanOrEqual(1)
++
++    // cart → frac via inv(transpose(lattice)): rows of `lattice` are a, b, c,
++    // so cart = Σ_i f_i·lattice[i] = transpose(lattice)·frac.
++    const inv = invert3(transpose3(lattice))
++    for (const ring of aromatic_rings) {
++      const f = mat_vec3(inv, ring.centroid)
++      // in-plane axes a (f0) and b (f1) must be inside the cell, no floaters
++      expect(f[0]).toBeGreaterThanOrEqual(0)
++      expect(f[0]).toBeLessThan(1)
++      expect(f[1]).toBeGreaterThanOrEqual(0)
++      expect(f[1]).toBeLessThan(1)
++    }
++  })
++
++  test(`graphene — Pt slab atoms in the same cell still get NO orders`, () => {
++    // graphene on a couple of Pt atoms: the metal stays single sticks, the
++    // sheet is fully perceived. Verifies the organic-vs-metal line.
++    const { lattice } = graphene_primitive()
++    const sites = [
++      make_site([0, 0, 0], `C`), // 0
++      make_site([1.23, 0.7101, 0], `C`), // 1
++      make_site([0.6, 0.35, -2.2], `Pt`), // 2 below the sheet
++      make_site([1.85, 1.06, -2.2], `Pt`), // 3
++    ]
++    const pairs = [
++      bond(sites, 0, 1, [0, 0, 0]),
++      bond(sites, 0, 1, [-1, 0, 0]),
++      bond(sites, 0, 1, [0, -1, 0]),
++      bond(sites, 2, 3, [0, 0, 0]), // Pt-Pt
++      bond(sites, 0, 2, [0, 0, 0]), // C-Pt binding (cut on metal side)
++    ]
++    const orders = perceive_adsorbate_orders(pairs, as_structure(sites, lattice))
++    // C-C ring bonds aromatic
++    expect(order_of(orders, 0, 1, [0, 0, 0])).toBe(1.5)
++    // metal bonds never ordered
++    expect(order_of(orders, 2, 3)).toBe(1)
++    expect(order_of(orders, 0, 2)).toBe(1)
++  })
++})
++
++// --- robustness -------------------------------------------------------------
++
++describe(`malformed / empty input guard`, () => {
++  test(`empty bond list does not throw and yields no fragments / empty orders`, () => {
++    const sites = [make_site([0, 0, 0], `C`)]
++    expect(() => isolate_adsorbate_fragments([], sites, null)).not.toThrow()
++    expect(isolate_adsorbate_fragments([], sites, null)).toEqual([])
++    const orders = perceive_adsorbate_orders([], as_structure(sites, null))
++    expect(orders.size).toBe(0)
++  })
++
++  test(`bond referencing an out-of-range / missing site is ignored, no throw`, () => {
++    const sites = [make_site([0, 0, 0], `C`), make_site([1.13, 0, 0], `O`)]
++    const bad: BondPair = {
++      pos_1: [0, 0, 0],
++      pos_2: [0, 0, 0],
++      site_idx_1: 0,
++      site_idx_2: 99, // missing
++      bond_length: 1,
++      strength: 1,
++      transform_matrix: new Float32Array(16),
++      jimage: [0, 0, 0],
++    }
++    expect(() => perceive_adsorbate_orders([bad], as_structure(sites, null))).not
++      .toThrow()
++  })
++
++  test(`a fully metallic structure yields no fragments`, () => {
++    const sites = [
++      make_site([0, 0, 0], `Pt`),
++      make_site([2.7, 0, 0], `Pt`),
++    ]
++    const pairs = [bond(sites, 0, 1)]
++    expect(isolate_adsorbate_fragments(pairs, sites, [[12, 0, 0], [0, 12, 0], [
++      0,
++      0,
++      12,
++    ]])).toEqual([])
++  })
++})

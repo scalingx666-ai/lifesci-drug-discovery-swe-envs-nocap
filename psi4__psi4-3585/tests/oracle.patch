@@ -1,0 +1,492 @@
+diff --git a/psi4/src/psi4/libfock/cuESTJK.h b/psi4/src/psi4/libfock/cuESTJK.h
+index fa2e672996c..e92ea48f95d 100644
+--- a/psi4/src/psi4/libfock/cuESTJK.h
++++ b/psi4/src/psi4/libfock/cuESTJK.h
+@@ -94,6 +94,11 @@ class PSI_API cuESTJK : public JK {
+     }
+     void print_header() const override;
+ 
++    /// cuEST receives alpha, beta and omega with the DF integral plan, so the K
++    /// it returns already carries the functional's exchange coefficients and
++    /// the long-range term.  See JK::exchange_is_prescaled().
++    bool exchange_is_prescaled() const override { return true; }
++
+     cuestDFIntPlan_t cuest_df_plan() { return cuest_df_plan_; }
+ };
+ 
+diff --git a/psi4/src/psi4/libfock/cubature.cc b/psi4/src/psi4/libfock/cubature.cc
+index 53df1cd6ff2..27cacf3cca0 100644
+--- a/psi4/src/psi4/libfock/cubature.cc
++++ b/psi4/src/psi4/libfock/cubature.cc
+@@ -3849,6 +3849,8 @@ void MolecularGrid::buildGridFromOptions(MolecularGridOptions const &opt, bool i
+                     break;
+             }
+             uint64_t nradial = rvalues.size();
++            // Record the nominal quadrature size for reporting; see cuest_npoints_.
++            for (uint64_t i = 0; i < nradial; i++) cuest_npoints_ += nangpts[i];
+             CHECK_CUEST(cuestAtomGridCreate(
+                 cuest_handle,
+                 nradial,
+@@ -4662,14 +4664,30 @@ void MolecularGrid::print(std::string out, int /*print*/) const {
+     printer->Printf("    Pruning alpha          = %14g\n", options_.pruning_alpha);
+     printer->Printf("    Radial Points          = %14d\n", options_.nradpts);
+     printer->Printf("    Spherical Points       = %14d\n", options_.nangpts);
+-    printer->Printf("    Total Points           = %14d\n", npoints_);
+-    printer->Printf("    Total Blocks           = %14zu\n", blocks_.size());
+-    printer->Printf("    Max Points             = %14d\n", max_points_);
+-    printer->Printf("    Max Functions          = %14d\n", max_functions_);
++    long int reported_npoints = npoints_;
++#ifdef USING_cuEST
++    if (is_cuest_grid()) {
++        // A cuEST grid lives on the device: it has no host points and no host blocks,
++        // so npoints_/blocks_/max_points_/max_functions_ are all legitimately 0 and
++        // printing them as such reads like a broken grid.  Report the nominal size
++        // handed to cuEST instead, flagged so nobody compares it against a host count
++        // (it is pre-screening; cuEST prunes on the device).
++        reported_npoints = cuest_npoints_;
++        printer->Printf("    Total Points           = %14ld  (GPU-resident, pre-screening)\n", cuest_npoints_);
++        printer->Printf("    Grid Residency         = %14s\n", "cuEST / device");
++    } else {
++#endif
++        printer->Printf("    Total Points           = %14d\n", npoints_);
++        printer->Printf("    Total Blocks           = %14zu\n", blocks_.size());
++        printer->Printf("    Max Points             = %14d\n", max_points_);
++        printer->Printf("    Max Functions          = %14d\n", max_functions_);
++#ifdef USING_cuEST
++    }
++#endif
+     printer->Printf("    Weights Tolerance      = %14.2E\n", options_.weights_cutoff);
+     // printer->Printf("    Collocation Size [MiB] = %14d\n", (int)((8.0 * collocation_size_) / (1024.0 * 1024.0)));
+     printer->Printf("\n");
+-    Process::environment.globals["XC GRID TOTAL POINTS"] = npoints_;
++    Process::environment.globals["XC GRID TOTAL POINTS"] = reported_npoints;
+     Process::environment.globals["XC GRID SPHERICAL POINTS"] = options_.nangpts;
+     Process::environment.globals["XC GRID RADIAL POINTS"] = options_.nradpts;
+ }
+diff --git a/psi4/src/psi4/libfock/cubature.h b/psi4/src/psi4/libfock/cubature.h
+index db6676e237a..da569ffeba6 100644
+--- a/psi4/src/psi4/libfock/cubature.h
++++ b/psi4/src/psi4/libfock/cubature.h
+@@ -98,6 +98,15 @@ class MolecularGrid {
+ #if USING_cuEST
+     cuestMolecularGrid_t cuest_molecular_grid_ = nullptr;
+     cuestWorkspace_t *cuest_molecular_grid_ws_ptr_ = nullptr;
++    /// Nominal quadrature size of a GPU-resident grid, summed over atoms and radial
++    /// shells as they were handed to cuEST.  A cuEST grid has no host points, so
++    /// `npoints_` is legitimately 0 for it and must stay 0 -- it is what every host
++    /// consumer loops over.  This is kept separately, purely so the grid can report
++    /// a meaningful size instead of printing "Total Points = 0".  It is a pre-
++    /// screening count: cuEST prunes on the device, so it is an upper bound on the
++    /// points actually integrated, where the host `npoints_` is a post-screening
++    /// count.  The two are therefore not directly comparable.
++    long int cuest_npoints_ = 0;
+ #endif
+     /// Orientation matrix
+     std::shared_ptr<Matrix> orientation_;
+@@ -170,6 +179,10 @@ class MolecularGrid {
+ 
+ #if USING_cuEST
+     cuestMolecularGrid_t cuest_grid() const { return cuest_molecular_grid_; }
++    /// Is this grid GPU-resident (built for cuEST) rather than host-resident?
++    bool is_cuest_grid() const { return cuest_molecular_grid_ != nullptr; }
++    /// Nominal, pre-screening quadrature size of a GPU-resident grid; see cuest_npoints_.
++    long int cuest_npoints() const { return cuest_npoints_; }
+ #endif
+     /// Number of grid points
+     int npoints() const { return npoints_; }
+diff --git a/psi4/src/psi4/libfock/jk.h b/psi4/src/psi4/libfock/jk.h
+index 82b49c7a754..0a122383451 100644
+--- a/psi4/src/psi4/libfock/jk.h
++++ b/psi4/src/psi4/libfock/jk.h
+@@ -487,6 +487,25 @@ class PSI_API JK {
+     virtual void set_omega_beta(double beta) { omega_beta_ = beta; }
+     double get_omega_beta() { return omega_beta_; }
+ 
++    /**
++    * Does this JK fold the functional's exact-exchange coefficients into the
++    * K it returns?
++    *
++    * Most implementations hand back a bare exchange matrix and leave the
++    * caller to scale it by alpha, and to add a separately built wK scaled by
++    * beta.  cuESTJK instead passes alpha, beta and omega to cuEST when it
++    * builds its DF integral plan, so the K it returns already carries both
++    * coefficients and the long-range term.  Callers must not scale that K a
++    * second time, and must not add wK on top of it.
++    *
++    * This is a property of the JK object, not of the USE_CUEST option.  With
++    * a non-DF SCF_TYPE, USE_CUEST accelerates only the DFT quadrature while
++    * J and K still come from an ordinary CPU JK that does need the scaling,
++    * so keying the decision on the option silently replaced the functional's
++    * alpha with 1.0 and returned a badly wrong hybrid-DFT energy.
++    */
++    virtual bool exchange_is_prescaled() const { return false; }
++
+     // => Computers <= //
+ 
+     /**
+diff --git a/psi4/src/psi4/libscf_solver/rhf.cc b/psi4/src/psi4/libscf_solver/rhf.cc
+index 126a8c67c96..d87c6b7b9d4 100644
+--- a/psi4/src/psi4/libscf_solver/rhf.cc
++++ b/psi4/src/psi4/libscf_solver/rhf.cc
+@@ -204,12 +204,12 @@ void RHF::form_G() {
+     const std::vector<SharedMatrix>& K = jk_->K();
+     const std::vector<SharedMatrix>& wK = jk_->wK();
+     J_ = J[0];
+-#ifdef USING_cuEST
+-    const bool use_cuest = options_.get_bool("USE_CUEST");
+-#else
+-    const bool use_cuest = false;
+-#endif
+-    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
++    // cuESTJK returns a K that already carries the functional's alpha and beta
++    // (and the long-range term).  Keyed on the JK object, not on the USE_CUEST
++    // option: with a non-DF SCF_TYPE, USE_CUEST accelerates only the DFT
++    // quadrature and J/K come from an ordinary CPU JK that does need scaling.
++    const bool prescaled_K = jk_->exchange_is_prescaled();
++    if (functional_->is_x_hybrid() || (prescaled_K && functional_->is_x_lrc())) {
+         K_ = K[0];
+     }
+     if (functional_->is_x_lrc()) {
+@@ -229,22 +229,20 @@ void RHF::form_G() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+     // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (use_cuest) {
++    if (prescaled_K) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+-    if ((functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) &&
++    if ((functional_->is_x_hybrid() || (prescaled_K && functional_->is_x_lrc())) &&
+         !(functional_->is_x_lrc() && jk_->get_wcombine())) {
+         G_->axpy(-alpha, K_);
+     } else {
+         K_->zero();
+     }
+ 
+-    if (functional_->is_x_lrc() && !use_cuest) { // if using cuEST, wK is encapsulated in K
++    if (functional_->is_x_lrc() && !prescaled_K) { // if using cuEST, wK is encapsulated in K
+         if (jk_->get_wcombine()) {
+             G_->axpy(-1.0, wK_);
+         } else {
+@@ -337,11 +335,11 @@ double RHF::compute_E() {
+     double alpha = functional_->x_alpha();
+     double beta = functional_->x_beta();
+ 
+-#ifdef USING_cuEST
+-    const bool use_cuest = options_.get_bool("USE_CUEST");
+-#else
+-    const bool use_cuest = false;
+-#endif
++    // cuESTJK returns a K that already carries the functional's alpha and beta
++    // (and the long-range term).  Keyed on the JK object, not on the USE_CUEST
++    // option: with a non-DF SCF_TYPE, USE_CUEST accelerates only the DFT
++    // quadrature and J/K come from an ordinary CPU JK that does need scaling.
++    const bool prescaled_K = jk_->exchange_is_prescaled();
+ 
+ #ifdef USING_BrianQC
+     if (brianEnable and brianEnableDFT) {
+@@ -351,18 +349,16 @@ double RHF::compute_E() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+     // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (use_cuest) {
++    if (prescaled_K) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+-    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
++    if (functional_->is_x_hybrid() || (prescaled_K && functional_->is_x_lrc())) {
+         exchange_E -= alpha * Da_->vector_dot(K_);
+     }
+-    if (functional_->is_x_lrc() && !use_cuest) {
++    if (functional_->is_x_lrc() && !prescaled_K) {
+         if (jk_->get_do_wK() && jk_->get_wcombine()) {
+             exchange_E -= Da_->vector_dot(wK_);
+         } else {
+@@ -552,13 +548,14 @@ std::vector<SharedMatrix> RHF::twoel_Hx_full(std::vector<SharedMatrix> x_vec, bo
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+-    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (options_.get_bool("USE_CUEST")) {
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here
++    // as well.  Keyed on the JK object, not on the USE_CUEST option: with a
++    // non-DF SCF_TYPE, USE_CUEST accelerates only the DFT quadrature and J/K
++    // come from an ordinary CPU JK that does need scaling.
++    if (jk_->exchange_is_prescaled()) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+     std::vector<SharedMatrix> ret;
+     if (!singlet) {
+@@ -1143,13 +1140,14 @@ void RHF::openorbital_scf() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+-    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (options_.get_bool("USE_CUEST")) {
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here
++    // as well.  Keyed on the JK object, not on the USE_CUEST option: with a
++    // non-DF SCF_TYPE, USE_CUEST accelerates only the DFT quadrature and J/K
++    // come from an ordinary CPU JK that does need scaling.
++    if (jk_->exchange_is_prescaled()) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+     std::vector<arma::mat> Vxc(nirrep_);
+     if (functional_->needs_xc()) {
+diff --git a/psi4/src/psi4/libscf_solver/uhf.cc b/psi4/src/psi4/libscf_solver/uhf.cc
+index 8c2849e76ea..2263cc466ee 100644
+--- a/psi4/src/psi4/libscf_solver/uhf.cc
++++ b/psi4/src/psi4/libscf_solver/uhf.cc
+@@ -205,12 +205,12 @@ void UHF::form_G() {
+     const std::vector<SharedMatrix>& wK = jk_->wK();
+     J_->copy(J[0]);
+     J_->add(J[1]);
+-#ifdef USING_cuEST
+-    const bool use_cuest = options_.get_bool("USE_CUEST");
+-#else
+-    const bool use_cuest = false;
+-#endif
+-    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
++    // cuESTJK returns a K that already carries the functional's alpha and beta
++    // (and the long-range term).  Keyed on the JK object, not on the USE_CUEST
++    // option: with a non-DF SCF_TYPE, USE_CUEST accelerates only the DFT
++    // quadrature and J/K come from an ordinary CPU JK that does need scaling.
++    const bool prescaled_K = jk_->exchange_is_prescaled();
++    if (functional_->is_x_hybrid() || (prescaled_K && functional_->is_x_lrc())) {
+         Ka_ = K[0];
+         Kb_ = K[1];
+     }
+@@ -232,14 +232,13 @@ void UHF::form_G() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+-    if (use_cuest) {
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (prescaled_K) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+-    if ((functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) &&
++    if ((functional_->is_x_hybrid() || (prescaled_K && functional_->is_x_lrc())) &&
+         !(functional_->is_x_lrc() && jk_->get_wcombine())) {
+         Ga_->axpy(-alpha, Ka_);
+         Gb_->axpy(-alpha, Kb_);
+@@ -248,7 +247,7 @@ void UHF::form_G() {
+         Kb_->zero();
+     }
+ 
+-    if (functional_->is_x_lrc() && !use_cuest) { // if using cuEST, wK is encapsulated in K
++    if (functional_->is_x_lrc() && !prescaled_K) { // if using cuEST, wK is encapsulated in K
+         if (jk_->get_wcombine()) {
+             Ga_->axpy(-1.0, wKa_);
+             Gb_->axpy(-1.0, wKb_);
+@@ -393,11 +392,11 @@ double UHF::compute_E() {
+     double alpha = functional_->x_alpha();
+     double beta = functional_->x_beta();
+ 
+-#ifdef USING_cuEST
+-    const bool use_cuest = options_.get_bool("USE_CUEST");
+-#else
+-    const bool use_cuest = false;
+-#endif
++    // cuESTJK returns a K that already carries the functional's alpha and beta
++    // (and the long-range term).  Keyed on the JK object, not on the USE_CUEST
++    // option: with a non-DF SCF_TYPE, USE_CUEST accelerates only the DFT
++    // quadrature and J/K come from an ordinary CPU JK that does need scaling.
++    const bool prescaled_K = jk_->exchange_is_prescaled();
+ 
+ #ifdef USING_BrianQC
+     if (brianEnable and brianEnableDFT) {
+@@ -407,20 +406,18 @@ double UHF::compute_E() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+     // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (use_cuest) {
++    if (prescaled_K) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+     double exchange_E = 0.0;
+-    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
++    if (functional_->is_x_hybrid() || (prescaled_K && functional_->is_x_lrc())) {
+         exchange_E -= alpha * Da_->vector_dot(Ka_);
+         exchange_E -= alpha * Db_->vector_dot(Kb_);
+     }
+-    if (functional_->is_x_lrc() && !use_cuest) {
++    if (functional_->is_x_lrc() && !prescaled_K) {
+         if (jk_->get_do_wK() && jk_->get_wcombine()) {
+             exchange_E -= Da_->vector_dot(wKa_);
+             exchange_E -= Db_->vector_dot(wKb_);
+@@ -676,13 +673,14 @@ std::vector<SharedMatrix> UHF::twoel_Hx(std::vector<SharedMatrix> x_vec, bool co
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+-    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (options_.get_bool("USE_CUEST")) {
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here
++    // as well.  Keyed on the JK object, not on the USE_CUEST option: with a
++    // non-DF SCF_TYPE, USE_CUEST accelerates only the DFT quadrature and J/K
++    // come from an ordinary CPU JK that does need scaling.
++    if (jk_->exchange_is_prescaled()) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+     std::vector<SharedMatrix> ret;
+     if (combine) {
+@@ -1366,13 +1364,14 @@ void UHF::openorbital_scf() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+-    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
+-    if (options_.get_bool("USE_CUEST")) {
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here
++    // as well.  Keyed on the JK object, not on the USE_CUEST option: with a
++    // non-DF SCF_TYPE, USE_CUEST accelerates only the DFT quadrature and J/K
++    // come from an ordinary CPU JK that does need scaling.
++    if (jk_->exchange_is_prescaled()) {
+         alpha = 1.0;
+         beta = 1.0;
+     }
+-#endif
+ 
+     std::vector<arma::mat> Vxca(nirrep_), Vxcb(nirrep_);
+     if (functional_->needs_xc()) {
+diff --git a/tests/pytests/test_cuest.py b/tests/pytests/test_cuest.py
+index 554a2d07289..168c6f0cdeb 100644
+--- a/tests/pytests/test_cuest.py
++++ b/tests/pytests/test_cuest.py
+@@ -756,3 +756,106 @@ def test_cuest_unsupported_route(route, expected, tmp_path):
+         f"cuEST '{route}' raised, but not from the expected guard "
+         f"(wanted {expected!r}).\nstdout:\n{proc.stdout}"
+     )
++
++
++# ===========================================================================
++# USE_CUEST must not rescale exact exchange unless the JK really is cuESTJK
++# ===========================================================================
++#
++# cuESTJK is built only for SCF_TYPE MEM_DF/DISK_DF (see JK::build_JK).  With
++# any other SCF_TYPE, USE_CUEST accelerates only the XC quadrature while J and
++# K come from an ordinary CPU JK.  RHF/UHF form_G and compute_E nonetheless
++# forced the exact-exchange coefficients alpha and beta to 1.0 whenever the
++# USE_CUEST *option* was set, because cuESTJK folds them into the K it returns.
++# Applied to a CPU JK's unscaled K that silently replaced B3LYP's 20% exact
++# exchange with 100%:
++#
++#   b3lyp/cc-pvdz water, scf_type direct, use_cuest true  ->  -83.7803465  (!)
++#                                         use_cuest false ->  -76.4203903
++#
++# and dropped the long-range term entirely for range-separated functionals.
++# Reproducible to 14 digits, so it looked like a converged answer.  The
++# decision is now keyed on JK::exchange_is_prescaled(), a property of the JK
++# object, rather than on the option.
++#
++# Reference energies from regular (non-cuEST) Psi4, same options as the test.
++
++__alpha_geoms = {
++    "rhf": """
++    0 1
++    symmetry c1
++    no_reorient
++    no_com
++    O
++    H  1  0.9584
++    H  1  0.9584  2  104.5
++    """,
++    "uhf": """
++    0 2
++    symmetry c1
++    no_reorient
++    no_com
++    O
++    H 1 0.97
++    """,
++}
++
++
++@pytest.mark.quick
++@uusing("cuest")
++@uusing("cuda_cc8")
++@pytest.mark.parametrize("scf_type", ["direct", "pk"])
++@pytest.mark.parametrize("reference,methodname,ref_energy", [
++    pytest.param("rhf", "b3lyp", -76.42039031091404, id="rhf_b3lyp"),
++    pytest.param("rhf", "wb97x", -76.40038403602661, id="rhf_wb97x"),
++    pytest.param("uhf", "b3lyp", -75.73193367482514, id="uhf_b3lyp"),
++    pytest.param("uhf", "wb97x", -75.71135638745669, id="uhf_wb97x"),
++])
++def test_cuest_non_df_scf_type_keeps_hybrid_alpha(reference, methodname, ref_energy, scf_type):
++    """A hybrid/RSH under USE_CUEST with a non-DF SCF_TYPE must keep its own alpha/beta."""
++    psi4.core.clean()
++    psi4.core.clean_options()
++    psi4.set_options({
++        'basis': 'cc-pvdz',
++        'scf_type': scf_type,
++        'reference': reference,
++        'e_convergence': 10,
++        'd_convergence': 8,
++        'maxiter': 200,
++        'use_cuest': True,
++    })
++
++    mol = psi4.geometry(__alpha_geoms[reference])
++    energy = psi4.energy(methodname, molecule=mol)
++
++    # 1e-5 covers the GPU XC quadrature difference (~1e-6 here); the bug this
++    # guards against was off by ~7 Eh, so the tolerance is not load-bearing.
++    assert compare_values(ref_energy, energy, 1e-5,
++                          f'{methodname} {reference} scf_type={scf_type} under cuEST')
++
++
++@pytest.mark.quick
++@uusing("cuest")
++@uusing("cuda_cc8")
++def test_cuest_grid_reports_its_size():
++    """A GPU-resident grid must report a real point count, not a bare zero."""
++    psi4.core.clean()
++    psi4.core.clean_options()
++    psi4.set_options({
++        'basis': 'cc-pvdz',
++        'scf_type': 'df',
++        'df_basis_scf': 'def2-universal-JKFIT',
++        'dft_radial_points': 75,
++        'dft_spherical_points': 302,
++        'use_cuest': True,
++    })
++
++    mol = psi4.geometry(__alpha_geoms["rhf"])
++    psi4.energy('pbe', molecule=mol)
++
++    # 3 atoms * 75 radial * 302 angular, pre-screening.  The host grid prunes
++    # this down, so only a lower bound and the nominal value are checked.
++    npoints = psi4.variable('XC GRID TOTAL POINTS')
++    assert npoints == 3 * 75 * 302, (
++        f"cuEST grid reported {npoints} points; a GPU-resident grid used to "
++        f"report 0 here, which reads like a broken grid.")

@@ -1,0 +1,391 @@
+diff --git a/devtools/conda-envs/openmm.yaml b/devtools/conda-envs/openmm.yaml
+index 56750df7d..e47dba7c8 100644
+--- a/devtools/conda-envs/openmm.yaml
++++ b/devtools/conda-envs/openmm.yaml
+@@ -7,6 +7,8 @@ dependencies:
+   - openff-toolkit
+   - openff-forcefields
+   - openmmforcefields
++  - geometric
++  - torsiondrive
+ 
+     # Core
+   - python
+diff --git a/devtools/conda-envs/psi.yaml b/devtools/conda-envs/psi.yaml
+index 65b7736b0..d5605a862 100644
+--- a/devtools/conda-envs/psi.yaml
++++ b/devtools/conda-envs/psi.yaml
+@@ -14,7 +14,7 @@ dependencies:
+   - pyyaml
+   - py-cpuinfo
+   - psutil
+-  - qcelemental=0.21.0  # test minimum constrained version. min stated version is 0.19.
++  - qcelemental=0.22.0  # test minimum constrained version. min stated version is 0.19.
+   - pydantic=1.8.2  # test minimun stated version.
+ 
+     # Testing
+diff --git a/qcengine/procedures/base.py b/qcengine/procedures/base.py
+index fb3678290..a88eb0409 100644
+--- a/qcengine/procedures/base.py
++++ b/qcengine/procedures/base.py
+@@ -9,6 +9,7 @@
+ from .geometric import GeometricProcedure
+ from .nwchem_opt import NWChemDriverProcedure
+ from .optking import OptKingProcedure
++from .torsiondrive import TorsionDriveProcedure
+ 
+ __all__ = ["register_procedure", "get_procedure", "list_all_procedures", "list_available_procedures"]
+ 
+@@ -68,3 +69,4 @@ def list_available_procedures() -> Set[str]:
+ register_procedure(OptKingProcedure())
+ register_procedure(BernyProcedure())
+ register_procedure(NWChemDriverProcedure())
++register_procedure(TorsionDriveProcedure())
+diff --git a/qcengine/procedures/torsiondrive.py b/qcengine/procedures/torsiondrive.py
+new file mode 100644
+index 000000000..66c313036
+--- /dev/null
++++ b/qcengine/procedures/torsiondrive.py
+@@ -0,0 +1,225 @@
++import io
++from collections import defaultdict
++from contextlib import redirect_stderr, redirect_stdout
++from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
++
++import numpy as np
++from qcelemental.models import FailedOperation, Molecule
++from qcelemental.models.procedures import OptimizationInput, OptimizationResult, TorsionDriveInput, TorsionDriveResult
++from qcelemental.util import which_import
++
++from .model import ProcedureHarness
++
++if TYPE_CHECKING:
++    from ..config import TaskConfig
++
++
++class TorsionDriveProcedure(ProcedureHarness):
++
++    _defaults = {"name": "TorsionDrive", "procedure": "torsiondrive"}
++
++    class Config(ProcedureHarness.Config):
++        pass
++
++    def found(self, raise_error: bool = False) -> bool:
++        return which_import(
++            "torsiondrive",
++            return_bool=True,
++            raise_error=raise_error,
++            raise_msg="Please install via `conda install torsiondrive -c conda-forge`.",
++        )
++
++    def build_input_model(self, data: Union[Dict[str, Any], "TorsionDriveInput"]) -> "TorsionDriveInput":
++        return self._build_model(data, TorsionDriveInput)
++
++    def _compute(self, input_model: "TorsionDriveInput", config: "TaskConfig"):
++
++        self.found(raise_error=True)
++
++        import torsiondrive.td_api
++
++        dihedrals = input_model.keywords.dihedrals
++        grid_spacing = input_model.keywords.grid_spacing
++
++        dihedral_ranges = input_model.keywords.dihedral_ranges
++
++        energy_decrease_thresh = input_model.keywords.energy_decrease_thresh
++        energy_upper_limit = input_model.keywords.energy_upper_limit
++
++        state = torsiondrive.td_api.create_initial_state(
++            dihedrals=dihedrals,
++            grid_spacing=grid_spacing,
++            elements=input_model.initial_molecule.symbols,
++            init_coords=[input_model.initial_molecule.geometry.flatten().tolist()],
++            dihedral_ranges=dihedral_ranges,
++            energy_upper_limit=energy_upper_limit,
++            energy_decrease_thresh=energy_decrease_thresh,
++        )
++
++        optimization_results = defaultdict(list)
++        error = None
++
++        # Spawn new optimizations at each grid points until convergence / an error.
++        while True:
++
++            next_jobs = torsiondrive.td_api.next_jobs_from_state(state, verbose=False)
++
++            if len(next_jobs) == 0:
++                break
++
++            grid_point_results = {
++                grid_point: [self._spawn_optimization(grid_point, job, input_model, config) for job in jobs]
++                for grid_point, jobs in next_jobs.items()
++            }
++
++            for grid_point, results in grid_point_results.items():
++
++                failed_results = [result for result in results if not result.success]
++
++                if len(failed_results) > 0:
++
++                    error_message = failed_results[0].error.error_message
++                    error = {
++                        "error_type": "unknown",
++                        "error_message": f"TorsionDrive error at {grid_point}:\n{error_message}",
++                    }
++                    break
++
++                optimization_results[grid_point].extend(results)
++
++            if error is not None:
++                break
++
++            task_results = {
++                grid_point: [
++                    (
++                        result.initial_molecule.geometry.flatten().tolist(),
++                        result.final_molecule.geometry.flatten().tolist(),
++                        result.energies[-1],
++                    )
++                    for result in results
++                ]
++                for grid_point, results in grid_point_results.items()
++            }
++
++            torsiondrive.td_api.update_state(state, {**task_results})
++
++        output_data = input_model.dict()
++        output_data["provenance"] = {
++            "creator": "TorsionDrive",
++            "routine": "torsiondrive.td_api.next_jobs_from_state",
++            "version": torsiondrive.__version__,
++        }
++        output_data["success"] = error is None
++
++        # even if we hit an error during the torsiondrive, we output what we can
++        output_data["final_energies"], output_data["final_molecules"] = {}, {}
++
++        for grid_point, results in optimization_results.items():
++
++            final_energy, final_molecule = self._find_final_results(results)
++
++            output_data["final_energies"][grid_point] = final_energy
++            output_data["final_molecules"][grid_point] = final_molecule
++
++        output_data["optimization_history"] = optimization_results
++
++        if error is not None:
++            output_data["error"] = error
++
++        return output_data
++
++    def compute(self, input_model: "TorsionDriveInput", config: "TaskConfig") -> "TorsionDriveResult":
++
++        # Capture the stdout and err here to avoid too much nesting in the _compute function
++        with io.StringIO() as stdout:
++            with io.StringIO() as stderr:
++
++                with redirect_stdout(stdout):
++                    with redirect_stderr(stderr):
++
++                        output_data = self._compute(input_model, config)
++
++                output_data["stdout"] = str(stdout.getvalue())
++                output_data["stderr"] = str(stderr.getvalue())
++
++        # these will get populated by the model below
++        output_data.pop("schema_name", None)
++        output_data.pop("schema_version", None)
++
++        output_data = TorsionDriveResult(**output_data)
++
++        return output_data
++
++    @staticmethod
++    def _spawn_optimization(
++        grid_point: str, job: List[float], input_model: "TorsionDriveInput", config: "TaskConfig"
++    ) -> Union[FailedOperation, OptimizationResult]:
++        """Spawns an optimization at a particular grid point and returns the result.
++
++        Parameters
++        ----------
++        grid_point
++            A string of the form 'dihedral_1_angle ... dihedral_n_angle' that encodes
++            the current dihedrals angles to optimize at.
++        job
++            The flattened conformer of the molecule to start the optimization at with
++            length=(n_atoms * 3)
++        input_model
++            The input model containing the relevant settings for how to optimize the
++            structure.
++        config
++            The configuration to launch the task using.
++
++        Returns
++        -------
++            The result of the optimization if successful, otherwise an error containing
++            object.
++        """
++
++        from qcengine import compute_procedure
++
++        input_molecule = input_model.initial_molecule.copy(deep=True).dict()
++        input_molecule["geometry"] = np.array(job).reshape(len(input_molecule["symbols"]), 3)
++        input_molecule = Molecule.from_data(input_molecule)
++
++        dihedrals = input_model.keywords.dihedrals
++        angles = grid_point.split()
++
++        keywords = {
++            **input_model.optimization_spec.keywords,
++            "constraints": {
++                "set": [
++                    {
++                        "type": "dihedral",
++                        "indices": dihedral,
++                        "value": int(angle),
++                    }
++                    for dihedral, angle in zip(dihedrals, angles)
++                ]
++            },
++        }
++
++        input_data = OptimizationInput(
++            keywords=keywords,
++            extras={},
++            protocols=input_model.optimization_spec.protocols,
++            input_specification=input_model.input_specification,
++            initial_molecule=input_molecule,
++        )
++
++        return compute_procedure(
++            input_data, procedure=input_model.optimization_spec.procedure, local_options=config.dict()
++        )
++
++    @staticmethod
++    def _find_final_results(
++        optimization_results: List[OptimizationResult],
++    ) -> Tuple[float, Molecule]:
++        """Returns the energy and final molecule of the lowest energy optimization
++        in a set."""
++
++        final_energies = np.array([result.energies[-1] for result in optimization_results])
++        lowest_energy_idx = final_energies.argmin()
++
++        return float(final_energies[lowest_energy_idx]), optimization_results[lowest_energy_idx].final_molecule
+diff --git a/qcengine/stock_mols.py b/qcengine/stock_mols.py
+index ceb4a873e..47522e5af 100644
+--- a/qcengine/stock_mols.py
++++ b/qcengine/stock_mols.py
+@@ -65,6 +65,20 @@
+             3.963929,
+         ],
+     },
++    "ethane": {
++        "geometry": [
++            [+1.54034068369141, -1.01730823913235, +0.93128102073425],
++            [+4.07197633001232, -0.09756825926424, -0.02203578938791],
++            [+0.00025636057017, +0.00139534039687, +0.00111211603233],
++            [+1.30983130616505, -3.03614919350581, +0.54918567185649],
++            [+1.38003941036405, -0.71812565437083, +2.97078783593882],
++            [+5.61209917480096, -1.11612498901607, +0.90799157528946],
++            [+4.30241880148479, +1.92102238874847, +0.36057345099335],
++            [+4.23222331256867, -0.39619160402976, -2.06158817835790],
++        ],
++        "symbols": ["C", "C", "H", "H", "H", "H", "H", "H"],
++        "connectivity": [[0, 1, 1], [0, 2, 1], [0, 3, 1], [0, 4, 1], [1, 5, 1], [1, 6, 1], [1, 7, 1]],
++    },
+     "mindless-01": {
+         "symbols": ["Na", "H", "O", "H", "F", "H", "H", "O", "N", "H", "H", "Cl", "B", "B", "N", "Al"],
+         "geometry": [
+diff --git a/qcengine/testing.py b/qcengine/testing.py
+index c50478365..b91759951 100644
+--- a/qcengine/testing.py
++++ b/qcengine/testing.py
+@@ -178,6 +178,7 @@ def get_job(self):
+     "terachem": which("terachem", return_bool=True),
+     "terachem_pbs": is_program_new_enough("terachem_pbs", "0.7.2"),
+     "torchani": is_program_new_enough("torchani", "0.9"),
++    "torsiondrive": which_import("torsiondrive", return_bool=True),
+     "turbomole": which("define", return_bool=True),
+     "xtb": which_import("xtb", return_bool=True),
+     "mrchem": is_program_new_enough("mrchem", "1.0.0"),
+diff --git a/qcengine/tests/test_procedures.py b/qcengine/tests/test_procedures.py
+index 244be06f9..6c32750fa 100644
+--- a/qcengine/tests/test_procedures.py
++++ b/qcengine/tests/test_procedures.py
+@@ -3,7 +3,9 @@
+ """
+ 
+ import pytest
+-from qcelemental.models import OptimizationInput
++from qcelemental.models import DriverEnum, OptimizationInput
++from qcelemental.models.common_models import Model
++from qcelemental.models.procedures import OptimizationSpecification, QCInputSpecification, TDKeywords, TorsionDriveInput
+ 
+ import qcengine as qcng
+ from qcengine.testing import failure_engine, using
+@@ -198,7 +200,7 @@ def test_geometric_retries(failure_engine, input_data):
+         pytest.param(
+             "openmm",
+             {"method": "openff-1.0.0", "basis": "smirnoff"},
+-            [1.889726881670907, 3.10070288709234, 110.25177977849998],
++            [1.8344994291796748, 3.010099477501204, 110.25177977849998],
+             marks=using("openmm"),
+         ),
+         pytest.param(
+@@ -210,7 +212,7 @@ def test_geometric_retries(failure_engine, input_data):
+         pytest.param(
+             "openmm",
+             {"method": "smirnoff99Frosst-1.1.0", "basis": "smirnoff"},
+-            [1.8897269787924604, 3.1516330703676063, 112.9999999990053],
++            [1.814137087600702, 3.025566213038376, 112.9999999990053],
+             marks=using("openmm"),
+         ),
+         pytest.param(
+@@ -261,3 +263,46 @@ def test_nwchem_relax(linopt):
+     assert 10 > len(ret.trajectory) > 1
+ 
+     assert pytest.approx(ret.final_molecule.measure([0, 1]), 1.0e-4) == 1.3459150737
++
++
++@using("rdkit")
++@using("torsiondrive")
++def test_torsiondrive_generic():
++
++    input_data = TorsionDriveInput(
++        keywords=TDKeywords(dihedrals=[(2, 0, 1, 5)], grid_spacing=[180]),
++        input_specification=QCInputSpecification(driver=DriverEnum.gradient, model=Model(method="UFF", basis=None)),
++        initial_molecule=qcng.get_molecule("ethane"),
++        optimization_spec=OptimizationSpecification(
++            procedure="geomeTRIC",
++            keywords={
++                "coordsys": "dlc",
++                "maxiter": 300,
++                "program": "rdkit",
++            },
++        ),
++    )
++
++    ret = qcng.compute_procedure(input_data, "torsiondrive", raise_error=True)
++
++    assert ret.error is None
++    assert ret.success
++
++    expected_grid_ids = {"180", "0"}
++
++    assert {*ret.optimization_history} == expected_grid_ids
++
++    assert {*ret.final_energies} == expected_grid_ids
++    assert {*ret.final_molecules} == expected_grid_ids
++
++    assert (
++        pytest.approx(ret.final_molecules["180"].measure([2, 0, 1, 5]), abs=1.0e-2) == 180.0
++        or pytest.approx(ret.final_molecules["180"].measure([2, 0, 1, 5]), abs=1.0e-2) == -180.0
++    )
++    assert pytest.approx(ret.final_molecules["0"].measure([2, 0, 1, 5]), abs=1.0e-2) == 0.0
++
++    assert ret.provenance.creator.lower() == "torsiondrive"
++    assert ret.optimization_history["180"][0].provenance.creator.lower() == "geometric"
++    assert ret.optimization_history["180"][0].trajectory[0].provenance.creator.lower() == "rdkit"
++
++    assert ret.stdout == "All optimizations converged at lowest energy. Job Finished!\n"

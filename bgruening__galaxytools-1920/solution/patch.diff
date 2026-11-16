@@ -1,0 +1,384 @@
+diff --git a/tools/rag/.shed.yml b/tools/rag/.shed.yml
+index 301a3bde2b..f7d5e6f695 100644
+--- a/tools/rag/.shed.yml
++++ b/tools/rag/.shed.yml
+@@ -3,8 +3,9 @@ owner: bgruening
+ description: Retrieve relevant context from documents using embeddings (RAG).
+ long_description: |
+   This tool implements the retrieval step of a Retrieval-Augmented Generation (RAG) pipeline.
+-  It loads documents provided through Galaxy datasets, creates embeddings using HuggingFace
+-  embedding models, and retrieves the most relevant text chunks for a given query.
++  It loads documents provided through Galaxy datasets, creates embeddings using a hosted
++  embedding model or a local HuggingFace embedding model, and retrieves the most relevant
++  text chunks for a given query.
+   The retrieved context can then be used by downstream LLM tools for question answering
+   or summarization tasks.
+   The tool supports GPU acceleration when available (CUDA) and falls back to CPU otherwise.
+diff --git a/tools/rag/rag_retriever.py b/tools/rag/rag_retriever.py
+index a666f26bf5..4c229bc010 100644
+--- a/tools/rag/rag_retriever.py
++++ b/tools/rag/rag_retriever.py
+@@ -1,35 +1,144 @@
++import hashlib
+ import json
+ import os
+ import sys
+ from pathlib import Path
+ 
+ import torch
++import yaml
+ from llama_index.core import Document, SimpleDirectoryReader, VectorStoreIndex
+ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
++from llama_index.embeddings.openai import OpenAIEmbedding
+ from llama_index.readers.file import PDFReader
+ from llama_index.readers.json import JSONReader
+ 
+ 
++# --- LiteLLM proxy config resolution -------------------------------------
++# The LiteLLM proxy exposes an OpenAI-compatible /v1/embeddings endpoint. The
++# YAML config may be flat (global LITELLM_API_KEY / LITELLM_BASE_URL) or expose
++# a ``servers`` mapping that keys provider names to per-server credentials; the
++# ``provider`` argument selects which server to use.
++
++def load_litellm_config() -> dict:
++    """Read the LiteLLM YAML config referenced by ``LITELLM_CONFIG_FILE``.
++
++    Exits with a clear message if the env var is unset or the file is missing,
++    since neither is recoverable for a tool job.
++    """
++    config_file = os.environ.get("LITELLM_CONFIG_FILE")
++    if not config_file:
++        sys.exit("LITELLM_CONFIG_FILE environment variable is not set.")
++    if not os.path.isfile(config_file):
++        sys.exit(f"LiteLLM config file does not exist: {config_file}")
++    with open(config_file, "r") as f:
++        config = yaml.safe_load(f)
++    if not config:
++        sys.exit(
++            f"LiteLLM config file is empty or contains no entries: {config_file}"
++        )
++    return config
++
++
++def resolve_server(config: dict, provider: str) -> dict:
++    """Resolve the server config for ``provider`` and validate its credentials.
++
++    Returns the per-provider ``servers[provider]`` dict when a ``servers`` block
++    exists, otherwise the global config (backward compatibility). Exits with a
++    message if the provider is unknown or the API key / base URL is missing.
++    """
++    servers = config.get("servers", {})
++    if servers:
++        if provider not in servers:
++            sys.exit(f"Provider '{provider}' not found in LiteLLM configuration.")
++        source = servers[provider]
++    else:
++        source = config
++    if not source.get("LITELLM_API_KEY"):
++        sys.exit(
++            "LiteLLM API key is not configured! Please set LITELLM_API_KEY "
++            "in the configuration."
++        )
++    if not source.get("LITELLM_BASE_URL"):
++        sys.exit(
++            "LiteLLM base URL is not configured! Please set LITELLM_BASE_URL "
++            "in the configuration."
++        )
++    return source
++
++
+ def main():
+     context_files = json.loads(sys.argv[1])
+     question = (sys.argv[2] or "").strip()
+-    embedding_model = sys.argv[3]
++    embed_cfg = json.loads(sys.argv[3])
+     top_k = int(sys.argv[4])
++    # Galaxy user id + instance URL, for request attribution on the proxy.
++    # The literal "Anonymous" is rendered for anonymous sessions, in which
++    # case no per-user id is sent (the request falls back to a per-instance
++    # shared "anonymous" bucket).
++    galaxy_user_id = sys.argv[5] if len(sys.argv) > 5 else ""
++    if galaxy_user_id == "Anonymous":
++        galaxy_user_id = ""
++    galaxy_url = sys.argv[6] if len(sys.argv) > 6 else ""
+ 
+     if not question:
+         sys.exit("Question is empty.")
+     if not context_files:
+         sys.exit("No input files given.")
+-    if not os.path.exists(embedding_model):
+-        sys.exit(f"Embedding model path does not exist: {embedding_model}")
+     if top_k <= 0:
+         sys.exit("Top K must be a positive integer.")
+ 
+-    device = "cuda" if torch.cuda.is_available() else "cpu"
+-
+-    embed_model = HuggingFaceEmbedding(
+-        model_name=embedding_model, normalize=True, device=device
+-    )
++    if not isinstance(embed_cfg, dict) or "source" not in embed_cfg:
++        sys.exit("Invalid embedding configuration: expected a JSON object with a 'source' key.")
++
++    if embed_cfg["source"] == "litellm":
++        model = embed_cfg.get("model")
++        provider = embed_cfg.get("provider")
++        if not model:
++            sys.exit("No LiteLLM embedding model selected.")
++        if not provider:
++            sys.exit("No LiteLLM provider selected.")
++        server = resolve_server(load_litellm_config(), provider)
++        # Attribute the embedding request to the Galaxy user so proxies
++        # (e.g. LiteLLM) can meter usage and apply per-user budgets/rate
++        # limits, via the standard OpenAI ``user`` field. The id is
++        # namespaced by the Galaxy instance URL and hashed: the URL keeps
++        # ids unique when several Galaxy instances share one proxy (e.g.
++        # usegalaxy.eu), and hashing means no instance-identifying or
++        # personal data leaves for the provider. Anonymous users (no id)
++        # fall back to a per-instance shared "anonymous" bucket. Mirrors the
++        # attribution in llm_hub.py so both tools map one Galaxy user to one
++        # proxy identity.
++        raw_user = galaxy_user_id or "anonymous"
++        attribution_user = hashlib.sha256(
++            f"{galaxy_url}|{raw_user}".encode()
++        ).hexdigest()
++        # OpenAIEmbedding validates ``model`` against a hardcoded enum of OpenAI
++        # model names; passing the LiteLLM model id via ``model_name`` instead is
++        # the class's intended escape hatch (it overrides the enum-derived
++        # engine), so arbitrary proxy-hosted models (BGE-M3, nomic, Qwen3, ...)
++        # can be used with the framework's batching, retry and client handling.
++        # ``additional_kwargs`` is forwarded as ``**kwargs`` to the OpenAI SDK's
++        # ``embeddings.create`` call, carrying the ``user`` field through.
++        embed_model = OpenAIEmbedding(
++            model_name=model,
++            api_key=server["LITELLM_API_KEY"],
++            api_base=server["LITELLM_BASE_URL"],
++            timeout=float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600")),
++            max_retries=int(os.environ.get("LITELLM_REQUEST_MAX_RETRIES", "3")),
++            embed_batch_size=100,
++            additional_kwargs={"user": attribution_user},
++        )
++    else:
++        # Local HuggingFace model (preinstalled path or uploaded archive).
++        model_path = embed_cfg.get("path")
++        if not model_path:
++            sys.exit("No embedding model path given.")
++        if not os.path.exists(model_path):
++            sys.exit(f"Embedding model path does not exist: {model_path}")
++        device = "cuda" if torch.cuda.is_available() else "cpu"
++        embed_model = HuggingFaceEmbedding(
++            model_name=model_path, normalize=True, device=device
++        )
+ 
+     docs: list[Document] = []
+ 
+diff --git a/tools/rag/rag_retriever.xml b/tools/rag/rag_retriever.xml
+index d3eb090133..18e6d0a2a7 100644
+--- a/tools/rag/rag_retriever.xml
++++ b/tools/rag/rag_retriever.xml
+@@ -4,7 +4,7 @@
+ 
+   <macros>
+     <token name="@TOOL_VERSION@">1.0.0</token>
+-    <token name="@VERSION_SUFFIX@">1</token>
++    <token name="@VERSION_SUFFIX@">2</token>
+     <token name="@CONTAINER_VERSION@">0.14.18</token>
+   </macros>
+ 
+@@ -29,9 +29,11 @@
+ #if $model_source.source_type == "upload":
+     mkdir -p ./local_model &&
+     (tar -xf '$model_source.model_archive' -C ./local_model --strip-components=1 || tar -xf '$model_source.model_archive' -C ./local_model) &&
+-    #set MODEL_PATH = "./local_model"
++    #set EMBED = {"source": "local", "path": "./local_model"}
++#else if $model_source.source_type == "litellm":
++    #set EMBED = {"source": "litellm", "model": str($model_source.embedding_model.fields.model_id), "provider": str($model_source.embedding_model.fields.provider)}
+ #else:
+-    #set MODEL_PATH = str($model_source.embedding_model)
++    #set EMBED = {"source": "local", "path": str($model_source.embedding_model)}
+ #end if
+ 
+ #set LINKED = []
+@@ -43,16 +45,31 @@
+ #end for
+ #set context_files = json.dumps($LINKED)
+ 
+-python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$MODEL_PATH' '$top_k'
++python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$json.dumps($EMBED)' '$top_k' '$__user_id__' '$__galaxy_url__'
+ ]]></command>
+ 
+   <inputs>
+     <conditional name="model_source">
+       <param name="source_type" type="select" label="Embedding Model Source">
+-        <option value="preinstalled">Use an installed model</option>
++        <option value="litellm" selected="true">Use a LiteLLM-hosted model</option>
++        <option value="preinstalled">Use an installed HuggingFace model</option>
+         <option value="upload">Upload a custom model archive</option>
+       </param>
+ 
++      <when value="litellm">
++        <param name="embedding_model" type="select" label="Select Embedding Model">
++          <options from_data_table="genai_models">
++            <column name="name" index="2" />
++            <column name="value" index="0" />
++            <column name="model_id" index="1" />
++            <column name="provider" index="4" />
++            <filter type="static_value" value="embedding" column="3" />
++          </options>
++          <validator type="no_options"
++            message="No embedding models are configured on this Galaxy instance. Ask your Galaxy admin to make an embedding model available." />
++        </param>
++      </when>
++
+       <when value="preinstalled">
+         <param name="embedding_model" type="select" label="Select Model">
+           <options from_data_table="huggingface">
+@@ -123,6 +140,19 @@ python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$MOD
+         <has_text text="Embedding model path does not exist: unknown" />
+       </assert_stderr>
+     </test>
++
++    <test expect_failure="true" expect_exit_code="1">
++      <conditional name="model_source">
++        <param name="source_type" value="litellm" />
++        <param name="embedding_model" value="unknown" />
++      </conditional>
++      <param name="files" value="test.txt" ftype="txt" />
++      <param name="question" value="How does it work?" />
++      <param name="top_k" value="2" />
++      <assert_stderr>
++        <has_text text="LITELLM_CONFIG_FILE environment variable is not set."/>
++      </assert_stderr>
++    </test>
+   </tests>
+ 
+ 
+@@ -132,7 +162,7 @@ python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$MOD
+ **What it does**
+ 
+ This tool performs **Retrieval-Augmented Generation (RAG) document retrieval**.
+-It extracts relevant text passages from a set of input files using **semantic search with HuggingFace embeddings**.
++It extracts relevant text passages from a set of input files using **semantic search with embedding models**.
+ 
+ The retrieved passages are written to a text file which can then be used as **context input for an LLM** (for example with the LLM Hub tool).
+ 
+@@ -148,9 +178,10 @@ Usage
+ 
+ 1. **Embedding Model Source**
+ 
+-   You can provide the embedding model in two ways:
+-   
+-   - **Use an installed model**: Select a model from a list provided by the administrator (configured via `.loc` files).
++   You can provide the embedding model in three ways:
++
++   - **Use a hosted embedding model**: Select an embedding model made available by your Galaxy administrator (e.g. BGE-M3, Qwen3 Embedding).
++   - **Use an installed HuggingFace model**: Select a local model from a list provided by your Galaxy administrator (configured via `.loc` files).
+    - **Upload custom Model Archive**: Provide your own model as a **.tgz** or archive. This allows the tool to run offline using the provided model files (e.g., config.json, model weights).
+ 
+ 2. **Corpus Documents**
+@@ -199,7 +230,6 @@ Notes
+ - GPU acceleration is automatically used if available.
+ - Retrieval quality strongly depends on the chosen embedding model.
+ - Larger Top-K values provide more context but may introduce irrelevant information.
+-- For the preinstalled models, the paths are managed via the `huggingface` data table.
+ 
+ ]]></help>
+ 
+diff --git a/tools/rag/tool-data/genai_models.loc.sample b/tools/rag/tool-data/genai_models.loc.sample
+new file mode 100644
+index 0000000000..13e8817dd6
+--- /dev/null
++++ b/tools/rag/tool-data/genai_models.loc.sample
+@@ -0,0 +1,29 @@
++#This is a sample file distributed with Galaxy that is used to define litellm
++#embedding models, using 6 columns tab separated
++#(longer whitespace are TAB characters):
++#
++#The entries are as follows:
++#
++#<value>	<model_id>	<name>	<domain>	<provider>	<free_tag>
++#
++#value: Unique identifier for the dropdown selection
++#model_id: The actual model identifier to send to the LiteLLM /v1/embeddings endpoint
++#name: Display name shown to users in the Galaxy interface
++#domain: Model type - must be "embedding" for the RAG Retriever to surface the entry
++#provider: Server identifier matching a key in the servers section of your YAML config
++#free_tag: Optional tag that can be freely used by admins to specify additional filter options
++#
++#These are the same genai_models table used by the LLM Hub (tools/llm_hub); the
++#RAG Retriever reads only the domain=embedding entries. Generation-model examples
++#(text, image, multimodal) live in tools/llm_hub/tool-data/genai_models.loc.sample.
++#
++#Examples:
++#
++#bge-m3-llmlb-freiburg	bge-m3-llmlb	Multilingual embedding model with strong retrieval performance, 1024 dimensions (BGE-M3) [uni-freiburg]	embedding	uni-freiburg	BAAI
++#qwen3-embedding-4b-freiburg	qwen3-embedding-4b	High-quality multilingual embedding model, 2560 dimensions (Qwen3-Embedding-4B) [uni-freiburg]	embedding	uni-freiburg	Alibaba Cloud
++#qwen3-embedding-4b-e-infra.cz	qwen3-embedding-4b	High-quality multilingual embedding model, 2560 dimensions (Qwen3-Embedding-4B) [e-INFRA CZ]	embedding	e-infra.cz	Alibaba Cloud
++#multilingual-e5-large-instruct-e-infra.cz	multilingual-e5-large-instruct	Instruct-tuned multilingual embedding model (Multilingual-E5-Large-Instruct) [e-INFRA CZ]	embedding	e-infra.cz	Microsoft
++#nomic-embed-text-v2-moe-e-infra.cz	nomic-embed-text-v2-moe	Mixture-of-experts text embedding model with long context (Nomic-Embed-Text-v2-MoE) [e-INFRA CZ]	embedding	e-infra.cz	Nomic
++#nomic-embed-text-v1.5-e-infra.cz	nomic-embed-text-v1.5	Lightweight and efficient text embedding model (Nomic-Embed-Text-v1.5) [e-INFRA CZ]	embedding	e-infra.cz	Nomic
++#mxbai-embed-large-e-infra.cz	mxbai-embed-large:latest	Large-scale embedding model with strong retrieval performance (Mixedbread-Embed-Large) [e-INFRA CZ]	embedding	e-infra.cz	Mixedbread AI
++#
+diff --git a/tools/rag/tool-data/huggingface.loc.sample b/tools/rag/tool-data/huggingface.loc.sample
+index 7d6f485bee..ab27d64c00 100644
+--- a/tools/rag/tool-data/huggingface.loc.sample
++++ b/tools/rag/tool-data/huggingface.loc.sample
+@@ -1,13 +1,35 @@
+-# Sample file for Galaxy HuggingFace model entries.
+-# Columns are TAB-separated:
++# This is a sample file distributed with Galaxy that is used to register local
++# HuggingFace embedding models for the RAG Retriever, using 7 tab-separated columns.
++# Lines starting with "#" are ignored by Galaxy.
+ #
+-# <unique_build_id>	<display_name>	<pipeline_tag>	<domain>	<free_tag>	<version>	<folder_base_path>
++# The RAG Retriever reuses the shared "huggingface" data table (also consumed by the
++# tabpfn and flux tools). Each tool family selects its own rows via the free_tag column,
++# so embedding models do not collide with models registered for other tools.
+ #
+-# For this tool, embedding models can be registered here and selected via the existing
+-# Galaxy "huggingface" data table. Use free_tag=vector-rag to make models visible to
+-# the RAG retriever tool.
++# Columns (TAB-separated):
++#   value	name	pipeline_tag	domain	free_tag	version	path
++#
++#   value         Unique row ID across the whole huggingface.loc table
++#   name          Human-readable label shown in the Galaxy select widget
++#   pipeline_tag  Official HuggingFace pipeline tag; text embedding models use
++#                 "feature-extraction"
++#                 (https://huggingface.co/models?pipeline_tag=feature-extraction)
++#   domain        Coarse model family (embedding / text / image / tabular / ...);
++#                 set this to "embedding" for text embedding models, consistent with
++#                 the genai_models table used by the LiteLLM path of this tool
++#   free_tag      Per-tool-family namespace used as the primary XML filter;
++#                 RAG Retriever rows use "vector-rag"
++#   version       Tool version these rows belong to; used as a secondary XML filter
++#   path          Path to the downloaded model directory on this server
++#
++# Administrators: copy this file to your Galaxy tool-data directory as "huggingface.loc"
++# and update each path to point to the actual model directory. Models can be downloaded
++# with download_embeddings.py (shipped with this tool) or directly from HuggingFace.
++#
++# For the full shared schema reference see:
++#   https://galaxyproject.org/news/2026-04-13-huggingface-data-table/
+ #
+ # Example entries for embedding models:
+ #
+-# sentence-transformers/all-MiniLM-L6-v2	all-MiniLM-L6-v2	feature-extraction	text	vector-rag	1	/path/to/huggingface_models/sentence-transformers/all-MiniLM-L6-v2
+-# BAAI/bge-small-en	BAAI bge-small-en	feature-extraction	text	vector-rag	1	/path/to/huggingface_models/BAAI/bge-small-en
+\ No newline at end of file
++# sentence-transformers/all-MiniLM-L6-v2	all-MiniLM-L6-v2	feature-extraction	embedding	vector-rag	1	/path/to/huggingface_models/sentence-transformers/all-MiniLM-L6-v2
++# BAAI/bge-small-en	BAAI bge-small-en	feature-extraction	embedding	vector-rag	1	/path/to/huggingface_models/BAAI/bge-small-en
+\ No newline at end of file
+diff --git a/tools/rag/tool_data_table_conf.xml.sample b/tools/rag/tool_data_table_conf.xml.sample
+index 95e9538e7d..4b120ad7de 100644
+--- a/tools/rag/tool_data_table_conf.xml.sample
++++ b/tools/rag/tool_data_table_conf.xml.sample
+@@ -4,4 +4,8 @@
+         <columns>value, name, pipeline_tag, domain, free_tag, version, path</columns>
+         <file path="huggingface.loc" />
+     </table>
++    <table name="genai_models" comment_char="#" allow_duplicate_entries="False">
++        <columns>value, model_id, name, domain, provider, free_tag</columns>
++        <file path="genai_models.loc" />
++    </table>
+ </tables>
+\ No newline at end of file

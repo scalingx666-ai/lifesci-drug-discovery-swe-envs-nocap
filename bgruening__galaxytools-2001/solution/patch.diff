@@ -1,0 +1,676 @@
+diff --git a/tools/rag/.shed.yml b/tools/rag/.shed.yml
+index f7d5e6f695..faeaa6c60c 100644
+--- a/tools/rag/.shed.yml
++++ b/tools/rag/.shed.yml
+@@ -6,6 +6,8 @@ long_description: |
+   It loads documents provided through Galaxy datasets, creates embeddings using a hosted
+   embedding model or a local HuggingFace embedding model, and retrieves the most relevant
+   text chunks for a given query.
++  Optionally, a cross-encoder reranker (hosted or a local HuggingFace model) re-scores a
++  wider pool of candidate chunks against the query and keeps the best ones.
+   The retrieved context can then be used by downstream LLM tools for question answering
+   or summarization tasks.
+   The tool supports GPU acceleration when available (CUDA) and falls back to CPU otherwise.
+diff --git a/tools/rag/download_embeddings.py b/tools/rag/download_embeddings.py
+index 2c0302a9c5..74289eb0bc 100644
+--- a/tools/rag/download_embeddings.py
++++ b/tools/rag/download_embeddings.py
+@@ -12,13 +12,14 @@
+ 
+ def main():
+     parser = argparse.ArgumentParser(
+-        description="Download multiple SentenceTransformer models."
++        description="Download SentenceTransformer embedding models and cross-encoder "
++        "rerankers (e.g. cross-encoder/ms-marco-MiniLM-L6-v2) for the RAG Retriever."
+     )
+     parser.add_argument(
+         "--models",
+         nargs="+",
+         required=True,
+-        help="Hugging Face model IDs, separated by spaces",
++        help="Hugging Face model IDs (embedding models or rerankers), separated by spaces",
+     )
+ 
+     args = parser.parse_args()
+diff --git a/tools/rag/rag_retriever.py b/tools/rag/rag_retriever.py
+index 4c229bc010..cc0d09ef0e 100644
+--- a/tools/rag/rag_retriever.py
++++ b/tools/rag/rag_retriever.py
+@@ -1,7 +1,9 @@
+ import hashlib
+ import json
++import logging
+ import os
+ import sys
++from functools import cache, partial
+ from pathlib import Path
+ 
+ import torch
+@@ -11,14 +13,29 @@
+ from llama_index.embeddings.openai import OpenAIEmbedding
+ from llama_index.readers.file import PDFReader
+ from llama_index.readers.json import JSONReader
++from openai import APIError, OpenAI
++from sentence_transformers import CrossEncoder
++
++
++# Limits for every request to the LiteLLM proxy (embeddings and reranking).
++REQUEST_TIMEOUT = float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600"))
++REQUEST_MAX_RETRIES = int(os.environ.get("LITELLM_REQUEST_MAX_RETRIES", "3"))
++# Largest pool a reranker may re-score (the form's limit). Gains level off at
++# about 20 candidates, and every candidate costs one more model pass.
++MAX_RERANK_CANDIDATES = 100
++# Cross-encoders judge the question and one chunk together; 512 tokens is the
++# window the evaluated models (ms-marco-MiniLM, MedCPT, bge-reranker) were
++# trained on.
++RERANK_MAX_LENGTH = 512
+ 
+ 
+ # --- LiteLLM proxy config resolution -------------------------------------
+-# The LiteLLM proxy exposes an OpenAI-compatible /v1/embeddings endpoint. The
+-# YAML config may be flat (global LITELLM_API_KEY / LITELLM_BASE_URL) or expose
+-# a ``servers`` mapping that keys provider names to per-server credentials; the
+-# ``provider`` argument selects which server to use.
++# The LiteLLM proxy exposes OpenAI-compatible embeddings and rerank endpoints.
++# The YAML config may be flat (global LITELLM_API_KEY / LITELLM_BASE_URL) or
++# expose a ``servers`` mapping that keys provider names to per-server
++# credentials; the ``provider`` argument selects which server to use.
+ 
++@cache
+ def load_litellm_config() -> dict:
+     """Read the LiteLLM YAML config referenced by ``LITELLM_CONFIG_FILE``.
+ 
+@@ -66,30 +83,25 @@ def resolve_server(config: dict, provider: str) -> dict:
+     return source
+ 
+ 
+-def main():
+-    context_files = json.loads(sys.argv[1])
+-    question = (sys.argv[2] or "").strip()
+-    embed_cfg = json.loads(sys.argv[3])
+-    top_k = int(sys.argv[4])
+-    # Galaxy user id + instance URL, for request attribution on the proxy.
+-    # The literal "Anonymous" is rendered for anonymous sessions, in which
+-    # case no per-user id is sent (the request falls back to a per-instance
+-    # shared "anonymous" bucket).
+-    galaxy_user_id = sys.argv[5] if len(sys.argv) > 5 else ""
+-    if galaxy_user_id == "Anonymous":
+-        galaxy_user_id = ""
+-    galaxy_url = sys.argv[6] if len(sys.argv) > 6 else ""
++def attribution_user(galaxy_user_id: str, galaxy_url: str) -> str:
++    """Proxy-side identity for the Galaxy user, sent as the OpenAI ``user`` field.
+ 
+-    if not question:
+-        sys.exit("Question is empty.")
+-    if not context_files:
+-        sys.exit("No input files given.")
+-    if top_k <= 0:
+-        sys.exit("Top K must be a positive integer.")
++    Proxies (e.g. LiteLLM) use it to meter usage and apply per-user budgets and
++    rate limits. The id is namespaced by the Galaxy instance URL and hashed: the
++    URL keeps ids unique when several Galaxy instances share one proxy (e.g.
++    usegalaxy.eu), and hashing means no instance-identifying or personal data
++    leaves for the provider. Anonymous sessions (Galaxy renders the literal
++    "Anonymous", or no id) share one per-instance "anonymous" bucket. Mirrors
++    the attribution in llm_hub.py so both tools map one Galaxy user to one
++    proxy identity.
++    """
++    if not galaxy_user_id or galaxy_user_id == "Anonymous":
++        galaxy_user_id = "anonymous"
++    return hashlib.sha256(f"{galaxy_url}|{galaxy_user_id}".encode()).hexdigest()
+ 
+-    if not isinstance(embed_cfg, dict) or "source" not in embed_cfg:
+-        sys.exit("Invalid embedding configuration: expected a JSON object with a 'source' key.")
+ 
++def build_embed_model(embed_cfg: dict, user: str):
++    """Embedding model for the LiteLLM proxy or a local HuggingFace model."""
+     if embed_cfg["source"] == "litellm":
+         model = embed_cfg.get("model")
+         provider = embed_cfg.get("provider")
+@@ -98,20 +110,6 @@ def main():
+         if not provider:
+             sys.exit("No LiteLLM provider selected.")
+         server = resolve_server(load_litellm_config(), provider)
+-        # Attribute the embedding request to the Galaxy user so proxies
+-        # (e.g. LiteLLM) can meter usage and apply per-user budgets/rate
+-        # limits, via the standard OpenAI ``user`` field. The id is
+-        # namespaced by the Galaxy instance URL and hashed: the URL keeps
+-        # ids unique when several Galaxy instances share one proxy (e.g.
+-        # usegalaxy.eu), and hashing means no instance-identifying or
+-        # personal data leaves for the provider. Anonymous users (no id)
+-        # fall back to a per-instance shared "anonymous" bucket. Mirrors the
+-        # attribution in llm_hub.py so both tools map one Galaxy user to one
+-        # proxy identity.
+-        raw_user = galaxy_user_id or "anonymous"
+-        attribution_user = hashlib.sha256(
+-            f"{galaxy_url}|{raw_user}".encode()
+-        ).hexdigest()
+         # OpenAIEmbedding validates ``model`` against a hardcoded enum of OpenAI
+         # model names; passing the LiteLLM model id via ``model_name`` instead is
+         # the class's intended escape hatch (it overrides the enum-derived
+@@ -119,26 +117,165 @@ def main():
+         # can be used with the framework's batching, retry and client handling.
+         # ``additional_kwargs`` is forwarded as ``**kwargs`` to the OpenAI SDK's
+         # ``embeddings.create`` call, carrying the ``user`` field through.
+-        embed_model = OpenAIEmbedding(
++        return OpenAIEmbedding(
+             model_name=model,
+             api_key=server["LITELLM_API_KEY"],
+             api_base=server["LITELLM_BASE_URL"],
+-            timeout=float(os.environ.get("LITELLM_REQUEST_TIMEOUT", "600")),
+-            max_retries=int(os.environ.get("LITELLM_REQUEST_MAX_RETRIES", "3")),
++            timeout=REQUEST_TIMEOUT,
++            max_retries=REQUEST_MAX_RETRIES,
+             embed_batch_size=100,
+-            additional_kwargs={"user": attribution_user},
++            additional_kwargs={"user": user},
+         )
+-    else:
+-        # Local HuggingFace model (preinstalled path or uploaded archive).
+-        model_path = embed_cfg.get("path")
+-        if not model_path:
+-            sys.exit("No embedding model path given.")
+-        if not os.path.exists(model_path):
+-            sys.exit(f"Embedding model path does not exist: {model_path}")
+-        device = "cuda" if torch.cuda.is_available() else "cpu"
+-        embed_model = HuggingFaceEmbedding(
+-            model_name=model_path, normalize=True, device=device
++    # Local HuggingFace model (preinstalled path or uploaded archive).
++    model_path = embed_cfg.get("path")
++    if not model_path:
++        sys.exit("No embedding model path given.")
++    if not os.path.exists(model_path):
++        sys.exit(f"Embedding model path does not exist: {model_path}")
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    return HuggingFaceEmbedding(model_name=model_path, normalize=True, device=device)
++
++
++# --- Reranking --------------------------------------------------------------
++# Retrieval embeds the question and each chunk separately and compares the two
++# vectors. A cross-encoder reads the question and one chunk together, so it can
++# judge whether the chunk answers *this* question: better, but one model pass
++# per pair. So retrieval first narrows the corpus to a few candidates, the
++# reranker re-sorts them, and the best ``top_k`` are kept.
++
++def is_cross_encoder(model_path: str) -> bool:
++    """Whether ``model_path`` holds a single-score cross-encoder.
++
++    That is a ``*ForSequenceClassification`` model with one output label.
++    CrossEncoder loads other models too, e.g. an embedding model gets a new,
++    randomly initialised scoring head and then ranks at random, so the check
++    reads the model's config.json instead of trusting the load.
++    """
++    try:
++        config = json.loads((Path(model_path) / "config.json").read_text(encoding="utf-8"))
++        labels = config.get("id2label")
++        num_labels = len(labels) if labels else config.get("num_labels", 2)
++        architectures = config.get("architectures") or []
++        return num_labels == 1 and any(a.endswith("ForSequenceClassification") for a in architectures)
++    except (OSError, ValueError, AttributeError, TypeError):
++        return False
++
++
++def rerank_local(model_path: str, question: str, chunks: list, top_k: int) -> list:
++    """Re-sort ``chunks`` with a local cross-encoder; return the best ``top_k``."""
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    model = CrossEncoder(model_path, max_length=RERANK_MAX_LENGTH, device=device)
++    ranked = model.rank(question, chunks, top_k=top_k, batch_size=16, show_progress_bar=False)
++    return [chunks[r["corpus_id"]] for r in ranked]
++
++
++def rerank_litellm(client: OpenAI, model: str, user: str, question: str, chunks: list, top_k: int) -> list:
++    """Re-sort ``chunks`` with a proxy-hosted reranker; return the best ``top_k``.
++
++    Posts to the proxy's rerank endpoint (``{LITELLM_BASE_URL}/rerank``)
++    through the OpenAI SDK client, so timeouts, retries (honouring the proxy's
++    Retry-After) and redirects behave as for the embedding requests. The
++    answer is checked before use: a proxy that returns too few results, or
++    indices that do not point at a chunk, fails the job instead of silently
++    returning wrong or short context.
++    """
++    top_n = min(top_k, len(chunks))
++    try:
++        response = client.post(
++            "/rerank",
++            cast_to=object,
++            body={"model": model, "query": question, "documents": chunks, "top_n": top_n, "user": user},
+         )
++    except APIError as e:
++        sys.exit(f"Reranker request to model '{model}' failed: {e}")
++    try:
++        ranked = sorted(response["results"], key=lambda r: -float(r["relevance_score"]))
++        order = list(dict.fromkeys(r["index"] for r in ranked))  # best first, repeats dropped
++    except (KeyError, TypeError, ValueError):
++        sys.exit(f"Unexpected response from reranker model '{model}': {str(response)[:500]}")
++    if len(order) < top_n or not all(type(i) is int and 0 <= i < len(chunks) for i in order):
++        sys.exit(
++            f"Unexpected response from reranker model '{model}': expected {top_n} "
++            f"distinct chunk indices from 0 to {len(chunks) - 1}, got {order}"
++        )
++    return [chunks[i] for i in order[:top_n]]
++
++
++def prepare_reranker(rerank_cfg: dict, user: str, top_k: int):
++    """Validate the reranker settings before any document is embedded.
++
++    Returns ``(rerank, fetch_k)``: a function ``rerank(question, chunks,
++    top_k)``, or None when reranking is off, and how many chunks retrieval
++    should return. Bad settings exit here, so a job fails in seconds rather
++    than after embedding the whole corpus.
++    """
++    source = rerank_cfg["source"]
++    if source == "none":
++        return None, top_k
++    if source not in ("litellm", "local"):
++        sys.exit(f"Unknown reranker source: {source}")
++    candidates = rerank_cfg.get("candidates")
++    if type(candidates) is not int or not 2 <= candidates <= MAX_RERANK_CANDIDATES:
++        sys.exit(f"Reranker candidates must be a whole number from 2 to {MAX_RERANK_CANDIDATES}.")
++    # A reranker needs a wider pool to choose from; never fewer than top_k.
++    fetch_k = max(candidates, top_k)
++    if source == "litellm":
++        model = rerank_cfg.get("model")
++        provider = rerank_cfg.get("provider")
++        if not model:
++            sys.exit("No LiteLLM reranker model selected.")
++        if not provider:
++            sys.exit("No LiteLLM reranker provider selected.")
++        server = resolve_server(load_litellm_config(), provider)
++        client = OpenAI(
++            api_key=server["LITELLM_API_KEY"],
++            base_url=server["LITELLM_BASE_URL"],
++            timeout=REQUEST_TIMEOUT,
++            max_retries=REQUEST_MAX_RETRIES,
++        )
++        return partial(rerank_litellm, client, model, user), fetch_k
++    model_path = rerank_cfg.get("path")
++    if not model_path:
++        sys.exit("No reranker model path given.")
++    if not os.path.exists(model_path):
++        sys.exit(f"Reranker model path does not exist: {model_path}")
++    if not is_cross_encoder(model_path):
++        sys.exit(
++            f"Reranker model is not a single-score cross-encoder: {model_path} "
++            "(expected a *ForSequenceClassification model with one output, "
++            "e.g. cross-encoder/ms-marco-MiniLM-L6-v2)."
++        )
++    return partial(rerank_local, model_path), fetch_k
++
++
++def main():
++    # httpx logs every proxy request at INFO; keep the job's stderr for errors.
++    logging.getLogger("httpx").setLevel(logging.WARNING)
++
++    context_files = json.loads(sys.argv[1])
++    question = (sys.argv[2] or "").strip()
++    embed_cfg = json.loads(sys.argv[3])
++    top_k = int(sys.argv[4])
++    # Galaxy user id + instance URL, for request attribution on the proxy.
++    galaxy_user_id = sys.argv[5]
++    galaxy_url = sys.argv[6]
++    rerank_cfg = json.loads(sys.argv[7])
++
++    if not question:
++        sys.exit("Question is empty.")
++    if not context_files:
++        sys.exit("No input files given.")
++    if top_k < 1:
++        sys.exit("Top K must be a positive integer.")
++
++    if not isinstance(embed_cfg, dict) or "source" not in embed_cfg:
++        sys.exit("Invalid embedding configuration: expected a JSON object with a 'source' key.")
++    if not isinstance(rerank_cfg, dict) or "source" not in rerank_cfg:
++        sys.exit("Invalid reranker configuration: expected a JSON object with a 'source' key.")
++
++    user = attribution_user(galaxy_user_id, galaxy_url)
++    rerank, fetch_k = prepare_reranker(rerank_cfg, user, top_k)
++    embed_model = build_embed_model(embed_cfg, user)
+ 
+     docs: list[Document] = []
+ 
+@@ -163,7 +300,7 @@ def main():
+         sys.exit("No documents loaded.")
+ 
+     index = VectorStoreIndex.from_documents(docs, embed_model=embed_model)
+-    retriever = index.as_retriever(similarity_top_k=top_k)
++    retriever = index.as_retriever(similarity_top_k=fetch_k)
+     nodes = retriever.retrieve(question)
+ 
+     chunks = []
+@@ -173,6 +310,9 @@ def main():
+         if text:
+             chunks.append(text.strip())
+ 
++    if rerank and chunks:
++        chunks = rerank(question, chunks, top_k)
++
+     context_text = "\n\n---\n\n".join(chunks).strip()
+ 
+     out = [
+diff --git a/tools/rag/rag_retriever.xml b/tools/rag/rag_retriever.xml
+index 18e6d0a2a7..279903f970 100644
+--- a/tools/rag/rag_retriever.xml
++++ b/tools/rag/rag_retriever.xml
+@@ -3,9 +3,13 @@
+   <description>Retrieve relevant chunks from documents and output a context file</description>
+ 
+   <macros>
+-    <token name="@TOOL_VERSION@">1.0.0</token>
+-    <token name="@VERSION_SUFFIX@">2</token>
++    <token name="@TOOL_VERSION@">1.1.0</token>
++    <token name="@VERSION_SUFFIX@">0</token>
+     <token name="@CONTAINER_VERSION@">0.14.18</token>
++    <xml name="rerank_candidates">
++      <param name="candidates" type="integer" value="20" min="2" max="100" label="Candidates to rerank"
++        help="How many of the closest chunks the reranker re-scores before the best Top K are kept. About 20 works well; larger pools rarely help and make CPU rerankers slower. Values below Top K are raised to Top K." />
++    </xml>
+   </macros>
+ 
+   <creator>
+@@ -36,6 +40,14 @@
+     #set EMBED = {"source": "local", "path": str($model_source.embedding_model)}
+ #end if
+ 
++#if $reranker.reranker_source == "litellm":
++    #set RERANK = {"source": "litellm", "model": str($reranker.reranker_model.fields.model_id), "provider": str($reranker.reranker_model.fields.provider), "candidates": int(str($reranker.candidates))}
++#else if $reranker.reranker_source == "preinstalled":
++    #set RERANK = {"source": "local", "path": str($reranker.reranker_model), "candidates": int(str($reranker.candidates))}
++#else:
++    #set RERANK = {"source": "none"}
++#end if
++
+ #set LINKED = []
+ #for $f in $files
+   #set base = re.sub('[^\w\-]', '_', os.path.splitext($f.element_identifier)[0])
+@@ -45,7 +57,7 @@
+ #end for
+ #set context_files = json.dumps($LINKED)
+ 
+-python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$json.dumps($EMBED)' '$top_k' '$__user_id__' '$__galaxy_url__'
++python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$json.dumps($EMBED)' '$top_k' '$__user_id__' '$__galaxy_url__' '$json.dumps($RERANK)'
+ ]]></command>
+ 
+   <inputs>
+@@ -107,6 +119,46 @@ python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$jso
+ 
+     <param name="top_k" type="integer" value="5" min="1" label="Top K chunks"
+       help="Select how many relevant text segments (chunks) should be extracted as context." />
++
++    <conditional name="reranker">
++      <param name="reranker_source" type="select" label="Reranker"
++        help="Optionally re-score a wider pool of candidate chunks with a cross-encoder, which reads the question and each chunk together, and keep the best Top K. This usually picks better chunks, at the cost of extra run time.">
++        <option value="none" selected="true">No reranking</option>
++        <option value="litellm">Use a LiteLLM-hosted reranker</option>
++        <option value="preinstalled">Use an installed HuggingFace cross-encoder</option>
++      </param>
++
++      <when value="none" />
++
++      <when value="litellm">
++        <param name="reranker_model" type="select" label="Select Reranker Model">
++          <options from_data_table="genai_models">
++            <column name="name" index="2" />
++            <column name="value" index="0" />
++            <column name="model_id" index="1" />
++            <column name="provider" index="4" />
++            <filter type="static_value" value="rerank" column="3" />
++          </options>
++          <validator type="no_options"
++            message="No reranker models are configured on this Galaxy instance. Ask your Galaxy admin to make a reranker model available." />
++        </param>
++        <expand macro="rerank_candidates" />
++      </when>
++
++      <when value="preinstalled">
++        <param name="reranker_model" type="select" label="Select Reranker Model">
++          <options from_data_table="huggingface">
++            <column name="name" index="1" />
++            <column name="value" index="6" />
++            <filter type="static_value" value="rag-reranker" column="4" />
++            <filter type="static_value" value="1" column="5" />
++          </options>
++          <validator type="no_options"
++            message="No reranker models are installed on this Galaxy instance." />
++        </param>
++        <expand macro="rerank_candidates" />
++      </when>
++    </conditional>
+   </inputs>
+ 
+   <outputs>
+@@ -128,7 +180,7 @@ python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$jso
+       </assert_stderr>
+     </test>
+ 
+-    <test expect_failure="true" expect_exit_code="5">
++    <test expect_failure="true" expect_exit_code="1">
+       <conditional name="model_source">
+         <param name="source_type" value="preinstalled" />
+         <param name="embedding_model" value="unknown" />
+@@ -153,6 +205,45 @@ python '$__tool_directory__/rag_retriever.py' '$context_files' '$question' '$jso
+         <has_text text="LITELLM_CONFIG_FILE environment variable is not set."/>
+       </assert_stderr>
+     </test>
++
++    <!-- Reranker settings are validated before the embedding model: the missing
++         embedding model below (a row of test-data/huggingface.loc) must not be
++         the error that is reported. -->
++    <test expect_failure="true" expect_exit_code="1">
++      <conditional name="model_source">
++        <param name="source_type" value="preinstalled" />
++        <param name="embedding_model" value="missing-embedding-model" />
++      </conditional>
++      <param name="files" value="test.txt" ftype="txt" />
++      <param name="question" value="How does it work?" />
++      <param name="top_k" value="2" />
++      <conditional name="reranker">
++        <param name="reranker_source" value="preinstalled" />
++        <param name="reranker_model" value="unknown" />
++      </conditional>
++      <assert_stderr>
++        <has_text text="Reranker model path does not exist: unknown" />
++        <not_has_text text="Embedding model path does not exist" />
++      </assert_stderr>
++    </test>
++
++    <test expect_failure="true" expect_exit_code="1">
++      <conditional name="model_source">
++        <param name="source_type" value="preinstalled" />
++        <param name="embedding_model" value="missing-embedding-model" />
++      </conditional>
++      <param name="files" value="test.txt" ftype="txt" />
++      <param name="question" value="How does it work?" />
++      <param name="top_k" value="2" />
++      <conditional name="reranker">
++        <param name="reranker_source" value="litellm" />
++        <param name="reranker_model" value="test-reranker" />
++      </conditional>
++      <assert_stderr>
++        <has_text text="LITELLM_CONFIG_FILE environment variable is not set." />
++        <not_has_text text="Embedding model path does not exist" />
++      </assert_stderr>
++    </test>
+   </tests>
+ 
+ 
+@@ -197,6 +288,17 @@ Usage
+ 
+    The number of most relevant document chunks that should be returned.
+ 
++5. **Reranker** (optional)
++
++   A reranker takes a wider pool of candidate chunks (by default the 20 closest), reads the question together with each chunk, and keeps the best Top-K.
++   It usually returns better chunks than the embedding search alone, especially when many passages are relevant or when chunks share words with the question without answering it.
++   It adds little when each question was written from one specific passage, because the embedding search then already finds that passage.
++
++   - **Use a LiteLLM-hosted reranker**: Select a reranker hosted by a provider your Galaxy administrator has configured (e.g. BGE-Reranker-v2-M3). It runs on the provider's servers, not on Galaxy's. Chunks can be about 1,000 tokens long, so the model must accept inputs of more than 1,000 tokens (question plus chunk); models limited to 512 tokens fail with a context-length error.
++   - **Use an installed HuggingFace cross-encoder**: Select a local cross-encoder provided by your Galaxy administrator (e.g. ms-marco-MiniLM-L6-v2, about 1 second per question on a CPU; larger models such as BGE-Reranker-v2-M3 are much slower without a GPU). It reads at most 512 tokens of question plus chunk, so it judges a long chunk by its beginning.
++
++   **Candidates to rerank** sets the size of the pool (2 to 100). About 20 works well; larger pools rarely help.
++
+ ---
+ 
+ How it works
+@@ -206,8 +308,9 @@ How it works
+ 2. Documents are automatically split into **smaller chunks**.
+ 3. Each chunk is converted into a **vector embedding** using the selected embedding model.
+ 4. The question is embedded using the same model.
+-5. A **vector similarity search** retrieves the *Top-K most relevant chunks*.
+-6. The retrieved chunks are written to a text file.
++5. A **vector similarity search** retrieves the *Top-K most relevant chunks* (or the larger candidate pool when a reranker is selected).
++6. *Optional:* the reranker re-scores each candidate chunk against the question and keeps the best Top-K.
++7. The retrieved chunks are written to a text file.
+ 
+ ---
+ 
+@@ -230,6 +333,7 @@ Notes
+ - GPU acceleration is automatically used if available.
+ - Retrieval quality strongly depends on the chosen embedding model.
+ - Larger Top-K values provide more context but may introduce irrelevant information.
++- A reranker changes which chunks are returned and their order, never how many.
+ 
+ ]]></help>
+ 
+diff --git a/tools/rag/test-data/genai_models.loc b/tools/rag/test-data/genai_models.loc
+new file mode 100644
+index 0000000000..56ffa9df48
+--- /dev/null
++++ b/tools/rag/test-data/genai_models.loc
+@@ -0,0 +1,3 @@
++#value	model_id	name	domain	provider	free_tag
++unknown	unknown-embedding-model	Unknown embedding model (test)	embedding	test	test
++test-reranker	test-reranker-model	Test reranker	rerank	test	test
+diff --git a/tools/rag/test-data/huggingface.loc b/tools/rag/test-data/huggingface.loc
+new file mode 100644
+index 0000000000..4e5d55c22e
+--- /dev/null
++++ b/tools/rag/test-data/huggingface.loc
+@@ -0,0 +1,4 @@
++#value	name	pipeline_tag	domain	free_tag	version	path
++test-embedding	Missing embedding model (test)	feature-extraction	embedding	vector-rag	1	missing-embedding-model
++test-embedding-unknown	Unknown embedding model (test)	feature-extraction	embedding	vector-rag	1	unknown
++test-reranker	Missing reranker (test)	text-ranking	rerank	rag-reranker	1	unknown
+diff --git a/tools/rag/tool-data/genai_models.loc.sample b/tools/rag/tool-data/genai_models.loc.sample
+index 13e8817dd6..899c5d6e0b 100644
+--- a/tools/rag/tool-data/genai_models.loc.sample
++++ b/tools/rag/tool-data/genai_models.loc.sample
+@@ -1,5 +1,5 @@
+ #This is a sample file distributed with Galaxy that is used to define litellm
+-#embedding models, using 6 columns tab separated
++#embedding and reranker models, using 6 columns tab separated
+ #(longer whitespace are TAB characters):
+ #
+ #The entries are as follows:
+@@ -7,15 +7,27 @@
+ #<value>	<model_id>	<name>	<domain>	<provider>	<free_tag>
+ #
+ #value: Unique identifier for the dropdown selection
+-#model_id: The actual model identifier to send to the LiteLLM /v1/embeddings endpoint
++#model_id: The actual model identifier to send to the LiteLLM endpoint
++#          (embeddings endpoint for embedding models, rerank endpoint for rerankers)
+ #name: Display name shown to users in the Galaxy interface
+-#domain: Model type - must be "embedding" for the RAG Retriever to surface the entry
++#domain: Model type - "embedding" rows are offered as embedding models and
++#        "rerank" rows as rerankers in the RAG Retriever
+ #provider: Server identifier matching a key in the servers section of your YAML config
+ #free_tag: Optional tag that can be freely used by admins to specify additional filter options
+ #
+ #These are the same genai_models table used by the LLM Hub (tools/llm_hub); the
+-#RAG Retriever reads only the domain=embedding entries. Generation-model examples
+-#(text, image, multimodal) live in tools/llm_hub/tool-data/genai_models.loc.sample.
++#RAG Retriever reads only the domain=embedding and domain=rerank entries.
++#Generation-model examples (text, image, multimodal) live in
++#tools/llm_hub/tool-data/genai_models.loc.sample.
++#
++#A reranker row only works if the proxy serves that model on its rerank
++#endpoint; check with a small request first, since not every hosted reranker is
++#routed there. Also check that the scores make sense (irrelevant documents should
++#score near 0): some rerankers, e.g. Qwen3-Reranker, need a special prompt format
++#and give misleading scores through a generic rerank endpoint when served without
++#it. The RAG Retriever's chunks can be about 1,000 tokens long, so a reranker must
++#accept inputs of more than 1,000 tokens (question plus chunk); models limited to
++#512 tokens fail with a context-length error.
+ #
+ #Examples:
+ #
+@@ -27,3 +39,7 @@
+ #nomic-embed-text-v1.5-e-infra.cz	nomic-embed-text-v1.5	Lightweight and efficient text embedding model (Nomic-Embed-Text-v1.5) [e-INFRA CZ]	embedding	e-infra.cz	Nomic
+ #mxbai-embed-large-e-infra.cz	mxbai-embed-large:latest	Large-scale embedding model with strong retrieval performance (Mixedbread-Embed-Large) [e-INFRA CZ]	embedding	e-infra.cz	Mixedbread AI
+ #
++#Reranker examples:
++#
++#bge-reranker-v2-m3-freiburg	bge-reranker-v2-m3-llmlb	Multilingual cross-encoder reranker (BGE-Reranker-v2-M3) [uni-freiburg]	rerank	uni-freiburg	BAAI
++#
+diff --git a/tools/rag/tool-data/huggingface.loc.sample b/tools/rag/tool-data/huggingface.loc.sample
+index ab27d64c00..577e1c4a0f 100644
+--- a/tools/rag/tool-data/huggingface.loc.sample
++++ b/tools/rag/tool-data/huggingface.loc.sample
+@@ -1,10 +1,10 @@
+ # This is a sample file distributed with Galaxy that is used to register local
+-# HuggingFace embedding models for the RAG Retriever, using 7 tab-separated columns.
+-# Lines starting with "#" are ignored by Galaxy.
++# HuggingFace embedding models and cross-encoder rerankers for the RAG Retriever,
++# using 7 tab-separated columns. Lines starting with "#" are ignored by Galaxy.
+ #
+ # The RAG Retriever reuses the shared "huggingface" data table (also consumed by the
+ # tabpfn and flux tools). Each tool family selects its own rows via the free_tag column,
+-# so embedding models do not collide with models registered for other tools.
++# so its models do not collide with models registered for other tools.
+ #
+ # Columns (TAB-separated):
+ #   value	name	pipeline_tag	domain	free_tag	version	path
+@@ -13,12 +13,15 @@
+ #   name          Human-readable label shown in the Galaxy select widget
+ #   pipeline_tag  Official HuggingFace pipeline tag; text embedding models use
+ #                 "feature-extraction"
+-#                 (https://huggingface.co/models?pipeline_tag=feature-extraction)
++#                 (https://huggingface.co/models?pipeline_tag=feature-extraction),
++#                 cross-encoders usually "text-ranking" or "text-classification"
+ #   domain        Coarse model family (embedding / text / image / tabular / ...);
+-#                 set this to "embedding" for text embedding models, consistent with
+-#                 the genai_models table used by the LiteLLM path of this tool
++#                 set this to "embedding" for text embedding models and "rerank" for
++#                 cross-encoder rerankers, consistent with the genai_models table
++#                 used by the LiteLLM path of this tool
+ #   free_tag      Per-tool-family namespace used as the primary XML filter;
+-#                 RAG Retriever rows use "vector-rag"
++#                 RAG Retriever embedding rows use "vector-rag", reranker rows
++#                 use "rag-reranker"
+ #   version       Tool version these rows belong to; used as a secondary XML filter
+ #   path          Path to the downloaded model directory on this server
+ #
+@@ -32,4 +35,13 @@
+ # Example entries for embedding models:
+ #
+ # sentence-transformers/all-MiniLM-L6-v2	all-MiniLM-L6-v2	feature-extraction	embedding	vector-rag	1	/path/to/huggingface_models/sentence-transformers/all-MiniLM-L6-v2
+-# BAAI/bge-small-en	BAAI bge-small-en	feature-extraction	embedding	vector-rag	1	/path/to/huggingface_models/BAAI/bge-small-en
+\ No newline at end of file
++# BAAI/bge-small-en	BAAI bge-small-en	feature-extraction	embedding	vector-rag	1	/path/to/huggingface_models/BAAI/bge-small-en
++#
++# Example entries for cross-encoder rerankers. A reranker must be a single-score
++# cross-encoder (a *ForSequenceClassification model with one output label, as
++# declared in its config.json); the tool refuses other models. ms-marco-MiniLM-L6-v2
++# (22M parameters, about 1 s per question on CPU) is a good trade-off;
++# bge-reranker-v2-m3 ranks slightly better but is much slower without a GPU:
++#
++# cross-encoder/ms-marco-MiniLM-L6-v2	ms-marco-MiniLM-L6-v2 (reranker)	text-ranking	rerank	rag-reranker	1	/path/to/huggingface_models/cross-encoder/ms-marco-MiniLM-L6-v2
++# BAAI/bge-reranker-v2-m3	BAAI bge-reranker-v2-m3 (reranker)	text-ranking	rerank	rag-reranker	1	/path/to/huggingface_models/BAAI/bge-reranker-v2-m3
+diff --git a/tools/rag/tool_data_table_conf.xml.test b/tools/rag/tool_data_table_conf.xml.test
+new file mode 100644
+index 0000000000..d618b30695
+--- /dev/null
++++ b/tools/rag/tool_data_table_conf.xml.test
+@@ -0,0 +1,13 @@
++<!-- Data tables for the tool tests: planemo prefers this file over the .sample.
++     The rows point at paths and models that do not exist, so the tests exercise
++     the tool's validation without downloading any model. -->
++<tables>
++    <table name="huggingface" comment_char="#" allow_duplicate_entries="False">
++        <columns>value, name, pipeline_tag, domain, free_tag, version, path</columns>
++        <file path="${__HERE__}/test-data/huggingface.loc" />
++    </table>
++    <table name="genai_models" comment_char="#" allow_duplicate_entries="False">
++        <columns>value, model_id, name, domain, provider, free_tag</columns>
++        <file path="${__HERE__}/test-data/genai_models.loc" />
++    </table>
++</tables>

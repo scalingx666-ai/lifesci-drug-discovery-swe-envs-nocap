@@ -1,0 +1,194 @@
+diff --git a/src/dxtb/_src/calculators/types/analytical.py b/src/dxtb/_src/calculators/types/analytical.py
+index ed4333e90..bc9dc5db6 100644
+--- a/src/dxtb/_src/calculators/types/analytical.py
++++ b/src/dxtb/_src/calculators/types/analytical.py
+@@ -25,6 +25,7 @@
+ 
+ import torch
+ from tad_mctc.convert import any_to_tensor
++from tad_mctc.math import einsum
+ 
+ from dxtb import OutputHandler
+ from dxtb import integrals as ints
+@@ -224,6 +225,35 @@ def forces_analytical(
+         total_grad += hamiltonian_grad
+         timer.stop("hgrad")
+ 
++        # dipole integral gradient (e.g., from an electric field)
++
++        if potential.dipole is not None and self.integrals.dipole is not None:
++            timer.start("dgrad", "Dipole Integral Gradient")
++
++            # Energy of the dipole potential for a fixed density matrix (cf.
++            # `potential_to_hamiltonian`). The position dependence of the
++            # dipole integral is differentiated via autograd.
++            #  - shape dipole integral: (..., 3, nao, nao)
++            #  - shape dipole potential: (..., nao, 3)
++            vdp = self.ihelp.spread_atom_to_orbital(
++                potential.dipole.detach(), dim=-2, extra=True
++            )
++            edp = -einsum(
++                "...ij,...kij,...jk->...",
++                density.detach(),
++                self.integrals.dipole.matrix,
++                vdp,
++            )
++
++            (dipole_grad,) = torch.autograd.grad(
++                edp.sum(),
++                positions,
++                retain_graph=True,
++                create_graph=torch.is_grad_enabled(),
++            )
++            total_grad += dipole_grad
++            timer.stop("dgrad")
++
+         return -total_grad
+ 
+     @cdec.requires_positions_grad
+diff --git a/src/dxtb/_src/components/interactions/field/efield.py b/src/dxtb/_src/components/interactions/field/efield.py
+index 7e1d614b0..bdc8f206f 100644
+--- a/src/dxtb/_src/components/interactions/field/efield.py
++++ b/src/dxtb/_src/components/interactions/field/efield.py
+@@ -27,7 +27,7 @@
+ from tad_mctc.math import einsum
+ 
+ from dxtb import IndexHelper
+-from dxtb._src.typing import Any, Slicers, Tensor, override
++from dxtb._src.typing import Any, Slicers, Tensor, TensorOrTensors, override
+ from dxtb._src.typing.exceptions import DeviceError, DtypeError
+ 
+ from ..base import Interaction, InteractionCache
+@@ -271,6 +271,46 @@ def get_dipole_atom_potential(
+         """
+         return -cache.vdp
+ 
++    @override
++    def get_atom_gradient(
++        self,
++        charges: Tensor,
++        positions: Tensor,
++        cache: ElectricFieldCache,
++        grad_outputs: TensorOrTensors | None = None,
++        retain_graph: bool | None = True,
++        create_graph: bool | None = None,
++    ) -> Tensor:
++        r"""
++        Calculate the nuclear gradient of the monopolar electric field energy
++        for fixed charges.
++
++        .. math::
++
++            \dfrac{\partial E}{\partial \mathbf{R}_A} = -q_A \mathbf{F}
++
++        The position dependence of the charges enters via the overlap
++        derivative in the Hamiltonian gradient, and the position dependence
++        of the dipole moments via the dipole integral gradient in
++        :meth:`~dxtb.Calculator.forces_analytical`.
++
++        Parameters
++        ----------
++        charges : Tensor
++            Atom-resolved partial charges (shape: ``(..., nat)``).
++        positions : Tensor
++            Cartesian coordinates of all atoms (shape: ``(..., nat, 3)``).
++        cache : ElectricFieldCache
++            Restart data for the interaction.
++
++        Returns
++        -------
++        Tensor
++            Nuclear gradient of the electric field energy
++            (shape: ``(..., nat, 3)``).
++        """
++        return -charges.unsqueeze(-1) * cache.vdp
++
+     def __str__(self) -> str:  # pragma: no cover
+         return f"{self.__class__.__name__}(field={self.field})"
+ 
+diff --git a/test/test_singlepoint/test_grad_pos_withfield.py b/test/test_singlepoint/test_grad_pos_withfield.py
+index e545c16d5..7106c4ad6 100644
+--- a/test/test_singlepoint/test_grad_pos_withfield.py
++++ b/test/test_singlepoint/test_grad_pos_withfield.py
+@@ -209,3 +209,81 @@ def test_gradgradcheck_batch(
+     assert dgradgradcheck(
+         func, diffvars, atol=tol, eps=1e-4, nondet_tol=1e-7, fast_mode=False
+     )
++
++
++def analytical_vs_autograd(
++    numbers: Tensor, positions: Tensor, charge: Tensor, dd: DD
++) -> None:
++    field_vector = torch.tensor([-2.0, 1.0, 0.5], **dd) * VAA2AU
++
++    options = dict(opts, **{"scf_mode": labels.SCF_MODE_IMPLICIT_NON_PURE})
++
++    # separate calculators, so that no cached quantities are shared
++    calc = Calculator(
++        numbers,
++        GFN1_XTB,
++        interaction=new_efield(field_vector),
++        opts=options,
++        **dd,
++    )
++    pos = positions.clone().requires_grad_(True)
++    energy = calc.energy(pos, charge)
++    (ref,) = torch.autograd.grad(-energy.sum(), pos)
++
++    calc = Calculator(
++        numbers,
++        GFN1_XTB,
++        interaction=new_efield(field_vector),
++        opts=options,
++        **dd,
++    )
++    pos = positions.clone().requires_grad_(True)
++    forces = calc.forces_analytical(pos, charge).detach()
++
++    assert pytest.approx(ref.cpu(), abs=1e-8, rel=1e-6) == forces.cpu()
++
++
++@pytest.mark.grad
++@pytest.mark.skipif(not has_libcint, reason="libcint not available")
++@pytest.mark.parametrize("dtype", [torch.double])
++def test_analytical(dtype: torch.dtype) -> None:
++    """
++    Check analytical forces in an electric field against autograd. The anion
++    has non-zero atomic charges and dipole moments, i.e., the gradient
++    contains the monopolar (:math:`-q_A F`) and the dipolar contribution.
++    """
++    dd: DD = {"device": DEVICE, "dtype": dtype}
++
++    numbers = samples["NO2"]["numbers"].to(DEVICE)
++    positions = samples["NO2"]["positions"].to(**dd)
++    charge = torch.tensor(-1.0, **dd)
++
++    analytical_vs_autograd(numbers, positions, charge, dd)
++
++
++@pytest.mark.grad
++@pytest.mark.skipif(not has_libcint, reason="libcint not available")
++@pytest.mark.parametrize("dtype", [torch.double])
++def test_analytical_batch(dtype: torch.dtype) -> None:
++    """
++    Check analytical forces in an electric field against autograd for a
++    batch of a neutral molecule and an anion.
++    """
++    dd: DD = {"device": DEVICE, "dtype": dtype}
++
++    sample1, sample2 = samples["SiH4"], samples["NO2"]
++    numbers = pack(
++        [
++            sample1["numbers"].to(DEVICE),
++            sample2["numbers"].to(DEVICE),
++        ]
++    )
++    positions = pack(
++        [
++            sample1["positions"].to(**dd),
++            sample2["positions"].to(**dd),
++        ]
++    )
++    charge = torch.tensor([0.0, -1.0], **dd)
++
++    analytical_vs_autograd(numbers, positions, charge, dd)

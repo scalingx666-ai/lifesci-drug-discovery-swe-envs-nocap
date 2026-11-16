@@ -1,0 +1,368 @@
+diff --git a/bionemo-recipes/models/esm2/src/esm/collator.py b/bionemo-recipes/models/esm2/src/esm/collator.py
+index 43158d3f9b..4f536845d4 100644
+--- a/bionemo-recipes/models/esm2/src/esm/collator.py
++++ b/bionemo-recipes/models/esm2/src/esm/collator.py
+@@ -19,6 +19,7 @@
+ """
+ 
+ import logging
++import threading
+ from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+@@ -431,6 +432,9 @@ def __init__(
+         self.cp_tp_group = cp_tp_mesh.get_group()
+         self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
++        self._prefetch_thread: threading.Thread | None = None
++        self._prefetch_result: Any = None
++        self._cuda_device: int | None = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+@@ -442,12 +446,43 @@ def __iter__(self):
+         """Make the dataloader iterable."""
+         if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
++        self.close()
++        # Capture CUDA device from main thread; torch.cuda.set_device is per-thread,
++        # so the background thread needs to set it explicitly.
++        self._cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
++        self._kick_prefetch()
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_tp_ranks()
+-        return batch
++        self._prefetch_thread.join()
++        result = self._prefetch_result
++        if isinstance(result, StopIteration):
++            self._prefetch_thread = None
++            raise result
++        self._kick_prefetch()
++        return result
++
++    def _kick_prefetch(self):
++        """Start a background thread to prefetch exactly one batch via scatter."""
++        self._prefetch_thread = threading.Thread(target=self._do_one_prefetch, daemon=True)
++        self._prefetch_thread.start()
++
++    def _do_one_prefetch(self):
++        """Fetch one batch in the background. Stores result in _prefetch_result."""
++        if self._cuda_device is not None:
++            torch.cuda.set_device(self._cuda_device)
++        try:
++            self._prefetch_result = self._send_data_to_cp_tp_ranks()
++        except Exception:
++            # Process group may have been destroyed; signal stop.
++            self._prefetch_result = StopIteration()
++
++    def close(self):
++        """Stop the prefetch thread. Must be called before destroy_process_group()."""
++        if self._prefetch_thread is not None:
++            self._prefetch_thread.join(timeout=10)
++            self._prefetch_thread = None
+ 
+     def _send_data_to_cp_tp_ranks(self):
+         """Send data to all the CP/TP ranks.
+diff --git a/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py b/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py
+index 295ccc5d75..d676c7dc4d 100644
+--- a/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py
++++ b/bionemo-recipes/models/esm2/tests/test_collator_context_parallel.py
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ 
+ import copy
++import threading
+ from typing import Dict, Iterator, List
+ from unittest import mock
+ 
+@@ -398,7 +399,7 @@ def run_roundtrip(base_batch):
+         loader_rank1 = ContextParallelDataLoaderWrapper(None, cp_mesh_rank1)
+ 
+         scatter_payload: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+-        current_rank = {"value": None}
++        data_ready = threading.Event()
+ 
+         def fake_scatter(
+             *,
+@@ -408,9 +409,14 @@ def fake_scatter(
+             group_src,
+         ):
+             if scatter_object_input_list is not None:
++                # Rank 0: store the full payload and return shard 0
+                 scatter_payload["data"] = scatter_object_input_list
+-            assert "data" in scatter_payload, "Rank 0 payload missing"
+-            scatter_object_output_list[0] = scatter_payload["data"][current_rank["value"]]
++                data_ready.set()
++                scatter_object_output_list[0] = scatter_object_input_list[0]
++            else:
++                # Rank 1: wait for rank 0's data, then return shard 1
++                data_ready.wait(timeout=5)
++                scatter_object_output_list[0] = scatter_payload["data"][1]
+ 
+         with (
+             mock.patch("esm.collator.torch.distributed.scatter_object_list", side_effect=fake_scatter),
+@@ -419,10 +425,7 @@ def fake_scatter(
+             iter(loader_rank0)
+             iter(loader_rank1)
+ 
+-            current_rank["value"] = 0
+             batch_cp0 = next(loader_rank0)
+-
+-            current_rank["value"] = 1
+             batch_cp1 = next(loader_rank1)
+ 
+         return batch_cp0, batch_cp1
+@@ -487,7 +490,7 @@ def run_roundtrip(base_batch):
+         loader_rank1 = ContextParallelDataLoaderWrapper(None, cp_mesh_rank1)
+ 
+         scatter_payload: Dict[str, List[Dict[str, torch.Tensor]]] = {}
+-        current_rank = {"value": None}
++        data_ready = threading.Event()
+ 
+         def fake_scatter(
+             *,
+@@ -497,9 +500,14 @@ def fake_scatter(
+             group_src,
+         ):
+             if scatter_object_input_list is not None:
++                # Rank 0: store the full payload and return shard 0
+                 scatter_payload["data"] = scatter_object_input_list
+-            assert "data" in scatter_payload, "Rank 0 payload missing"
+-            scatter_object_output_list[0] = scatter_payload["data"][current_rank["value"]]
++                data_ready.set()
++                scatter_object_output_list[0] = scatter_object_input_list[0]
++            else:
++                # Rank 1: wait for rank 0's data, then return shard 1
++                data_ready.wait(timeout=5)
++                scatter_object_output_list[0] = scatter_payload["data"][1]
+ 
+         with (
+             mock.patch("esm.collator.torch.distributed.scatter_object_list", side_effect=fake_scatter),
+@@ -508,10 +516,7 @@ def fake_scatter(
+             iter(loader_rank0)
+             iter(loader_rank1)
+ 
+-            current_rank["value"] = 0
+             batch_cp0 = next(loader_rank0)
+-
+-            current_rank["value"] = 1
+             batch_cp1 = next(loader_rank1)
+ 
+         return batch_cp0, batch_cp1
+diff --git a/bionemo-recipes/models/llama3/collator.py b/bionemo-recipes/models/llama3/collator.py
+index 43158d3f9b..4f536845d4 100644
+--- a/bionemo-recipes/models/llama3/collator.py
++++ b/bionemo-recipes/models/llama3/collator.py
+@@ -19,6 +19,7 @@
+ """
+ 
+ import logging
++import threading
+ from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+@@ -431,6 +432,9 @@ def __init__(
+         self.cp_tp_group = cp_tp_mesh.get_group()
+         self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
++        self._prefetch_thread: threading.Thread | None = None
++        self._prefetch_result: Any = None
++        self._cuda_device: int | None = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+@@ -442,12 +446,43 @@ def __iter__(self):
+         """Make the dataloader iterable."""
+         if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
++        self.close()
++        # Capture CUDA device from main thread; torch.cuda.set_device is per-thread,
++        # so the background thread needs to set it explicitly.
++        self._cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
++        self._kick_prefetch()
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_tp_ranks()
+-        return batch
++        self._prefetch_thread.join()
++        result = self._prefetch_result
++        if isinstance(result, StopIteration):
++            self._prefetch_thread = None
++            raise result
++        self._kick_prefetch()
++        return result
++
++    def _kick_prefetch(self):
++        """Start a background thread to prefetch exactly one batch via scatter."""
++        self._prefetch_thread = threading.Thread(target=self._do_one_prefetch, daemon=True)
++        self._prefetch_thread.start()
++
++    def _do_one_prefetch(self):
++        """Fetch one batch in the background. Stores result in _prefetch_result."""
++        if self._cuda_device is not None:
++            torch.cuda.set_device(self._cuda_device)
++        try:
++            self._prefetch_result = self._send_data_to_cp_tp_ranks()
++        except Exception:
++            # Process group may have been destroyed; signal stop.
++            self._prefetch_result = StopIteration()
++
++    def close(self):
++        """Stop the prefetch thread. Must be called before destroy_process_group()."""
++        if self._prefetch_thread is not None:
++            self._prefetch_thread.join(timeout=10)
++            self._prefetch_thread = None
+ 
+     def _send_data_to_cp_tp_ranks(self):
+         """Send data to all the CP/TP ranks.
+diff --git a/bionemo-recipes/recipes/esm2_native_te/collator.py b/bionemo-recipes/recipes/esm2_native_te/collator.py
+index 43158d3f9b..4f536845d4 100644
+--- a/bionemo-recipes/recipes/esm2_native_te/collator.py
++++ b/bionemo-recipes/recipes/esm2_native_te/collator.py
+@@ -19,6 +19,7 @@
+ """
+ 
+ import logging
++import threading
+ from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+@@ -431,6 +432,9 @@ def __init__(
+         self.cp_tp_group = cp_tp_mesh.get_group()
+         self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
++        self._prefetch_thread: threading.Thread | None = None
++        self._prefetch_result: Any = None
++        self._cuda_device: int | None = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+@@ -442,12 +446,43 @@ def __iter__(self):
+         """Make the dataloader iterable."""
+         if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
++        self.close()
++        # Capture CUDA device from main thread; torch.cuda.set_device is per-thread,
++        # so the background thread needs to set it explicitly.
++        self._cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
++        self._kick_prefetch()
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_tp_ranks()
+-        return batch
++        self._prefetch_thread.join()
++        result = self._prefetch_result
++        if isinstance(result, StopIteration):
++            self._prefetch_thread = None
++            raise result
++        self._kick_prefetch()
++        return result
++
++    def _kick_prefetch(self):
++        """Start a background thread to prefetch exactly one batch via scatter."""
++        self._prefetch_thread = threading.Thread(target=self._do_one_prefetch, daemon=True)
++        self._prefetch_thread.start()
++
++    def _do_one_prefetch(self):
++        """Fetch one batch in the background. Stores result in _prefetch_result."""
++        if self._cuda_device is not None:
++            torch.cuda.set_device(self._cuda_device)
++        try:
++            self._prefetch_result = self._send_data_to_cp_tp_ranks()
++        except Exception:
++            # Process group may have been destroyed; signal stop.
++            self._prefetch_result = StopIteration()
++
++    def close(self):
++        """Stop the prefetch thread. Must be called before destroy_process_group()."""
++        if self._prefetch_thread is not None:
++            self._prefetch_thread.join(timeout=10)
++            self._prefetch_thread = None
+ 
+     def _send_data_to_cp_tp_ranks(self):
+         """Send data to all the CP/TP ranks.
+diff --git a/bionemo-recipes/recipes/llama3_native_te/collator.py b/bionemo-recipes/recipes/llama3_native_te/collator.py
+index 43158d3f9b..4f536845d4 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/collator.py
++++ b/bionemo-recipes/recipes/llama3_native_te/collator.py
+@@ -19,6 +19,7 @@
+ """
+ 
+ import logging
++import threading
+ from dataclasses import dataclass, field
+ from typing import Any, TypedDict
+ 
+@@ -431,6 +432,9 @@ def __init__(
+         self.cp_tp_group = cp_tp_mesh.get_group()
+         self.num_cp_tp_ranks = cp_tp_mesh.size()
+         self._iterator = None
++        self._prefetch_thread: threading.Thread | None = None
++        self._prefetch_result: Any = None
++        self._cuda_device: int | None = None
+ 
+         logger.debug(
+             "Created ContextParallelDataLoaderWrapper on global rank %s, cp rank %s",
+@@ -442,12 +446,43 @@ def __iter__(self):
+         """Make the dataloader iterable."""
+         if self.cp_tp_rank == 0:
+             self._iterator = iter(self.dataloader)  # < --- collator output.
++        self.close()
++        # Capture CUDA device from main thread; torch.cuda.set_device is per-thread,
++        # so the background thread needs to set it explicitly.
++        self._cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
++        self._kick_prefetch()
+         return self
+ 
+     def __next__(self):
+         """Get the batch from the dataloader for the current CP rank."""
+-        batch = self._send_data_to_cp_tp_ranks()
+-        return batch
++        self._prefetch_thread.join()
++        result = self._prefetch_result
++        if isinstance(result, StopIteration):
++            self._prefetch_thread = None
++            raise result
++        self._kick_prefetch()
++        return result
++
++    def _kick_prefetch(self):
++        """Start a background thread to prefetch exactly one batch via scatter."""
++        self._prefetch_thread = threading.Thread(target=self._do_one_prefetch, daemon=True)
++        self._prefetch_thread.start()
++
++    def _do_one_prefetch(self):
++        """Fetch one batch in the background. Stores result in _prefetch_result."""
++        if self._cuda_device is not None:
++            torch.cuda.set_device(self._cuda_device)
++        try:
++            self._prefetch_result = self._send_data_to_cp_tp_ranks()
++        except Exception:
++            # Process group may have been destroyed; signal stop.
++            self._prefetch_result = StopIteration()
++
++    def close(self):
++        """Stop the prefetch thread. Must be called before destroy_process_group()."""
++        if self._prefetch_thread is not None:
++            self._prefetch_thread.join(timeout=10)
++            self._prefetch_thread = None
+ 
+     def _send_data_to_cp_tp_ranks(self):
+         """Send data to all the CP/TP ranks.
+diff --git a/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py b/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py
+index 414fa0418d..fe0a0af406 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py
++++ b/bionemo-recipes/recipes/llama3_native_te/tests/test_dataset.py
+@@ -854,4 +854,5 @@ def test_cp_dataloader_multi_gpu(recipe_path, dataset_path):
+         assert batch["labels"] is None
+         assert batch["shift_labels"].shape[1] == actual_shape
+ 
++    dataloader.close()
+     torch.distributed.destroy_process_group()

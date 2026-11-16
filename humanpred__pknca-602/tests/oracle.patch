@@ -1,0 +1,507 @@
+diff --git a/NEWS.md b/NEWS.md
+index d0b084339..59cb33e9b 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -6,6 +6,17 @@ the dosing including dose amount and route.
+ 
+ # Development version
+ 
++* The message about missing dosing information is now raised only when a
++  requested parameter actually needs it, and it names the parameters that will
++  not be calculated (#538).  Dose amount, time, and duration are checked
++  separately, so requesting `c0` with dose times but no amounts is quiet while
++  requesting `cl.last` is not.
++
++* `get.parameter.deps()` gains a `recursive` argument.  The default is
++  unchanged and returns the parameters calculated from `x`; `recursive = TRUE`
++  returns what `x` is calculated from, following each dependency back to raw
++  inputs such as `conc`, `time`, and `dose`.
++
+ * PKNCA now declares a minimum R version of 4.4 in DESCRIPTION, and
+   continuous integration tests it.  The floor comes from `Matrix`, which
+   requires R >= 4.4 and is needed by `lme4` and so by the bioequivalence
+diff --git a/R/001-add.interval.col.R b/R/001-add.interval.col.R
+index 3acbd2289..6305f010d 100644
+--- a/R/001-add.interval.col.R
++++ b/R/001-add.interval.col.R
+@@ -246,6 +246,11 @@ add.interval.col <- function(name,
+   validate_cdisc_arg(pptest_cdisc, "pptest_cdisc")
+ 
+   current <- get("interval.cols", envir=.PKNCAEnv)
++  # A parameter may be registered before the parameters it depends on, so the
++  # requires_dose_* values are left empty here and filled in on first use by
++  # set_requires_dose().  Re-registering an existing parameter can change what
++  # anything downstream of it needs, so clear every cached value in that case.
++  redefining <- name %in% names(current)
+   current[[name]] <-
+     list(
+       FUN=FUN,
+@@ -258,8 +263,18 @@ add.interval.col <- function(name,
+       depends=depends,
+       datatype=datatype,
+       pptestcd_cdisc=pptestcd_cdisc,
+-      pptest_cdisc=pptest_cdisc
++      pptest_cdisc=pptest_cdisc,
++      requires_dose_amt=NULL,
++      requires_dose_time=NULL,
++      requires_dose_dur=NULL
+     )
++  if (redefining) {
++    for (current_name in names(current)) {
++      current[[current_name]][["requires_dose_amt"]] <- NULL
++      current[[current_name]][["requires_dose_time"]] <- NULL
++      current[[current_name]][["requires_dose_dur"]] <- NULL
++    }
++  }
+   assign("interval.cols", current, envir=.PKNCAEnv)
+ }
+ 
+diff --git a/R/check.intervals.R b/R/check.intervals.R
+index 5aaa08e38..36b0d9654 100644
+--- a/R/check.intervals.R
++++ b/R/check.intervals.R
+@@ -193,14 +193,173 @@ get.parameter.deps_helper_searchdeps <- function(current, funmap, all_intervals)
+   }
+ }
+ 
++# Fill in the requires_dose_* values for `params` and cache them in the
++# registry, computing only the ones that are not already known.  Deferred to
++# first use because a parameter may be registered before what it depends on.
++set_requires_dose <- function(params) {
++  all_intervals <- get.interval.cols()
++  params <- intersect(params, names(all_intervals))
++  unknown <-
++    params[vapply(
++      X = params,
++      FUN = function(x) is.null(all_intervals[[x]][["requires_dose_amt"]]),
++      FUN.VALUE = TRUE
++    )]
++  if (length(unknown) > 0) {
++    for (current_param in unknown) {
++      current_src <-
++        parameter_source_inputs(
++          current_param, all_intervals = all_intervals, optional_dose = FALSE
++        )
++      all_intervals[[current_param]][["requires_dose_amt"]] <-
++        any(c("dose", "dose.group") %in% current_src)
++      all_intervals[[current_param]][["requires_dose_time"]] <-
++        any(c("time.dose", "time.dose.group") %in% current_src)
++      all_intervals[[current_param]][["requires_dose_dur"]] <-
++        any(c("duration.dose", "duration.dose.group") %in% current_src)
++    }
++    assign("interval.cols", all_intervals, envir = .PKNCAEnv)
++  }
++  all_intervals[params]
++}
++
++# The parameters requested by at least one interval
++requested_parameters <- function(intervals) {
++  candidates <- intersect(names(intervals), names(get.interval.cols()))
++  keep <-
++    vapply(
++      X = candidates,
++      FUN = function(x) any(intervals[[x]] %in% TRUE),
++      FUN.VALUE = TRUE
++    )
++  candidates[keep]
++}
++
++# Which requested parameters cannot be calculated from the dosing information
++# that was given.  Dose amount, time, and duration are supplied independently
++# (e.g. `PKNCAdose(data, ~time)` gives timing without an amount), so each is
++# checked separately: c0 needs the dose time but not the amount, and ceoi needs
++# the duration.
++uncalculable_without_dose <- function(intervals, o_dose) {
++  params <- requested_parameters(intervals)
++  if (length(params) == 0) {
++    return(character(0))
++  }
++  has_dose <- !identical(o_dose, NA)
++  have_amt <- has_dose && length(o_dose$columns$dose) > 0
++  have_time <- has_dose && length(o_dose$columns$time) > 0
++  have_dur <- has_dose && length(o_dose$columns$duration) > 0
++  if (have_amt && have_time && have_dur) {
++    return(character(0))
++  }
++  specs <- set_requires_dose(params)
++  keep <-
++    vapply(
++      X = specs,
++      FUN = function(x) {
++        (isTRUE(x[["requires_dose_amt"]]) && !have_amt) ||
++          (isTRUE(x[["requires_dose_time"]]) && !have_time) ||
++          (isTRUE(x[["requires_dose_dur"]]) && !have_dur)
++      },
++      FUN.VALUE = TRUE
++    )
++  sort(names(specs)[keep])
++}
++
++# The inputs pk.nca.interval() supplies directly rather than calculating, so a
++# backward dependency search ends when it reaches one of these.
++pknca_source_inputs <- c(
++  "conc", "time", "volume", "duration.conc", "dose", "time.dose", "duration.dose",
++  "route", "subject", "options", "lloq", "interval", "start", "end",
++  paste0(
++    c("conc", "time", "volume", "duration.conc", "dose", "time.dose", "duration.dose", "route"),
++    ".group"
++  )
++)
++
++# Dose inputs a calculation accepts but does not require.  pk.calc.half.life()
++# refines its point selection with the dose timing when it is available and
++# returns the same answer without it, so treating it as required would report
++# the whole terminal-phase family as uncalculable whenever dosing is absent.
++pknca_optional_dose_args <- list(
++  pk.calc.half.life = c("time.dose", "duration.dose")
++)
++
++# What a single parameter is calculated from: its function's formals after the
++# formalsmap is applied, plus the parameters it declares a dependency on.  A
++# parameter with `FUN = NA` is produced by another parameter's function, so the
++# chain continues through `depends`.
++parameter_direct_refs <- function(x, all_intervals, optional_dose) {
++  spec <- all_intervals[[x]]
++  if (is.null(spec)) {
++    return(character(0))
++  }
++  if (length(spec$FUN) != 1 || is.na(spec$FUN)) {
++    return(unique(spec$depends))
++  }
++  fun <- tryCatch(get(spec$FUN), error = function(e) NULL)
++  if (is.null(fun)) {
++    return(unique(spec$depends))  # nocov
++  }
++  arg_names <- setdiff(names(formals(fun)), "...")
++  args <- stats::setNames(as.list(arg_names), arg_names)
++  if (length(spec$formalsmap) > 0) {
++    args[names(spec$formalsmap)] <- spec$formalsmap
++  }
++  args <- args[!vapply(X = args, FUN = is.null, FUN.VALUE = TRUE)]
++  if (!optional_dose) {
++    drop_args <- pknca_optional_dose_args[[spec$FUN]]
++    if (!is.null(drop_args)) {
++      args <- args[!(names(args) %in% drop_args)]
++    }
++  }
++  unique(c(unlist(args, use.names = FALSE), spec$depends))
++}
++
++# Everything `x` is calculated from, following each reference to a source input.
++parameter_source_inputs <- function(x, all_intervals = get.interval.cols(),
++                                    optional_dose = TRUE, seen = character(0)) {
++  if (x %in% seen) {
++    return(character(0))
++  }
++  seen <- c(seen, x)
++  ret <- character(0)
++  for (current_ref in parameter_direct_refs(x, all_intervals, optional_dose)) {
++    if (current_ref %in% names(all_intervals)) {
++      ret <-
++        c(
++          ret,
++          parameter_source_inputs(
++            current_ref, all_intervals = all_intervals,
++            optional_dose = optional_dose, seen = seen
++          )
++        )
++    } else {
++      ret <- c(ret, current_ref)
++    }
++  }
++  unique(ret)
++}
++
+ #' Get all columns that depend on a parameter
+ #'
+ #' @param x The parameter name (as a character string)
+-#' @returns A character vector of parameter names that depend on the parameter
+-#'   `x`.  If none depend on `x`, then the result will be an empty vector.
++#' @param recursive Search backward to the inputs `x` is calculated from,
++#'   rather than forward to the parameters calculated from `x`.  See the
++#'   details.
++#' @returns With `recursive = FALSE` (default), a character vector of
++#'   parameter names that depend on the parameter `x`; empty if none do.
++#'   With `recursive = TRUE`, the unique set of everything `x` is calculated
++#'   from, following each dependency to the end.
++#' @details The two directions answer different questions.  The default
++#'   answers "what becomes invalid if `x` changes?".  `recursive = TRUE`
++#'   answers "what does `x` need?", and its result mixes parameter names
++#'   with the raw inputs the calculation ends at, such as `"conc"`,
++#'   `"time"`, `"dose"`, and `"time.dose"`.
+ #' @family Interval specifications
+ #' @export
+-get.parameter.deps <- function(x) {
++get.parameter.deps <- function(x, recursive = FALSE) {
++  checkmate::assert_flag(recursive)
+   all_intervals <- get.interval.cols()
+   if (!(x %in% names(all_intervals))) {
+     rlang::abort(
+@@ -208,6 +367,9 @@ get.parameter.deps <- function(x) {
+       class = "pknca_error_invalid_parameter"
+     )
+   }
++  if (recursive) {
++    return(sort(parameter_source_inputs(x, all_intervals = all_intervals, optional_dose = TRUE)))
++  }
+   funmap <-
+     lapply(
+       X=all_intervals,
+diff --git a/R/prepare_data.R b/R/prepare_data.R
+index 2d8c58509..2d0a44ad1 100644
+--- a/R/prepare_data.R
++++ b/R/prepare_data.R
+@@ -15,10 +15,8 @@
+ full_join_PKNCAconc_PKNCAdose <- function(o_conc, o_dose, extra_cols_conc = character()) {
+   checkmate::assert_class(o_conc, "PKNCAconc")
+   if (identical(o_dose, NA)) {
+-    rlang::inform(
+-      "No dose information provided, calculations requiring dose will return NA.",
+-      class = "pknca_message_missing_dose"
+-    )
++    # Whether this matters depends on which parameters were requested, which is
++    # only known where the intervals are; full_join_PKNCAdata() reports it.
+     n_dose <- tibble::tibble(data_dose=list(NA))
+   } else {
+     checkmate::assert_class(o_dose, "PKNCAdose")
+@@ -47,6 +45,16 @@ full_join_PKNCAconc_PKNCAdose <- function(o_conc, o_dose, extra_cols_conc = char
+ #' @keywords Internal
+ #' @noRd
+ full_join_PKNCAdata <- function(x, extra_conc_cols = character()) {
++  missing_dose_params <- uncalculable_without_dose(x$intervals, x$dose)
++  if (length(missing_dose_params) > 0) {
++    rlang::inform(
++      sprintf(
++        "Missing dosing information; these parameters will not be calculated: %s",
++        paste(missing_dose_params, collapse = ", ")
++      ),
++      class = "pknca_message_missing_dose"
++    )
++  }
+   conc_dose <- full_join_PKNCAconc_PKNCAdose(o_conc = x$conc, o_dose = x$dose, extra_cols_conc = extra_conc_cols)
+   n_i <-
+     prepare_PKNCAintervals(
+diff --git a/man/get.parameter.deps.Rd b/man/get.parameter.deps.Rd
+index af7a40865..47298116e 100644
+--- a/man/get.parameter.deps.Rd
++++ b/man/get.parameter.deps.Rd
+@@ -4,18 +4,31 @@
+ \alias{get.parameter.deps}
+ \title{Get all columns that depend on a parameter}
+ \usage{
+-get.parameter.deps(x)
++get.parameter.deps(x, recursive = FALSE)
+ }
+ \arguments{
+ \item{x}{The parameter name (as a character string)}
++
++\item{recursive}{Search backward to the inputs \code{x} is calculated from,
++rather than forward to the parameters calculated from \code{x}.  See the
++details.}
+ }
+ \value{
+-A character vector of parameter names that depend on the parameter
+-\code{x}.  If none depend on \code{x}, then the result will be an empty vector.
++With \code{recursive = FALSE} (default), a character vector of
++parameter names that depend on the parameter \code{x}; empty if none do.
++With \code{recursive = TRUE}, the unique set of everything \code{x} is calculated
++from, following each dependency to the end.
+ }
+ \description{
+ Get all columns that depend on a parameter
+ }
++\details{
++The two directions answer different questions.  The default
++answers "what becomes invalid if \code{x} changes?".  \code{recursive = TRUE}
++answers "what does \code{x} need?", and its result mixes parameter names
++with the raw inputs the calculation ends at, such as \code{"conc"},
++\code{"time"}, \code{"dose"}, and \code{"time.dose"}.
++}
+ \seealso{
+ Other Interval specifications:
+ \code{\link[=add.interval.col]{add.interval.col()}},
+diff --git a/tests/testthat/test-check.intervals.R b/tests/testthat/test-check.intervals.R
+index f93e8ac9a..1274b37ab 100644
+--- a/tests/testthat/test-check.intervals.R
++++ b/tests/testthat/test-check.intervals.R
+@@ -239,3 +239,109 @@ test_that("check.intervals works with tibble input (fix #141)", {
+     intervals_manual$start
+   )
+ })
++
++test_that("get.parameter.deps(recursive=TRUE) reaches the inputs a parameter is calculated from (#538)", {
++  # cmax is calculated from the concentrations alone; tmax also needs the times
++  expect_true("conc" %in% get.parameter.deps("cmax", recursive = TRUE))
++  expect_false("time" %in% get.parameter.deps("cmax", recursive = TRUE))
++  expect_true(all(c("conc", "time") %in% get.parameter.deps("tmax", recursive = TRUE)))
++  # cl.obs needs the dose amount; vz.obs needs it only through cl.obs
++  expect_true("dose" %in% get.parameter.deps("cl.obs", recursive = TRUE))
++  expect_true("dose" %in% get.parameter.deps("vz.obs", recursive = TRUE))
++  # The default direction is unchanged: parameters calculated from cmax
++  expect_true("cmax.dn" %in% get.parameter.deps("cmax"))
++  expect_false("cmax.dn" %in% get.parameter.deps("cmax", recursive = TRUE))
++  expect_error(
++    get.parameter.deps("not a parameter", recursive = TRUE),
++    class = "pknca_error_invalid_parameter"
++  )
++})
++
++test_that("dose amount, time, and duration are required separately (#538)", {
++  expect_equal(
++    unlist(set_requires_dose("c0")[["c0"]][c("requires_dose_amt", "requires_dose_time", "requires_dose_dur")]),
++    c(requires_dose_amt = FALSE, requires_dose_time = TRUE, requires_dose_dur = FALSE)
++  )
++  expect_equal(
++    unlist(set_requires_dose("ceoi")[["ceoi"]][c("requires_dose_amt", "requires_dose_time", "requires_dose_dur")]),
++    c(requires_dose_amt = FALSE, requires_dose_time = FALSE, requires_dose_dur = TRUE)
++  )
++  expect_true(set_requires_dose("cl.obs")[["cl.obs"]]$requires_dose_amt)
++  # pk.calc.half.life() uses the dose timing when present but does not need
++  # it, so neither it nor anything downstream of it is reported
++  for (param in c("half.life", "lambda.z", "aucinf.obs", "mrt.obs", "span.ratio")) {
++    expect_false(any(unlist(set_requires_dose(param)[[param]][
++      c("requires_dose_amt", "requires_dose_time", "requires_dose_dur")
++    ])), info = param)
++  }
++})
++
++test_that("every derived dose requirement matches what pk.nca() can calculate (#538)", {
++  # Enumerating guard: a parameter whose flags are wrong, or a newly added
++  # parameter, is caught here rather than producing a wrong message.
++  d_conc <- data.frame(conc = c(2, 1, 0.5, 0.25, 0.125), time = 0:4, subject = 1)
++  d_dose <- data.frame(dose = 100, time = 0, subject = 1)
++  o_conc <- PKNCAconc(d_conc, conc~time|subject)
++  o_dose <- PKNCAdose(d_dose, dose~time|subject)
++  check_params <-
++    c("cmax", "tmax", "auclast", "aucinf.obs", "half.life", "mrt.last", "cav",
++      "cl.last", "cl.obs", "vz.obs", "vss.obs", "cmax.dn", "auclast.dn", "totdose")
++  ivl <- data.frame(start = 0, end = Inf)
++  for (param in check_params) ivl[[param]] <- TRUE
++  res_with <-
++    suppressWarnings(suppressMessages(
++      as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals = ivl)))
++    ))
++  res_without <-
++    suppressWarnings(suppressMessages(
++      as.data.frame(pk.nca(PKNCAdata(o_conc, intervals = ivl)))
++    ))
++  all_na <- function(d, param) {
++    v <- d$PPORRES[d$PPTESTCD %in% param]
++    length(v) == 0 || all(is.na(v))
++  }
++  for (param in check_params) {
++    spec <- set_requires_dose(param)[[param]]
++    derived <- any(unlist(spec[c("requires_dose_amt", "requires_dose_time", "requires_dose_dur")]))
++    observed <- !all_na(res_with, param) && all_na(res_without, param)
++    expect_equal(derived, observed, info = param)
++  }
++})
++
++test_that("the missing dose message names only what cannot be calculated (#538)", {
++  d_conc <- data.frame(conc = c(2, 1, 0.5, 0.25, 0.125), time = 0:4, subject = 1)
++  d_dose <- data.frame(dose = 100, time = 0, subject = 1)
++  o_conc <- PKNCAconc(d_conc, conc~time|subject)
++  mk <- function(params) {
++    ivl <- data.frame(start = 0, end = Inf)
++    for (param in params) ivl[[param]] <- TRUE
++    ivl
++  }
++  # Nothing requested needs dosing, so nothing is reported
++  expect_no_message(
++    suppressWarnings(pk.nca(PKNCAdata(o_conc, intervals = mk(c("cmax", "auclast"))))),
++    class = "pknca_message_missing_dose"
++  )
++  # Only the affected parameter is named
++  expect_message(
++    suppressWarnings(pk.nca(PKNCAdata(o_conc, intervals = mk(c("cmax", "cl.last"))))),
++    regexp = "will not be calculated: cl.last",
++    fixed = TRUE
++  )
++  # Dose timing without an amount covers c0 but not cl.last
++  expect_message(
++    suppressWarnings(pk.nca(PKNCAdata(
++      o_conc, PKNCAdose(d_dose, ~time|subject), intervals = mk(c("c0", "cl.last"))
++    ))),
++    regexp = "will not be calculated: cl.last",
++    fixed = TRUE
++  )
++  # A dose amount without timing covers cl.last but not c0
++  expect_message(
++    suppressWarnings(pk.nca(PKNCAdata(
++      o_conc, PKNCAdose(d_dose, dose~.|subject), intervals = mk(c("c0", "cl.last"))
++    ))),
++    regexp = "will not be calculated: c0",
++    fixed = TRUE
++  )
++})
+diff --git a/tests/testthat/test-class-PKNCAresults.R b/tests/testthat/test-class-PKNCAresults.R
+index 33feafe6f..9dc5b23f1 100644
+--- a/tests/testthat/test-class-PKNCAresults.R
++++ b/tests/testthat/test-class-PKNCAresults.R
+@@ -206,12 +206,14 @@ test_that("exclude values are maintained in derived parameters during automatic
+           aucinf.obs=TRUE
+         )
+     )
+-  expect_message(
++  # aucinf.obs is calculated without dosing information, so its absence is
++  # not reported (#538)
++  expect_no_message(
+     expect_warning(
+       results_obj <- pk.nca(data_obj),
+       regexp="Too few points for half-life"
+     ),
+-    regexp="No dose information provided"
++    class="pknca_message_missing_dose"
+   )
+   d_results <- as.data.frame(results_obj)
+   expect_equal(
+@@ -233,12 +235,13 @@ test_that("ctrough is correctly calculated", {
+           ctrough=TRUE
+         )
+     )
+-  expect_message(
++  # ctrough is calculated from conc and time alone (#538)
++  expect_no_message(
+     expect_equal(
+       as.data.frame(pk.nca(data_obj))$PPORRES,
+       c(2^-6, NA_real_)
+     ),
+-    regexp="No dose information provided"
++    class="pknca_message_missing_dose"
+   )
+ })
+ 
+@@ -255,12 +258,13 @@ test_that("single subject, ungrouped data works (#74)", {
+           cmax=TRUE
+         )
+     )
+-  expect_message(
++  # cmax is calculated from conc alone (#538)
++  expect_no_message(
+     expect_equal(
+       as.data.frame(pk.nca(data_obj))$PPORRES,
+       1
+     ),
+-    regexp="No dose information provided",
++    class="pknca_message_missing_dose"
+   )
+ })
+ 
+diff --git a/tests/testthat/test-pk.calc.all.R b/tests/testthat/test-pk.calc.all.R
+index 5df625a7e..0bd65d8e8 100644
+--- a/tests/testthat/test-pk.calc.all.R
++++ b/tests/testthat/test-pk.calc.all.R
+@@ -241,10 +241,11 @@ test_that("Calculations when no dose info is given", {
+   tmpconc <- generate.conc(2, 1, 0:24)
+   myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+   mydata <- PKNCAdata(myconc, intervals=data.frame(start=0, end=24, cmax=TRUE, cl.last=TRUE))
++  # cmax needs no dosing information, cl.last needs the dose amount (#538)
+   expect_message(
+     myresult <- pk.nca(mydata),
+-    regexp="No dose information provided, calculations requiring dose will return NA.",
+-    info="Dosing information not required."
++    regexp="these parameters will not be calculated: cl.last",
++    fixed=TRUE
+   )
+   expect_equal(
+     myresult$result,

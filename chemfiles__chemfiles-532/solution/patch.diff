@@ -1,0 +1,132 @@
+diff --git a/doc/src/properties/frame.toml b/doc/src/properties/frame.toml
+index 0e8d59567..ea104e4bf 100644
+--- a/doc/src/properties/frame.toml
++++ b/doc/src/properties/frame.toml
+@@ -20,7 +20,7 @@ LAMMPS = "The time of the frame in time units."
+ TNG = "The time of the frame in picoseconds."
+ TRR = "The time of the frame in picoseconds."
+ XTC = "The time of the frame in picoseconds."
+-DCD = "The time of the frame in the file units, only set when reading a file."
++DCD = "The time of the frame in picoseconds. DCD stores DELTA in AKMA time units; chemfiles converts on read and write."
+ "Amber NetCDF" = "The time of the frame in picoseconds."
+ "Amber Restart" = "The time of the frame in picoseconds."
+ 
+@@ -31,7 +31,7 @@ LAMMPS = "The time of the frame in time units."
+ TNG = "The time of the frame in picoseconds."
+ TRR = "The time of the frame in picoseconds."
+ XTC = "The time of the frame in picoseconds."
+-DCD = "The time of the frame in the file units, only set when reading a file."
++DCD = "The time of the frame in picoseconds."
+ "Amber NetCDF" = "The time of the frame in picoseconds."
+ "Amber Restart" = "The time of the frame in picoseconds."
+ 
+diff --git a/src/formats/DCD.cpp b/src/formats/DCD.cpp
+index 962eb52f8..9e470abd2 100644
+--- a/src/formats/DCD.cpp
++++ b/src/formats/DCD.cpp
+@@ -53,6 +53,12 @@ static size_t checked_cast(int64_t value) {
+     return static_cast<size_t>(value);
+ }
+ 
++// DCD stores time in AKMA units (CHARMM/NAMD convention); chemfiles uses
++// picoseconds internally (Frame.time, and the unit assumed by every other
++// trajectory format). 1 AKMA = 4.888821e-2 ps. We convert at the file I/O
++// boundary so `timesteps_.dt` is in ps everywhere in memory.
++static constexpr double AKMA_TO_PS = 4.888821e-2;
++
+ 
+ using namespace chemfiles;
+ 
+@@ -219,7 +225,7 @@ void DCDFormat::read_header() {
+     auto n_fixed_atoms = checked_cast(file_->read_single_i32());
+ 
+     if (options_.charmm_format) {
+-        timesteps_.dt = static_cast<double>(file_->read_single_f32());
++        timesteps_.dt = static_cast<double>(file_->read_single_f32()) * AKMA_TO_PS;
+ 
+         if (file_->read_single_i32() != 0) {
+             options_.charmm_unitcell = true;
+@@ -230,7 +236,7 @@ void DCDFormat::read_header() {
+         }
+     } else {
+         // `timesteps_.dt` uses a 64-bite float in X-PLOR format
+-        timesteps_.dt = file_->read_single_f64();
++        timesteps_.dt = file_->read_single_f64() * AKMA_TO_PS;
+     }
+ 
+     file_->seek(header_start + 84);
+@@ -592,7 +598,7 @@ void DCDFormat::patch_timesteps_metadata(const Frame& frame) {
+     file_->write_single_i32(static_cast<int32_t>(timesteps_.start));
+     file_->write_single_i32(static_cast<int32_t>(timesteps_.step));
+     file_->seek(44);
+-    file_->write_single_f32(static_cast<float>(timesteps_.dt));
++    file_->write_single_f32(static_cast<float>(timesteps_.dt / AKMA_TO_PS));
+ }
+ 
+ void DCDFormat::write_header() {
+@@ -611,7 +617,7 @@ void DCDFormat::write_header() {
+     // dt is written as 0 here; the actual value is back-patched by `write()`
+     // after observing the `time` and `simulation_step` properties of the
+     // first two frames.
+-    file_->write_single_f32(static_cast<float>(timesteps_.dt));
++    file_->write_single_f32(static_cast<float>(timesteps_.dt / AKMA_TO_PS));
+ 
+     file_->write_single_i32(options_.charmm_unitcell ? 1 : 0);
+     file_->write_single_i32(/* has_4d_data */ 0);
+diff --git a/tests/formats/dcd.cpp b/tests/formats/dcd.cpp
+index 57cc6509f..478dbf101 100644
+--- a/tests/formats/dcd.cpp
++++ b/tests/formats/dcd.cpp
+@@ -42,7 +42,12 @@ TEST_CASE("Read files in DCD format") {
+ 
+     frame = file.read_at(2);
+     CHECK(frame.size() == 297);
+-    CHECK(frame.get<Property::DOUBLE>("time") == 2.0);
++    // DCD stores DELTA in AKMA time units; chemfiles returns Frame.time
++    // in picoseconds. The file's DELTA*(NPRIV+NSAVC*2) is 2.0 AKMA, which
++    // is 2.0 * 4.888821e-2 ps. approx_eq because the reader's evaluation
++    // order is (DELTA * AKMA_TO_PS) * sim_step, which is not associative
++    // with the literal 2.0 * AKMA_TO_PS.
++    CHECK(approx_eq(frame.get<Property::DOUBLE>("time").value(), 2.0 * 4.888821e-2, 1e-12));
+ 
+     positions = frame.positions();
+     CHECK(positions[0] == vector3d_float(0.29909524f, 8.31003f, 11.721462f));
+@@ -493,18 +498,23 @@ TEST_CASE("DCD timestep round-trip") {
+     SECTION("dt/start/step survive write -> read") {
+         auto tmpfile = NamedTempPath(".dcd");
+ 
+-        // mimic a typical CHARMM/NAMD output: integration timestep 15 fs
+-        // (delta = 15 / 48.88821 AKMA), NSAVC = 5000, NPRIV = 5000.
+-        // frame 0 is at simulation step 5000, frame 1 at 10000, etc.
+-        // delta is truncated to f32 to match the header's storage precision
+-        const double delta = static_cast<double>(static_cast<float>(15.0 / 48.88821));
++        // mimic a typical CHARMM/NAMD output: integration timestep 15 fs,
++        // NSAVC = 5000, NPRIV = 5000. Frame 0 is at simulation step 5000,
++        // frame 1 at 10000, etc. chemfiles uses picoseconds for Frame.time
++        // while DCD stores DELTA in AKMA time units on disk (1 AKMA =
++        // 4.888821e-2 ps), so 15 fs = 15/48.88821 AKMA on disk = 0.015 ps
++        // in memory. delta is truncated through f32 to match the on-disk
++        // DELTA precision so the round-trip is exact.
++        constexpr double AKMA_TO_PS = 4.888821e-2;
++        const double delta_akma = static_cast<double>(static_cast<float>(15.0 / 48.88821));
++        const double delta_ps = delta_akma * AKMA_TO_PS;
+         const size_t nsavc = 5000;
+         const size_t npriv = 5000;
+         {
+             auto file = Trajectory(tmpfile, 'w');
+             for (size_t i = 0; i < 4; i++) {
+                 double sim_step = static_cast<double>(npriv + nsavc * i);
+-                file.write(make_frame(delta * sim_step, sim_step));
++                file.write(make_frame(delta_ps * sim_step, sim_step));
+             }
+         }
+ 
+@@ -517,7 +527,7 @@ TEST_CASE("DCD timestep round-trip") {
+             auto step = frame.get<Property::DOUBLE>("simulation_step");
+             REQUIRE(time);
+             REQUIRE(step);
+-            CHECK(approx_eq(*time, delta * sim_step, 1e-12));
++            CHECK(approx_eq(*time, delta_ps * sim_step, 1e-12));
+             CHECK(approx_eq(*step, sim_step, 1e-12));
+         }
+     }

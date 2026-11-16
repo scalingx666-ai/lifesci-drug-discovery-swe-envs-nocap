@@ -1,0 +1,935 @@
+diff --git a/avogadro/qtgui/sceneplugin.cpp b/avogadro/qtgui/sceneplugin.cpp
+index 86610ed95e6..6bbb9b2156e 100644
+--- a/avogadro/qtgui/sceneplugin.cpp
++++ b/avogadro/qtgui/sceneplugin.cpp
+@@ -15,6 +15,12 @@ void ScenePlugin::process(const QtGui::Molecule&, Rendering::GroupNode&) {}
+ 
+ void ScenePlugin::processEditable(const RWMolecule&, Rendering::GroupNode&) {}
+ 
++bool ScenePlugin::updateCoordinates(const QtGui::Molecule&,
++                                    Rendering::GroupNode&)
++{
++  return false;
++}
++
+ QWidget* ScenePlugin::setupWidget()
+ {
+   return nullptr;
+diff --git a/avogadro/qtgui/sceneplugin.h b/avogadro/qtgui/sceneplugin.h
+index 77e8c7c2148..5e7215cf13c 100644
+--- a/avogadro/qtgui/sceneplugin.h
++++ b/avogadro/qtgui/sceneplugin.h
+@@ -51,6 +51,19 @@ class AVOGADROQTGUI_EXPORT ScenePlugin : public QObject
+   virtual void processEditable(const RWMolecule& molecule,
+                                Rendering::GroupNode& node);
+ 
++  /**
++   * Update the scene after only the atom positions changed (the Moved and
++   * Conformer molecule changes). It is called instead of process(), with the
++   * same @p node that was passed to the last process() call; the node still
++   * holds what that call added.
++   *
++   * @return True if the plugin updated @p node in place. Return false (the
++   * default) to have the caller rebuild this plugin's node: the caller clears
++   * the children of @p node, keeping the node itself, and calls process().
++   */
++  virtual bool updateCoordinates(const QtGui::Molecule& molecule,
++                                 Rendering::GroupNode& node);
++
+   /**
+    * The name of the scene plugin, will be displayed in the user interface.
+    */
+diff --git a/avogadro/qtopengl/glwidget.cpp b/avogadro/qtopengl/glwidget.cpp
+index 793f9e0c6b0..cecfd91ea58 100644
+--- a/avogadro/qtopengl/glwidget.cpp
++++ b/avogadro/qtopengl/glwidget.cpp
+@@ -53,6 +53,20 @@ double elapsedMs(Clock::time_point from, Clock::time_point to)
+   return std::chrono::duration<double, std::milli>(to - from).count();
+ }
+ 
++// Milliseconds since the last mark, which it then resets to now.
++struct Lap
++{
++  Clock::time_point mark;
++  void reset() { mark = Clock::now(); }
++  double operator()()
++  {
++    const Clock::time_point now = Clock::now();
++    const double ms = elapsedMs(mark, now);
++    mark = now;
++    return ms;
++  }
++};
++
+ // The GPU time of a pass or total, or "n/a" when the driver gave none.
+ QString gpuText(double ms)
+ {
+@@ -75,6 +89,18 @@ Rendering::PassTiming passTiming(const Rendering::RenderTimings& timings,
+   return none;
+ }
+ 
++// True if the merged molecule changes only moved atoms, so scene plugins can
++// update their existing nodes: Moved or Conformer, with nothing but Atoms
++// besides.
++bool isPositionsOnly(unsigned int changes)
++{
++  using Change = QtGui::Molecule::MoleculeChange;
++  constexpr unsigned int allowed =
++    Change::Atoms | Change::Moved | Change::Conformer;
++  return (changes & (Change::Moved | Change::Conformer)) != 0 &&
++         (changes & ~allowed) == 0;
++}
++
+ } // namespace
+ 
+ // Frame statistics, see setFrameStatsVisible(). Only touched when the overlay
+@@ -98,6 +124,89 @@ class GLWidget::Private
+   std::vector<std::pair<QString, double>> rebuildPlugins;
+   int rebuildsSincePaint = 0;
+   int rebuildsAtLastPaint = 0;
++  // Aggregates over the ~1 s window starting at lastStatsLog; the "shown"
++  // values are those of the last completed window.
++  struct Window
++  {
++    int maxRebuilds = 0;
++    int rebuilds = 0;
++    int frames = 0;
++  };
++  Window current;
++  Window shown;
++  // Scene changes that arrived since the last rebuild. The merged
++  // Molecule::changed flags are kept for dispatching on the kind of change;
++  // anything from plugins or tools needs a full rebuild.
++  bool scenePending = false;
++  bool sceneFullRebuild = false;
++  unsigned int pendingChanges = 0;
++  // The scene tree of the last full rebuild, kept so a positions-only change
++  // can update it in place. Valid only while treeMolecule is non-null; reset
++  // by invalidateTree() whenever the tree is cleared or rebuilt.
++  struct EngineNode
++  {
++    QPointer<QtGui::ScenePlugin> plugin;
++    Rendering::GroupNode* node = nullptr;
++  };
++  struct ToolNode
++  {
++    QPointer<QtGui::ToolPlugin> tool;
++    Rendering::GroupNode* node = nullptr;
++  };
++  QPointer<QtGui::Molecule> treeMolecule;
++  std::vector<EngineNode> engineNodes;
++  std::vector<ToolNode> toolNodes;
++  bool rebuildCoords = false;
++
++  void invalidateTree()
++  {
++    treeMolecule = nullptr;
++    engineNodes.clear();
++    toolNodes.clear();
++  }
++
++  void clearPending()
++  {
++    scenePending = false;
++    sceneFullRebuild = false;
++    pendingChanges = 0;
++  }
++
++  // True if the recorded tree belongs to `mol`, with the same active plugins
++  // and tools in the same order.
++  bool treeMatches(const QtGui::Molecule* mol,
++                   const QList<QtGui::ScenePlugin*>& active,
++                   const QList<QtGui::ToolPlugin*>& activeTools) const
++  {
++    if (!mol || treeMolecule != mol)
++      return false;
++    if (static_cast<size_t>(active.size()) != engineNodes.size() ||
++        static_cast<size_t>(activeTools.size()) != toolNodes.size())
++      return false;
++    for (size_t i = 0; i < engineNodes.size(); ++i) {
++      if (engineNodes[i].plugin != active[static_cast<qsizetype>(i)])
++        return false;
++    }
++    for (size_t i = 0; i < toolNodes.size(); ++i) {
++      if (toolNodes[i].tool != activeTools[static_cast<qsizetype>(i)])
++        return false;
++    }
++    return true;
++  }
++
++  // The tail shared by both rebuild passes: reset the renderer's geometry
++  // and record the reset and total times.
++  void finishRebuild(Rendering::GLRenderer& renderer, bool stats, Lap& lap,
++                     Clock::time_point tStart)
++  {
++    if (stats)
++      lap.reset();
++    renderer.resetGeometry();
++    if (stats) {
++      rebuildResetMs = lap();
++      rebuildTotalMs = elapsedMs(tStart, lap.mark);
++    }
++  }
+ };
+ 
+ GLWidget::GLWidget(QWidget* p)
+@@ -106,9 +215,9 @@ GLWidget::GLWidget(QWidget* p)
+ {
+   setFocusPolicy(Qt::ClickFocus);
+   connect(&m_scenePlugins, &QtGui::ScenePluginModel::pluginStateChanged, this,
+-          &GLWidget::updateScene);
++          &GLWidget::requestSceneRebuild);
+   connect(&m_scenePlugins, &QtGui::ScenePluginModel::pluginConfigChanged, this,
+-          &GLWidget::updateScene);
++          &GLWidget::requestSceneRebuild);
+   m_renderer.setTextRenderStrategy(new QtTextRenderStrategy);
+ 
+   QSettings settings;
+@@ -137,12 +246,13 @@ GLWidget::~GLWidget()
+ void GLWidget::setMolecule(QtGui::Molecule* mol)
+ {
+   clearScene();
++  d->invalidateTree();
+   // Remove only this widget's own connection. A blanket disconnect would also
+   // drop connections owned by other objects (e.g. the main window marking the
+   // document modified), which may still be watching the same molecule.
+   if (m_molecule) {
+     disconnect(m_molecule, &QtGui::Molecule::changed, this,
+-               &GLWidget::updateScene);
++               &GLWidget::moleculeChanged);
+   }
+   m_molecule = mol;
+   foreach (QtGui::ToolPlugin* tool, m_tools)
+@@ -155,7 +265,7 @@ void GLWidget::setMolecule(QtGui::Molecule* mol)
+ 
+   if (m_molecule != nullptr) {
+     connect(m_molecule, &QtGui::Molecule::changed, this,
+-            &GLWidget::updateScene);
++            &GLWidget::moleculeChanged);
+   }
+ }
+ 
+@@ -177,7 +287,116 @@ void GLWidget::updateMolecule()
+   }
+ }
+ 
++void GLWidget::moleculeChanged(unsigned int changes)
++{
++  d->scenePending = true;
++  d->pendingChanges |= changes;
++  update();
++}
++
++void GLWidget::requestSceneRebuild()
++{
++  d->scenePending = true;
++  d->sceneFullRebuild = true;
++  update();
++}
++
++bool GLWidget::applyPending()
++{
++  if (!d->scenePending)
++    return false;
++  // A nested event loop inside a build: the running pass rebuilds once more
++  // when it finishes, which supersedes what is pending now.
++  if (m_updatingScene) {
++    m_sceneUpdatePending = true;
++    d->clearPending();
++    return false;
++  }
++
++  if (!d->sceneFullRebuild && isPositionsOnly(d->pendingChanges) &&
++      d->treeMatches(m_molecule, m_scenePlugins.activeScenePlugins(),
++                     m_tools)) {
++    rebuildCoordinates();
++  } else {
++    rebuildScene();
++  }
++  return true;
++}
++
++void GLWidget::applyPendingSceneChanges()
++{
++  if (applyPending())
++    update();
++}
++
++void GLWidget::rebuildCoordinates()
++{
++  d->clearPending();
++
++  const bool stats = d->statsVisible;
++  Clock::time_point tStart;
++  Lap lap;
++  if (stats) {
++    tStart = Clock::now();
++    ++d->rebuildsSincePaint;
++    d->rebuildCoords = true;
++    d->rebuildPlugins.clear();
++    d->rebuildClearMs = 0.0;
++    lap.mark = tStart;
++  }
++
++  // The tree is only trusted while nothing clears it (clearScene() defers
++  // while m_updatingScene is set). Work on copies so that a nested call
++  // cannot invalidate what is being iterated.
++  QtGui::Molecule* mol = m_molecule;
++  const std::vector<Private::EngineNode> engines = d->engineNodes;
++  const std::vector<Private::ToolNode> tools = d->toolNodes;
++
++  m_updatingScene = true;
++  m_sceneUpdatePending = false;
++  for (const Private::EngineNode& engine : engines) {
++    if (!engine.plugin)
++      continue;
++    if (stats)
++      lap.reset();
++    if (!engine.plugin->updateCoordinates(*mol, *engine.node)) {
++      // No in-place update: rebuild this plugin's node, keeping the node.
++      engine.node->clear();
++      engine.node->clearUI();
++      engine.plugin->process(*mol, *engine.node);
++    }
++    if (stats)
++      d->rebuildPlugins.emplace_back(engine.plugin->name(), lap());
++  }
++  if (stats)
++    lap.reset();
++  for (const Private::ToolNode& tool : tools) {
++    if (!tool.tool)
++      continue;
++    tool.node->clear();
++    tool.tool->draw(*tool.node);
++  }
++  if (stats)
++    d->rebuildToolsMs = lap();
++  m_updatingScene = false;
++
++  // A nested event loop delivered another change. It may be of any kind, so
++  // rebuild everything rather than reason about what the plugins saw.
++  if (m_sceneUpdatePending) {
++    rebuildScene();
++    return;
++  }
++
++  d->finishRebuild(m_renderer, stats, lap, tStart);
++}
++
+ void GLWidget::updateScene()
++{
++  if (rebuildScene())
++    update();
++}
++
++bool GLWidget::rebuildScene()
+ {
+   // A scene plugin or tool can spin a nested event loop while it builds the
+   // scene (e.g. waiting on an external process), which may deliver another
+@@ -186,22 +405,19 @@ void GLWidget::updateScene()
+   // the current pass has finished.
+   if (m_updatingScene) {
+     m_sceneUpdatePending = true;
+-    return;
++    return false;
+   }
+ 
++  // A rebuild now supersedes anything waiting for the next paint.
++  d->clearPending();
++
+   // Each pass counts as a rebuild; the overlay shows the last pass's
+   // breakdown and the total for the whole call.
+   const bool stats = d->statsVisible;
+-  Clock::time_point tStart, mark;
++  Clock::time_point tStart;
++  Lap lap;
+   if (stats)
+     tStart = Clock::now();
+-  // Milliseconds since the last mark, which it then resets to now.
+-  auto lap = [&mark]() {
+-    const Clock::time_point now = Clock::now();
+-    const double ms = elapsedMs(mark, now);
+-    mark = now;
+-    return ms;
+-  };
+ 
+   m_updatingScene = true;
+   do {
+@@ -209,8 +425,10 @@ void GLWidget::updateScene()
+     if (stats) {
+       ++d->rebuildsSincePaint;
+       d->rebuildPlugins.clear();
+-      mark = Clock::now();
++      d->rebuildCoords = false;
++      lap.reset();
+     }
++    d->invalidateTree();
+ 
+     // Build up the scene with the scene plugins, creating the appropriate
+     // nodes. m_molecule is a QPointer and may change between passes.
+@@ -221,6 +439,8 @@ void GLWidget::updateScene()
+       Rendering::GroupNode& node = m_renderer.scene().rootNode();
+       node.clear();
+       auto* moleculeNode = new Rendering::GroupNode(&node);
++      std::vector<Private::EngineNode> engines;
++      std::vector<Private::ToolNode> tools;
+       if (stats)
+         d->rebuildClearMs = lap();
+ 
+@@ -228,18 +448,26 @@ void GLWidget::updateScene()
+                m_scenePlugins.activeScenePlugins()) {
+         auto* engineNode = new Rendering::GroupNode(moleculeNode);
+         if (stats)
+-          mark = Clock::now();
++          lap.reset();
+         scenePlugin->process(*mol, *engineNode);
++        engines.push_back({ scenePlugin, engineNode });
+         if (stats)
+           d->rebuildPlugins.emplace_back(scenePlugin->name(), lap());
+       }
+ 
+       // Let the tools perform any drawing they need to do.
+       if (stats)
+-        mark = Clock::now();
++        lap.reset();
+       foreach (QtGui::ToolPlugin* tool, m_tools) {
+         auto* toolNode = new Rendering::GroupNode(moleculeNode);
+         tool->draw(*toolNode);
++        tools.push_back({ tool, toolNode });
++      }
++      // Only a tree built for the widget's own molecule can be updated later.
++      if (mol == m_molecule) {
++        d->treeMolecule = mol;
++        d->engineNodes = std::move(engines);
++        d->toolNodes = std::move(tools);
+       }
+       if (stats)
+         d->rebuildToolsMs = lap();
+@@ -249,14 +477,8 @@ void GLWidget::updateScene()
+   } while (m_sceneUpdatePending);
+   m_updatingScene = false;
+ 
+-  if (stats)
+-    mark = Clock::now();
+-  m_renderer.resetGeometry();
+-  if (stats) {
+-    d->rebuildResetMs = lap();
+-    d->rebuildTotalMs = elapsedMs(tStart, mark);
+-  }
+-  update();
++  d->finishRebuild(m_renderer, stats, lap, tStart);
++  return true;
+ }
+ 
+ void GLWidget::clearScene()
+@@ -266,17 +488,20 @@ void GLWidget::clearScene()
+     m_sceneUpdatePending = true;
+     return;
+   }
++  d->invalidateTree();
+   m_renderer.scene().clear();
+ }
+ 
+ void GLWidget::resetCamera()
+ {
++  applyPendingSceneChanges();
+   m_renderer.resetCamera();
+   update();
+ }
+ 
+ void GLWidget::resetGeometry()
+ {
++  applyPendingSceneChanges();
+   m_renderer.resetGeometry();
+ }
+ 
+@@ -320,7 +545,7 @@ void GLWidget::setActiveTool(QtGui::ToolPlugin* tool)
+ 
+   if (m_activeTool && m_activeTool != m_defaultTool) {
+     disconnect(m_activeTool, &QtGui::ToolPlugin::drawablesChanged, this,
+-               &GLWidget::updateScene);
++               &GLWidget::requestSceneRebuild);
+   }
+ 
+   if (tool)
+@@ -329,7 +554,7 @@ void GLWidget::setActiveTool(QtGui::ToolPlugin* tool)
+ 
+   if (m_activeTool && m_activeTool != m_defaultTool) {
+     connect(m_activeTool, &QtGui::ToolPlugin::drawablesChanged, this,
+-            &GLWidget::updateScene);
++            &GLWidget::requestSceneRebuild);
+   }
+ }
+ 
+@@ -353,7 +578,7 @@ void GLWidget::setDefaultTool(QtGui::ToolPlugin* tool)
+ 
+   if (m_defaultTool && m_activeTool != m_defaultTool) {
+     disconnect(m_defaultTool, &QtGui::ToolPlugin::drawablesChanged, this,
+-               &GLWidget::updateScene);
++               &GLWidget::requestSceneRebuild);
+   }
+ 
+   if (tool)
+@@ -362,7 +587,7 @@ void GLWidget::setDefaultTool(QtGui::ToolPlugin* tool)
+ 
+   if (m_defaultTool && m_activeTool != m_defaultTool) {
+     connect(m_defaultTool, &QtGui::ToolPlugin::drawablesChanged, this,
+-            &GLWidget::updateScene);
++            &GLWidget::requestSceneRebuild);
+   }
+ }
+ 
+@@ -398,6 +623,11 @@ void GLWidget::paintGL()
+   if (pixelRatio != m_pixelRatio)
+     resizeGL(width(), height());
+ 
++  // Coalesced scene changes are built here, so a burst of changes between
++  // paints costs one rebuild (counted toward this frame).
++  // The paint in progress draws the result, so no update() is scheduled.
++  applyPending();
++
+   if (!d->statsVisible) {
+     m_renderer.render();
+     return;
+@@ -426,11 +656,23 @@ void GLWidget::paintGL()
+   d->rebuildsAtLastPaint = d->rebuildsSincePaint;
+   d->rebuildsSincePaint = 0;
+ 
++  d->current.maxRebuilds =
++    std::max(d->current.maxRebuilds, d->rebuildsAtLastPaint);
++  d->current.rebuilds += d->rebuildsAtLastPaint;
++  ++d->current.frames;
++  bool windowRolled = false;
++  if (elapsedMs(d->lastStatsLog, now) >= 1000.0) {
++    d->shown = d->current;
++    d->current = {};
++    d->lastStatsLog = now;
++    windowRolled = true;
++  }
++
+   m_renderer.render();
+-  drawFrameStats();
++  drawFrameStats(windowRolled);
+ }
+ 
+-void GLWidget::drawFrameStats()
++void GLWidget::drawFrameStats(bool windowRolled)
+ {
+   // Median frame interval of the recent paints.
+   double interval = 0.0;
+@@ -470,8 +712,11 @@ void GLWidget::drawFrameStats()
+                                interval);
+   else
+     lines << QStringLiteral("idle");
+-  lines << QString::asprintf("rebuild %.1f ms (%d this frame)",
+-                             d->rebuildTotalMs, d->rebuildsAtLastPaint);
++  lines << QString::asprintf(
++    "rebuild %.1f ms (%s; %d this frame; last 1 s: max %d, %d in %d frames)",
++    d->rebuildTotalMs, d->rebuildCoords ? "coords" : "full",
++    d->rebuildsAtLastPaint, d->shown.maxRebuilds, d->shown.rebuilds,
++    d->shown.frames);
+   lines << QString::asprintf("  clear %.1f  tools %.1f  reset %.1f",
+                              d->rebuildClearMs, d->rebuildToolsMs,
+                              d->rebuildResetMs);
+@@ -495,10 +740,8 @@ void GLWidget::drawFrameStats()
+                              static_cast<long long>(atoms),
+                              static_cast<long long>(bonds));
+ 
+-  if (d->statsLog && elapsedMs(d->lastStatsLog, d->lastPaint) >= 1000.0) {
+-    d->lastStatsLog = d->lastPaint;
++  if (d->statsLog && windowRolled)
+     qInfo().noquote() << "frame-stats:" << lines.join(QStringLiteral(" | "));
+-  }
+ 
+   // Hand the context to QPainter in the state its paint engine expects: none
+   // of our objects bound, and the widget's own framebuffer as the target.
+@@ -566,6 +809,8 @@ void GLWidget::setFrameStatsVisible(bool visible)
+   d->frameIntervalNext = 0;
+   d->rebuildsSincePaint = 0;
+   d->rebuildsAtLastPaint = 0;
++  d->current = {};
++  d->shown = {};
+   makeCurrent();
+   m_renderer.setTimingEnabled(visible);
+   doneCurrent();
+@@ -679,6 +924,8 @@ QImage GLWidget::renderImage(const RenderOptions& options, QString* error)
+   // A scene change that has not been built yet must not be missed.
+   if (m_sceneUpdatePending)
+     updateScene();
++  else
++    applyPendingSceneChanges();
+   // updateScene() calls update() and leaves the context alone, but a scene
+   // plugin may have spun an event loop; make sure we are still current.
+   makeCurrent();
+@@ -795,6 +1042,26 @@ bool GLWidget::isNavigationKeyGesture(const QKeyEvent* event) const
+   }
+ }
+ 
++bool GLWidget::event(QEvent* e)
++{
++  // Tools hit-test against the scene, so it must be current before any input
++  // event reaches them.
++  switch (e->type()) {
++    case QEvent::MouseButtonPress:
++    case QEvent::MouseButtonRelease:
++    case QEvent::MouseButtonDblClick:
++    case QEvent::MouseMove:
++    case QEvent::Wheel:
++    case QEvent::KeyPress:
++    case QEvent::KeyRelease:
++      applyPendingSceneChanges();
++      break;
++    default:
++      break;
++  }
++  return QOpenGLWidget::event(e);
++}
++
+ void GLWidget::mouseDoubleClickEvent(QMouseEvent* e)
+ {
+   e->ignore();
+diff --git a/avogadro/qtopengl/glwidget.h b/avogadro/qtopengl/glwidget.h
+index 960c04c2fe4..450ebb5d678 100644
+--- a/avogadro/qtopengl/glwidget.h
++++ b/avogadro/qtopengl/glwidget.h
+@@ -175,6 +175,14 @@ public slots:
+    */
+   void updateScene();
+ 
++  /**
++   * Rebuild the scene now if changes are pending (see Molecule::changed).
++   * Changes are normally coalesced and built once in paintGL(); callers that
++   * read the scene outside a paint (hit testing, bounds, export) should call
++   * this first. Does nothing if no changes are pending.
++   */
++  void applyPendingSceneChanges();
++
+   /**
+    * Request update of molecule properties (e.g., dipole moment)
+    */
+@@ -238,6 +246,7 @@ public slots:
+   void paintGL() override;
+ 
+   /** Reimplemented from QOpenGLWidget @{ */
++  bool event(QEvent*) override;
+   void mouseDoubleClickEvent(QMouseEvent*) override;
+   void mousePressEvent(QMouseEvent*) override;
+   void mouseMoveEvent(QMouseEvent*) override;
+@@ -247,7 +256,23 @@ public slots:
+   void keyReleaseEvent(QKeyEvent*) override;
+   /** @} */
+ 
++private slots:
++  /** Record a molecule change; the scene is rebuilt at the next paint. */
++  void moleculeChanged(unsigned int changes);
++  /** Record a change that always needs a full rebuild (plugins, tools). */
++  void requestSceneRebuild();
++
+ private:
++  /**
++   * Build the pending scene changes, if any, without scheduling a repaint.
++   * @return true if the scene was rebuilt.
++   */
++  bool applyPending();
++  /** Rebuild the whole scene without scheduling a repaint. @return false if
++   * deferred to the running build. */
++  bool rebuildScene();
++  /** Update the existing scene tree after a positions-only change. */
++  void rebuildCoordinates();
+   bool isNavigationMouseGesture(const QMouseEvent* event) const;
+   bool isNavigationKeyGesture(const QKeyEvent* event) const;
+ 
+@@ -260,7 +285,8 @@ public slots:
+   QtGui::ScenePluginModel m_scenePlugins;
+ 
+   // Frame statistics overlay, see setFrameStatsVisible().
+-  void drawFrameStats();
++  /** @param windowRolled true if this frame completed a statistics window. */
++  void drawFrameStats(bool windowRolled);
+ 
+   Qt::KeyboardModifiers m_navigationModifier;
+   bool m_navigationDrag = false;
+diff --git a/tests/qtplugins/CMakeLists.txt b/tests/qtplugins/CMakeLists.txt
+index 8c492ea10a2..7d2c5ec93c9 100644
+--- a/tests/qtplugins/CMakeLists.txt
++++ b/tests/qtplugins/CMakeLists.txt
+@@ -152,7 +152,7 @@ endforeach()
+ 
+ if(haveGLWidgetTest)
+   add_test(NAME "QtPlugins-GLWidgetReentry"
+-    COMMAND AvogadroQtPluginsTests "--gtest_filter=GLWidgetReentryTest.*")
++    COMMAND AvogadroQtPluginsTests "--gtest_filter=GLWidgetReentryTest.*:GLWidgetCoalesceTest.*:GLWidgetCoordsTest.*")
+   set_tests_properties("QtPlugins-GLWidgetReentry" PROPERTIES
+     ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
+     TIMEOUT 120)
+diff --git a/tests/qtplugins/glwidgetreentrytest.cpp b/tests/qtplugins/glwidgetreentrytest.cpp
+index 7ac23e42717..e2e43841ae3 100644
+--- a/tests/qtplugins/glwidgetreentrytest.cpp
++++ b/tests/qtplugins/glwidgetreentrytest.cpp
+@@ -119,3 +119,238 @@ TEST(GLWidgetReentryTest, clearSceneDuringBuildIsDeferred)
+ {
+   runCase(ReentrantPlugin::Mode::ClearScene);
+ }
++
++namespace {
++
++using Avogadro::QtGui::Molecule;
++
++class CoordPlugin : public Avogadro::QtGui::ScenePlugin
++{
++public:
++  QString name() const override { return "Coord"; }
++  QString description() const override { return "Test plugin"; }
++  bool isEnabled() const override { return true; }
++  void process(const Molecule&, GroupNode& node) override
++  {
++    ++processCalls;
++    node.addChild(new GeometryNode);
++  }
++  bool updateCoordinates(const Molecule&, GroupNode&) override
++  {
++    ++coordCalls;
++    return inPlace;
++  }
++  int processCalls = 0;
++  int coordCalls = 0;
++  // What updateCoordinates() returns; false asks the widget to rebuild.
++  bool inPlace = true;
++};
++
++} // namespace
++
++TEST(GLWidgetCoalesceTest, changesAreCoalescedUntilApplied)
++{
++  GLWidget widget;
++  auto* molecule = new Avogadro::QtGui::Molecule(&widget);
++  widget.setMolecule(molecule);
++  auto* plugin = new CoordPlugin;
++  widget.sceneModel().addItem(plugin);
++
++  molecule->emitChanged(Avogadro::QtGui::Molecule::Atoms);
++  molecule->emitChanged(Avogadro::QtGui::Molecule::Atoms |
++                        Avogadro::QtGui::Molecule::Added);
++  molecule->emitChanged(Avogadro::QtGui::Molecule::Bonds);
++  EXPECT_EQ(plugin->processCalls, 0);
++
++  widget.applyPendingSceneChanges();
++  EXPECT_EQ(plugin->processCalls, 1);
++
++  // Nothing pending now.
++  widget.applyPendingSceneChanges();
++  EXPECT_EQ(plugin->processCalls, 1);
++}
++
++TEST(GLWidgetCoalesceTest, updateSceneIsImmediateAndClearsPending)
++{
++  GLWidget widget;
++  auto* molecule = new Avogadro::QtGui::Molecule(&widget);
++  widget.setMolecule(molecule);
++  auto* plugin = new CoordPlugin;
++  widget.sceneModel().addItem(plugin);
++
++  molecule->emitChanged(Avogadro::QtGui::Molecule::Atoms);
++  EXPECT_EQ(plugin->processCalls, 0);
++  widget.updateScene();
++  EXPECT_EQ(plugin->processCalls, 1);
++
++  widget.applyPendingSceneChanges();
++  EXPECT_EQ(plugin->processCalls, 1);
++}
++
++// Positions-only dispatch: a coordinate change keeps the scene tree and calls
++// ScenePlugin::updateCoordinates() instead of process().
++namespace {
++
++struct CoordFixture
++{
++  CoordFixture()
++  {
++    molecule = new Molecule(&widget);
++    widget.setMolecule(molecule);
++    plugin = new CoordPlugin;
++    widget.sceneModel().addItem(plugin);
++    widget.updateScene();
++    plugin->processCalls = 0;
++  }
++  // Emit `changes` and apply; true if the positions-only path ran.
++  bool coordsPath(unsigned int changes)
++  {
++    plugin->processCalls = plugin->coordCalls = 0;
++    molecule->emitChanged(changes);
++    widget.applyPendingSceneChanges();
++    EXPECT_EQ(plugin->processCalls + plugin->coordCalls, 1);
++    return plugin->coordCalls == 1 && plugin->processCalls == 0;
++  }
++  GLWidget widget;
++  Molecule* molecule = nullptr;
++  CoordPlugin* plugin = nullptr;
++};
++
++} // namespace
++
++TEST(GLWidgetCoordsTest, movedAtomsUpdateCoordinates)
++{
++  CoordFixture f;
++  EXPECT_TRUE(f.coordsPath(Molecule::Atoms | Molecule::Moved));
++  EXPECT_TRUE(f.coordsPath(Molecule::Moved));
++  EXPECT_TRUE(
++    f.coordsPath(Molecule::Atoms | Molecule::Moved | Molecule::Conformer));
++  EXPECT_TRUE(f.coordsPath(Molecule::Conformer));
++}
++
++TEST(GLWidgetCoordsTest, coalescedMovesStayOnCoordsPath)
++{
++  CoordFixture f;
++  f.plugin->coordCalls = 0;
++  f.molecule->emitChanged(Molecule::Atoms | Molecule::Moved);
++  f.molecule->emitChanged(Molecule::Atoms | Molecule::Moved);
++  f.widget.applyPendingSceneChanges();
++  EXPECT_EQ(f.plugin->coordCalls, 1);
++  EXPECT_EQ(f.plugin->processCalls, 0);
++}
++
++TEST(GLWidgetCoordsTest, otherChangesRebuildFully)
++{
++  CoordFixture f;
++  EXPECT_FALSE(f.coordsPath(Molecule::Atoms | Molecule::Added));
++  EXPECT_FALSE(f.coordsPath(Molecule::Bonds | Molecule::Modified));
++  EXPECT_FALSE(
++    f.coordsPath(Molecule::Atoms | Molecule::Moved | Molecule::Bonds));
++  EXPECT_FALSE(f.coordsPath(Molecule::Layers));
++  EXPECT_FALSE(f.coordsPath(Molecule::Selection));
++  EXPECT_FALSE(f.coordsPath(Molecule::Atoms));
++  // A move merged with an unrelated change in the same frame.
++  f.plugin->processCalls = f.plugin->coordCalls = 0;
++  f.molecule->emitChanged(Molecule::Atoms | Molecule::Moved);
++  f.molecule->emitChanged(Molecule::Atoms | Molecule::Removed);
++  f.widget.applyPendingSceneChanges();
++  EXPECT_EQ(f.plugin->processCalls, 1);
++  EXPECT_EQ(f.plugin->coordCalls, 0);
++}
++
++TEST(GLWidgetCoordsTest, noPriorBuildIsFull)
++{
++  GLWidget widget;
++  auto* molecule = new Molecule(&widget);
++  widget.setMolecule(molecule);
++  auto* plugin = new CoordPlugin;
++  widget.sceneModel().addItem(plugin);
++  molecule->emitChanged(Molecule::Atoms | Molecule::Moved);
++  widget.applyPendingSceneChanges();
++  EXPECT_EQ(plugin->processCalls, 1);
++  EXPECT_EQ(plugin->coordCalls, 0);
++}
++
++TEST(GLWidgetCoordsTest, differentMoleculeIsFull)
++{
++  CoordFixture f;
++  auto* other = new Molecule(&f.widget);
++  f.widget.setMolecule(other);
++  f.plugin->processCalls = f.plugin->coordCalls = 0;
++  other->emitChanged(Molecule::Atoms | Molecule::Moved);
++  f.widget.applyPendingSceneChanges();
++  EXPECT_EQ(f.plugin->processCalls, 1);
++  EXPECT_EQ(f.plugin->coordCalls, 0);
++}
++
++TEST(GLWidgetCoordsTest, pluginChangesAreFull)
++{
++  CoordFixture f;
++  // A plugin state change.
++  emit f.widget.sceneModel().pluginStateChanged(f.plugin);
++  f.molecule->emitChanged(Molecule::Atoms | Molecule::Moved);
++  f.plugin->processCalls = 0;
++  f.widget.applyPendingSceneChanges();
++  EXPECT_EQ(f.plugin->processCalls, 1);
++  EXPECT_EQ(f.plugin->coordCalls, 0);
++  // Coordinates work again once the rebuild has recorded a tree.
++  EXPECT_TRUE(f.coordsPath(Molecule::Moved));
++
++  // A different set of active plugins, with no signal at all.
++  auto* second = new CoordPlugin;
++  f.widget.sceneModel().addItem(second);
++  f.plugin->processCalls = f.plugin->coordCalls = 0;
++  f.molecule->emitChanged(Molecule::Moved);
++  f.widget.applyPendingSceneChanges();
++  EXPECT_EQ(f.plugin->processCalls, 1);
++  EXPECT_EQ(second->processCalls, 1);
++  EXPECT_EQ(f.plugin->coordCalls + second->coordCalls, 0);
++}
++
++TEST(GLWidgetCoordsTest, clearedSceneIsFull)
++{
++  CoordFixture f;
++  f.widget.clearScene();
++  f.plugin->processCalls = f.plugin->coordCalls = 0;
++  f.molecule->emitChanged(Molecule::Moved);
++  f.widget.applyPendingSceneChanges();
++  EXPECT_EQ(f.plugin->processCalls, 1);
++  EXPECT_EQ(f.plugin->coordCalls, 0);
++}
++
++TEST(GLWidgetCoordsTest, fallbackKeepsNodeAndDoesNotAccumulate)
++{
++  CoordFixture f;
++  f.plugin->inPlace = false;
++  auto& root = f.widget.renderer().scene().rootNode();
++  auto* molNode = dynamic_cast<GroupNode*>(root.children().front().node);
++  ASSERT_NE(molNode, nullptr);
++  auto* engine = dynamic_cast<GroupNode*>(molNode->children().front().node);
++  ASSERT_NE(engine, nullptr);
++  EXPECT_EQ(engine->children().size(), 1u);
++  for (int i = 0; i < 3; ++i) {
++    f.plugin->processCalls = f.plugin->coordCalls = 0;
++    f.molecule->emitChanged(Molecule::Atoms | Molecule::Moved);
++    f.widget.applyPendingSceneChanges();
++    EXPECT_EQ(f.plugin->coordCalls, 1);
++    EXPECT_EQ(f.plugin->processCalls, 1); // the widget's fallback
++    ASSERT_EQ(molNode->children().size(), 1u);
++    EXPECT_EQ(molNode->children().front().node, engine);
++    EXPECT_EQ(engine->children().size(), 1u);
++  }
++}
++
++TEST(GLWidgetCoordsTest, inPlaceUpdateLeavesNodeAlone)
++{
++  CoordFixture f;
++  auto& root = f.widget.renderer().scene().rootNode();
++  auto* molNode = dynamic_cast<GroupNode*>(root.children().front().node);
++  ASSERT_NE(molNode, nullptr);
++  auto* engine = dynamic_cast<GroupNode*>(molNode->children().front().node);
++  ASSERT_NE(engine, nullptr);
++  auto* child = engine->children().front().node;
++  EXPECT_TRUE(f.coordsPath(Molecule::Atoms | Molecule::Moved));
++  EXPECT_EQ(f.plugin->processCalls, 0);
++  ASSERT_EQ(engine->children().size(), 1u);
++  EXPECT_EQ(engine->children().front().node, child);
++}
+diff --git a/tests/qtplugins/toolinteractionharness.cpp b/tests/qtplugins/toolinteractionharness.cpp
+index 1bf69ef4514..ff815f1258f 100644
+--- a/tests/qtplugins/toolinteractionharness.cpp
++++ b/tests/qtplugins/toolinteractionharness.cpp
+@@ -120,6 +120,8 @@ void ToolInteractionHarness::updateScene()
+ 
+ void ToolInteractionHarness::resetCamera()
+ {
++  // Changes are built lazily in paintGL(), which offscreen tests never reach.
++  m_widget->applyPendingSceneChanges();
+   renderer().resetCamera();
+   renderer().applyProjection();
+ }
+@@ -162,12 +164,14 @@ QPoint ToolInteractionHarness::emptyPoint() const
+ 
+ Rendering::Identifier ToolInteractionHarness::hitAt(const QPoint& point) const
+ {
++  m_widget->applyPendingSceneChanges();
+   return m_widget->renderer().hit(point.x(), point.y());
+ }
+ 
+ void ToolInteractionHarness::settle()
+ {
+   QCoreApplication::processEvents();
++  m_widget->applyPendingSceneChanges();
+   renderer().applyProjection();
+ }
+ 

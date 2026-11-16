@@ -1,0 +1,356 @@
+diff --git a/baybe/acquisition/_builder.py b/baybe/acquisition/_builder.py
+index fbf5d52b88..a38b74ed4f 100644
+--- a/baybe/acquisition/_builder.py
++++ b/baybe/acquisition/_builder.py
+@@ -107,7 +107,7 @@ class BotorchAcquisitionFunctionBuilder:
+ 
+     # Context shared across building methods
+     _args: BotorchAcquisitionArgs = field(init=False)
+-    _botorch_acqf_cls: BoAcquisitionFunction = field(init=False)
++    _botorch_acqf_cls: type[BoAcquisitionFunction] = field(init=False)
+     _signature: MappingProxyType = field(init=False)
+ 
+     def __attrs_post_init__(self) -> None:
+@@ -140,6 +140,12 @@ def _posterior_mean_comp(self) -> Tensor:
+         # TODO: Currently, this is the "transformed posterior mean of the targets"
+         #   rather than the "posterior mean of the transformed targets".
+         posterior = self._botorch_surrogate.posterior(to_tensor(self._train_x))
++        if not hasattr(posterior, "mean"):
++            raise IncompatibilityError(
++                f"The used surrogate model of type "
++                f"'{type(self._botorch_surrogate).__name__}' "
++                f"does not provide a posterior mean."
++            )
+         return self.objective.to_botorch()(posterior.mean)
+ 
+     @cached_property
+@@ -265,11 +271,12 @@ def _set_best_f(self) -> None:
+ 
+     def set_default_sample_shape(self, acqf: BoAcquisitionFunction, /):
+         """Apply temporary workaround for Thompson sampling."""
++        # TODO: Needs redesign once bandits are supported more generally
+         if not isinstance(self.acqf, qThompsonSampling):
+             return
+ 
+         assert hasattr(acqf, "_default_sample_shape")
+-        acqf._default_sample_shape = torch.Size([self.acqf.n_mc_samples])
++        acqf._default_sample_shape = torch.Size([self.acqf.n_mc_samples])  # type: ignore[assignment]
+ 
+     def _set_mc_points(self) -> None:
+         """Set BoTorch's ``mc_points`` argument."""
+diff --git a/baybe/campaign.py b/baybe/campaign.py
+index ba36461630..012114c8ff 100644
+--- a/baybe/campaign.py
++++ b/baybe/campaign.py
+@@ -56,9 +56,11 @@
+ )
+ 
+ if TYPE_CHECKING:
+-    from botorch.acquisition import AcquisitionFunction
++    from botorch.acquisition import AcquisitionFunction as BoAcquisitionFunction
+     from botorch.posteriors import Posterior
+ 
++    from baybe.acquisition.base import AcquisitionFunction
++
+     _T = TypeVar("_T")
+ 
+ # Metadata columns
+@@ -779,8 +781,8 @@ def get_acquisition_function(
+         self,
+         batch_size: int | None = None,
+         pending_experiments: pd.DataFrame | None = None,
+-    ) -> AcquisitionFunction:
+-        """Get the current acquisition function.
++    ) -> BoAcquisitionFunction:
++        """Get the current BoTorch acquisition function.
+ 
+         Args:
+             batch_size: See :meth:`recommend`.
+@@ -794,7 +796,7 @@ def get_acquisition_function(
+                 function.
+ 
+         Returns:
+-            The acquisition function of the current recommender.
++            The BoTorch acquisition function of the current recommender.
+         """
+         if self.objective is None:
+             raise IncompatibilityError(
+diff --git a/baybe/insights/shap.py b/baybe/insights/shap.py
+index 53b787cb81..68676799bb 100644
+--- a/baybe/insights/shap.py
++++ b/baybe/insights/shap.py
+@@ -15,7 +15,11 @@
+ 
+ from baybe import Campaign
+ from baybe._optional.insights import shap
+-from baybe.exceptions import IncompatibleExplainerError, NoMeasurementsError
++from baybe.exceptions import (
++    IncompatibilityError,
++    IncompatibleExplainerError,
++    NoMeasurementsError,
++)
+ from baybe.objectives.base import Objective
+ from baybe.recommenders.base import RecommenderProtocol
+ from baybe.searchspace import SearchSpace
+@@ -101,19 +105,27 @@ def make_explainer_for_surrogate(
+ 
+     if use_comp_rep:
+ 
++        @torch.no_grad()
+         def model(x: np.ndarray) -> np.ndarray:
+             tensor = to_tensor(x)
+-            with torch.no_grad():
+-                output = surrogate._posterior_comp(tensor).mean
+-            return output.numpy()
++            posterior = surrogate._posterior_comp(tensor)
++            if not hasattr(posterior, "mean"):
++                raise IncompatibilityError(
++                    "SHAP explainers require a posterior that allows mean computation."
++                )
++            return posterior.mean.numpy()
+ 
+     else:
+ 
++        @torch.no_grad()
+         def model(x: np.ndarray) -> np.ndarray:
+             df = pd.DataFrame(x, columns=data.columns)
+-            with torch.no_grad():
+-                output = surrogate.posterior(df).mean
+-            return output.numpy()
++            posterior = surrogate.posterior(df)
++            if not hasattr(posterior, "mean"):
++                raise IncompatibilityError(
++                    "SHAP explainers require a posterior that allows mean computation."
++                )
++            return posterior.mean.numpy()
+ 
+     # Handle special settings: Lime default mode is otherwise set to "classification"
+     kwargs = {"mode": "regression"} if explainer_cls.__name__ == "LimeTabular" else {}
+diff --git a/baybe/objectives/base.py b/baybe/objectives/base.py
+index ca561166a1..fadcba040d 100644
+--- a/baybe/objectives/base.py
++++ b/baybe/objectives/base.py
+@@ -97,7 +97,7 @@ def _full_transformation(self) -> MCAcquisitionObjective:
+ 
+     def to_botorch(self) -> MCAcquisitionObjective:
+         """Convert to BoTorch representation."""
+-        if not is_all_instance(self._oriented_targets, NumericalTarget):
++        if not is_all_instance(targets := self._oriented_targets, NumericalTarget):
+             raise NotImplementedError(
+                 "Conversion to BoTorch is only supported for numerical targets."
+             )
+@@ -111,7 +111,7 @@ def to_botorch(self) -> MCAcquisitionObjective:
+             lambda samples, X: torch.stack(
+                 [
+                     t.transformation.to_botorch_objective()(samples[..., i])
+-                    for i, t in enumerate(self._oriented_targets)
++                    for i, t in enumerate(targets)
+                 ],
+                 dim=-1,
+             )
+diff --git a/baybe/objectives/botorch.py b/baybe/objectives/botorch.py
+index 062f7fce1d..0e767bba5a 100644
+--- a/baybe/objectives/botorch.py
++++ b/baybe/objectives/botorch.py
+@@ -2,6 +2,7 @@
+ 
+ from botorch.acquisition.objective import MCAcquisitionObjective
+ from torch import Tensor
++from typing_extensions import override
+ 
+ from baybe.utils.basic import compose
+ 
+@@ -13,5 +14,6 @@ def __init__(self, *objectives: MCAcquisitionObjective) -> None:
+         super().__init__()
+         self.objectives = objectives
+ 
++    @override
+     def forward(self, samples: Tensor, X: Tensor | None = None) -> Tensor:  # noqa: D102
+         return compose(*(o.forward for o in self.objectives))(samples, X)
+diff --git a/baybe/objectives/desirability.py b/baybe/objectives/desirability.py
+index 9443778a5e..bee6f3f70a 100644
+--- a/baybe/objectives/desirability.py
++++ b/baybe/objectives/desirability.py
+@@ -234,16 +234,15 @@ def _to_botorch_full(self) -> MCAcquisitionObjective:
+ 
+         from baybe.objectives.botorch import ChainedMCObjective
+ 
++        outer: MCAcquisitionObjective
+         if self.scalarizer is Scalarizer.MEAN:
+             outer = LinearMCObjective(torch.tensor(self._normalized_weights))
+-
+         elif self.scalarizer is Scalarizer.GEOM_MEAN:
+             outer = GenericMCObjective(
+                 lambda samples, X: _geometric_mean(
+                     samples, torch.tensor(self._normalized_weights)
+                 )
+             )
+-
+         else:
+             raise NotImplementedError(
+                 f"No scalarization mechanism defined for '{self.scalarizer.name}'."
+diff --git a/baybe/recommenders/pure/bayesian/base.py b/baybe/recommenders/pure/bayesian/base.py
+index 6601476785..0361998d65 100644
+--- a/baybe/recommenders/pure/bayesian/base.py
++++ b/baybe/recommenders/pure/bayesian/base.py
+@@ -141,7 +141,7 @@ def get_acquisition_function(
+         measurements: pd.DataFrame,
+         pending_experiments: pd.DataFrame | None = None,
+     ) -> BoAcquisitionFunction:
+-        """Get the acquisition function for the given recommendation context.
++        """Get the BoTorch acquisition function for the given recommendation context.
+ 
+         For details on the method arguments, see :meth:`recommend`.
+         """
+diff --git a/baybe/recommenders/pure/bayesian/botorch.py b/baybe/recommenders/pure/bayesian/botorch.py
+index 941c619415..6b3fcad519 100644
+--- a/baybe/recommenders/pure/bayesian/botorch.py
++++ b/baybe/recommenders/pure/bayesian/botorch.py
+@@ -448,7 +448,7 @@ def _recommend_hybrid(
+             q=batch_size,
+             num_restarts=self.n_restarts,
+             raw_samples=self.n_raw_samples,
+-            fixed_features_list=fixed_features_list,
++            fixed_features_list=fixed_features_list,  # type: ignore[arg-type]
+             equality_constraints=[
+                 c.to_botorch(
+                     searchspace.continuous.parameters,
+diff --git a/baybe/surrogates/_adapter.py b/baybe/surrogates/_adapter.py
+index a91188b022..d2c180bbd5 100644
+--- a/baybe/surrogates/_adapter.py
++++ b/baybe/surrogates/_adapter.py
+@@ -6,6 +6,7 @@
+ from botorch.models.gpytorch import Model
+ from botorch.posteriors import Posterior
+ from torch import Tensor
++from typing_extensions import override
+ 
+ from baybe.surrogates.base import Surrogate
+ 
+@@ -24,6 +25,7 @@ def __init__(self, surrogate: Surrogate):
+         super().__init__()
+         self._surrogate = surrogate
+ 
++    @override
+     @property
+     def num_outputs(self) -> int:
+         if (objective := self._surrogate._objective) is None:
+@@ -32,11 +34,12 @@ def num_outputs(self) -> int:
+             )
+         return objective.n_outputs
+ 
++    @override
+     def posterior(
+         self,
+         X: Tensor,
+         output_indices: list[int] | None = None,
+-        observation_noise: bool = False,
++        observation_noise: bool | Tensor = False,
+         posterior_transform: Callable[[Posterior], Posterior] | None = None,
+         **kwargs: Any,
+     ) -> Posterior:
+diff --git a/baybe/surrogates/bandit.py b/baybe/surrogates/bandit.py
+index bd2f5aeac4..c7a1411210 100644
+--- a/baybe/surrogates/bandit.py
++++ b/baybe/surrogates/bandit.py
+@@ -21,7 +21,7 @@
+ 
+ if TYPE_CHECKING:
+     from botorch.models.model import Model
+-    from botorch.posteriors import TorchPosterior
++    from botorch.posteriors import Posterior, TorchPosterior
+     from torch import Tensor
+ 
+ 
+@@ -96,9 +96,11 @@ def to_botorch(self) -> Model:
+         class CustomMCSampler(MCSampler):
+             """Customer sampler for beta posterior."""
+ 
+-            def forward(self, posterior: TorchPosterior) -> Tensor:
++            @override
++            def forward(self, posterior: Posterior) -> Tensor:
+                 """Sample the posterior."""
+-                with temporary_seed(self.seed):
++                # FIXME[typing]: https://github.com/meta-pytorch/botorch/issues/3061
++                with temporary_seed(int(self.seed)):
+                     samples = posterior.rsample(self.sample_shape)
+                 return samples
+ 
+diff --git a/baybe/surrogates/composite.py b/baybe/surrogates/composite.py
+index 7662407839..5b1b54addb 100644
+--- a/baybe/surrogates/composite.py
++++ b/baybe/surrogates/composite.py
+@@ -115,12 +115,11 @@ def to_botorch(self) -> ModelList:
+         from botorch.models import ModelList
+         from botorch.models.model_list_gp_regression import ModelListGP
+ 
+-        cls = (
+-            ModelListGP
+-            if is_all_instance(self._surrogates_flat, GaussianProcessSurrogate)
+-            else ModelList
+-        )
+-        return cls(*(s.to_botorch() for s in self._surrogates_flat))
++        surrogates = self._surrogates_flat
++        if is_all_instance(surrogates, GaussianProcessSurrogate):
++            return ModelListGP(*(s.to_botorch() for s in surrogates))
++        else:
++            return ModelList(*(s.to_botorch() for s in surrogates))
+ 
+     def posterior(self, candidates: pd.DataFrame) -> PosteriorList:
+         """Compute the posterior for candidates in experimental representation.
+diff --git a/baybe/surrogates/gaussian_process/core.py b/baybe/surrogates/gaussian_process/core.py
+index 8d1c2e2630..2e6d460a8e 100644
+--- a/baybe/surrogates/gaussian_process/core.py
++++ b/baybe/surrogates/gaussian_process/core.py
+@@ -27,7 +27,7 @@
+ from baybe.utils.conversion import to_string
+ 
+ if TYPE_CHECKING:
+-    from botorch.models.model import Model
++    from botorch.models.gpytorch import GPyTorchModel
+     from botorch.models.transforms.input import InputTransform
+     from botorch.models.transforms.outcome import OutcomeTransform
+     from botorch.posteriors import Posterior
+@@ -119,7 +119,7 @@ def from_preset(preset: GaussianProcessPreset) -> GaussianProcessSurrogate:
+         return make_gp_from_preset(preset)
+ 
+     @override
+-    def to_botorch(self) -> Model:
++    def to_botorch(self) -> GPyTorchModel:
+         return self._model
+ 
+     @override
+@@ -156,7 +156,9 @@ def _fit(self, train_x: Tensor, train_y: Tensor) -> None:
+ 
+         # For GPs, we let botorch handle the scaling. See [Scaling Workaround] above.
+         input_transform = botorch.models.transforms.Normalize(
+-            train_x.shape[-1], bounds=context.parameter_bounds, indices=numerical_idxs
++            train_x.shape[-1],
++            bounds=context.parameter_bounds,
++            indices=list(numerical_idxs),
+         )
+         outcome_transform = botorch.models.transforms.Standardize(train_y.shape[-1])
+ 
+diff --git a/baybe/targets/botorch.py b/baybe/targets/botorch.py
+index 3f22f5adf6..b6f79189c0 100644
+--- a/baybe/targets/botorch.py
++++ b/baybe/targets/botorch.py
+@@ -3,6 +3,7 @@
+ from botorch.acquisition.objective import PosteriorTransform
+ from botorch.posteriors import GPyTorchPosterior
+ from torch import Tensor
++from typing_extensions import override
+ 
+ 
+ class AffinePosteriorTransform(PosteriorTransform):
+@@ -13,8 +14,10 @@ def __init__(self, factor: float, shift: float) -> None:
+         self.factor = factor
+         self.shift = shift
+ 
++    @override
+     def forward(self, posterior: GPyTorchPosterior) -> GPyTorchPosterior:  # noqa: D102
+         return GPyTorchPosterior(posterior.distribution * self.factor + self.shift)
+ 
++    @override
+     def evaluate(self, Y: Tensor) -> Tensor:  # noqa: D102
+         raise NotImplementedError()

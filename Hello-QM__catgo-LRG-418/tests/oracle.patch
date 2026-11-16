@@ -1,0 +1,636 @@
+diff --git a/server/catgo/workflow/engine/advancer.py b/server/catgo/workflow/engine/advancer.py
+index c5781b374..f2d98d188 100644
+--- a/server/catgo/workflow/engine/advancer.py
++++ b/server/catgo/workflow/engine/advancer.py
+@@ -194,6 +194,14 @@ def _generate_local_preview(db: WorkflowDB, task: dict, workflow_id: str) -> Non
+     elif inputs.get("product_structure"):
+         # Legacy fallback
+         params["_resolved_product_structure"] = inputs["product_structure"]
++    elif task_type in ("neb", "ts_search"):
++        # NEB endpoints wired to the same `structure` port (two parents, e.g.
++        # reactant_opt + product_opt → neb) instead of structure/structure_product.
++        # Use the first structure as initial (already structure_str) and the
++        # second as the product endpoint. Mirrors orca._resolve_neb_product.
++        structs = inputs.get("structure")
++        if isinstance(structs, list) and len(structs) > 1:
++            params["_resolved_product_structure"] = structs[1]
+ 
+     # Create local preview directory keyed on the bare graph node_id (not the
+     # namespaced task id) so the path stays stable and matches submitter.py.
+diff --git a/server/catgo/workflow/engine/engine_builtins.py b/server/catgo/workflow/engine/engine_builtins.py
+index 9f3759f72..f5fa43e9d 100644
+--- a/server/catgo/workflow/engine/engine_builtins.py
++++ b/server/catgo/workflow/engine/engine_builtins.py
+@@ -185,6 +185,116 @@ def _generate_inputs_local(work_dir: str, node_type: str, engine_key: str, param
+         _generate_orca_inputs_local(work_dir, node_type, params, structure_str)
+ 
+ 
++def _parse_structure_any(s):
++    """Coerce a structure input (JSON dict / dict / list-of / POSCAR text) into a
++    pymatgen Structure. Returns None on failure."""
++    import json as _json
++    from pymatgen.core import Structure
++    if s is None:
++        return None
++    if isinstance(s, list):
++        s = s[0] if s else None
++        if s is None:
++            return None
++    if isinstance(s, dict):
++        return Structure.from_dict(s)
++    if isinstance(s, str):
++        try:
++            return Structure.from_dict(_json.loads(s))
++        except Exception:
++            return Structure.from_str(s, fmt="poscar")
++    return None
++
++
++def _write_vasp_neb_inputs(wd, params: dict, structure_str, product_str) -> None:
++    """Write a VASP NEB job: image subdirectories 00/POSCAR ... 0(N+1)/POSCAR
++    (initial → interpolated images → final) plus a root INCAR (IMAGES/SPRING/
++    LCLIMB) and KPOINTS. Initial is structure_str, final is product_str; the
++    N intermediate images are IDPP-free linear interpolations (pymatgen)."""
++    initial = _parse_structure_any(structure_str)
++    final = _parse_structure_any(product_str)
++    n_images = int(params.get("nimages", params.get("n_images", 5)) or 5)
++    climbing = params.get("climbing", params.get("climb", True))
++    spring_k = float(params.get("spring_k", 5.0) or 5.0)
++
++    if initial is None or final is None:
++        init_state = "ok" if initial is not None else "MISSING"
++        final_state = "ok" if final is not None else (
++            "MISSING — connect a structure to the 'structure_product' input port")
++        (wd / "NEB_README.txt").write_text(
++            "VASP NEB needs TWO endpoint structures (initial + final). "
++            f"initial={init_state}, final={final_state}.\n"
++        )
++        if initial is not None:
++            (wd / "POSCAR").write_text(initial.to(fmt="poscar"))
++        return
++
++    # Interpolate: nimages=n_images+1 yields n_images+2 frames (initial..final).
++    try:
++        frames = initial.interpolate(final, nimages=n_images + 1,
++                                     interpolate_lattices=False, autosort_tol=0.5)
++    except Exception as e:
++        (wd / "NEB_README.txt").write_text(
++            f"NEB interpolation failed (initial/final must have the same atom "
++            f"count and ordering): {e}\n"
++        )
++        return
++
++    # One subdir per frame: 00 (initial, fixed), 01..0N (images), 0(N+1) (final).
++    for i, frame in enumerate(frames):
++        sub = wd / f"{i:02d}"
++        sub.mkdir(parents=True, exist_ok=True)
++        (sub / "POSCAR").write_text(frame.to(fmt="poscar"))
++
++    # NEB INCAR (root). IMAGES = intermediate count; endpoints are 00 and last.
++    incar = _build_vasp_incar_lines(params, "neb")
++    incar_keys = {ln.split("=")[0].strip().upper() for ln in incar}
++    neb_defaults = [
++        ("IMAGES", n_images),
++        ("IBRION", 3),
++        ("POTIM", 0),
++        ("SPRING", -abs(spring_k)),
++        ("LCLIMB", ".TRUE." if climbing else ".FALSE."),
++        ("EDIFFG", -0.05),
++        ("NSW", 200),
++    ]
++    for k, v in neb_defaults:
++        if k not in incar_keys:
++            incar.append(f"{k} = {v}")
++    (wd / "INCAR").write_text("\n".join(sorted(incar)) + "\n")
++    _write_vasp_kpoints(wd, params)
++
++
++def _build_vasp_incar_lines(params: dict, node_type: str) -> list:
++    """Build INCAR lines from params (filtered to known VASP keys)."""
++    incar_lines: list = []
++    for k, v in params.items():
++        if k.upper() in _VASP_INCAR_KEYS:
++            val = '.TRUE.' if v is True else '.FALSE.' if v is False else str(v)
++            incar_lines.append(f"{k.upper()} = {val}")
++    return incar_lines
++
++
++def _write_vasp_kpoints(wd, params: dict) -> None:
++    kpoints = params.get("KPOINTS", params.get("kpoints", [1, 1, 1]))
++    if isinstance(kpoints, list) and len(kpoints) == 3:
++        kpt_str = f"Automatic\n0\nGamma\n{kpoints[0]} {kpoints[1]} {kpoints[2]}\n0 0 0\n"
++    else:
++        kpt_str = "Automatic\n0\nGamma\n1 1 1\n0 0 0\n"
++    (wd / "KPOINTS").write_text(kpt_str)
++
++
++_VASP_INCAR_KEYS = {
++    'ENCUT', 'EDIFF', 'EDIFFG', 'NSW', 'IBRION', 'ISIF', 'ISMEAR', 'SIGMA',
++    'PREC', 'ALGO', 'LREAL', 'LWAVE', 'LCHARG', 'NELM', 'NELMIN', 'NCORE',
++    'KPAR', 'ISPIN', 'MAGMOM', 'LDAU', 'LDAUU', 'LDAUJ', 'LDAUL', 'IVDW',
++    'GGA', 'METAGGA', 'LASPH', 'LORBIT', 'NEDOS', 'EMIN', 'EMAX',
++    'NFREE', 'POTIM',
++    # NEB tags (else silently dropped by the filter)
++    'IMAGES', 'SPRING', 'LCLIMB', 'LCLIMBING', 'LDNEB', 'ICHAIN', 'IOPT',
++}
++
++
+ def _generate_vasp_inputs_local(work_dir: str, node_type: str, params: dict, structure_str: str | None) -> None:
+     """Generate INCAR, POSCAR, KPOINTS locally."""
+     import json as _json
+@@ -192,6 +302,13 @@ def _generate_vasp_inputs_local(work_dir: str, node_type: str, params: dict, str
+ 
+     wd = Path(work_dir)
+ 
++    # --- NEB: multi-image directory layout (00/POSCAR ... 0(N+1)/POSCAR) ---
++    if node_type == "neb":
++        product_str = params.pop("_resolved_product_structure", None) \
++            or params.pop("product_structure", None)
++        _write_vasp_neb_inputs(wd, params, structure_str, product_str)
++        return
++
+     # POSCAR from structure
+     if structure_str:
+         try:
+diff --git a/server/catgo/workflow/engine/scanner.py b/server/catgo/workflow/engine/scanner.py
+index edff0a6b3..5b241e9b5 100644
+--- a/server/catgo/workflow/engine/scanner.py
++++ b/server/catgo/workflow/engine/scanner.py
+@@ -634,9 +634,10 @@ def _execute_ready_local_tasks(self, workflow_id: str) -> None:
+             params = json.loads(task.get("params_json", "{}") or "{}")
+ 
+             # Resolve unified calc types (geo_opt+mlp → mlp_relax) and the
+-            # generic `analysis` node (analysis+type=elastic → elastic_analysis).
+-            # _resolve_software returns the type unchanged for everything else,
+-            # so calling it for both keeps a single resolution point.
++            # generic "analysis" node (carries its concrete kind in params.type
++            # → e.g. surface_energy/elastic_analysis). Without including
++            # "analysis" here the resolver never ran and the node fell through
++            # to the HPC submitter ("No HPC connection available").
+             resolved_type = task_type
+             if task_type in UNIFIED_CALC_NODES or task_type == "analysis":
+                 resolved_type, _ = _resolve_software(task_type, params)
+@@ -817,6 +818,28 @@ async def _bcast(wf_id: str, msg: dict) -> None:
+                 if mlp_result.get("_fan_out") and mlp_result.get("results"):
+                     # --- Batch result: multiple structures processed ---
+                     batch_results = mlp_result["results"]
++                    # Re-expose the optimized structures as a flat `structures`
++                    # list (with parallel `labels`) so a DOWNSTREAM fan-out
++                    # consumer (e.g. geo_opt → single_point/freq chain) detects
++                    # the fan-out again and re-fans. Without this the batch result
++                    # only carries `results`, which the fan-out detector ignores,
++                    # so the chain silently collapses to the first structure.
++                    fanned_structs: list = []
++                    fanned_labels: list = []
++                    for entry in batch_results:
++                        if entry.get("status") != "completed":
++                            continue
++                        r = entry.get("result", {})
++                        contcar = r.get("contcar")
++                        if contcar:
++                            fanned_structs.append(_poscar_to_json(contcar))
++                            fanned_labels.append(entry.get("label", f"structure_{entry.get('index', len(fanned_structs))}"))
++                    if len(fanned_structs) > 1:
++                        mlp_result = {
++                            **mlp_result,
++                            "structures": fanned_structs,
++                            "labels": fanned_labels,
++                        }
+                     # Store ALL results in outputs_json for frontend display
+                     db_fields["outputs_json"] = _json_bridge.dumps(mlp_result, default=str)
+                     # Use first completed structure as primary structure_json for downstream
+diff --git a/server/catgo/workflow/engine/submitter.py b/server/catgo/workflow/engine/submitter.py
+index 359db6852..33b456cbd 100644
+--- a/server/catgo/workflow/engine/submitter.py
++++ b/server/catgo/workflow/engine/submitter.py
+@@ -219,6 +219,13 @@ async def _submit_one(
+     elif inputs.get("product_structure"):
+         # Legacy fallback — older workflows may use "product_structure" as key
+         params["_resolved_product_structure"] = inputs["product_structure"]
++    elif resolved_type in ("neb", "mlp_neb", "orca_neb_ts"):
++        # NEB endpoints wired to the same `structure` port (two parents:
++        # reactant_opt + product_opt) rather than structure/structure_product.
++        # Take the second structure as the product endpoint.
++        structs = inputs.get("structure")
++        if isinstance(structs, list) and len(structs) > 1:
++            params["_resolved_product_structure"] = structs[1]
+ 
+     # Stash parent .gbw wavefunction path for ORCA SCF restart.
+     # The wavefunction_file is not a linked handle — scan all parent results.
+diff --git a/server/workflow/engines/analysis.py b/server/workflow/engines/analysis.py
+index f172089e8..65737a64a 100644
+--- a/server/workflow/engines/analysis.py
++++ b/server/workflow/engines/analysis.py
+@@ -259,6 +259,24 @@ def update_step(wf_id: str, s_id: str, data: dict) -> None:
+                         "(teaching demo). Use catgo-campaign for production runs.",
+             })
+ 
++        elif node_type == "analysis_passthrough":
++            # Generic teaching-demo analysis: collect upstream energies/structures
++            # and complete with a summary. Used for unmapped/blank analysis kinds
++            # so the node produces real (upstream) data instead of erroring.
++            energies = []
++            for pid in parent_ids:
++                pr = step_results.get(pid, {})
++                e = pr.get("energy") or pr.get("final_energy") or pr.get("gibbs")
++                if e is not None:
++                    energies.append(e)
++            analysis_result.update({
++                "analysis_type": str(params.get("type", "") or "generic"),
++                "n_inputs": len(parent_ids),
++                "energies": energies,
++                "note": "Generic analysis passthrough (teaching demo): upstream "
++                        "results collected. Use catgo-campaign for production.",
++            })
++
+         else:
+             raise RuntimeError(f"Unhandled ANALYSIS node type: {node_type}")
+ 
+diff --git a/server/workflow/engines/local.py b/server/workflow/engines/local.py
+index 4e2bddf52..ada5188eb 100644
+--- a/server/workflow/engines/local.py
++++ b/server/workflow/engines/local.py
+@@ -146,10 +146,22 @@ def update_step(wf_id: str, s_id: str, data: dict) -> None:
+                     structures = [parent["structure"]]
+                 if not structures and parent.get("structure_json"):
+                     structures = [parent["structure_json"]]
++                # Always bridge a scalar structure_json (first structure) so a
++                # downstream single-structure consumer (e.g. geo_opt with only one
++                # iteration) can find an input. The _fan_out batch path uses the
++                # `structures` list; the single path uses structure_json. Without
++                # this, a loop over 1 structure produced only `structures` (which
++                # the single MLP consumer never reads) → "No input structure".
++                first_struct = structures[0] if structures else None
++                if isinstance(first_struct, dict):
++                    first_json = json.dumps(first_struct)
++                else:
++                    first_json = first_struct
+                 step_results[step_id] = {
+                     "structures": structures,
+                     "_fan_out": True,
+                     "n_iterations": len(structures),
++                    **({"structure_json": first_json} if first_json else {}),
+                 }
+             elif loop_type == "parameters":
+                 step_results[step_id] = {
+@@ -646,12 +658,17 @@ def _place_one(struct_dict: dict) -> dict:
+                         "label": labels[0] if labels else f"{host_element}->{dopant}",
+                     }
+                 else:
+-                    # Multiple structures: set _fan_out for downstream batch/loop
++                    # Multiple structures: set _fan_out for downstream batch/loop.
++                    # Also bridge a scalar structure_json (first config) so a
++                    # single-structure downstream consumer still has an input.
++                    _first = structures[0] if structures else None
++                    _first_json = json.dumps(_first) if isinstance(_first, dict) else _first
+                     step_results[step_id] = {
+                         "structures": structures,
+                         "labels": labels,
+                         "_fan_out": True,
+                         "n_configs": len(structures),
++                        **({"structure_json": _first_json} if _first_json else {}),
+                     }
+ 
+                 update_step(workflow_id, step_id, {
+@@ -1066,3 +1083,9 @@ def _place_one(struct_dict: dict) -> dict:
+             "type": "step_status", "step_id": step_id,
+             "status": "failed", "error": str(e),
+         })
++        # Re-raise so the V2 task engine (scanner._execute_v1_local_task) marks
++        # the task FAILED too. Without this the exception is swallowed here and
++        # the V2 task is marked COMPLETED with no result — a silent false pass
++        # (e.g. doping_gen API error reported as "completed", downstream then
++        # dies with "No input structure"). Mirrors the mlp.py re-raise fix.
++        raise
+diff --git a/server/workflow/engines/mlp.py b/server/workflow/engines/mlp.py
+index 7d556976d..b5f8b4ac6 100644
+--- a/server/workflow/engines/mlp.py
++++ b/server/workflow/engines/mlp.py
+@@ -582,6 +582,14 @@ def _safe_update_step(wf_id: str, s_id: str, data: dict) -> None:
+             if parent_result.get("structure"):
+                 input_structure_str = parent_result["structure"]
+                 break
++            # Fan-out parent (loop / doping_gen / batch_slab_gen) that produced
++            # only a `structures` list and no scalar: fall back to the first
++            # structure so a single-structure step still runs instead of raising.
++            structs = parent_result.get("structures")
++            if structs:
++                first = structs[0]
++                input_structure_str = json.dumps(first) if isinstance(first, dict) else first
++                break
+         if not input_structure_str:
+             config_str = params.get("structure_json") or params.get("poscar")
+             if config_str:
+diff --git a/server/workflow/engines/vasp.py b/server/workflow/engines/vasp.py
+index 6789003f6..a617c0255 100644
+--- a/server/workflow/engines/vasp.py
++++ b/server/workflow/engines/vasp.py
+@@ -549,6 +549,47 @@ def _sort_key(site):
+         "POSCAR": poscar_str,
+     }
+ 
++    # ── NEB: image subdirectories + NEB INCAR tags ──
++    # VASP NEB reads one POSCAR per image directory 00/ (initial) .. 0(N+1)/
++    # (final) and a shared root INCAR/KPOINTS/POTCAR. write_remote_files writes
++    # any "subdir/file" key under work_dir, so we just add subdir-keyed POSCARs.
++    if node_type == "neb":
++        product_str = params.get("_resolved_product_structure") or params.get("product_structure")
++        final = None
++        if product_str:
++            try:
++                final = Structure.from_str(product_str, fmt="poscar") if isinstance(product_str, str) and not product_str.lstrip().startswith("{") else Structure.from_dict(json.loads(product_str) if isinstance(product_str, str) else product_str)
++            except Exception as exc:
++                logger.warning("NEB: could not parse product structure: %s", exc)
++        if final is not None:
++            n_images = int(params.get("nimages", params.get("n_images", 5)) or 5)
++            spring_k = float(params.get("spring_k", 5.0) or 5.0)
++            climbing = params.get("climbing", params.get("climb", True))
++            try:
++                frames = struct.interpolate(final, nimages=n_images + 1,
++                                            interpolate_lattices=False, autosort_tol=0.5)
++                # Per-image POSCARs (00=initial .. 0(N+1)=final)
++                for i, frame in enumerate(frames):
++                    input_files[f"{i:02d}/POSCAR"] = str(Poscar(frame, sort_structure=False))
++                # Root POSCAR is unused by NEB; keep it for POTCAR generation only.
++                neb_tags = [
++                    f"IMAGES = {n_images}", "IBRION = 3", "POTIM = 0",
++                    f"SPRING = {-abs(spring_k)}",
++                    f"LCLIMB = {'.TRUE.' if climbing else '.FALSE.'}",
++                ]
++                # NEB must override any preset IBRION/POTIM (e.g. relax IBRION=2),
++                # so strip those keys from the generated INCAR before appending.
++                _neb_keys = {"IMAGES", "IBRION", "POTIM", "SPRING", "LCLIMB"}
++                kept = [ln for ln in incar_str.splitlines()
++                        if not ("=" in ln and ln.split("=")[0].strip().upper() in _neb_keys)]
++                input_files["INCAR"] = "\n".join(kept).rstrip() + "\n" + "\n".join(neb_tags) + "\n"
++            except Exception as exc:
++                logger.warning("NEB: interpolation failed (initial/final atom "
++                               "count/order must match): %s", exc)
++        else:
++            logger.warning("NEB: no product structure resolved — connect a "
++                           "structure to the 'structure_product' input port.")
++
+     if params.get("double_relax") and node_type in ("vasp_relax", "bulk_opt"):
+         input_files["run_vasp.sh"] = (
+             "#!/bin/bash\n"
+diff --git a/server/workflow/node_sets.py b/server/workflow/node_sets.py
+index f5dfc8351..6fbbd2d03 100644
+--- a/server/workflow/node_sets.py
++++ b/server/workflow/node_sets.py
+@@ -30,18 +30,22 @@
+ # Node types that produce VASP calculations
+ VASP_CALC_NODES = {
+     "vasp_relax", "vasp_static", "vasp_md", "bulk_opt", "slab_relax",
+-    "frequency", "electronic", "reference_mol", "slow_growth",
++    "frequency", "electronic", "reference_mol", "slow_growth", "neb",
+ }
+ 
+ # Unified node types (software chosen by params.software)
+-UNIFIED_CALC_NODES = {"geo_opt", "single_point", "cell_opt", "md", "md_minimize", "freq", "ts_search", "irc", "uvvis"}
++UNIFIED_CALC_NODES = {"geo_opt", "single_point", "cell_opt", "md", "md_minimize", "freq", "ts_search", "irc", "uvvis", "neb"}
+ 
+ # Node types that are handled locally (no HPC submission)
+ LOCAL_NODES = {
+     "structure_input", "structure_list_input", "slab_gen", "adsorbate_place",
+     "batch_adsorbate_place",
+     "condition", "loop", "merge",
+-    "free_energy", "gibbs_energy",
++    # NOTE: free_energy is routed via ANALYSIS_NODES (its handler lives in
++    # workflow.engines.analysis.execute_analysis_node, not local.py). Keeping it
++    # out of LOCAL_NODES avoids the no-op path that marked it COMPLETED with no
++    # result (which silently broke every recipe ending in free_energy).
++    "gibbs_energy",
+     # export_data is handled by workflow.engines.local (node_type=="export_data")
+     # but was missing from this set, so it routed to "unknown".
+     "export_data",
+@@ -55,7 +59,7 @@
+ }
+ 
+ # Node types that use ML potentials (submitted as HPC jobs too)
+-MLP_NODES = {"mlp_relax", "mlp_md"}
++MLP_NODES = {"mlp_relax", "mlp_md", "mlp_single_point", "mlp_vibrations", "mlp_neb"}
+ 
+ # Node types that use xTB (semi-empirical, submitted as HPC jobs)
+ XTB_NODES = {"xtb_relax", "xtb_static"}
+@@ -113,6 +117,13 @@
+     # here, so the scanner routed them to "unknown" and templates using them
+     # could not run.
+     "convergence_check", "energy_compare", "pick_best", "her_analysis",
++    # free_energy builds the reaction free-energy diagram from upstream
++    # freq/energy results; its handler is in execute_analysis_node. It used to
++    # sit in LOCAL_NODES (→ no-op COMPLETED, empty result), breaking every
++    # recipe (HER/OER/ORR/NRR/CO2RR) whose final node is free_energy.
++    "free_energy",
++    # Generic passthrough for unmapped/blank analysis kinds (see _resolve_software).
++    "analysis_passthrough",
+ }
+ 
+ # HPC analysis nodes (currently empty — charge_analysis moved to ANALYSIS_NODES
+@@ -153,6 +164,11 @@ def _resolve_software(node_type: str, params: dict[str, object]) -> tuple[str, s
+         mapped = _ANALYSIS_TYPE_MAP.get(atype)
+         if mapped:
+             return mapped, ""
++        # Unmapped analysis kind (e.g. a teaching template with type="re-optimize"
++        # or a blank type) → generic passthrough that echoes upstream results,
++        # so the node completes locally with real data instead of falling through
++        # to the HPC submitter ("No HPC connection available").
++        return "analysis_passthrough", ""
+ 
+     if node_type not in UNIFIED_CALC_NODES:
+         return node_type, ""
+@@ -180,8 +196,14 @@ def _resolve_software(node_type: str, params: dict[str, object]) -> tuple[str, s
+         ("single_point", "cp2k"): "cp2k_static",
+         ("single_point", "orca"): "orca_sp",
+         ("single_point", "xtb"): "xtb_static",
++        ("single_point", "mlp"): "mlp_single_point",
++        ("freq", "mlp"): "mlp_vibrations",
++        ("neb", "vasp"): "neb",
++        ("neb", "mlp"): "mlp_neb",
++        ("ts_search", "mlp"): "mlp_neb",
+         ("cell_opt", "vasp"): "bulk_opt",
+         ("cell_opt", "cp2k"): "cp2k_cellopt",
++        ("cell_opt", "mlp"): "mlp_relax",
+         ("md", "vasp"): "vasp_md",
+         ("md", "cp2k"): "cp2k_md",
+         ("md", "lammps"): "lammps_md",
+diff --git a/src/lib/workflow/NodeStatusPanel.svelte b/src/lib/workflow/NodeStatusPanel.svelte
+index 9eacab7cc..c0252e8dd 100644
+--- a/src/lib/workflow/NodeStatusPanel.svelte
++++ b/src/lib/workflow/NodeStatusPanel.svelte
+@@ -29,6 +29,7 @@
+   import NEBPathPlot from './NEBPathPlot.svelte'
+   import { lazy_load_plotly, base_layout, base_config } from './plotly-utils'
+   import { pending_open_structure } from './workflow-state.svelte'
++  import { NODE_DEFINITIONS } from './node-definitions'
+   import type { TaskRef } from '$lib/api/task-adapter'
+   import * as adapter from '$lib/api/task-adapter'
+   import { normalize_status, is_valid_task_id } from '$lib/api/task-adapter'
+@@ -260,10 +261,37 @@
+     'GGA', 'METAGGA', 'LASPH', 'LORBIT', 'NEDOS', 'EMIN', 'EMAX',
+   ])
+ 
++  // Params whose node-def `show_if` does NOT match the current params (e.g. a
++  // VASP-only `kpoints`/`ENCUT` on an MLP node) are baked in by default_params
++  // but irrelevant to the chosen software, so hide them from the readout. Keys
++  // not present in the schema (custom params) are always kept.
++  // Keys whose node-def show_if fails for the given params (e.g. VASP-only
++  // kpoints/ENCUT on an MLP node). Shared by the params readout and the
++  // pending-review gate so both hide the same irrelevant params.
++  function compute_hidden_param_keys(
++    node_type: string,
++    node_params: Record<string, unknown>,
++  ): Set<string> {
++    const schema = NODE_DEFINITIONS[node_type]?.param_schema ?? []
++    const hidden = new Set<string>()
++    for (const param of schema) {
++      if (!param.show_if) continue
++      const conditions = Array.isArray(param.show_if) ? param.show_if : [param.show_if]
++      const visible = conditions.every(cond =>
++        cond.values.map(v => String(v)).includes(String(node_params[cond.key] ?? ``)))
++      if (!visible) hidden.add(param.key)
++    }
++    return hidden
++  }
++
++  const _irrelevant_param_keys = $derived.by(() =>
++    compute_hidden_param_keys(effective_node_type, effective_node_params))
++
+   const vasp_param_entries = $derived.by(() => {
+     const entries: Record<string, unknown> = {}
+     for (const [k, v] of Object.entries(effective_node_params)) {
+       if (k === 'structure' || k === 'structure_json') continue
++      if (_irrelevant_param_keys.has(k)) continue
+       if (VASP_KEYS.has(k.toUpperCase())) entries[k] = v
+     }
+     return entries
+@@ -273,6 +301,7 @@
+     const entries: Record<string, unknown> = {}
+     for (const [k, v] of Object.entries(effective_node_params)) {
+       if (k === 'structure' || k === 'structure_json') continue
++      if (_irrelevant_param_keys.has(k)) continue
+       if (!VASP_KEYS.has(k.toUpperCase())) entries[k] = v
+     }
+     return entries
+@@ -1029,9 +1058,10 @@
+             try { return JSON.parse(engine_task.params_json) }
+             catch { return {} }
+           })()}
++          {@const review_hidden = compute_hidden_param_keys(effective_node_type, params)}
+           <div style="font-size:11px;color:#aaa;">
+             {#each Object.entries(params) as [key, value]}
+-              {#if key !== 'structure' && key !== 'structure_json'}
++              {#if key !== 'structure' && key !== 'structure_json' && !review_hidden.has(key)}
+                 <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
+                   <span>{key}:</span>
+                   <span style="color:#fff;font-weight:500;">
+diff --git a/src/lib/workflow/WorkflowEditor.svelte b/src/lib/workflow/WorkflowEditor.svelte
+index 88aeaf4a2..ce0a9ca78 100644
+--- a/src/lib/workflow/WorkflowEditor.svelte
++++ b/src/lib/workflow/WorkflowEditor.svelte
+@@ -57,7 +57,7 @@
+   import {
+     type WfNode, type WfEdge,
+     NW, NH, GRID, HANDLE_R, MM_W, MM_H,
+-    snap, uid, get_display_params, get_nh, get_handle_pos,
++    snap, uid, get_display_params, get_relevant_params, get_nh, get_handle_pos,
+     bezier, point_on_bezier,
+     dist_to_edge as _dist_to_edge,
+     has_cycle as _has_cycle,
+@@ -2587,12 +2587,14 @@
+                 {#if formula_sub}
+                   <text x={NW / 2} y={44} fill="var(--text-color-dim, #8a9aba)" font-size="10" text-anchor="middle" class="mono" font-style="italic">{node_formula}</text>
+                 {/if}
+-                {#each get_display_params(node.params) as [k, v], i}
++                {@const shown_params = get_display_params(node.params, node.type)}
++                {@const relevant_count = get_relevant_params(node.params, node.type).length}
++                {#each shown_params as [k, v], i}
+                   {@const ptext = `${k}=${String(v)}`}
+                   <text x={NW / 2} y={44 + y_offset + i * 14} fill="var(--text-color-dim, #5a7a9a)" font-size="9.5" text-anchor="middle" class="mono">{ptext.length > 32 ? ptext.slice(0, 30) + `\u2026` : ptext}</text>
+                 {/each}
+-                {#if Object.keys(node.params || {}).length > get_display_params(node.params).length}
+-                  <text x={NW / 2} y={44 + y_offset + get_display_params(node.params).length * 14} fill="var(--text-color-dim, #3a5a7a)" font-size="9" text-anchor="middle" class="mono">{t('workflow.we_more_params', { n: Object.keys(node.params).length - get_display_params(node.params).length }) || `+${Object.keys(node.params).length - get_display_params(node.params).length} more`}</text>
++                {#if relevant_count > shown_params.length}
++                  <text x={NW / 2} y={44 + y_offset + shown_params.length * 14} fill="var(--text-color-dim, #3a5a7a)" font-size="9" text-anchor="middle" class="mono">{t('workflow.we_more_params', { n: relevant_count - shown_params.length }) || `+${relevant_count - shown_params.length} more`}</text>
+                 {/if}
+               {/if}
+               {#each { length: Math.max(inputs.length, 1) } as _, i}
+diff --git a/src/lib/workflow/graph-model.ts b/src/lib/workflow/graph-model.ts
+index 5ad555962..b23d8ccdd 100644
+--- a/src/lib/workflow/graph-model.ts
++++ b/src/lib/workflow/graph-model.ts
+@@ -58,18 +58,39 @@ const HIDDEN_PARAM_KEYS = new Set([
+   `frame_selection`,
+ ])
+ 
+-export function get_display_params(params: Record<string, unknown> | undefined): [string, unknown][] {
++/** Params relevant to display for a node: drops hidden keys, oversized values,
++ *  and (when node_type is given) params whose schema `show_if` doesn't match the
++ *  current params — e.g. a VASP-only `kpoints`/`ENCUT` baked into an MLP node by
++ *  default_params. Not sliced. */
++export function get_relevant_params(
++  params: Record<string, unknown> | undefined,
++  node_type?: string,
++): [string, unknown][] {
+   if (!params) return []
++  const schema = (node_type ? NODE_DEFINITIONS[node_type]?.param_schema : undefined) ?? []
++  const hidden_by_software = new Set<string>()
++  for (const p of schema) {
++    if (!p.show_if) continue
++    const conds = Array.isArray(p.show_if) ? p.show_if : [p.show_if]
++    const visible = conds.every(c => c.values.map(v => String(v)).includes(String(params[c.key] ?? ``)))
++    if (!visible) hidden_by_software.add(p.key)
++  }
+   return Object.entries(params)
+-    .filter(([k, v]) => !HIDDEN_PARAM_KEYS.has(k) && String(v).length <= 80)
+-    .slice(0, 3)
++    .filter(([k, v]) => !HIDDEN_PARAM_KEYS.has(k) && !hidden_by_software.has(k) && String(v).length <= 80)
++}
++
++export function get_display_params(
++  params: Record<string, unknown> | undefined,
++  node_type?: string,
++): [string, unknown][] {
++  return get_relevant_params(params, node_type).slice(0, 3)
+ }
+ 
+ // ─── Geometry helpers ───
+ export function get_nh(node: WfNode): number {
+   const cfg = NODE_DEFINITIONS[node.type]
+   if (!cfg) return NH
+-  const pc = get_display_params(node.params).length
++  const pc = get_display_params(node.params, node.type).length
+   if (cfg.is_condition) return 95
+   if (cfg.is_loop || cfg.is_merge) return 80
+   return pc > 0 ? NH + Math.min(pc, 3) * 14 + 4 : NH
+diff --git a/src/lib/workflow/node-defs/index.ts b/src/lib/workflow/node-defs/index.ts
+index 9eee65514..b9229bae4 100644
+--- a/src/lib/workflow/node-defs/index.ts
++++ b/src/lib/workflow/node-defs/index.ts
+@@ -59,6 +59,10 @@ export const NODE_TYPE_MIGRATION: Record<string, { type: string; defaults: Recor
+ 
+   sella_ts:     { type: `ts_search`,    defaults: { software: `sella` } },
+   orca_neb_ts:  { type: `ts_search`,    defaults: { software: `orca` } },
++  // Backend recipes / engine emit a raw `neb` node; the frontend models NEB as
++  // the TS Search calc node (software=MLP NEB / ORCA NEB-TS), so migrate it so
++  // those workflows render instead of showing edges into an unrendered node.
++  neb:          { type: `ts_search`,    defaults: { software: `mlp` } },
+ 
+   orca_irc:     { type: `irc`,          defaults: { software: `orca` } },
+ }
+diff --git a/tests/vitest/workflow/graph-model.test.ts b/tests/vitest/workflow/graph-model.test.ts
+index 4f657b0c0..200e09306 100644
+--- a/tests/vitest/workflow/graph-model.test.ts
++++ b/tests/vitest/workflow/graph-model.test.ts
+@@ -97,8 +97,10 @@ describe(`get_nh`, () => {
+   })
+ 
+   it(`increases height when node has display params`, () => {
+-    // geo_opt with visible params like ENCUT
+-    const node = make_node(`n1`, `geo_opt`, 0, 0, { ENCUT: 520, EDIFF: `1e-5`, ISIF: 3 })
++    // geo_opt with visible params like ENCUT. software=vasp so the VASP-only
++    // params pass the node-def show_if filter (get_display_params now hides
++    // params irrelevant to the chosen software, e.g. ENCUT on an MLP node).
++    const node = make_node(`n1`, `geo_opt`, 0, 0, { software: `vasp`, ENCUT: 520, EDIFF: `1e-5`, ISIF: 3 })
+     const h = get_nh(node)
+     expect(h).toBeGreaterThan(NH)
+   })

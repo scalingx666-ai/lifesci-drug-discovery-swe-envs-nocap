@@ -1,0 +1,3457 @@
+diff --git a/bionemo-recipes/models/mixtral/README.md b/bionemo-recipes/models/mixtral/README.md
+index 7b28426621..313a79e8e7 100644
+--- a/bionemo-recipes/models/mixtral/README.md
++++ b/bionemo-recipes/models/mixtral/README.md
+@@ -14,10 +14,86 @@ The Mixtral implementation natively supports the following TransformerEngine-pro
+ | **MXFP8**                               | ✅ Supported on compute capacity 10.0 and 10.3 (Blackwell), 12.0 support pending |
+ | **Sequence Packing / THD input format** | ✅ Supported                                                                     |
+ | **FP8 with THD input format**           | ✅ Supported where FP8 is supported                                              |
++| **Expert Parallelism (EP)**             | ✅ Supported via DTensor sharding, composable with FSDP2                         |
+ | **Import from HuggingFace checkpoints** | ✅ Supported                                                                     |
+ | **Export to HuggingFace checkpoints**   | ✅ Supported                                                                     |
+ | **KV-cache inference**                  | ✅ Supported                                                                     |
+ 
++## Expert Parallelism (EP)
++
++Expert parallelism shards MoE experts across GPUs so that each rank owns a subset of experts.
++This reduces per-GPU memory and allows scaling to larger expert counts. EP is implemented with
++PyTorch `DTensor` (`Shard(0)` on the expert dimension) and composes with FSDP2 on a 2D
++`(dp, ep)` device mesh.
++
++### Enabling EP
++
++Set `expert_parallel_size` in the config, then call `set_ep_groups` after model creation:
++
++```python
++from torch.distributed.device_mesh import init_device_mesh
++
++from modeling_mixtral_te import NVMixtralConfig, NVMixtralForCausalLM
++
++config = NVMixtralConfig(expert_parallel_size=ep_size, ...)
++model = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device=device)
++
++# Create a 2D mesh and activate EP
++device_mesh = init_device_mesh("cuda", (dp_size, ep_size), mesh_dim_names=("dp", "ep"))
++ep_mesh = device_mesh["ep"]
++model.model.set_ep_groups(ep_mesh.get_group(), ep_mesh)
++```
++
++`set_ep_groups` wraps each expert weight tensor as a `DTensor` with `Shard(0)` placement, and
++configures the active token dispatcher for inter-rank communication. After this call, FSDP2 can
++be applied on the `"dp"` sub-mesh as usual.
++
++### Token dispatchers
++
++The MoE block delegates token routing to a pluggable `TokenDispatcher`. Two implementations are
++provided:
++
++**`AllToAllTokenDispatcher`** (default) -- Uses NCCL `all_to_all_single` to exchange tokens
++between EP ranks, with TE `moe_permute`/`moe_unpermute` for local expert sorting. This is the
++safe default that works on any multi-GPU setup with NCCL support.
++
++**`FusedTokenRouter`** -- Uses DeepEP fused all-to-all kernels for dispatch/combine with a Triton
++kernel for index conversion. This is a higher-performance alternative that requires installing
++[`deep_ep`](https://github.com/deepseek-ai/DeepEP) and NVLink peer access between GPUs. Use this
++when training at scale where the all-to-all communication is a bottleneck. Install DeepEP with the
++provided helper script:
++
++```bash
++bash install_hybridep.sh
++```
++
++To use the fused dispatcher, pass it to the model constructor:
++
++```python
++from fused_token_router import FusedTokenRouter
++
++dispatcher = FusedTokenRouter(
++    num_experts=num_experts,
++    num_local_experts=num_local_experts,
++    hidden_size=hidden_size,
++    ep_size=ep_size,
++)
++model = NVMixtralForCausalLM(config, dispatcher=dispatcher)
++```
++
++### Checkpointing with EP
++
++EP models use `DTensor`-based state dicts and are compatible with `torch.distributed.checkpoint`
++(DCP) for save/load. To export a fully gathered checkpoint (e.g., for sharing or loading into an
++EP=1 model), use `save_final_model_ep`, which gathers all expert shards into a single safetensors
++file.
++
++### Attribution
++
++`fused_a2a.py` and `fused_indices_converter.py` are adapted from
++[NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM). `fused_a2a.py` additionally contains
++portions from the [DeepSeek DeepEP project](https://github.com/deepseek-ai/DeepEP) (MIT License).
++
+ ## Inference Examples
+ 
+ ### Quick start: convert and run
+diff --git a/bionemo-recipes/models/mixtral/convert.py b/bionemo-recipes/models/mixtral/convert.py
+index beba1ff4cb..9083f63323 100644
+--- a/bionemo-recipes/models/mixtral/convert.py
++++ b/bionemo-recipes/models/mixtral/convert.py
+@@ -30,6 +30,8 @@
+     "model.layers.*.self_attn.o_proj.weight": "model.layers.*.self_attention.proj.weight",
+     "model.layers.*.post_attention_layernorm.weight": "model.layers.*.post_attention_layernorm.weight",
+     "model.layers.*.mlp.gate.weight": "model.layers.*.mlp.gate.weight",
++    "model.layers.*.mlp.experts.gate_up_proj": "model.layers.*.mlp.experts_gate_up_weight",
++    "model.layers.*.mlp.experts.down_proj": "model.layers.*.mlp.experts_down_weight",
+     "model.norm.weight": "model.norm.weight",
+     "lm_head.weight": "lm_head.weight",
+ }
+@@ -37,55 +39,6 @@
+ reverse_mapping = {v: k for k, v in mapping.items()}
+ 
+ 
+-def _split_experts_gate_up(gate_up_proj: torch.Tensor):
+-    """Split a stacked expert gate_up tensor into per-expert tensors.
+-
+-    Args:
+-        gate_up_proj: Tensor of shape [num_experts, 2*ffn, hidden].
+-
+-    Returns:
+-        Tuple of per-expert tensors, each of shape [2*ffn, hidden].
+-    """
+-    return tuple(gate_up_proj[i] for i in range(gate_up_proj.shape[0]))
+-
+-
+-def _split_experts_down(down_proj: torch.Tensor):
+-    """Split a stacked expert down_proj tensor into per-expert tensors.
+-
+-    Args:
+-        down_proj: Tensor of shape [num_experts, hidden, ffn].
+-
+-    Returns:
+-        Tuple of per-expert tensors, each of shape [hidden, ffn].
+-    """
+-    return tuple(down_proj[i] for i in range(down_proj.shape[0]))
+-
+-
+-def _make_merge_experts_fn(num_experts: int):
+-    """Create a merge function with the correct number of named parameters.
+-
+-    The state.py transform system maps function parameter names to source dict keys by inspecting
+-    the function signature. When ``source_key`` is a tuple, it pairs each tuple element with the
+-    corresponding named parameter via ``{param: source_key[i]}``. This means ``*args`` style
+-    parameters do not work -- the system cannot map positional varargs to specific source keys.
+-
+-    Since the number of experts is dynamic (varies per model config), we use ``exec()`` to generate
+-    a function with exactly ``num_experts`` named parameters (weight0, weight1, ..., weightN-1).
+-
+-    Args:
+-        num_experts: The number of expert weight parameters the generated function will accept.
+-
+-    Returns:
+-        A callable ``(weight0, weight1, ..., weight{N-1}) -> torch.Tensor`` that stacks the
+-        per-expert weight tensors into a single tensor of shape ``[num_experts, ...]``.
+-    """
+-    param_names = [f"weight{i}" for i in range(num_experts)]
+-    code = f"def merge_experts({', '.join(param_names)}):\n    return torch.stack([{', '.join(param_names)}])"
+-    local_ns = {"torch": torch}
+-    exec(code, local_ns)
+-    return local_ns["merge_experts"]
+-
+-
+ def convert_mixtral_hf_to_te(model_hf: MixtralForCausalLM, **config_kwargs) -> NVMixtralForCausalLM:
+     """Convert a Hugging Face Mixtral model to a Transformer Engine model.
+ 
+@@ -100,12 +53,6 @@ def convert_mixtral_hf_to_te(model_hf: MixtralForCausalLM, **config_kwargs) -> N
+     with torch.device("meta"):
+         model_te = NVMixtralForCausalLM(te_config)
+ 
+-    num_experts = model_hf.config.num_local_experts
+-
+-    # Build expert weight target keys for gate_up and down projections
+-    gate_up_target_keys = tuple(f"model.layers.*.mlp.experts_gate_up.weight{i}" for i in range(num_experts))
+-    down_target_keys = tuple(f"model.layers.*.mlp.experts_down.weight{i}" for i in range(num_experts))
+-
+     output_model = state.apply_transforms(
+         model_hf,
+         model_te,
+@@ -120,16 +67,6 @@ def convert_mixtral_hf_to_te(model_hf: MixtralForCausalLM, **config_kwargs) -> N
+                 target_key="model.layers.*.self_attention.layernorm_qkv.weight",
+                 fn=state.TransformFns.merge_qkv,
+             ),
+-            state.state_transform(
+-                source_key="model.layers.*.mlp.experts.gate_up_proj",
+-                target_key=gate_up_target_keys,
+-                fn=_split_experts_gate_up,
+-            ),
+-            state.state_transform(
+-                source_key="model.layers.*.mlp.experts.down_proj",
+-                target_key=down_target_keys,
+-                fn=_split_experts_down,
+-            ),
+         ],
+     )
+ 
+@@ -156,13 +93,6 @@ def convert_mixtral_te_to_hf(model_te: NVMixtralForCausalLM, **config_kwargs) ->
+     with torch.device("meta"):
+         model_hf = MixtralForCausalLM(hf_config)
+ 
+-    num_experts = hf_config.num_local_experts
+-
+-    gate_up_source_keys = tuple(f"model.layers.*.mlp.experts_gate_up.weight{i}" for i in range(num_experts))
+-    down_source_keys = tuple(f"model.layers.*.mlp.experts_down.weight{i}" for i in range(num_experts))
+-
+-    merge_fn = _make_merge_experts_fn(num_experts)
+-
+     output_model = state.apply_transforms(
+         model_te,
+         model_hf,
+@@ -177,16 +107,6 @@ def convert_mixtral_te_to_hf(model_te: NVMixtralForCausalLM, **config_kwargs) ->
+                 ),
+                 fn=state.TransformFns.split_qkv,
+             ),
+-            state.state_transform(
+-                source_key=gate_up_source_keys,
+-                target_key="model.layers.*.mlp.experts.gate_up_proj",
+-                fn=merge_fn,
+-            ),
+-            state.state_transform(
+-                source_key=down_source_keys,
+-                target_key="model.layers.*.mlp.experts.down_proj",
+-                fn=merge_fn,
+-            ),
+         ],
+     )
+ 
+diff --git a/bionemo-recipes/models/mixtral/fused_a2a.py b/bionemo-recipes/models/mixtral/fused_a2a.py
+new file mode 100644
+index 0000000000..3b07ede489
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/fused_a2a.py
+@@ -0,0 +1,300 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++# Portions of this code are from DeepSeek DeepEP project
++# Copyright (c) 2025 DeepSeek
++# Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
++
++import os
++
++
++try:
++    from deep_ep import Buffer
++    from deep_ep.utils import EventHandle, EventOverlap
++
++    HAVE_DEEP_EP = True
++    Buffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", "20")))
++except ImportError:
++    HAVE_DEEP_EP = False
++
++import torch
++
++
++_buffer = None
++_nvshmem_available = None
++
++
++def _is_nvshmem_available() -> bool:
++    """Check if DeepEP was compiled with NVSHMEM support.
++
++    Probes NVSHMEM by calling get_rdma_buffer_size_hint, since
++    is_sm90_compiled() alone is not a reliable proxy — SM90 can
++    be compiled while NVSHMEM is still disabled.
++    """
++    global _nvshmem_available  # noqa: PLW0603
++    if _nvshmem_available is None:
++        try:
++            config = Buffer.get_dispatch_config(2)
++            config.get_rdma_buffer_size_hint(256, 2)
++            _nvshmem_available = True
++        except RuntimeError:
++            _nvshmem_available = False
++    return _nvshmem_available
++
++
++def get_hidden_bytes(x: torch.Tensor) -> int:
++    """Calculate the number of hidden bytes for a tensor.
++
++    Args:
++        x (torch.Tensor): Input tensor
++
++    Returns:
++        int: Number of hidden bytes
++    """
++    return x.size(1) * max(x.element_size(), 2)
++
++
++def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
++    """Get or create a buffer for all-to-all communication.
++
++    Args:
++        group (torch.distributed.ProcessGroup): Process group for communication
++        hidden_bytes (int): Number of hidden bytes needed
++
++    Returns:
++        Buffer: Communication buffer
++    """
++    global _buffer  # noqa: PLW0603
++    num_nvl_bytes, num_rdma_bytes = 0, 0
++    nvshmem = _is_nvshmem_available()
++    for config in (
++        Buffer.get_dispatch_config(group.size()),
++        Buffer.get_combine_config(group.size()),
++    ):
++        num_nvl_bytes = max(config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
++        if nvshmem:
++            num_rdma_bytes = max(config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
++
++    # Allocate buffer if not existed or not enough buffer
++    # NOTES: the adaptive routing configuration of the network **must be off**
++    if (
++        _buffer is None
++        or _buffer.group != group
++        or _buffer.num_nvl_bytes < num_nvl_bytes
++        or _buffer.num_rdma_bytes < num_rdma_bytes
++    ):
++        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
++    return _buffer
++
++
++class FusedDispatch(torch.autograd.Function):
++    """Fused dispatch operation for MoE routing combining computation and communication."""
++
++    @staticmethod
++    def forward(
++        ctx,
++        x,
++        token_indices,
++        token_probs,
++        num_experts,
++        group,
++        async_finish=False,
++        allocate_on_comm_stream=False,
++    ):
++        """Forward pass of fused dispatch."""
++        previous_event = None
++        if async_finish:
++            previous_event = EventOverlap(EventHandle())
++        # Calculate layout before actual dispatch
++        buffer = get_buffer(group, get_hidden_bytes(x))
++        (
++            num_tokens_per_rank,
++            num_tokens_per_rdma_rank,
++            num_tokens_per_expert,
++            is_token_in_rank,
++            event,
++        ) = buffer.get_dispatch_layout(
++            token_indices,
++            num_experts,
++            previous_event=previous_event,
++            async_finish=async_finish,
++            allocate_on_comm_stream=allocate_on_comm_stream,
++        )
++
++        # Do MoE dispatch
++        # NOTES: the CPU will wait for GPU's signal to arrive,
++        # so this is not compatible with CUDA graph
++        (
++            recv_x,
++            recv_token_indices,
++            recv_token_probs,
++            num_recv_tokens_per_expert_list,
++            handle,
++            after_event_overlap,
++        ) = buffer.dispatch(
++            x,
++            topk_idx=token_indices,
++            topk_weights=token_probs,  # DeepEP only supports float32 probs
++            num_tokens_per_rank=num_tokens_per_rank,
++            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
++            is_token_in_rank=is_token_in_rank,
++            num_tokens_per_expert=num_tokens_per_expert,
++            previous_event=event,  # wait in deepep::intra/inter_dispatch
++            async_finish=async_finish,
++            allocate_on_comm_stream=allocate_on_comm_stream,
++        )
++
++        # Make sure current stream is synchronized
++        if async_finish:
++            after_event_overlap.current_stream_wait()
++
++        # Save for backward
++        ctx.group = group
++        ctx.handle = handle
++        ctx.async_finish = async_finish
++        ctx.allocate_on_comm_stream = allocate_on_comm_stream
++        tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
++
++        return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
++
++    @staticmethod
++    def backward(
++        ctx,
++        grad_output,
++        grad_token_indices,
++        grad_token_probs,
++        grad_tokens_per_expert,
++        grad_handle,
++    ):
++        """Backward pass of fused dispatch."""
++        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
++        handle = ctx.handle
++        previous_event = None
++        if ctx.async_finish:
++            previous_event = EventOverlap(EventHandle())
++        grad_x, grad_token_probs, after_event = buffer.combine(
++            grad_output.contiguous(),
++            handle,
++            topk_weights=grad_token_probs.float(),
++            previous_event=previous_event,
++            async_finish=ctx.async_finish,
++            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
++        )
++        # Make sure current stream is synchronized
++        if ctx.async_finish:
++            after_event.current_stream_wait()
++        return grad_x, None, grad_token_probs, None, None, None, None
++
++
++class FusedCombine(torch.autograd.Function):
++    """Fused combine operation for MoE output combining computation and communication."""
++
++    @staticmethod
++    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
++        """Forward pass of fused combine."""
++        previous_event = None
++        if async_finish:
++            previous_event = EventOverlap(EventHandle())
++        buffer = get_buffer(group, get_hidden_bytes(x))
++        combined_x, _, after_event = buffer.combine(
++            x,
++            handle=handle,
++            async_finish=async_finish,
++            previous_event=previous_event,
++            allocate_on_comm_stream=allocate_on_comm_stream,
++        )
++        # Make sure current stream is synchronized
++        if async_finish:
++            after_event.current_stream_wait()
++
++        ctx.handle = handle
++        ctx.group = group
++        ctx.async_finish = async_finish
++        ctx.allocate_on_comm_stream = allocate_on_comm_stream
++        return combined_x, None
++
++    @staticmethod
++    def backward(ctx, grad_output, previous_event=None):
++        """Backward pass of fused combine."""
++        previous_event = None
++        if ctx.async_finish:
++            previous_event = EventOverlap(EventHandle())
++        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
++        grad_x, _, _, _, _, after_event = buffer.dispatch(
++            grad_output.contiguous(),
++            handle=ctx.handle,
++            previous_event=previous_event,
++            async_finish=ctx.async_finish,
++            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
++        )
++        # Make sure current stream is synchronized
++        if ctx.async_finish:
++            after_event.current_stream_wait()
++        return grad_x, None, None, None, None
++
++
++if HAVE_DEEP_EP:
++
++    def fused_dispatch(
++        x,
++        token_indices,
++        token_probs,
++        num_experts,
++        group,
++        async_finish=False,
++        allocate_on_comm_stream=False,
++    ):
++        """Perform fused dispatch operation if deep_ep is available.
++
++        Args:
++            x: Input tensor [num_tokens, hidden_size]
++            token_indices: Token routing indices [num_tokens, topk]
++            token_probs: Token routing probabilities [num_tokens, topk]
++            num_experts: Number of experts
++            group: Process group
++            async_finish: Whether to finish asynchronously
++            allocate_on_comm_stream: Whether to allocate on communication stream
++
++        Returns:
++            Result of FusedDispatch
++        """
++        return FusedDispatch.apply(
++            x.contiguous(),
++            token_indices,
++            token_probs,
++            num_experts,
++            group,
++            async_finish,
++            allocate_on_comm_stream,
++        )
++
++    def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
++        """Perform fused combine operation if deep_ep is available.
++
++        Args:
++            x: Input tensor
++            group: Process group
++            handle: Communication handle
++            async_finish: Whether to finish asynchronously
++            allocate_on_comm_stream: Whether to allocate on communication stream
++
++        Returns:
++            Result of FusedCombine
++        """
++        return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
++
++else:
++    fused_dispatch = None
++    fused_combine = None
+diff --git a/bionemo-recipes/models/mixtral/fused_indices_converter.py b/bionemo-recipes/models/mixtral/fused_indices_converter.py
+new file mode 100644
+index 0000000000..860cec6a70
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/fused_indices_converter.py
+@@ -0,0 +1,305 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import math
++from typing import TYPE_CHECKING
++from unittest.mock import MagicMock
++
++import torch
++
++
++def _identity_decorator(fn):
++    """Return the decorated callable unchanged (no-op decorator fallback)."""
++    return fn
++
++
++null_decorator = _identity_decorator
++
++try:
++    import triton
++    import triton.language as tl
++
++    HAVE_TRITON = True
++except ImportError:
++    HAVE_TRITON = False
++
++if not HAVE_TRITON:
++    triton = MagicMock()
++    triton.jit = null_decorator
++    triton.autotune = null_decorator
++    triton.heuristics = null_decorator
++    tl = MagicMock()
++
++
++if TYPE_CHECKING:
++    import triton
++    import triton.language as tl
++
++
++# Assign a block to a row([1,topk]), generate a local routing map([1,num_of_local_experts])
++@triton.jit
++def _indices_to_multihot_kernel(
++    indices_ptr,
++    probs_in_indices_ptr,
++    multihot_indices_ptr,  # bool
++    probs_in_multihot_ptr,
++    position_map_ptr,
++    num_of_local_experts: tl.constexpr,
++    num_of_local_experts_next_power_of_2: tl.constexpr,
++    topk: tl.constexpr,
++    topk_next_power_of_2: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,  # noqa: N803
++):
++    """Triton kernel for converting indices to multihot representation.
++
++    Input:
++        indices: [num_of_tokens, topk]
++        probs_in_indices: [num_of_tokens, topk]
++    Output:
++        multihot_indices: [num_of_tokens, num_of_local_experts]
++        probs_in_multihot: [num_of_tokens, num_of_local_experts]
++
++    Assume that topk = 2 , num_of_local_experts = 4, num_of_tokens = 2,
++    then the kernel can process the following conversion:
++
++    Input Example:
++        indices = [
++                [0, 1],
++                [1, 2]
++            ]
++        probs_in_indices = [
++                [0.1, 0.2],
++                [0.3, 0.4]
++            ]
++    Output Example:
++        multihot_indices = [
++                [1, 1, -1, -1],
++                [-1, 1, 1, -1]
++            ]
++        probs_in_multihot = [
++                [0.1, 0.2, 0.0, 0.0],
++                [0.0, 0.3, 0.4, 0.0]
++            ]
++    """
++    # Prepare the [0, topk) row
++    topk_row = tl.arange(0, topk_next_power_of_2)
++    topk_row = tl.where(topk_row < topk, topk_row, -1)
++    topk_row_mask = topk_row != -1
++    # Prepare the [0, num_of_local_experts) row
++    num_exp_row = tl.arange(0, num_of_local_experts_next_power_of_2)
++    num_exp_row = tl.where(num_exp_row < num_of_local_experts, num_exp_row, -1)
++    num_exp_row_mask = num_exp_row != -1
++
++    # Load a [1, topk] row from the indices buffer
++    row_idx = tl.program_id(0)
++    indices_row = tl.load(indices_ptr + row_idx * topk + topk_row, mask=topk_row_mask)
++    indices_row = tl.where(topk_row_mask, indices_row, -1)
++    probs_row = tl.load(probs_in_indices_ptr + row_idx * topk + topk_row, mask=topk_row_mask)
++
++    # Get the position of the each index in the indices_row, which is saved for backwards
++    position_row = tl.where(indices_row != -1, topk_row, -1)
++    # Mask of the valid indices
++    mask = (indices_row != -1) & (indices_row < num_of_local_experts)
++
++    row_idx_offset = row_idx * num_of_local_experts
++    # Store to initialize
++    tl.store(multihot_indices_ptr + row_idx_offset + num_exp_row, 0, mask=num_exp_row_mask)
++    tl.store(probs_in_multihot_ptr + row_idx_offset + num_exp_row, 0, mask=num_exp_row_mask)
++    tl.store(position_map_ptr + row_idx_offset + num_exp_row, -1, mask=num_exp_row_mask)
++    # Use barrier to make sure the initialization is done
++    tl.debug_barrier()
++    # Store the indices and probs_in_indices
++    tl.store(multihot_indices_ptr + row_idx_offset + indices_row, 1, mask)
++    tl.store(probs_in_multihot_ptr + row_idx_offset + indices_row, probs_row, mask)
++    # Store the position of the position_row for backwards
++    tl.store(position_map_ptr + row_idx_offset + indices_row, position_row, mask)
++
++
++# Assign a block to a row([1,topk]), generate a probs_indices([1,topk])
++@triton.jit
++def _multihot_to_indices_kernel(
++    probs_in_multihot_ptr,
++    position_map_ptr,
++    probs_indices_ptr,
++    num_of_local_experts: tl.constexpr,
++    num_of_local_experts_next_power_of_2: tl.constexpr,
++    topk: tl.constexpr,
++    topk_next_power_of_2: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,  # noqa: N803
++):
++    """Triton kernel for converting multihot representation to indices.
++
++    Input:
++        probs_in_multihot: [num_of_tokens, num_of_local_experts]
++        position_map: [num_of_tokens, num_of_local_experts]
++    Output:
++        probs_indices: [num_of_tokens, topk]
++
++    Assume that topk = 2 , num_of_local_experts = 4, num_of_tokens = 2,
++    then the kernel can process the following conversion:
++
++    Input Example:
++        probs_in_multihot = [
++                [0.7, 0.8, 0.0, 0.0],
++                [0.0, 0.1, 0.9, 0.0]
++            ]
++        position_map = [
++                [1, 1, -1, -1],
++                [-1, 1, 1, -1]
++            ]
++    Output Example:
++        probs_indices = [
++                [0.7, 0.8],
++                [0.1, 0.9]
++            ]
++    """
++    # Prepare the [0, topk) row
++    topk_row = tl.arange(0, topk_next_power_of_2)
++    topk_row = tl.where(topk_row < topk, topk_row, -1)
++    topk_row_mask = topk_row != -1
++    # Prepare the [0, num_of_local_experts) row
++    num_exp_row = tl.arange(0, num_of_local_experts_next_power_of_2)
++    num_exp_row = tl.where(num_exp_row < num_of_local_experts, num_exp_row, -1)
++    num_exp_row_mask = num_exp_row != -1
++
++    # Load a [1, num_of_local_experts] row from the local routing map
++    row_idx = tl.program_id(0)
++    ptr_offset = row_idx * num_of_local_experts + num_exp_row
++    probs_in_multihot_row = tl.load(probs_in_multihot_ptr + ptr_offset, mask=num_exp_row_mask)
++
++    # Get the original position of the valid value in the the indices
++    position_map_row = tl.load(position_map_ptr + ptr_offset, mask=num_exp_row_mask)
++    position_map_row = tl.where(num_exp_row_mask, position_map_row, -1)
++    mask = position_map_row != -1
++
++    # Store to initialize
++    tl.store(probs_indices_ptr + row_idx * topk + topk_row, 0, mask=topk_row_mask)
++    # Use barrier to make sure the initialization is done
++    tl.debug_barrier()
++    # Restore the indices and probs_indices
++    tl.store(
++        probs_indices_ptr + row_idx * topk + position_map_row,
++        probs_in_multihot_row,
++        mask,
++    )
++
++
++class IndicesToMultihot(torch.autograd.Function):
++    """Convert moe topk indices to multihot representation.
++
++    This class implements a custom forward and backward propagation
++    operation for efficiently converting indices to multihot
++    representation.
++    It is an experimental feature and may change in future versions.
++    """
++
++    @staticmethod
++    def forward(ctx, indices, probs_indices, num_of_local_experts):  # noqa: D417
++        """Forward function for IndicesToMultihot.
++
++        Convert indices to multihot representation.
++
++        Args:
++            indices: [num_of_tokens, topk]
++            probs_indices: [num_of_tokens, topk]
++            num_of_local_experts: int
++
++        Returns:
++            multihot_indices: [num_of_tokens, num_of_local_experts]
++            probs_in_multihot: [num_of_tokens, num_of_local_experts]
++        """
++        assert HAVE_TRITON, "Triton is not installed"
++        num_of_tokens = indices.shape[0]
++        assert indices.shape == probs_indices.shape, "indices and probs_indices must have the same shape"
++        topk = indices.shape[1]
++        device = indices.device
++        multihot_indices = torch.empty((num_of_tokens, num_of_local_experts), dtype=torch.bool, device=device)
++        probs_in_multihot = torch.empty(
++            (num_of_tokens, num_of_local_experts),
++            dtype=probs_indices.dtype,
++            device=device,
++        )
++        position_map = torch.empty((num_of_tokens, num_of_local_experts), dtype=torch.int32, device=device)
++        # Compute the next power of 2 for the topk and num_of_local_experts
++        topk_next_power_of_2 = 2 ** math.ceil(math.log2(topk))
++        num_of_local_experts_next_power_of_2 = 2 ** math.ceil(math.log2(num_of_local_experts))
++        grid = (num_of_tokens,)
++        _indices_to_multihot_kernel[grid](
++            indices,
++            probs_indices,
++            multihot_indices,
++            probs_in_multihot,
++            position_map,
++            num_of_local_experts,
++            num_of_local_experts_next_power_of_2,
++            topk,
++            topk_next_power_of_2,
++            BLOCK_SIZE=32,  # use only 1 warp per block
++            num_warps=1,
++        )
++
++        ctx.save_for_backward(position_map)
++        ctx.num_of_tokens = num_of_tokens
++        ctx.num_of_local_experts = num_of_local_experts
++        ctx.topk = topk
++        return multihot_indices, probs_in_multihot
++
++    @staticmethod
++    def backward(ctx, grad_multihot_indices, grad_probs_in_multihot):  # noqa: D417
++        """Backward function for IndicesToMultihot.
++
++        Convert multihot probs representation to indices.
++        indices is ignored in the backward function.
++
++        Args:
++            grad_multihot_indices: [num_of_tokens, num_of_local_experts]
++            grad_probs_in_multihot: [num_of_tokens, num_of_local_experts]
++
++        Returns:
++            grad_probs_indices: [num_of_tokens, topk]
++        """
++        position_map = ctx.saved_tensors[0]
++        num_of_tokens = ctx.num_of_tokens
++        num_of_local_experts = ctx.num_of_local_experts
++        topk = ctx.topk
++
++        # Initialize the gradient of the indices and probs_indices
++        grad_probs_indices = torch.empty(
++            (num_of_tokens, topk), dtype=grad_probs_in_multihot.dtype, device=grad_probs_in_multihot.device
++        )
++        # Compute the next power of 2 for the topk and num_of_local_experts
++        topk_next_power_of_2 = 2 ** math.ceil(math.log2(topk))
++        num_of_local_experts_next_power_of_2 = 2 ** math.ceil(math.log2(num_of_local_experts))
++
++        grid = (num_of_tokens,)
++        _multihot_to_indices_kernel[grid](
++            # if the grad_probs_in_multihot is all-one/all-zero,
++            # overlapping stride will cause error without contiguous()
++            grad_probs_in_multihot.contiguous(),
++            position_map,
++            grad_probs_indices,
++            num_of_local_experts,
++            num_of_local_experts_next_power_of_2,
++            topk,
++            topk_next_power_of_2,
++            BLOCK_SIZE=32,  # use only 1 warp per block
++            num_warps=1,
++        )
++        return None, grad_probs_indices, None
++
++
++def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
++    """Convert moe topk indices to multihot representation."""
++    return IndicesToMultihot.apply(indices, probs_indices, num_of_local_experts)
+diff --git a/bionemo-recipes/models/mixtral/fused_token_router.py b/bionemo-recipes/models/mixtral/fused_token_router.py
+new file mode 100644
+index 0000000000..1c7b393e02
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/fused_token_router.py
+@@ -0,0 +1,153 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""DeepEP-backed TokenDispatcher using fused all-to-all and Triton index conversion."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++import torch.distributed as dist
++import transformer_engine.pytorch
++
++from fused_a2a import fused_combine, fused_dispatch
++from fused_indices_converter import HAVE_TRITON, fused_indices_to_multihot
++from modeling_mixtral_te import DispatchOutput
++
++
++@dataclass
++class _FusedHandle:
++    """Opaque state for FusedTokenRouter between dispatch and combine."""
++
++    deepep_handle: Any
++    row_id_map: torch.Tensor
++    probs_multihot: torch.Tensor
++    recv_shape: torch.Size
++
++
++class FusedTokenRouter:
++    """TokenDispatcher using DeepEP fused communication and Triton index conversion.
++
++    Dispatch flow:
++        1. ``fused_dispatch`` — DeepEP all-to-all sends tokens to expert-owning ranks.
++        2. ``fused_indices_to_multihot`` — Triton kernel converts sparse ``[N, top_k]``
++           indices to dense ``[N, num_local_experts]`` mask with differentiable probs.
++        3. ``moe_permute(map_type="mask")`` — TE sorts received tokens by local expert.
++
++    Combine flow:
++        1. ``moe_unpermute(map_type="mask")`` — TE unsorts and applies routing weights.
++        2. ``fused_combine`` — DeepEP reverse all-to-all sends results back.
++
++    Args:
++        num_experts: Total number of experts (global, across all EP ranks).
++        num_local_experts: Number of experts hosted on this rank.
++        hidden_size: Hidden dimension size.
++        ep_size: Expert parallel world size.
++    """
++
++    def __init__(self, num_experts: int, num_local_experts: int, hidden_size: int, ep_size: int):
++        """Initialize the FusedTokenRouter."""
++        if fused_dispatch is None or fused_combine is None:
++            raise ImportError("deep_ep is required for FusedTokenRouter. Install it with: pip install deep_ep")
++        if not HAVE_TRITON:
++            raise ImportError(
++                "Triton is required for FusedTokenRouter (used by fused_indices_to_multihot). "
++                "Install it with: pip install triton"
++            )
++        self.num_experts = num_experts
++        self.num_local_experts = num_local_experts
++        self.hidden_size = hidden_size
++        self.ep_size = ep_size
++        self._ep_group: dist.ProcessGroup | None = None
++
++    def set_ep_group(self, ep_group: dist.ProcessGroup) -> None:
++        """Set the expert-parallel process group for communication."""
++        self._ep_group = ep_group
++
++    def dispatch(
++        self,
++        hidden_states: torch.Tensor,
++        selected_experts: torch.Tensor,
++        routing_weights: torch.Tensor,
++    ) -> DispatchOutput:
++        """Dispatch tokens to their assigned experts via DeepEP fused all-to-all.
++
++        Args:
++            hidden_states: Flattened input tensor of shape ``[N, H]``.
++            selected_experts: Expert assignments, shape ``[N, top_k]``, int.
++            routing_weights: Normalized routing probabilities, shape ``[N, top_k]``, float32.
++
++        Returns:
++            DispatchOutput with expert-sorted tokens, per-expert counts, and an opaque handle.
++        """
++        assert self._ep_group is not None, "EP group must be set via set_ep_group() before dispatch"
++
++        # Step 1: Fused all-to-all dispatch (DeepEP)
++        recv_x, recv_indices, recv_probs, tokens_per_expert, deepep_handle = fused_dispatch(
++            hidden_states,
++            selected_experts,
++            routing_weights.float(),  # DeepEP requires float32 probs
++            self.num_experts,
++            self._ep_group,
++        )
++
++        # Step 2: Convert sparse [N, top_k] indices to dense [N, num_local_experts] multihot (Triton)
++        # Note: DeepEP returns local expert indices (0-based per rank), not global indices.
++        multihot_mask, probs_multihot = fused_indices_to_multihot(recv_indices, recv_probs, self.num_local_experts)
++
++        # Step 3: Permute received tokens by local expert for GroupedLinear
++        num_out_tokens = int(tokens_per_expert.sum().item())
++        permuted_x, row_id_map = transformer_engine.pytorch.moe_permute(
++            recv_x, multihot_mask.to(torch.int32), num_out_tokens=num_out_tokens, map_type="mask"
++        )
++
++        handle = _FusedHandle(
++            deepep_handle=deepep_handle,
++            row_id_map=row_id_map,
++            probs_multihot=probs_multihot,
++            recv_shape=recv_x.shape,
++        )
++
++        return DispatchOutput(
++            expert_input=permuted_x,
++            tokens_per_expert=tokens_per_expert.tolist(),
++            handle=handle,
++        )
++
++    def combine(self, expert_output: torch.Tensor, handle: _FusedHandle) -> torch.Tensor:
++        """Combine expert outputs back to the original token order.
++
++        Args:
++            expert_output: Expert output tensor of shape ``[total_recv_tokens, H]``.
++            handle: Opaque state from ``dispatch()``.
++
++        Returns:
++            Combined output tensor of shape ``[N, H]`` with routing weights applied.
++        """
++        # Step 1: Unpermute expert output and apply routing weights
++        unpermuted = transformer_engine.pytorch.moe_unpermute(
++            expert_output,
++            handle.row_id_map,
++            merging_probs=handle.probs_multihot,
++            restore_shape=handle.recv_shape,
++            map_type="mask",
++        )
++
++        # Step 2: Fused all-to-all combine (reverse dispatch)
++        combined, _ = fused_combine(unpermuted, self._ep_group, handle.deepep_handle)
++
++        return combined
+diff --git a/bionemo-recipes/models/mixtral/install_hybridep.sh b/bionemo-recipes/models/mixtral/install_hybridep.sh
+new file mode 100755
+index 0000000000..ec6dd925bc
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/install_hybridep.sh
+@@ -0,0 +1,144 @@
++#!/bin/bash
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Install DeepEP (hybrid-ep branch).
++#
++# NVSHMEM support (fast nvlink communication) blocked by
++# https://nvbugspro.nvidia.com/bug/5810040
++#
++# Environment expectations:
++#   - CUDA toolkit (nvcc) available via $CUDA_HOME or /usr/local/cuda
++#   - PyTorch pre-installed (NGC container or equivalent)
++#   - GPU with Blackwell architecture (sm_100 / sm_120) recommended
++#
++# Usage:
++#   bash install_hybridep.sh
++#
++set -euo pipefail
++
++CLONE_DIR="$(mktemp -d)"
++trap 'rm -rf "$CLONE_DIR"' EXIT
++
++echo "============================================"
++echo " DeepEP (hybrid-ep) Installation"
++echo "============================================"
++echo ""
++
++# ---------------------------------------------------------------------------
++# 1. Install pynvml (DeepEP runtime dependency)
++# ---------------------------------------------------------------------------
++echo "[1/3] Installing pynvml ..."
++pip install --no-cache-dir pynvml 2>&1 | tail -2
++echo ""
++
++# ---------------------------------------------------------------------------
++# 2. Detect target GPU architecture
++# ---------------------------------------------------------------------------
++echo "[2/3] Detecting GPU architecture ..."
++
++FORCE_ARCH="${FORCE_ARCH:-}"
++GPU_ARCH="$(python3 -c "
++import torch, sys, os
++force = os.environ.get('FORCE_ARCH', '')
++if force:
++    print(force)
++    sys.exit(0)
++if not torch.cuda.is_available():
++    print('10.0')                       # safe default (Blackwell datacenter)
++    sys.exit(0)
++cap = torch.cuda.get_device_capability(0)
++major, minor = cap
++arch = f'{major}.{minor}'
++if major < 10:
++    print(f'ERROR: Detected GPU compute capability {arch} (sm_{major}{minor}), '
++          f'but DeepEP hybrid-ep kernels require Blackwell (sm_100+).', file=sys.stderr)
++    print(f'To force a target architecture anyway, set FORCE_ARCH=10.0 '
++          f'and re-run.', file=sys.stderr)
++    sys.exit(1)
++print(arch)
++")"
++echo "       Target TORCH_CUDA_ARCH_LIST=${GPU_ARCH}"
++echo ""
++
++# ---------------------------------------------------------------------------
++# 3. Clone & build DeepEP (hybrid-ep branch)
++# ---------------------------------------------------------------------------
++echo "[3/3] Cloning and building DeepEP ..."
++git clone --branch hybrid-ep --depth 1 \
++    https://github.com/deepseek-ai/DeepEP.git \
++    "${CLONE_DIR}/DeepEP" 2>&1 | tail -3
++
++pushd "${CLONE_DIR}/DeepEP" > /dev/null
++
++# Build knobs:
++# - TORCH_CUDA_ARCH_LIST: compile for the detected (or default) arch.
++# - NVSHMEM_DIR is intentionally NOT set.  The pip-installed NVSHMEM ships
++#   libnvshmem_device.a compiled without -fPIC, whose relocations are
++#   incompatible with shared-library linking via the host linker.
++#   Without NVSHMEM_DIR, setup.py disables internode / low-latency features
++#   in deep_ep_cpp but the hybrid_ep_cpp extension (the primary expert-
++#   parallelism module) is unaffected.
++# - DISABLE_AGGRESSIVE_PTX_INSTRS: automatically set to 1 by setup.py for
++#   any arch != 9.0, so no need to export it here.
++unset NVSHMEM_DIR 2>/dev/null || true
++export TORCH_CUDA_ARCH_LIST="${GPU_ARCH}"
++
++# Force-disable NVSHMEM in setup.py so it does not auto-discover the pip
++# package via importlib (the pip archive has link-incompatible objects).
++sed -i 's/disable_nvshmem = False/disable_nvshmem = True/' setup.py
++
++echo "       Building wheel (this may take several minutes) ..."
++python3 setup.py bdist_wheel 2>&1 | tail -5
++echo ""
++
++echo "       Installing wheel ..."
++pip install --no-cache-dir --no-deps dist/*.whl 2>&1 | tail -3
++
++popd > /dev/null
++echo ""
++
++# ---------------------------------------------------------------------------
++# Verify imports
++# ---------------------------------------------------------------------------
++echo "Verifying imports ..."
++python3 -c "
++import sys
++
++failures = []
++
++# -- deep_ep (Python package) --
++try:
++    import deep_ep
++    print('  OK  deep_ep')
++except Exception as e:
++    print(f'  FAIL deep_ep: {e}')
++    failures.append('deep_ep')
++
++# -- deep_ep_cpp (C++/CUDA extension) --
++try:
++    import deep_ep_cpp
++    print('  OK  deep_ep_cpp')
++except Exception as e:
++    print(f'  FAIL deep_ep_cpp: {e}')
++    failures.append('deep_ep_cpp')
++
++# -- hybrid_ep_cpp (C++/CUDA extension) --
++try:
++    import hybrid_ep_cpp
++    print('  OK  hybrid_ep_cpp')
++except Exception as e:
++    print(f'  FAIL hybrid_ep_cpp: {e}')
++    failures.append('hybrid_ep_cpp')
++
++if failures:
++    print(f'\nERROR: {len(failures)} import(s) failed: {failures}', file=sys.stderr)
++    sys.exit(1)
++else:
++    print('\nAll imports succeeded.')
++"
++
++echo ""
++echo "============================================"
++echo " Installation complete"
++echo "============================================"
+diff --git a/bionemo-recipes/models/mixtral/modeling_mixtral_te.py b/bionemo-recipes/models/mixtral/modeling_mixtral_te.py
+index e299c63006..e61a852016 100644
+--- a/bionemo-recipes/models/mixtral/modeling_mixtral_te.py
++++ b/bionemo-recipes/models/mixtral/modeling_mixtral_te.py
+@@ -15,16 +15,23 @@
+ 
+ """TransformerEngine-optimized Mixtral model with Mixture of Experts."""
+ 
++import logging
++import os
+ import warnings
+ from collections import OrderedDict
+ from contextlib import nullcontext
+-from typing import ClassVar, ContextManager, Unpack
++from dataclasses import dataclass
++from typing import Any, ClassVar, ContextManager, Protocol, Unpack
+ 
+ import torch
++import torch.distributed as dist
+ import torch.nn as nn
+ import transformer_engine.common.recipe
+ import transformer_engine.pytorch
+ import transformers
++from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
++from torch.distributed.tensor import DTensor, Shard
++from torch.distributed.tensor.device_mesh import DeviceMesh
+ from transformer_engine.pytorch.attention import InferenceParams
+ from transformer_engine.pytorch.attention.inference import PagedKVCacheManager
+ from transformer_engine.pytorch.attention.rope import RotaryPositionEmbedding
+@@ -34,6 +41,9 @@
+ from transformers.utils.generic import TransformersKwargs
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ AUTO_MAP = {
+     "AutoConfig": "modeling_mixtral_te.NVMixtralConfig",
+     "AutoModel": "modeling_mixtral_te.NVMixtralModel",
+@@ -49,33 +59,90 @@ class NVMixtralConfig(MixtralConfig):
+     #   "thd"  = Total tokens (packed/unpadded), Head, Dimension (sequence packing format)
+     attn_input_format: str = "thd"
+     self_attn_mask_type: str = "padding_causal"
++    layer_precision: list[str | None] | None = None
++    use_quantized_model_init: bool = False
++    expert_parallel_size: int = 1
++    moe_aux_loss_coeff: float = 0.0
+ 
+-    def __init__(
+-        self,
+-        layer_precision: list[str | None] | None = None,
+-        use_quantized_model_init: bool = False,
+-        **kwargs,
+-    ):
+-        """Initialize the NVMixtralConfig with additional TE-related config options.
+-
+-        Args:
+-            layer_precision: Per-layer quantization precision, a list of length ``num_hidden_layers``
+-                where each element is ``"fp8"``, ``"fp4"``, or ``None`` (BF16 fallback). ``None``
+-                (the default) means no quantization is configured.
+-            use_quantized_model_init: Whether to use `quantized_model_init` for layer initialization.
+-            **kwargs: Additional config options to pass to MixtralConfig.
+-        """
++    def __init__(self, **kwargs):
++        """Initialize the NVMixtralConfig with additional TE-related config options."""
+         super().__init__(**kwargs)
+-        self.layer_precision = layer_precision
+-        self.use_quantized_model_init = use_quantized_model_init
+ 
+-        if layer_precision is not None:
+-            if len(layer_precision) != self.num_hidden_layers:
++        if self.layer_precision is not None:
++            if len(self.layer_precision) != self.num_hidden_layers:
+                 raise ValueError(f"layer_precision must be a list of length {self.num_hidden_layers}")
+-            for precision in layer_precision:
++            for precision in self.layer_precision:
+                 if precision not in {"fp8", "fp4", None}:
+                     raise ValueError(f'layer_precision element must be "fp8", "fp4", or None, got {precision!r}')
+ 
++        if self.num_local_experts % self.expert_parallel_size != 0:
++            raise ValueError(
++                f"num_local_experts ({self.num_local_experts}) must be divisible by "
++                f"expert_parallel_size ({self.expert_parallel_size})"
++            )
++
++
++@dataclass
++class DispatchOutput:
++    """Output of TokenDispatcher.dispatch().
++
++    Attributes:
++        expert_input: Tokens sorted by local expert, shape ``[total_recv_tokens, H]``.
++        tokens_per_expert: Token count per local expert.
++        handle: Opaque state needed by ``combine()`` to reverse the dispatch.
++    """
++
++    expert_input: torch.Tensor
++    tokens_per_expert: list[int]
++    handle: Any
++
++
++class TokenDispatcher(Protocol):
++    """Protocol for MoE token dispatch/combine strategies.
++
++    Encapsulates the full dispatch cycle (permute -> communicate -> sort) and
++    combine cycle (unsort -> communicate -> unpermute) so that the MoE block
++    is agnostic to the communication backend (NCCL all-to-all, HybridEP, etc.).
++    """
++
++    def dispatch(
++        self,
++        hidden_states: torch.Tensor,
++        selected_experts: torch.Tensor,
++        routing_weights: torch.Tensor,
++    ) -> DispatchOutput:
++        """Dispatch tokens to their assigned experts.
++
++        Args:
++            hidden_states: Flattened input tensor of shape ``[N, H]``.
++            selected_experts: Expert assignments, shape ``[N, top_k]``, int.
++            routing_weights: Normalized routing probabilities, shape ``[N, top_k]``, float32.
++
++        Returns:
++            DispatchOutput with expert-sorted tokens, per-expert counts, and an opaque handle.
++        """
++        ...
++
++    def combine(
++        self,
++        expert_output: torch.Tensor,
++        handle: Any,
++    ) -> torch.Tensor:
++        """Combine expert outputs back to the original token order.
++
++        Args:
++            expert_output: Expert output tensor of shape ``[total_recv_tokens, H]``.
++            handle: Opaque state from ``dispatch()``.
++
++        Returns:
++            Combined output tensor of shape ``[N, H]`` with routing weights applied.
++        """
++        ...
++
++    def set_ep_group(self, ep_group: dist.ProcessGroup) -> None:
++        """Set the expert-parallel process group for communication."""
++        ...
++
+ 
+ class NVMixtralPreTrainedModel(PreTrainedModel):
+     """Base class for NVMixtral models."""
+@@ -92,6 +159,12 @@ def init_empty_weights(self):
+             if hasattr(module, "reset_parameters"):
+                 module.reset_parameters()
+ 
++        # After reset_parameters materializes GroupedLinear views on CUDA,
++        # re-stack them into the authoritative stacked parameters.
++        for module in self.modules():
++            if isinstance(module, NVMixtralSparseMoeBlock):
++                module._restack_from_views()
++
+         self.model.embed_tokens.to_empty(device="cuda")
+         self.model.embed_tokens.apply(self._init_weights)
+ 
+@@ -119,7 +192,7 @@ def state_dict(self, *args, **kwargs):
+ class NVMixtralSparseMoeBlock(nn.Module):
+     """Mixture of Experts block using TransformerEngine GroupedLinear."""
+ 
+-    def __init__(self, config: MixtralConfig):
++    def __init__(self, config: MixtralConfig, dispatcher: TokenDispatcher | None = None):
+         """Initialize the sparse MoE block."""
+         super().__init__()
+         self.hidden_size = config.hidden_size
+@@ -128,11 +201,26 @@ def __init__(self, config: MixtralConfig):
+         self.top_k = config.num_experts_per_tok
+         self.jitter_noise = config.router_jitter_noise
+ 
++        # Expert parallelism
++        self.ep_size = getattr(config, "expert_parallel_size", 1)
++        self.num_local_experts = self.num_experts // self.ep_size
++        self.moe_aux_loss_coeff = getattr(config, "moe_aux_loss_coeff", 0.0)
++        self._aux_loss: torch.Tensor = torch.tensor(0.0)
++        self.initializer_range = config.initializer_range
++
++        self.dispatcher: TokenDispatcher = dispatcher or AllToAllTokenDispatcher(
++            self.num_experts,
++            self.num_local_experts,
++            self.hidden_size,
++            self.ep_size,
++        )
++
+         device = "meta" if torch.get_default_device() == torch.device("meta") else "cuda"
+ 
+         def _init_method(x):
+             torch.nn.init.normal_(x, mean=0.0, std=config.initializer_range)
+ 
++        # Router always outputs num_experts logits (replicated across EP ranks)
+         with transformer_engine.pytorch.quantized_model_init(enabled=False):
+             self.gate = transformer_engine.pytorch.Linear(
+                 self.hidden_size,
+@@ -143,9 +231,9 @@ def _init_method(x):
+                 init_method=_init_method,
+             )
+ 
+-        # Expert FFNs using TE GroupedLinear for efficient parallel processing
++        # Expert FFNs — only num_local_experts per rank when EP > 1
+         self.experts_gate_up = transformer_engine.pytorch.GroupedLinear(
+-            num_gemms=self.num_experts,
++            num_gemms=self.num_local_experts,
+             in_features=self.hidden_size,
+             out_features=2 * self.intermediate_size,
+             bias=False,
+@@ -154,7 +242,7 @@ def _init_method(x):
+             init_method=_init_method,
+         )
+         self.experts_down = transformer_engine.pytorch.GroupedLinear(
+-            num_gemms=self.num_experts,
++            num_gemms=self.num_local_experts,
+             in_features=self.intermediate_size,
+             out_features=self.hidden_size,
+             bias=False,
+@@ -163,6 +251,100 @@ def _init_method(x):
+             init_method=_init_method,
+         )
+ 
++        # Stack per-expert weights into single parameters (authoritative weight store).
++        # GroupedLinear's _parameters dict is emptied; weight attributes are set as views
++        # so that reset_parameters() / _get_weight_tensors() can still find them.
++        self.experts_gate_up_weight = nn.Parameter(
++            torch.stack(
++                [self.experts_gate_up._parameters.pop(f"weight{i}").data for i in range(self.num_local_experts)]
++            )
++        )  # [num_local_experts, 2*intermediate_size, hidden_size]
++
++        self.experts_down_weight = nn.Parameter(
++            torch.stack([self.experts_down._parameters.pop(f"weight{i}").data for i in range(self.num_local_experts)])
++        )  # [num_local_experts, hidden_size, intermediate_size]
++
++        # Set views back on GroupedLinear so getattr(self, "weight{i}") still works
++        # (needed by GroupedLinear.reset_parameters and _get_weight_tensors).
++        self._sync_expert_views()
++
++    def _restack_from_views(self) -> None:
++        """Re-create stacked parameters on CUDA after meta init.
++
++        Called by ``init_empty_weights()`` after ``reset_parameters()`` has been called
++        on all TE modules. Since GroupedLinear has no registered parameters (we popped them),
++        its ``reset_parameters()`` cannot move them from meta to CUDA. This method explicitly
++        creates the stacked parameters on CUDA and reinitializes them.
++        """
++        device = torch.cuda.current_device()
++        for attr_name in ("experts_gate_up_weight", "experts_down_weight"):
++            old_param = getattr(self, attr_name)
++            new_data = torch.empty_like(old_param, device=device)
++            torch.nn.init.normal_(new_data, mean=0.0, std=self.initializer_range)
++            setattr(self, attr_name, nn.Parameter(new_data))
++
++        # Re-sync views to point to the new stacked parameter
++        self._sync_expert_views()
++
++    def _sync_expert_views(self) -> None:
++        """Set GroupedLinear weight attributes as views of the stacked parameters.
++
++        GroupedLinear internally uses ``getattr(self, f"weight{i}")`` in methods like
++        ``reset_parameters()`` and ``_get_weight_tensors()``. After popping the original
++        parameters, we set views of the stacked tensor so these methods keep working.
++        Uses ``object.__setattr__`` to bypass ``nn.Module.__setattr__`` and avoid
++        re-registering them as parameters.
++        """
++        gate_up_w = self.experts_gate_up_weight
++        if isinstance(gate_up_w, DTensor):
++            gate_up_w = gate_up_w.to_local()
++        for i in range(self.num_local_experts):
++            object.__setattr__(self.experts_gate_up, f"weight{i}", gate_up_w[i])
++
++        down_w = self.experts_down_weight
++        if isinstance(down_w, DTensor):
++            down_w = down_w.to_local()
++        for i in range(self.num_local_experts):
++            object.__setattr__(self.experts_down, f"weight{i}", down_w[i])
++
++    def set_ep_group(self, ep_group: dist.ProcessGroup, ep_mesh: DeviceMesh) -> None:
++        """Set the expert-parallel process group and convert stacked weights to DTensors.
++
++        Must be called before the first forward pass when ``ep_size > 1``.
++
++        Args:
++            ep_group: A ``torch.distributed.ProcessGroup`` whose world size equals ``self.ep_size``.
++            ep_mesh: A 1-D ``DeviceMesh`` for expert parallelism. Used to wrap stacked weights
++                as ``DTensor(Shard(0))`` so that DCP can save/load/reshard them automatically.
++        """
++        self.dispatcher.set_ep_group(ep_group)
++        # Convert stacked parameters to DTensors with Shard(0) on the expert dimension.
++        # Global shape is [num_experts, ...]; each rank stores [num_local_experts, ...].
++        # Guard: only wrap plain tensors; skip if already DTensors (e.g. repeated calls).
++        if not isinstance(self.experts_gate_up_weight.data, DTensor):
++            self.experts_gate_up_weight = nn.Parameter(
++                DTensor.from_local(self.experts_gate_up_weight.data, device_mesh=ep_mesh, placements=[Shard(0)])
++            )
++        if not isinstance(self.experts_down_weight.data, DTensor):
++            self.experts_down_weight = nn.Parameter(
++                DTensor.from_local(self.experts_down_weight.data, device_mesh=ep_mesh, placements=[Shard(0)])
++            )
++
++    def _expert_ffn(self, tokens: torch.Tensor, m_splits: list[int]) -> torch.Tensor:
++        """Run the expert SwiGLU FFN (gate_up -> silu -> down).
++
++        Args:
++            tokens: Input tensor of shape [total_tokens, H], sorted by expert.
++            m_splits: Number of tokens per local expert.
++
++        Returns:
++            Output tensor of shape [total_tokens, H].
++        """
++        gate_up_output = self.experts_gate_up(tokens, m_splits=m_splits)
++        gate_output, up_output = gate_up_output.chunk(2, dim=-1)
++        intermediate = torch.nn.functional.silu(gate_output) * up_output
++        return self.experts_down(intermediate, m_splits=m_splits)
++
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Forward pass for the MoE block.
+ 
+@@ -194,44 +376,34 @@ def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Normalize routing weights
+         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+ 
+-        # Permute tokens by expert using TE moe_permute
+-        permuted_hidden, row_id_map = transformer_engine.pytorch.moe_permute(
+-            hidden_states, selected_experts.to(torch.int32), map_type="index"
+-        )
++        # Auxiliary load-balancing loss (switch transformer style)
++        if self.moe_aux_loss_coeff > 0:
++            num_tokens = hidden_states.shape[0]
++            m_splits_tensor = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts).int()
++            # f_i: fraction of tokens dispatched to each expert
++            f = m_splits_tensor.float() / (num_tokens * self.top_k)
++            # P_i: mean router probability per expert (over all tokens)
++            router_probs = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float32)
++            p = router_probs.mean(dim=0)
++            self._aux_loss = self.moe_aux_loss_coeff * self.num_experts * (f * p).sum()
++        else:
++            self._aux_loss = torch.tensor(0.0, device=hidden_states.device)
+ 
+-        # Compute m_splits: number of tokens per expert
+-        # selected_experts is [N, top_k], flatten and count per expert
+-        flat_experts = selected_experts.reshape(-1)
+-        m_splits = torch.histc(flat_experts.float(), bins=self.num_experts, min=0, max=self.num_experts - 1)
+-        m_splits = m_splits.int().tolist()
++        # Populate GroupedLinear weight attributes from stacked parameters.
++        # For EP, the stacked parameter is a DTensor; .to_local() gives the local shard.
++        self._sync_expert_views()
+ 
+-        # Expert computation: gate_up projection
+-        gate_up_output = self.experts_gate_up(permuted_hidden, m_splits=m_splits)  # [total_tokens, 2*ffn]
++        dispatch_output = self.dispatcher.dispatch(hidden_states, selected_experts, routing_weights)
++        expert_output = self._expert_ffn(dispatch_output.expert_input, dispatch_output.tokens_per_expert)
++        output = self.dispatcher.combine(expert_output, dispatch_output.handle)
+ 
+-        # Split into gate and up, apply SwiGLU activation
+-        gate_output, up_output = gate_up_output.chunk(2, dim=-1)
+-        intermediate = torch.nn.functional.silu(gate_output) * up_output
+-
+-        # Down projection
+-        expert_output = self.experts_down(intermediate, m_splits=m_splits)  # [total_tokens, H]
+-
+-        # Unpermute and combine with routing weights (keep probs in float32 for numerical stability)
+-        output = transformer_engine.pytorch.moe_unpermute(
+-            expert_output,
+-            row_id_map,
+-            merging_probs=routing_weights,
+-            map_type="index",
+-        )
+-
+-        # Reshape back to original shape
+-        output = output.reshape(original_shape)
+-        return output
++        return output.reshape(original_shape)
+ 
+ 
+ class NVMixtralDecoderLayer(nn.Module):
+     """Mixtral decoder layer using TE attention and MoE MLP."""
+ 
+-    def __init__(self, config: MixtralConfig, layer_idx: int):
++    def __init__(self, config: MixtralConfig, layer_idx: int, dispatcher: TokenDispatcher | None = None):
+         """Initialize the decoder layer."""
+         super().__init__()
+         self.hidden_size = config.hidden_size
+@@ -268,7 +440,7 @@ def _init_method(x):
+             device=device,
+         )
+ 
+-        self.mlp = NVMixtralSparseMoeBlock(config)
++        self.mlp = NVMixtralSparseMoeBlock(config, dispatcher)
+ 
+     def forward(
+         self,
+@@ -314,6 +486,7 @@ def __init__(
+         config: MixtralConfig,
+         fp8_recipe: transformer_engine.common.recipe.Recipe | None = None,
+         fp4_recipe: transformer_engine.common.recipe.Recipe | None = None,
++        dispatcher: TokenDispatcher | None = None,
+     ):
+         """Initialize the NVMixtral model.
+ 
+@@ -321,6 +494,7 @@ def __init__(
+             config: The configuration of the model.
+             fp8_recipe: The FP8 recipe for the model.
+             fp4_recipe: The FP4 recipe for the model.
++            dispatcher: The token dispatcher for the model. If None, the default AllToAllTokenDispatcher will be used.
+         """
+         super().__init__(config)
+         self.config = config
+@@ -341,7 +515,7 @@ def __init__(
+         layers: list[NVMixtralDecoderLayer] = []
+         for layer_idx in range(config.num_hidden_layers):
+             with self.get_autocast_context(layer_idx, init=True):
+-                layers += [NVMixtralDecoderLayer(config, layer_idx)]
++                layers += [NVMixtralDecoderLayer(config, layer_idx, dispatcher)]
+ 
+         self.layers = nn.ModuleList(layers)
+ 
+@@ -359,6 +533,16 @@ def __init__(
+ 
+         self.post_init()
+ 
++    def set_ep_groups(self, ep_group: dist.ProcessGroup, ep_mesh: DeviceMesh) -> None:
++        """Propagate an expert-parallel process group and mesh to every MoE block.
++
++        Args:
++            ep_group: The EP process group to set on each ``NVMixtralSparseMoeBlock``.
++            ep_mesh: A 1-D ``DeviceMesh`` for expert parallelism.
++        """
++        for layer in self.layers:
++            layer.mlp.set_ep_group(ep_group, ep_mesh)
++
+     def forward(
+         self,
+         input_ids: torch.Tensor | None = None,
+@@ -497,6 +681,7 @@ def __init__(
+         config,
+         fp8_recipe: transformer_engine.common.recipe.Recipe | None = None,
+         fp4_recipe: transformer_engine.common.recipe.Recipe | None = None,
++        dispatcher: TokenDispatcher | None = None,
+     ):
+         """Initialize the NVMixtralForCausalLM model.
+ 
+@@ -504,9 +689,11 @@ def __init__(
+             config: The configuration of the model.
+             fp8_recipe: The FP8 recipe for the model.
+             fp4_recipe: The FP4 recipe for the model.
++            dispatcher: The token dispatcher for expert parallelism. If None, the default
++                AllToAllTokenDispatcher will be used.
+         """
+         super().__init__(config)
+-        self.model = NVMixtralModel(config, fp8_recipe=fp8_recipe, fp4_recipe=fp4_recipe)
++        self.model = NVMixtralModel(config, fp8_recipe=fp8_recipe, fp4_recipe=fp4_recipe, dispatcher=dispatcher)
+         self.vocab_size = config.vocab_size
+ 
+         with transformer_engine.pytorch.quantized_model_init(enabled=False):
+@@ -562,6 +749,11 @@ def forward(
+                 logits=logits, labels=labels, shift_labels=shift_labels, vocab_size=self.config.vocab_size, **kwargs
+             )
+ 
++        # Collect auxiliary load-balancing loss from all MoE layers
++        if self.config.moe_aux_loss_coeff > 0 and loss is not None:
++            aux_loss = sum(layer.mlp._aux_loss for layer in self.model.layers)
++            loss = loss + aux_loss
++
+         return CausalLMOutputWithPast(
+             loss=loss,
+             logits=logits,
+@@ -571,12 +763,49 @@ def forward(
+         )
+ 
+ 
+-# Required for torch.compile'd functions below (_pad_input, _unpad_input) that use
+-# data-dependent scalar values (e.g., max_seqlen_in_batch.item()). Without this,
+-# torch._dynamo will raise a GuardOnDataDependentSymNode error during tracing.
+-# This must be set at module level because torch.compile traces lazily on first call,
++def save_final_model_ep(
++    model: NVMixtralForCausalLM,
++    save_directory: str | os.PathLike,
++    dist_config=None,
++) -> None:
++    """Gather all EP-sharded expert weights and save as safetensors.
++
++    Uses ``get_model_state_dict(full_state_dict=True)`` to all-gather DTensors,
++    matching the pattern from ``save_final_model_fsdp2`` in the llama3 checkpoint module.
++
++    All ranks must call this function. Only rank 0 writes files.
++
++    Args:
++        model: The NVMixtral model (may have DTensor expert parameters).
++        save_directory: Directory to save ``model.safetensors`` and config.
++        dist_config: Optional distributed config with ``is_main_process()`` method.
++            If ``None``, only rank 0 saves.
++    """
++    from safetensors.torch import save_file
++
++    model_state_dict = get_model_state_dict(
++        model,
++        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
++    )
++
++    # Filter out TE _extra_state keys
++    model_state_dict = {k: v for k, v in model_state_dict.items() if not k.endswith("_extra_state")}
++
++    is_main = dist_config.is_main_process() if dist_config is not None else (dist.get_rank() == 0)
++    if is_main:
++        os.makedirs(save_directory, exist_ok=True)
++        save_file(model_state_dict, os.path.join(save_directory, "model.safetensors"))
++        model.config.save_pretrained(save_directory)
++        logger.info(f"Saved final EP model to {save_directory}")
++
++
++# Required for torch.compile'd functions below (_pad_input, _unpad_input, _build_expert_sort_indices)
++# that use data-dependent scalar values (e.g., max_seqlen_in_batch.item()) or produce tensors
++# whose shape depends on input data (e.g., repeat_interleave with tensor counts).
++# These must be set at module level because torch.compile traces lazily on first call,
+ # so a scoped setting would not be active at trace time.
+ torch._dynamo.config.capture_scalar_outputs = True
++torch._dynamo.config.capture_dynamic_output_shape_ops = True
+ 
+ 
+ @torch.compile
+@@ -646,3 +875,248 @@ def reorder_cache(self, beam_idx: torch.LongTensor):
+             updated_key_cache = key_cache.index_select(0, beam_idx)
+             updated_value_cache = value_cache.index_select(0, beam_idx)
+             self.cache_manager.cache[layer_number] = (updated_key_cache, updated_value_cache)
++
++
++@torch.compile(fullgraph=True)
++def _build_expert_sort_indices(recv_counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """Build sort and unsort index tensors for reordering received tokens by local expert.
++
++    After all-to-all, tokens arrive grouped by source rank:
++    ``[src0_exp0..src0_expL, src1_exp0..src1_expL, ...]``. ``GroupedLinear`` expects them
++    grouped by expert: ``[all_exp0, all_exp1, ...]``.
++
++    Uses only vectorized tensor operations (no ``.item()`` calls or Python-level loops)
++    so that it is compatible with ``torch.compile(fullgraph=True)``.
++
++    Args:
++        recv_counts: Integer tensor of shape ``[ep_size, num_local_experts]`` giving the
++            number of tokens received from each source rank for each local expert.
++
++    Returns:
++        A ``(sort_indices, unsort_indices)`` pair of 1-D ``int64`` tensors that can be
++        used to reorder and restore the token dimension.
++    """
++    ep_size, num_local_experts = recv_counts.shape
++    device = recv_counts.device
++    num_blocks = ep_size * num_local_experts
++
++    # Source-grouped (row-major) block offsets: [s0e0, s0e1, ..., s1e0, s1e1, ...]
++    counts_src = recv_counts.reshape(-1).long()
++    offsets_src = torch.zeros(num_blocks, dtype=torch.long, device=device)
++    offsets_src[1:] = counts_src[:-1].cumsum(0)
++
++    # Expert-grouped (column-major) block offsets: [e0s0, e0s1, ..., e1s0, e1s1, ...]
++    counts_exp = recv_counts.t().contiguous().reshape(-1).long()
++    offsets_exp = torch.zeros(num_blocks, dtype=torch.long, device=device)
++    offsets_exp[1:] = counts_exp[:-1].cumsum(0)
++
++    total = counts_src.sum()
++
++    # Mapping from source block index (s * L + e) to expert block index (e * S + s)
++    s_idx = torch.arange(ep_size, device=device).unsqueeze(1).expand(ep_size, num_local_experts)
++    e_idx = torch.arange(num_local_experts, device=device).unsqueeze(0).expand(ep_size, num_local_experts)
++    src_to_exp = (e_idx * ep_size + s_idx).reshape(-1)
++
++    # Per-block positional shift from source layout to expert layout
++    shifts = offsets_exp[src_to_exp] - offsets_src
++
++    # Expand per-block shifts to per-token
++    token_shifts = shifts.repeat_interleave(counts_src)
++
++    # Map each source-grouped position to its expert-grouped destination
++    src_positions = torch.arange(total, device=device)
++    dst_positions = src_positions + token_shifts
++
++    # sort_indices[exp_pos] = src_pos (gathers source tokens into expert order)
++    sort_indices = torch.empty(total, dtype=torch.long, device=device)
++    sort_indices[dst_positions] = src_positions
++
++    # unsort_indices: inverse permutation (restores expert-ordered output to source order)
++    unsort_indices = torch.empty_like(sort_indices)
++    unsort_indices[sort_indices] = torch.arange(total, device=device)
++
++    return sort_indices, unsort_indices
++
++
++@dataclass
++class _AllToAllHandle:
++    """Opaque handle for AllToAllTokenDispatcher, storing state between dispatch and combine."""
++
++    row_id_map: torch.Tensor
++    routing_weights: torch.Tensor
++    unsort_indices: torch.Tensor | None = None
++    input_split_sizes: list[int] | None = None
++    output_split_sizes: list[int] | None = None
++
++
++class _DifferentiableAllToAll(torch.autograd.Function):
++    """Differentiable wrapper around dist.all_to_all_single.
++
++    The forward pass performs the standard all-to-all communication.
++    The backward pass reverses the communication direction (swapping
++    input/output split sizes) so that gradients flow correctly.
++    """
++
++    @staticmethod
++    def forward(
++        ctx,
++        input: torch.Tensor,
++        output_split_sizes: list[int],
++        input_split_sizes: list[int],
++        group: dist.ProcessGroup,
++    ) -> torch.Tensor:
++        """Perform all-to-all forward and save sizes for backward."""
++        ctx.input_split_sizes = input_split_sizes
++        ctx.output_split_sizes = output_split_sizes
++        ctx.group = group
++        output = torch.empty(
++            sum(output_split_sizes),
++            input.shape[1],
++            device=input.device,
++            dtype=input.dtype,
++        )
++        dist.all_to_all_single(output, input.contiguous(), output_split_sizes, input_split_sizes, group=group)
++        return output
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
++        """Reverse all-to-all: swap input and output split sizes."""
++        grad_input = torch.empty(
++            sum(ctx.input_split_sizes),
++            grad_output.shape[1],
++            device=grad_output.device,
++            dtype=grad_output.dtype,
++        )
++        dist.all_to_all_single(
++            grad_input,
++            grad_output.contiguous(),
++            ctx.input_split_sizes,
++            ctx.output_split_sizes,
++            group=ctx.group,
++        )
++        return grad_input, None, None, None
++
++
++class AllToAllTokenDispatcher:
++    """TokenDispatcher using NCCL all-to-all for expert-parallel communication.
++
++    Handles both EP=1 (no communication, just permute/unpermute) and EP>1
++    (all-to-all token exchange between ranks) cases transparently.
++
++    Args:
++        num_experts: Total number of experts (global).
++        num_local_experts: Number of experts on this rank.
++        hidden_size: Hidden dimension size.
++        ep_size: Expert parallel world size.
++    """
++
++    def __init__(self, num_experts: int, num_local_experts: int, hidden_size: int, ep_size: int):
++        """Initialize the AllToAllTokenDispatcher."""
++        self.num_experts = num_experts
++        self.num_local_experts = num_local_experts
++        self.hidden_size = hidden_size
++        self.ep_size = ep_size
++        self._ep_group: dist.ProcessGroup | None = None
++
++    def set_ep_group(self, ep_group: dist.ProcessGroup) -> None:
++        """Set the expert-parallel process group for all-to-all communication."""
++        self._ep_group = ep_group
++
++    def dispatch(
++        self,
++        hidden_states: torch.Tensor,
++        selected_experts: torch.Tensor,
++        routing_weights: torch.Tensor,
++    ) -> DispatchOutput:
++        """Dispatch tokens to their assigned experts via permute and optional all-to-all.
++
++        Args:
++            hidden_states: Flattened input tensor of shape ``[N, H]``.
++            selected_experts: Expert assignments, shape ``[N, top_k]``, int.
++            routing_weights: Normalized routing probabilities, shape ``[N, top_k]``, float32.
++
++        Returns:
++            DispatchOutput with expert-sorted tokens, per-expert counts, and an opaque handle.
++        """
++        # Permute tokens by expert using TE moe_permute
++        permuted_hidden, row_id_map = transformer_engine.pytorch.moe_permute(
++            hidden_states, selected_experts.to(torch.int32), map_type="index"
++        )
++
++        # Compute m_splits: number of tokens per expert
++        m_splits_tensor = torch.bincount(selected_experts.reshape(-1), minlength=self.num_experts).int()
++
++        if self._ep_group is not None:
++            ep_group = self._ep_group
++
++            # Token counts per expert, reshaped to [ep_size, num_local_experts]
++            send_counts = m_splits_tensor.reshape(self.ep_size, self.num_local_experts)
++
++            # Exchange per-expert token counts between EP ranks
++            recv_counts = torch.empty_like(send_counts)
++            dist.all_to_all_single(recv_counts.flatten(), send_counts.flatten(), group=ep_group)
++
++            # Derive split sizes for the token all-to-all
++            input_split_sizes = send_counts.sum(dim=1).tolist()
++            output_split_sizes = recv_counts.sum(dim=1).tolist()
++            local_m_splits = recv_counts.sum(dim=0).int().tolist()
++
++            # Dispatch tokens to expert-owning ranks (differentiable)
++            recv_tokens = _DifferentiableAllToAll.apply(
++                permuted_hidden, output_split_sizes, input_split_sizes, ep_group
++            )
++
++            # Sort received tokens by local expert index.
++            # After all_to_all layout is [src0_exp0..src0_expL, src1_exp0..src1_expL, ...].
++            # GroupedLinear needs [all_exp0, all_exp1, ...].
++            sort_indices, unsort_indices = _build_expert_sort_indices(recv_counts)
++
++            handle = _AllToAllHandle(
++                row_id_map=row_id_map,
++                routing_weights=routing_weights,
++                unsort_indices=unsort_indices,
++                input_split_sizes=input_split_sizes,
++                output_split_sizes=output_split_sizes,
++            )
++            return DispatchOutput(
++                expert_input=recv_tokens[sort_indices],
++                tokens_per_expert=local_m_splits,
++                handle=handle,
++            )
++
++        handle = _AllToAllHandle(row_id_map=row_id_map, routing_weights=routing_weights)
++        return DispatchOutput(
++            expert_input=permuted_hidden,
++            tokens_per_expert=m_splits_tensor.tolist(),
++            handle=handle,
++        )
++
++    def combine(self, expert_output: torch.Tensor, handle: _AllToAllHandle) -> torch.Tensor:
++        """Combine expert outputs back to the original token order.
++
++        Args:
++            expert_output: Expert output tensor of shape ``[total_recv_tokens, H]``.
++            handle: Handle from ``dispatch()`` containing state for the reverse operation.
++
++        Returns:
++            Combined output tensor of shape ``[N, H]`` with routing weights applied.
++        """
++        if self._ep_group is not None:
++            assert handle.unsort_indices is not None
++            # Unsort back to source-rank-grouped order and reverse all_to_all (differentiable)
++            combined = _DifferentiableAllToAll.apply(
++                expert_output[handle.unsort_indices],
++                handle.input_split_sizes,
++                handle.output_split_sizes,
++                self._ep_group,
++            )
++        else:
++            combined = expert_output
++
++        # Unpermute and combine with routing weights (keep probs in float32 for numerical stability)
++        return transformer_engine.pytorch.moe_unpermute(
++            combined,
++            handle.row_id_map,
++            merging_probs=handle.routing_weights,
++            map_type="index",
++        )
+diff --git a/bionemo-recipes/models/mixtral/tests/distributed_helpers.py b/bionemo-recipes/models/mixtral/tests/distributed_helpers.py
+new file mode 100644
+index 0000000000..e4ed9da3ed
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/tests/distributed_helpers.py
+@@ -0,0 +1,67 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Shared test utilities for distributed (EP/FSDP) tests."""
++
++import os
++from dataclasses import dataclass, field
++
++import torch
++
++from modeling_mixtral_te import NVMixtralConfig
++
++
++def create_small_mixtral_config(**overrides) -> NVMixtralConfig:
++    """Create a small Mixtral config suitable for testing."""
++    defaults = {
++        "hidden_size": 128,
++        "intermediate_size": 256,
++        "num_hidden_layers": 2,
++        "num_attention_heads": 4,
++        "num_key_value_heads": 2,
++        "num_local_experts": 4,
++        "num_experts_per_tok": 2,
++        "max_position_embeddings": 128,
++        "vocab_size": 1000,
++        "attn_input_format": "bshd",
++        "self_attn_mask_type": "causal",
++        "router_jitter_noise": 0.0,
++    }
++    defaults.update(overrides)
++    return NVMixtralConfig(**defaults)
++
++
++def get_dummy_batch(vocab_size: int, seq_len: int = 32, batch_size: int = 2, device: str = "cuda"):
++    """Create a simple dummy batch for testing."""
++    torch.manual_seed(42)
++    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
++    attention_mask = torch.ones_like(input_ids)
++    labels = input_ids.clone()
++    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
++
++
++@dataclass(frozen=True)
++class DistributedConfig:
++    """Distributed environment configuration."""
++
++    rank: int = field(default_factory=lambda: int(os.environ.setdefault("RANK", "0")))
++    local_rank: int = field(default_factory=lambda: int(os.environ.setdefault("LOCAL_RANK", "0")))
++    world_size: int = field(default_factory=lambda: int(os.environ.setdefault("WORLD_SIZE", "1")))
++    _master_addr: str = field(default_factory=lambda: os.environ.setdefault("MASTER_ADDR", "localhost"))
++    _master_port: str = field(default_factory=lambda: os.environ.setdefault("MASTER_PORT", "12355"))
++
++    def is_main_process(self) -> bool:
++        """Return True if this is the global rank 0 process."""
++        return self.rank == 0
+diff --git a/bionemo-recipes/models/mixtral/tests/test_ep.py b/bionemo-recipes/models/mixtral/tests/test_ep.py
+new file mode 100644
+index 0000000000..9b02b27898
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/tests/test_ep.py
+@@ -0,0 +1,293 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for expert parallelism (EP) in the Mixtral MoE model.
++
++Verifies that running with EP=2 (experts sharded across 2 GPUs) produces
++the same logits and loss as EP=1 (all experts on a single GPU).
++"""
++
++import subprocess
++import sys
++from pathlib import Path
++
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++sys.path.insert(0, str(Path(__file__).parent))
++
++import pytest
++import torch
++from distributed_helpers import DistributedConfig, create_small_mixtral_config, get_dummy_batch
++
++from modeling_mixtral_te import NVMixtralForCausalLM
++
++
++requires_multi_gpu = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
++    reason="Test requires at least 2 GPUs",
++)
++
++
++def _run_torchrun(test_name: str, port: int):
++    """Run a named test worker via torchrun with 2 GPUs."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        "--rdzv-backend=c10d",
++        f"--rdzv-endpoint=localhost:{port}",
++        str(Path(__file__).resolve()),
++        test_name,
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        cwd=str(Path(__file__).parent.parent),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=300,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"EP {test_name} test failed with exit code {result.returncode}")
++
++
++@requires_multi_gpu
++def test_ep2_matches_ep1(unused_tcp_port):
++    """Test that EP=2 produces the same logits as EP=1."""
++    _run_torchrun("forward", unused_tcp_port)
++
++
++@requires_multi_gpu
++def test_ep2_backward_matches_ep1(unused_tcp_port):
++    """Test that EP=2 backward pass produces the same gradients as EP=1."""
++    _run_torchrun("backward", unused_tcp_port)
++
++
++# ---------------------------------------------------------------------------
++# Distributed worker executed via torchrun
++# ---------------------------------------------------------------------------
++
++
++def _distribute_state_dict(full_state_dict: dict, model: torch.nn.Module, device: torch.device) -> dict:
++    """Distribute a full (EP=1) state dict to match a model's DTensor sharding.
++
++    After calling ``set_ep_groups``, expert weight parameters become DTensors with
++    ``Shard(0)`` placement.  This function uses ``distribute_tensor`` to automatically
++    shard full expert weights according to those annotations, avoiding manual slicing.
++
++    Args:
++        full_state_dict: Complete state dict from an EP=1 model (plain tensors).
++        model: Target EP model whose expert parameters are already DTensors.
++        device: Device to move source tensors to before distributing.
++    """
++    from torch.distributed.tensor import DTensor, distribute_tensor
++
++    distributed_state: dict = {}
++    # model.state_dict() filters _extra_state keys via the NVMixtralPreTrainedModel
++    # override, so use nn.Module.state_dict to get the unfiltered dict that includes
++    # TransformerEngine _extra_state entries required by load_state_dict(strict=True).
++    for key, value in torch.nn.Module.state_dict(model).items():
++        if key.endswith("_extra_state"):
++            distributed_state[key] = value
++        elif key not in full_state_dict:
++            continue
++        elif isinstance(value, DTensor):
++            distributed_state[key] = distribute_tensor(
++                full_state_dict[key].to(device),
++                value.device_mesh,
++                list(value.placements),
++            )
++        else:
++            distributed_state[key] = full_state_dict[key]
++    return distributed_state
++
++
++def _run_ep_equivalence_test():
++    """Main worker function for the EP equivalence test.
++
++    1. Set up each rank's device, init distributed.
++    2. Every rank creates an EP=1 model on its own GPU, runs forward, saves reference.
++    3. Create EP=2 model with sharded expert weights, run forward, compare.
++    """
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    # --- Setup distributed first so each rank uses its own GPU ---
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++    ep_size = dist_config.world_size
++
++    # --- Phase 1: EP=1 reference (every rank computes independently) ---
++    config_ep1 = create_small_mixtral_config(expert_parallel_size=1)
++    torch.manual_seed(0)
++    model_ep1 = NVMixtralForCausalLM(config_ep1).to(dtype=torch.bfloat16, device=device)
++    model_ep1.eval()
++
++    batch = get_dummy_batch(config_ep1.vocab_size, seq_len=32, batch_size=2, device=device)
++
++    with torch.no_grad():
++        outputs_ep1 = model_ep1(**batch)
++
++    logits_ep1 = outputs_ep1.logits.detach().clone().cpu()
++    loss_ep1 = outputs_ep1.loss.detach().clone().cpu()
++
++    # Save EP=1 full state dict on CPU for loading into EP model
++    full_state_dict = {k: v.clone().cpu() for k, v in model_ep1.state_dict().items()}
++
++    del model_ep1, outputs_ep1
++    torch.cuda.empty_cache()
++
++    # --- Phase 2: EP=2 distributed run ---
++    config_ep2 = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model_ep2 = NVMixtralForCausalLM(config_ep2).to(dtype=torch.bfloat16, device=device)
++
++    # Set EP groups first to create DTensor annotations on expert weights
++    ep_mesh = DeviceMesh("cuda", list(range(ep_size)))
++    ep_group = ep_mesh.get_group()
++    model_ep2.model.set_ep_groups(ep_group, ep_mesh)
++
++    # Load EP=1 weights — distribute_tensor handles expert sharding automatically
++    distributed_state = _distribute_state_dict(full_state_dict, model_ep2, device)
++    model_ep2.load_state_dict(distributed_state, strict=True)
++    model_ep2.eval()
++
++    # Same batch on all ranks (EP dispatches tokens, input is replicated)
++    batch_cuda = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
++
++    with torch.no_grad():
++        outputs_ep2 = model_ep2(**batch_cuda)
++
++    logits_ep2 = outputs_ep2.logits.detach().cpu()
++    loss_ep2 = outputs_ep2.loss.detach().cpu()
++
++    # --- Phase 3: Compare on rank 0 ---
++    if dist_config.is_main_process():
++        torch.testing.assert_close(
++            logits_ep2,
++            logits_ep1,
++            atol=1e-2,
++            rtol=1e-2,
++            msg="EP=2 logits do not match EP=1 logits",
++        )
++
++        torch.testing.assert_close(
++            loss_ep2,
++            loss_ep1,
++            atol=1e-3,
++            rtol=1e-3,
++            msg="EP=2 loss does not match EP=1 loss",
++        )
++
++        print("EP equivalence test PASSED: EP=2 logits and loss match EP=1")
++
++    torch.distributed.destroy_process_group()
++
++
++def _run_ep_backward_test():
++    """Worker function for the EP backward equivalence test.
++
++    1. Init distributed with 2 GPUs.
++    2. Every rank creates an EP=1 model, runs forward+backward, saves gradients.
++    3. Create EP=2 model with sharded weights, runs forward+backward, compares gradients.
++    """
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++    ep_size = dist_config.world_size
++
++    # --- Phase 1: EP=1 reference (every rank computes independently) ---
++    config_ep1 = create_small_mixtral_config(expert_parallel_size=1)
++    torch.manual_seed(0)
++    model_ep1 = NVMixtralForCausalLM(config_ep1).to(dtype=torch.bfloat16, device=device)
++
++    batch = get_dummy_batch(config_ep1.vocab_size, seq_len=32, batch_size=2, device=device)
++
++    outputs_ep1 = model_ep1(**batch)
++    outputs_ep1.loss.backward()
++
++    ref_grads = {name: p.grad.detach().clone().cpu() for name, p in model_ep1.named_parameters() if p.grad is not None}
++    loss_ep1 = outputs_ep1.loss.detach().clone().cpu()
++
++    full_state_dict = {k: v.clone().cpu() for k, v in model_ep1.state_dict().items()}
++    del model_ep1, outputs_ep1
++    torch.cuda.empty_cache()
++
++    # --- Phase 2: EP=2 distributed run ---
++    config_ep2 = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model_ep2 = NVMixtralForCausalLM(config_ep2).to(dtype=torch.bfloat16, device=device)
++
++    ep_mesh = DeviceMesh("cuda", list(range(ep_size)))
++    ep_group = ep_mesh.get_group()
++    model_ep2.model.set_ep_groups(ep_group, ep_mesh)
++
++    distributed_state = _distribute_state_dict(full_state_dict, model_ep2, device)
++    model_ep2.load_state_dict(distributed_state, strict=True)
++
++    batch_cuda = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
++
++    outputs_ep2 = model_ep2(**batch_cuda)
++    outputs_ep2.loss.backward()
++
++    test_grads = {}
++    for name, p in model_ep2.named_parameters():
++        if p.grad is not None:
++            g = p.grad
++            if hasattr(g, "full_tensor"):
++                g = g.full_tensor()
++            test_grads[name] = g.detach().clone().cpu()
++    loss_ep2 = outputs_ep2.loss.detach().clone().cpu()
++
++    # --- Phase 3: Compare on rank 0 ---
++    if dist_config.is_main_process():
++        torch.testing.assert_close(
++            loss_ep2,
++            loss_ep1,
++            atol=1e-3,
++            rtol=1e-3,
++            msg="EP=2 backward: loss does not match EP=1 loss",
++        )
++
++        # All EP=1 parameters should have gradients in EP=2 as well
++        for name in ref_grads:
++            assert name in test_grads, f"EP=2 model missing gradient for {name}"
++
++        for name in ref_grads:
++            torch.testing.assert_close(
++                test_grads[name],
++                ref_grads[name],
++                atol=3e-2,
++                rtol=3e-2,
++                msg=f"EP=2 gradient mismatch for {name}",
++            )
++
++        print("EP backward test PASSED: EP=2 gradients match EP=1")
++
++    torch.distributed.destroy_process_group()
++
++
++if __name__ == "__main__":
++    test_name = sys.argv[1] if len(sys.argv) > 1 else "forward"
++    if test_name == "backward":
++        _run_ep_backward_test()
++    else:
++        _run_ep_equivalence_test()
+diff --git a/bionemo-recipes/models/mixtral/tests/test_ep_dcp.py b/bionemo-recipes/models/mixtral/tests/test_ep_dcp.py
+new file mode 100644
+index 0000000000..89ebc596f8
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/tests/test_ep_dcp.py
+@@ -0,0 +1,276 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for DCP (Distributed Checkpoint) with expert parallelism in the Mixtral MoE model.
++
++Verifies:
++1. DCP round-trip: save EP=2 model, load into fresh EP=2 model, weights and logits match.
++2. Full gather: save_final_model_ep gathers all experts into a single safetensors file
++   that can be loaded by an EP=1 model and produces matching logits.
++"""
++
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++sys.path.insert(0, str(Path(__file__).parent))
++
++import pytest
++import torch
++from distributed_helpers import DistributedConfig, create_small_mixtral_config, get_dummy_batch
++
++from modeling_mixtral_te import NVMixtralForCausalLM
++
++
++requires_multi_gpu = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
++    reason="Test requires at least 2 GPUs",
++)
++
++
++# ---------------------------------------------------------------------------
++# Pytest entry points — launch torchrun subprocesses
++# ---------------------------------------------------------------------------
++
++
++def _run_torchrun(test_fn_name: str, port: int, tmp_dir: str):
++    """Run a named worker function via torchrun with 2 GPUs."""
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        "--rdzv-backend=c10d",
++        f"--rdzv-endpoint=localhost:{port}",
++        str(Path(__file__).resolve()),
++        test_fn_name,
++        tmp_dir,
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        cwd=str(Path(__file__).parent.parent),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=300,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"{test_fn_name} failed with exit code {result.returncode}")
++
++
++@requires_multi_gpu
++def test_ep_dcp_roundtrip(unused_tcp_port, tmp_path):
++    """Test DCP save/load round-trip with EP=2."""
++    _run_torchrun("dcp_roundtrip", unused_tcp_port, str(tmp_path))
++
++
++@requires_multi_gpu
++def test_ep_save_final_model(unused_tcp_port, tmp_path):
++    """Test gathering EP-sharded weights into a single safetensors file."""
++    _run_torchrun("save_final_model", unused_tcp_port, str(tmp_path))
++
++
++# ---------------------------------------------------------------------------
++# Distributed workers executed via torchrun
++# ---------------------------------------------------------------------------
++
++
++def _init_distributed():
++    """Initialize distributed environment and return config, device, mesh."""
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++    ep_size = dist_config.world_size
++    ep_mesh = DeviceMesh("cuda", list(range(ep_size)))
++    ep_group = ep_mesh.get_group()
++    return dist_config, device, ep_mesh, ep_group
++
++
++def _create_ep_model(device, ep_mesh, ep_group, ep_size, seed=0):
++    """Create a small EP model with DTensor expert weights."""
++    config = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(seed)
++    model = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device=device)
++    model.model.set_ep_groups(ep_group, ep_mesh)
++    return model
++
++
++def _worker_dcp_roundtrip(tmp_dir: str):
++    """DCP round-trip test worker.
++
++    1. Create EP=2 model with known seed, save reference state dict.
++    2. Save via DCP.
++    3. Create fresh EP=2 model (different seed), load via DCP.
++    4. Compare all weights and forward outputs.
++    """
++    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
++    from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
++    from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
++    from torch.distributed.tensor import DTensor
++
++    dist_config, device, ep_mesh, ep_group = _init_distributed()
++    ep_size = dist_config.world_size
++    ckpt_dir = os.path.join(tmp_dir, "dcp_ckpt")
++
++    # --- Phase 1: Create reference model and save ---
++    model_ref = _create_ep_model(device, ep_mesh, ep_group, ep_size, seed=0)
++    model_ref.eval()
++
++    # Save reference weights (local tensors on CPU for comparison)
++    ref_state = {}
++    for k, v in model_ref.state_dict().items():
++        if isinstance(v, DTensor):
++            ref_state[k] = v.to_local().detach().clone().cpu()
++        else:
++            ref_state[k] = v.detach().clone().cpu()
++
++    # Verify DTensors appear in state dict
++    has_dtensor = any(isinstance(v, DTensor) for v in model_ref.state_dict().values())
++    assert has_dtensor, "Expected DTensor parameters in EP model state_dict"
++
++    # DCP save
++    model_state_dict = get_model_state_dict(model_ref)
++    dcp_save({"model": model_state_dict}, checkpoint_id=ckpt_dir)
++
++    # Reference forward
++    batch = get_dummy_batch(model_ref.config.vocab_size, device=str(device))
++    with torch.no_grad():
++        ref_logits = model_ref(**batch).logits.detach().cpu()
++
++    del model_ref
++    torch.cuda.empty_cache()
++
++    # --- Phase 2: Create fresh model and load from DCP ---
++    model_new = _create_ep_model(device, ep_mesh, ep_group, ep_size, seed=999)
++    model_new.eval()
++
++    # DCP load
++    new_state_dict = get_model_state_dict(model_new)
++    dcp_load({"model": new_state_dict}, checkpoint_id=ckpt_dir)
++    set_model_state_dict(model_new, new_state_dict, options=StateDictOptions(strict=False))
++
++    # --- Phase 3: Compare weights ---
++    for k, v in model_new.state_dict().items():
++        local_v = v.to_local() if isinstance(v, DTensor) else v
++        local_v = local_v.detach().cpu()
++        assert k in ref_state, f"Key {k} missing from reference"
++        torch.testing.assert_close(
++            local_v,
++            ref_state[k],
++            atol=0,
++            rtol=0,
++            msg=f"Weight mismatch for {k}",
++        )
++
++    # --- Phase 4: Compare forward outputs ---
++    with torch.no_grad():
++        new_logits = model_new(**batch).logits.detach().cpu()
++
++    if dist_config.is_main_process():
++        torch.testing.assert_close(
++            new_logits,
++            ref_logits,
++            atol=1e-3,
++            rtol=1e-3,
++            msg="DCP round-trip logits do not match",
++        )
++        print("DCP round-trip test PASSED")
++
++    torch.distributed.destroy_process_group()
++
++
++def _worker_save_final_model(tmp_dir: str):
++    """Save final model test worker.
++
++    1. Create EP=2 model with known seed, run forward, save reference logits.
++    2. Call save_final_model_ep to gather all experts into safetensors.
++    3. On rank 0: verify safetensors has full expert shapes.
++    4. Load into EP=1 model, run forward, compare logits.
++    """
++    from safetensors.torch import load_file
++
++    from modeling_mixtral_te import save_final_model_ep
++
++    dist_config, device, ep_mesh, ep_group = _init_distributed()
++    ep_size = dist_config.world_size
++    save_dir = os.path.join(tmp_dir, "final_model")
++
++    # --- Phase 1: Create EP=2 model, get reference logits ---
++    model_ep2 = _create_ep_model(device, ep_mesh, ep_group, ep_size, seed=0)
++    model_ep2.eval()
++
++    batch = get_dummy_batch(model_ep2.config.vocab_size, device=str(device))
++    with torch.no_grad():
++        ref_logits = model_ep2(**batch).logits.detach().cpu()
++
++    # --- Phase 2: Save gathered model ---
++    save_final_model_ep(model_ep2, save_dir, dist_config)
++
++    # Barrier to ensure all ranks finish saving before rank 0 checks
++    torch.distributed.barrier()
++
++    # --- Phase 3: Verify and load on rank 0 ---
++    if dist_config.is_main_process():
++        safetensors_path = os.path.join(save_dir, "model.safetensors")
++        assert os.path.exists(safetensors_path), f"Expected {safetensors_path} to exist"
++
++        gathered_state = load_file(safetensors_path)
++
++        # Verify expert weights have full (ungathered) shape
++        num_experts = model_ep2.config.num_local_experts
++        for key in gathered_state:
++            if key.endswith("experts_gate_up_weight") or key.endswith("experts_down_weight"):
++                assert gathered_state[key].shape[0] == num_experts, (
++                    f"Expected {num_experts} experts in {key}, got {gathered_state[key].shape[0]}"
++                )
++
++        # Load into EP=1 model and compare logits
++        config_ep1 = create_small_mixtral_config(expert_parallel_size=1)
++        torch.manual_seed(0)
++        model_ep1 = NVMixtralForCausalLM(config_ep1).to(dtype=torch.bfloat16, device=device)
++        model_ep1.load_state_dict(gathered_state, strict=False)
++        model_ep1.eval()
++
++        with torch.no_grad():
++            ep1_logits = model_ep1(**batch).logits.detach().cpu()
++
++        torch.testing.assert_close(
++            ep1_logits,
++            ref_logits,
++            atol=1e-2,
++            rtol=1e-2,
++            msg="Gathered EP=1 logits do not match EP=2 reference",
++        )
++        print("Save final model test PASSED")
++
++    torch.distributed.destroy_process_group()
++
++
++if __name__ == "__main__":
++    test_name = sys.argv[1]
++    tmp_dir = sys.argv[2]
++
++    workers = {
++        "dcp_roundtrip": _worker_dcp_roundtrip,
++        "save_final_model": _worker_save_final_model,
++    }
++    workers[test_name](tmp_dir)
+diff --git a/bionemo-recipes/models/mixtral/tests/test_fsdp_ep.py b/bionemo-recipes/models/mixtral/tests/test_fsdp_ep.py
+new file mode 100644
+index 0000000000..3934328fb7
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/tests/test_fsdp_ep.py
+@@ -0,0 +1,366 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for FSDP2 + Expert Parallelism (EP) in the Mixtral MoE model.
++
++Verifies that FSDP2 and EP can be composed together:
++- FSDP=2, EP=1 (2 GPUs): Data-parallel sharding, all experts on each rank.
++- FSDP=1, EP=2 (2 GPUs): Expert-parallel training, no data parallelism.
++- FSDP=2, EP=2 (4 GPUs): Both data and expert parallelism (skipped on 2-GPU machines).
++"""
++
++import subprocess
++import sys
++from pathlib import Path
++
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++sys.path.insert(0, str(Path(__file__).parent))
++
++import pytest
++import torch
++from distributed_helpers import DistributedConfig, create_small_mixtral_config, get_dummy_batch
++
++from modeling_mixtral_te import NVMixtralForCausalLM
++
++
++requires_2_gpus = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
++    reason="Test requires at least 2 GPUs",
++)
++
++requires_4_gpus = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.device_count() < 4,
++    reason="Test requires at least 4 GPUs",
++)
++
++
++def _distribute_state_dict(full_state_dict: dict, model: torch.nn.Module, device: torch.device) -> dict:
++    """Distribute a full (EP=1) state dict to match a model's DTensor sharding.
++
++    After calling ``set_ep_groups``, expert weight parameters become DTensors with
++    ``Shard(0)`` placement.  This function uses ``distribute_tensor`` to automatically
++    shard full expert weights according to those annotations, avoiding manual slicing.
++
++    Args:
++        full_state_dict: Complete state dict from an EP=1 model (plain tensors).
++        model: Target EP model whose expert parameters are already DTensors.
++        device: Device to move source tensors to before distributing.
++    """
++    from torch.distributed.tensor import DTensor, distribute_tensor
++
++    distributed_state: dict = {}
++    # model.state_dict() filters _extra_state keys via the NVMixtralPreTrainedModel
++    # override, so use nn.Module.state_dict to get the unfiltered dict that includes
++    # TransformerEngine _extra_state entries required by load_state_dict(strict=True).
++    for key, value in torch.nn.Module.state_dict(model).items():
++        if key.endswith("_extra_state"):
++            distributed_state[key] = value
++        elif key not in full_state_dict:
++            continue
++        elif isinstance(value, DTensor):
++            distributed_state[key] = distribute_tensor(
++                full_state_dict[key].to(device),
++                value.device_mesh,
++                list(value.placements),
++            )
++        else:
++            distributed_state[key] = full_state_dict[key]
++    return distributed_state
++
++
++def _train_step(model, batch):
++    """Run a single forward + backward + optimizer step.
++
++    Returns:
++        Tuple of (loss value, dict of gradient norms, dict of weight change norms).
++    """
++    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
++
++    # Snapshot weights before step
++    pre_weights = {n: p.detach().clone() for n, p in model.named_parameters()}
++
++    optimizer.zero_grad()
++    outputs = model(**batch)
++    loss = outputs.loss
++    loss.backward()
++
++    grad_norms = {}
++    for name, param in model.named_parameters():
++        if param.grad is not None:
++            g = param.grad
++            if hasattr(g, "full_tensor"):
++                g = g.full_tensor()
++            grad_norms[name] = g.detach().float().norm().item()
++
++    optimizer.step()
++
++    # Measure weight changes
++    weight_changes = {}
++    for name, param in model.named_parameters():
++        pre = pre_weights[name]
++        cur = param.detach()
++        if hasattr(pre, "full_tensor"):
++            pre = pre.full_tensor()
++        if hasattr(cur, "full_tensor"):
++            cur = cur.full_tensor()
++        weight_changes[name] = (cur.float() - pre.float()).norm().item()
++
++    return loss.detach().item(), grad_norms, weight_changes
++
++
++# ---------------------------------------------------------------------------
++# Pytest entry points — launch torchrun subprocesses
++# ---------------------------------------------------------------------------
++
++
++def _run_torchrun(test_fn_name: str, port: int, nproc: int = 2):
++    """Run a named worker function via torchrun."""
++    model_dir = str(Path(__file__).resolve().parent.parent)
++    script = str(Path(__file__).resolve())
++    cmd = [
++        "torchrun",
++        f"--nproc_per_node={nproc}",
++        "--rdzv-backend=c10d",
++        f"--rdzv-endpoint=localhost:{port}",
++        script,
++        test_fn_name,
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        cwd=model_dir,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=300,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"{test_fn_name} failed with exit code {result.returncode}")
++
++
++@requires_2_gpus
++def test_fsdp2_ep1(unused_tcp_port):
++    """Test FSDP=2, EP=1: data-parallel training with all experts on each rank."""
++    _run_torchrun("fsdp2_ep1", unused_tcp_port, nproc=2)
++
++
++@requires_2_gpus
++def test_fsdp1_ep2(unused_tcp_port):
++    """Test FSDP=1, EP=2: expert-parallel training without data parallelism."""
++    _run_torchrun("fsdp1_ep2", unused_tcp_port, nproc=2)
++
++
++@requires_4_gpus
++def test_fsdp2_ep2(unused_tcp_port):
++    """Test FSDP=2, EP=2: combined data and expert parallelism."""
++    _run_torchrun("fsdp2_ep2", unused_tcp_port, nproc=4)
++
++
++# ---------------------------------------------------------------------------
++# Distributed workers executed via torchrun
++# ---------------------------------------------------------------------------
++
++
++def _worker_fsdp2_ep1():
++    """FSDP=2, EP=1: weights sharded by FSDP, all experts on each rank.
++
++    Uses a 2D device mesh (dp=2, ep=1) so that DTensor multi-dimensional
++    placement logic is exercised even though the EP dimension is trivial.
++
++    1. Init distributed, create 2D device mesh with ep=1.
++    2. Create model with EP=1, set EP groups on the trivial EP sub-mesh.
++    3. Wrap with FSDP2 on the DP sub-mesh.
++    4. Run one training step, verify loss/gradients are finite and weights update.
++    """
++    from torch.distributed.device_mesh import init_device_mesh
++    from torch.distributed.fsdp import fully_shard
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++
++    ep_size = 1
++    dp_size = dist_config.world_size
++    device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, ep_size), mesh_dim_names=("dp", "ep"))
++
++    config = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device=device)
++
++    # EP setup with trivial (size-1) EP sub-mesh
++    ep_mesh = device_mesh["ep"]
++    ep_group = ep_mesh.get_group()
++    model.model.set_ep_groups(ep_group, ep_mesh)
++
++    # FSDP2 wrapping on DP sub-mesh
++    for layer in model.model.layers:
++        fully_shard(layer, mesh=device_mesh["dp"])
++    fully_shard(model, mesh=device_mesh["dp"])
++
++    model.train()
++    batch = get_dummy_batch(config.vocab_size, device=str(device))
++
++    loss_val, grad_norms, weight_changes = _train_step(model, batch)
++
++    assert torch.isfinite(torch.tensor(loss_val)), f"Loss is not finite: {loss_val}"
++    assert len(grad_norms) > 0, "No gradients computed"
++    for name, gnorm in grad_norms.items():
++        assert torch.isfinite(torch.tensor(gnorm)), f"Gradient for {name} is not finite: {gnorm}"
++    assert any(wc > 0 for wc in weight_changes.values()), "No weights updated after optimizer step"
++
++    torch.distributed.destroy_process_group()
++
++
++def _worker_fsdp1_ep2():
++    """FSDP=1, EP=2: experts sharded across ranks, trivial data parallelism.
++
++    Uses a 2D device mesh (dp=1, ep=2) so that DTensor multi-dimensional
++    placement logic is exercised even though the DP dimension is trivial.
++
++    1. Init distributed, create 2D device mesh with dp=1.
++    2. Create full EP=1 model for reference weights.
++    3. Create EP=2 model, set EP groups (DTensor annotations), load via distribute_tensor.
++    4. Wrap with FSDP2 on the trivial DP sub-mesh.
++    5. Run one training step, verify loss/gradients are finite and weights update.
++    """
++    from torch.distributed.device_mesh import init_device_mesh
++    from torch.distributed.fsdp import fully_shard
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++
++    ep_size = dist_config.world_size
++    dp_size = 1
++    device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, ep_size), mesh_dim_names=("dp", "ep"))
++
++    ep_mesh = device_mesh["ep"]
++    ep_group = ep_mesh.get_group()
++
++    # Get reference weights from a full EP=1 model
++    config_full = create_small_mixtral_config(expert_parallel_size=1)
++    torch.manual_seed(0)
++    full_model = NVMixtralForCausalLM(config_full).to(dtype=torch.bfloat16, device="cpu")
++    full_state_dict = {k: v.clone() for k, v in full_model.state_dict().items()}
++    del full_model
++
++    # Create EP=2 model, set EP groups to create DTensor annotations, then load weights
++    config_ep = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model = NVMixtralForCausalLM(config_ep).to(dtype=torch.bfloat16, device=device)
++
++    # EP setup on EP sub-mesh first (creates DTensor annotations on expert weights)
++    model.model.set_ep_groups(ep_group, ep_mesh)
++
++    # Load EP=1 weights — distribute_tensor handles expert sharding automatically
++    distributed_state = _distribute_state_dict(full_state_dict, model, device)
++    model.load_state_dict(distributed_state, strict=True)
++
++    # FSDP2 wrapping on trivial (size-1) DP sub-mesh
++    for layer in model.model.layers:
++        fully_shard(layer, mesh=device_mesh["dp"])
++    fully_shard(model, mesh=device_mesh["dp"])
++
++    model.train()
++    batch = get_dummy_batch(config_ep.vocab_size, device=str(device))
++
++    loss_val, grad_norms, weight_changes = _train_step(model, batch)
++
++    assert torch.isfinite(torch.tensor(loss_val)), f"Loss is not finite: {loss_val}"
++    assert len(grad_norms) > 0, "No gradients computed"
++    for name, gnorm in grad_norms.items():
++        assert torch.isfinite(torch.tensor(gnorm)), f"Gradient for {name} is not finite: {gnorm}"
++    assert any(wc > 0 for wc in weight_changes.values()), "No weights updated after optimizer step"
++
++    torch.distributed.destroy_process_group()
++
++
++def _worker_fsdp2_ep2():
++    """FSDP=2, EP=2: both FSDP and EP active (requires 4 GPUs).
++
++    1. Init distributed, create 2D device mesh (dp=2, ep=2).
++    2. Create full EP=1 model for reference weights.
++    3. Create EP=2 model, set EP groups (DTensor annotations), load via distribute_tensor.
++    4. Wrap with FSDP2 on DP sub-mesh.
++    5. Run one training step, verify loss/gradients are finite and weights update.
++    """
++    from torch.distributed.device_mesh import init_device_mesh
++    from torch.distributed.fsdp import fully_shard
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++
++    ep_size = 2
++    dp_size = dist_config.world_size // ep_size
++    assert dp_size >= 2, f"Need at least 4 GPUs for FSDP=2 EP=2, got {dist_config.world_size}"
++
++    device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, ep_size), mesh_dim_names=("dp", "ep"))
++    ep_mesh = device_mesh["ep"]
++    ep_group = ep_mesh.get_group()
++
++    # Get reference weights from a full EP=1 model
++    config_full = create_small_mixtral_config(expert_parallel_size=1)
++    torch.manual_seed(0)
++    full_model = NVMixtralForCausalLM(config_full).to(dtype=torch.bfloat16, device="cpu")
++    full_state_dict = {k: v.clone() for k, v in full_model.state_dict().items()}
++    del full_model
++
++    # Create EP=2 model, set EP groups to create DTensor annotations, then load weights
++    config_ep = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model = NVMixtralForCausalLM(config_ep).to(dtype=torch.bfloat16, device=device)
++
++    # EP setup first: wrap expert weights as DTensors on EP sub-mesh
++    model.model.set_ep_groups(ep_group, ep_mesh)
++
++    # Load EP=1 weights — distribute_tensor handles expert sharding automatically
++    distributed_state = _distribute_state_dict(full_state_dict, model, device)
++    model.load_state_dict(distributed_state, strict=True)
++
++    # FSDP2 wrapping on DP sub-mesh
++    for layer in model.model.layers:
++        fully_shard(layer, mesh=device_mesh["dp"])
++    fully_shard(model, mesh=device_mesh["dp"])
++
++    model.train()
++    batch = get_dummy_batch(config_ep.vocab_size, device=str(device))
++
++    loss_val, grad_norms, weight_changes = _train_step(model, batch)
++
++    assert torch.isfinite(torch.tensor(loss_val)), f"Loss is not finite: {loss_val}"
++    assert len(grad_norms) > 0, "No gradients computed"
++    for name, gnorm in grad_norms.items():
++        assert torch.isfinite(torch.tensor(gnorm)), f"Gradient for {name} is not finite: {gnorm}"
++    assert any(wc > 0 for wc in weight_changes.values()), "No weights updated after optimizer step"
++
++    torch.distributed.destroy_process_group()
++
++
++if __name__ == "__main__":
++    test_name = sys.argv[1]
++
++    workers = {
++        "fsdp2_ep1": _worker_fsdp2_ep1,
++        "fsdp1_ep2": _worker_fsdp1_ep2,
++        "fsdp2_ep2": _worker_fsdp2_ep2,
++    }
++    workers[test_name]()
+diff --git a/bionemo-recipes/models/mixtral/tests/test_hybrid_ep.py b/bionemo-recipes/models/mixtral/tests/test_hybrid_ep.py
+new file mode 100644
+index 0000000000..41b2e1cba2
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/tests/test_hybrid_ep.py
+@@ -0,0 +1,361 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Tests for the DeepEP-backed FusedTokenRouter in the Mixtral MoE model.
++
++Verifies that FusedTokenRouter produces the same logits and loss as the
++AllToAllTokenDispatcher when running with EP=2. Also verifies that the
++backward pass produces matching gradients.
++"""
++
++import subprocess
++import sys
++from pathlib import Path
++
++
++sys.path.insert(0, str(Path(__file__).parent.parent))
++sys.path.insert(0, str(Path(__file__).parent))
++
++import pytest
++import torch
++from distributed_helpers import DistributedConfig, create_small_mixtral_config, get_dummy_batch
++
++from modeling_mixtral_te import NVMixtralForCausalLM
++
++
++requires_multi_gpu = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
++    reason="Test requires at least 2 GPUs",
++)
++
++
++def _deep_ep_and_triton_available() -> bool:
++    """Check if the deep_ep package is importable."""
++    try:
++        import deep_ep  # noqa: F401
++        import triton
++        import triton.language  # noqa: F401
++
++        return True
++    except ImportError:
++        return False
++
++
++def _cuda_peer_access_available() -> bool:
++    """Check if CUDA peer access (NVLink IPC) is supported between GPU 0 and GPU 1."""
++    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
++        return False
++    return torch.cuda.can_device_access_peer(0, 1)
++
++
++requires_deep_ep = pytest.mark.skipif(
++    not _deep_ep_and_triton_available(), reason="deep_ep and/or triton not available"
++)
++
++requires_peer_access = pytest.mark.skipif(
++    not _cuda_peer_access_available(),
++    reason="CUDA peer access (NVLink IPC) not supported between GPUs",
++)
++
++
++def _shard_expert_weights(full_state_dict: dict, ep_rank: int, ep_size: int, num_experts: int) -> dict:
++    """Shard stacked expert weights from a full (EP=1) state dict for a given EP rank.
++
++    Expert weight keys are ``...experts_gate_up_weight`` and ``...experts_down_weight``
++    with shape ``[num_experts, ...]``. For EP, each rank keeps only its local slice.
++    """
++    experts_per_rank = num_experts // ep_size
++    start_expert = ep_rank * experts_per_rank
++    end_expert = start_expert + experts_per_rank
++
++    new_state_dict = {}
++    for key, value in full_state_dict.items():
++        if key.endswith("experts_gate_up_weight") or key.endswith("experts_down_weight"):
++            new_state_dict[key] = value[start_expert:end_expert]
++        else:
++            new_state_dict[key] = value
++
++    return new_state_dict
++
++
++# ---------------------------------------------------------------------------
++# Pytest entry points — launch torchrun subprocesses
++# ---------------------------------------------------------------------------
++
++
++def _run_torchrun(test_name: str, port: int):
++    """Run the equivalence test worker via torchrun with 2 GPUs."""
++    model_dir = str(Path(__file__).resolve().parent.parent)
++    script = str(Path(__file__).resolve())
++    cmd = [
++        "torchrun",
++        "--nproc_per_node=2",
++        "--rdzv-backend=c10d",
++        f"--rdzv-endpoint=localhost:{port}",
++        script,
++        test_name,
++    ]
++    result = subprocess.run(
++        cmd,
++        check=False,
++        text=True,
++        cwd=model_dir,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=300,
++    )
++    if result.returncode != 0:
++        print(f"STDOUT:\n{result.stdout}")
++        print(f"STDERR:\n{result.stderr}")
++        pytest.fail(f"FusedTokenRouter {test_name} test failed with exit code {result.returncode}")
++
++
++@requires_multi_gpu
++@requires_deep_ep
++@requires_peer_access
++def test_fused_router_matches_alltoall(unused_tcp_port):
++    """Test that FusedTokenRouter dispatcher matches AllToAll dispatcher at EP=2."""
++    _run_torchrun("forward", unused_tcp_port)
++
++
++@requires_multi_gpu
++@requires_deep_ep
++@requires_peer_access
++def test_fused_router_backward(unused_tcp_port):
++    """Test that backward pass with FusedTokenRouter dispatcher matches AllToAll at EP=2."""
++    _run_torchrun("backward", unused_tcp_port)
++
++
++# ---------------------------------------------------------------------------
++# Distributed worker executed via torchrun
++# ---------------------------------------------------------------------------
++
++
++def _run_equivalence_test():
++    """Main worker function for the FusedTokenRouter forward equivalence test.
++
++    1. Init distributed with 2 GPUs.
++    2. Create EP=1 model for reference weights.
++    3. Create EP=2 model with AllToAll dispatcher -> reference logits/loss.
++    4. Create EP=2 model with FusedTokenRouter dispatcher -> test logits/loss.
++    5. Compare results.
++    """
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    from fused_token_router import FusedTokenRouter
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++    ep_rank = dist_config.rank
++    ep_size = dist_config.world_size
++
++    # --- Phase 1: Create EP=1 model for reference weights ---
++    config_ep1 = create_small_mixtral_config(expert_parallel_size=1)
++    torch.manual_seed(0)
++    model_ep1 = NVMixtralForCausalLM(config_ep1).to(dtype=torch.bfloat16, device=device)
++    full_state_dict = {k: v.clone().cpu() for k, v in model_ep1.state_dict().items()}
++    del model_ep1
++    torch.cuda.empty_cache()
++
++    batch = get_dummy_batch(config_ep1.vocab_size, seq_len=32, batch_size=2, device=device)
++    num_experts = config_ep1.num_local_experts
++
++    # --- Phase 2: EP=2 + AllToAll dispatcher -> reference logits/loss ---
++    config_ep2 = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model_alltoall = NVMixtralForCausalLM(config_ep2).to(dtype=torch.bfloat16, device=device)
++
++    sharded_state = _shard_expert_weights(full_state_dict, ep_rank, ep_size, num_experts)
++    model_alltoall.load_state_dict(sharded_state, strict=False)
++    model_alltoall.eval()
++
++    ep_mesh = DeviceMesh("cuda", list(range(ep_size)))
++    ep_group = ep_mesh.get_group()
++    model_alltoall.model.set_ep_groups(ep_group, ep_mesh)
++
++    with torch.no_grad():
++        outputs_ref = model_alltoall(**batch)
++    logits_ref = outputs_ref.logits.detach().clone().cpu()
++    loss_ref = outputs_ref.loss.detach().clone().cpu()
++
++    del model_alltoall, outputs_ref
++    torch.cuda.empty_cache()
++
++    # --- Phase 3: EP=2 + FusedTokenRouter dispatcher -> test logits/loss ---
++    num_local_experts = num_experts // ep_size
++    hidden_size = config_ep2.hidden_size
++
++    dispatcher = FusedTokenRouter(
++        num_experts=num_experts,
++        num_local_experts=num_local_experts,
++        hidden_size=hidden_size,
++        ep_size=ep_size,
++    )
++
++    torch.manual_seed(0)
++    model_fused = NVMixtralForCausalLM(config_ep2, dispatcher=dispatcher).to(dtype=torch.bfloat16, device=device)
++    model_fused.load_state_dict(sharded_state, strict=False)
++    model_fused.eval()
++
++    model_fused.model.set_ep_groups(ep_group, ep_mesh)
++
++    with torch.no_grad():
++        outputs_test = model_fused(**batch)
++    logits_test = outputs_test.logits.detach().cpu()
++    loss_test = outputs_test.loss.detach().cpu()
++
++    # --- Phase 4: Compare on rank 0 ---
++    if dist_config.is_main_process():
++        torch.testing.assert_close(
++            logits_test,
++            logits_ref,
++            atol=1e-2,
++            rtol=1e-2,
++            msg="FusedTokenRouter logits do not match AllToAll logits",
++        )
++
++        torch.testing.assert_close(
++            loss_test,
++            loss_ref,
++            atol=1e-3,
++            rtol=1e-3,
++            msg="FusedTokenRouter loss does not match AllToAll loss",
++        )
++
++    torch.distributed.destroy_process_group()
++
++
++def _run_backward_test():
++    """Worker function for the FusedTokenRouter backward pass equivalence test.
++
++    1. Init distributed with 2 GPUs.
++    2. Create EP=1 model for reference weights.
++    3. Create EP=2 model with AllToAll dispatcher -> reference loss + gradients.
++    4. Create EP=2 model with FusedTokenRouter dispatcher -> test loss + gradients.
++    5. Compare loss and parameter gradients.
++    """
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    from fused_token_router import FusedTokenRouter
++
++    dist_config = DistributedConfig()
++    device = torch.device(f"cuda:{dist_config.local_rank}")
++    torch.cuda.set_device(device)
++    torch.distributed.init_process_group(backend="nccl", device_id=device)
++    ep_rank = dist_config.rank
++    ep_size = dist_config.world_size
++
++    # --- Phase 1: Create EP=1 model for reference weights ---
++    config_ep1 = create_small_mixtral_config(expert_parallel_size=1)
++    torch.manual_seed(0)
++    model_ep1 = NVMixtralForCausalLM(config_ep1).to(dtype=torch.bfloat16, device=device)
++    full_state_dict = {k: v.clone().cpu() for k, v in model_ep1.state_dict().items()}
++    del model_ep1
++    torch.cuda.empty_cache()
++
++    batch = get_dummy_batch(config_ep1.vocab_size, seq_len=32, batch_size=2, device=device)
++    num_experts = config_ep1.num_local_experts
++
++    # --- Phase 2: EP=2 + AllToAll dispatcher -> reference loss + gradients ---
++    config_ep2 = create_small_mixtral_config(expert_parallel_size=ep_size)
++    torch.manual_seed(0)
++    model_alltoall = NVMixtralForCausalLM(config_ep2).to(dtype=torch.bfloat16, device=device)
++
++    sharded_state = _shard_expert_weights(full_state_dict, ep_rank, ep_size, num_experts)
++    model_alltoall.load_state_dict(sharded_state, strict=False)
++
++    ep_mesh = DeviceMesh("cuda", list(range(ep_size)))
++    ep_group = ep_mesh.get_group()
++    model_alltoall.model.set_ep_groups(ep_group, ep_mesh)
++
++    outputs_ref = model_alltoall(**batch)
++    loss_ref = outputs_ref.loss
++    loss_ref.backward()
++
++    ref_grads = {
++        name: p.grad.detach().clone().cpu() for name, p in model_alltoall.named_parameters() if p.grad is not None
++    }
++    loss_ref_cpu = loss_ref.detach().cpu()
++
++    del model_alltoall, outputs_ref
++    torch.cuda.empty_cache()
++
++    # --- Phase 3: EP=2 + FusedTokenRouter dispatcher -> test loss + gradients ---
++    num_local_experts = num_experts // ep_size
++    hidden_size = config_ep2.hidden_size
++
++    dispatcher = FusedTokenRouter(
++        num_experts=num_experts,
++        num_local_experts=num_local_experts,
++        hidden_size=hidden_size,
++        ep_size=ep_size,
++    )
++
++    torch.manual_seed(0)
++    model_fused = NVMixtralForCausalLM(config_ep2, dispatcher=dispatcher).to(dtype=torch.bfloat16, device=device)
++    model_fused.load_state_dict(sharded_state, strict=False)
++
++    model_fused.model.set_ep_groups(ep_group, ep_mesh)
++
++    outputs_test = model_fused(**batch)
++    loss_test = outputs_test.loss
++    loss_test.backward()
++
++    test_grads = {
++        name: p.grad.detach().clone().cpu() for name, p in model_fused.named_parameters() if p.grad is not None
++    }
++    loss_test_cpu = loss_test.detach().cpu()
++
++    # --- Phase 4: Compare on rank 0 ---
++    if dist_config.is_main_process():
++        torch.testing.assert_close(
++            loss_test_cpu,
++            loss_ref_cpu,
++            atol=1e-3,
++            rtol=1e-3,
++            msg="FusedTokenRouter backward: loss does not match AllToAll loss",
++        )
++
++        assert len(ref_grads) > 0, "AllToAll model produced no gradients"
++        assert len(test_grads) > 0, "FusedTokenRouter model produced no gradients"
++
++        # Both AllToAll (via _DifferentiableAllToAll) and FusedTokenRouter provide
++        # differentiable dispatch/combine, so all parameters should have gradients.
++        assert ref_grads.keys() == test_grads.keys(), (
++            f"Gradient key mismatch: "
++            f"AllToAll-only={ref_grads.keys() - test_grads.keys()}, "
++            f"Fused-only={test_grads.keys() - ref_grads.keys()}"
++        )
++
++        for name in ref_grads:
++            torch.testing.assert_close(
++                test_grads[name],
++                ref_grads[name],
++                atol=3e-2,
++                rtol=3e-2,
++                msg=f"FusedTokenRouter gradient mismatch for {name}",
++            )
++
++    torch.distributed.destroy_process_group()
++
++
++if __name__ == "__main__":
++    test_name = sys.argv[1]
++    if test_name == "backward":
++        _run_backward_test()
++    else:
++        _run_equivalence_test()
+diff --git a/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py b/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py
+index e15645a3c1..2a14ba0d85 100644
+--- a/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py
++++ b/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py
+@@ -162,3 +162,139 @@ def create_inference_params(self, config, batch_size=1, max_seq_len=256, num_bea
+         for layer_number in range(1, config.num_hidden_layers + 1):
+             past_key_values.allocate_memory(layer_number)
+         return past_key_values
++
++
++# ---------------------------------------------------------------------------
++# Single-GPU tests for the AllToAll dispatch/combine code path
++#
++# By initialising a single-rank NCCL process group and setting an EP group on
++# the model, we force the AllToAllTokenDispatcher to take the all-to-all path
++# (differentiable all-to-all, expert sort/unsort, etc.) even on one GPU.
++# This ensures CI coverage of that code without requiring multiple GPUs.
++# ---------------------------------------------------------------------------
++
++requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
++
++
++@pytest.fixture
++def dist_process_group():
++    """Initialize and tear down a single-rank NCCL process group."""
++    if torch.distributed.is_initialized():
++        pytest.skip("Distributed already initialized")
++    torch.cuda.set_device(0)
++    store = torch.distributed.HashStore()
++    torch.distributed.init_process_group(backend="nccl", store=store, rank=0, world_size=1)
++    yield
++    torch.distributed.destroy_process_group()
++
++
++def _small_config():
++    """Create a small Mixtral config for single-GPU EP tests."""
++    return NVMixtralConfig(
++        hidden_size=128,
++        intermediate_size=256,
++        num_hidden_layers=2,
++        num_attention_heads=4,
++        num_key_value_heads=2,
++        num_local_experts=4,
++        num_experts_per_tok=2,
++        max_position_embeddings=128,
++        vocab_size=1000,
++        attn_input_format="bshd",
++        self_attn_mask_type="causal",
++        router_jitter_noise=0.0,
++    )
++
++
++def _dummy_batch(vocab_size, device="cuda"):
++    """Create a deterministic dummy batch."""
++    torch.manual_seed(42)
++    input_ids = torch.randint(0, vocab_size, (2, 32), device=device)
++    attention_mask = torch.ones_like(input_ids)
++    labels = input_ids.clone()
++    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
++
++
++@requires_cuda
++def test_alltoall_forward_matches_local(dist_process_group):
++    """All-to-all code path produces the same output as the local-only path."""
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    config = _small_config()
++    batch = _dummy_batch(config.vocab_size)
++
++    # Reference: local-only path (no EP group set)
++    torch.manual_seed(0)
++    model_local = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device="cuda")
++    model_local.eval()
++    with torch.no_grad():
++        out_local = model_local(**batch)
++
++    # Test: all-to-all path (EP group set on a single-rank mesh)
++    torch.manual_seed(0)
++    model_ep = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device="cuda")
++    ep_mesh = DeviceMesh("cuda", [0])
++    model_ep.model.set_ep_groups(ep_mesh.get_group(), ep_mesh)
++    model_ep.eval()
++    with torch.no_grad():
++        out_ep = model_ep(**batch)
++
++    torch.testing.assert_close(out_ep.logits, out_local.logits, atol=1e-5, rtol=1e-5)
++    torch.testing.assert_close(out_ep.loss, out_local.loss, atol=1e-5, rtol=1e-5)
++
++
++@requires_cuda
++def test_alltoall_backward_all_params_have_gradients(dist_process_group):
++    """All trainable parameters receive gradients through the all-to-all code path."""
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    config = _small_config()
++    batch = _dummy_batch(config.vocab_size)
++
++    torch.manual_seed(0)
++    model = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device="cuda")
++    ep_mesh = DeviceMesh("cuda", [0])
++    model.model.set_ep_groups(ep_mesh.get_group(), ep_mesh)
++
++    outputs = model(**batch)
++    outputs.loss.backward()
++
++    for name, param in model.named_parameters():
++        if param.requires_grad:
++            assert param.grad is not None, f"Parameter {name} has no gradient with all-to-all code path"
++
++
++@requires_cuda
++def test_alltoall_backward_gradients_match_local(dist_process_group):
++    """All-to-all backward produces the same gradients as the local-only path."""
++    from torch.distributed.tensor.device_mesh import DeviceMesh
++
++    config = _small_config()
++    batch = _dummy_batch(config.vocab_size)
++
++    # Reference: local-only path
++    torch.manual_seed(0)
++    model_local = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device="cuda")
++    model_local(**batch).loss.backward()
++    ref_grads = {name: p.grad.detach().clone() for name, p in model_local.named_parameters() if p.grad is not None}
++
++    # Test: all-to-all path
++    torch.manual_seed(0)
++    model_ep = NVMixtralForCausalLM(config).to(dtype=torch.bfloat16, device="cuda")
++    ep_mesh = DeviceMesh("cuda", [0])
++    model_ep.model.set_ep_groups(ep_mesh.get_group(), ep_mesh)
++    model_ep(**batch).loss.backward()
++
++    for name, param in model_ep.named_parameters():
++        if param.requires_grad:
++            g = param.grad
++            if hasattr(g, "full_tensor"):
++                g = g.full_tensor()
++            assert name in ref_grads, f"Unexpected gradient for {name}"
++            torch.testing.assert_close(
++                g,
++                ref_grads[name],
++                atol=1e-5,
++                rtol=1e-5,
++                msg=f"All-to-all gradient mismatch for {name}",
++            )

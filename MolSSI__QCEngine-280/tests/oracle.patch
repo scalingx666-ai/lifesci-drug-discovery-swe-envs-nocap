@@ -1,0 +1,392 @@
+diff --git a/qcengine/exceptions.py b/qcengine/exceptions.py
+index 28bae2edf..9f22709cf 100644
+--- a/qcengine/exceptions.py
++++ b/qcengine/exceptions.py
+@@ -1,4 +1,7 @@
+ import traceback
++from typing import Dict, Optional, Any
++
++from qcelemental.models import AtomicInput
+ 
+ 
+ class QCEngineException(Exception):
+@@ -67,3 +70,68 @@ class RandomError(QCEngineException):
+ 
+     error_type = "random_error"
+     header = "QCEngine Random Error"
++
++
++class KnownErrorException(QCEngineException):
++    """Base class for detecting errors in the output of a ProgramHarness
++
++    Subclasses for this class must define `error_name` and `description`, which provide
++    a short name for the error used in the error correction code and a human-readable
++    description of the error and how it is corrected.
++
++    Subclasses for this exception must fulfill the `detect_error` class method,
++     which detects if an error has occurred and raises an exception if one was detected.
++     When raising the exception, the `detect_error` routine can optionally provide details
++     about the error that are needed to correction.
++    """
++
++    error_type = "known_error"
++    header = "QCEngine Known Error"
++
++    error_name: str  # Unique name for this error. Used in autodetection logic
++    description: str  # Human-readable description of the error.
++    details: Optional[Dict[str, Any]]  # Any details for this error. Used for user feedback and autocorrection logic
++
++    def __init__(self, details: Optional[dict] = None):
++        super().__init__(self.description)
++        self.details = details
++
++    @classmethod
++    def detect_error(cls, outputs: Dict[str, str]):
++        """Detect whether this operation throws an error
++        Args:
++            outputs (dict): Output files needed to check for errors
++        Raises:
++            KnownErrorException: Error, if one was detected
++        """
++        raise NotImplementedError()
++
++    def create_keyword_update(self, input_data: AtomicInput) -> Dict[str, Any]:
++        """Create an keyword used to the update the dictionary given observed error
++
++        Parameters
++        ----------
++            input_data
++                Input specification used to perform the calculation that failed
++
++        Returns
++        -------
++            Dictionary used to update the keywords field of ``input_data``
++        """
++        raise NotImplementedError()
++
++
++class SimpleKnownErrorException(KnownErrorException):
++    """Subclass for errors with simple detection logic.
++
++    Most useful for error types that do not need any additional details to correct."""
++
++    @classmethod
++    def detect_error(cls, outputs: Dict[str, str]):
++        if cls._detect(outputs):
++            raise cls()
++
++    @classmethod
++    def _detect(cls, outputs: Dict[str, str]) -> bool:
++        """Detect whether an error is present"""
++        raise NotImplementedError()
+diff --git a/qcengine/programs/model.py b/qcengine/programs/model.py
+index ad11bc8f4..77d70fe96 100644
+--- a/qcengine/programs/model.py
++++ b/qcengine/programs/model.py
+@@ -1,7 +1,13 @@
+ import abc
++import logging
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+ from pydantic import BaseModel
++from qcelemental.models import AtomicInput, AtomicResult
++
++from qcengine.exceptions import KnownErrorException
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ class ProgramHarness(BaseModel, abc.ABC):
+@@ -73,3 +79,71 @@ def execute(
+ 
+     def parse_output(self, outfiles: Dict[str, str], input_model: "AtomicInput") -> "AtomicResult":
+         raise ValueError("parse_output is not implemented for {}.", self.__class__)
++
++
++class ErrorCorrectionProgramHarness(ProgramHarness, abc.ABC):
++    """Base class for Harnesses that include logic to correct common errors
++
++    Classes which implement this Hardness must override the :meth:`_compute` method
++    rather than :meth:`compute`. The ``compute`` method from this class will make
++    calls to ``_compute`` with different actions as it attempts to correct errors in the
++    input files.
++
++    The error corrections are defined by first implementing a :class:`KnownErrorException`
++    that contains logic to determine if a certain error occurs and returns an appropriate
++    update to the keywords of an AtomicInput.
++
++    Then, modify the ``_compute`` method of your Harness to run the ``detect_error`` method
++    of each ``KnownErrorException`` for the Harness after it finishes performing the computation.
++    The ``detect_error`` method will raise an exception that is caught by the
++    ``ErrorCorrectionProgramHarness`` and used to determine if/how to re-run the computation.
++    """
++
++    def _compute(self, input_data: AtomicInput, config: "TaskConfig") -> AtomicResult:
++        raise NotImplementedError()
++
++    def compute(self, input_data: AtomicInput, config: "TaskConfig") -> AtomicResult:
++        # Get the error correction configuration
++        error_policy = input_data.protocols.error_correction
++
++        # Create a local copy of the input data
++        local_input_data = input_data
++
++        # Run the method and, if it fails, assess if the failure is restartable
++        observed_errors = {}  # Errors that have been observed previously
++        while True:
++            try:
++                result = self._compute(local_input_data, config)
++                break
++            except KnownErrorException as e:
++                logger.info(f"Caught a {type(e)} error.")
++
++                # Determine whether this specific type of error is allowed
++                correction_allowed = error_policy.allows(e.error_name)
++                if not correction_allowed:
++                    logger.info(f'Error correction for "{e.error_name}" is not allowed')
++                    raise e
++                logger.info(f'Error correction for "{e.error_name}" is allowed')
++
++                # Check if it has run before
++                # TODO (wardlt): Should we allow errors to be run >1 time?
++                previously_run = e.error_name in observed_errors
++                if previously_run:
++                    logger.info(
++                        "Error has been observed before and mitigation did not fix the issue. Raising exception"
++                    )
++                    raise e
++
++                # Generate and apply the updated keywords
++                keyword_updates = e.create_keyword_update(local_input_data)
++                new_keywords = local_input_data.keywords.copy()
++                new_keywords.update(keyword_updates)
++                local_input_data = AtomicInput(**local_input_data.dict(exclude={"keywords"}), keywords=new_keywords)
++
++                # Store the error details and mitigations employed
++                observed_errors[e.error_name] = {"details": e.details, "keyword_updates": keyword_updates}
++
++        # Add the errors observed and corrected for, if any
++        if len(observed_errors) > 0:
++            result.extras["observed_errors"] = observed_errors
++        return result
+diff --git a/qcengine/programs/nwchem/errors.py b/qcengine/programs/nwchem/errors.py
+new file mode 100644
+index 000000000..a85aa8c8a
+--- /dev/null
++++ b/qcengine/programs/nwchem/errors.py
+@@ -0,0 +1,24 @@
++"""Known errors for NWChem"""
++from typing import Dict, Any
++
++from qcelemental.models import AtomicInput
++
++from qcengine.exceptions import SimpleKnownErrorException
++
++
++class GeomBinvrError(SimpleKnownErrorException):
++    """GeomBinvr Error"""
++
++    error_name = "geom_binvr"
++    description = "Error when generating redundant atomic coordinates. Fixed by turning this feature off (`noautoz`)"
++
++    @classmethod
++    def _detect(cls, outputs: Dict[str, str]) -> bool:
++        return "geom_binvr: #indep variables incorrect" in outputs["stdout"]
++
++    def create_keyword_update(self, input_data: AtomicInput) -> Dict[str, Any]:
++        return {"geometry__noautoz": True}
++
++
++# List of all the known errors
++all_errors = [GeomBinvrError]
+diff --git a/qcengine/programs/nwchem/runner.py b/qcengine/programs/nwchem/runner.py
+index 3ffb9ba5c..d4ffd3a16 100644
+--- a/qcengine/programs/nwchem/runner.py
++++ b/qcengine/programs/nwchem/runner.py
+@@ -17,7 +17,8 @@
+ 
+ from ...exceptions import InputError
+ from ...util import create_mpi_invocation, execute
+-from ..model import ProgramHarness
++from ..model import ErrorCorrectionProgramHarness
++from .errors import all_errors
+ from ..qcvar_identities_resources import build_atomicproperties, build_out
+ from .germinate import muster_modelchem
+ from .harvester import harvest
+@@ -27,7 +28,7 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
+-class NWChemHarness(ProgramHarness):
++class NWChemHarness(ErrorCorrectionProgramHarness):
+     """
+ 
+     Notes
+@@ -47,7 +48,7 @@ class NWChemHarness(ProgramHarness):
+     # ATL: OpenMP only >=6.6 and only for Phi; potential for Mac using MKL and Intel compilers
+     version_cache: Dict[str, str] = {}
+ 
+-    class Config(ProgramHarness.Config):
++    class Config(ErrorCorrectionProgramHarness.Config):
+         pass
+ 
+     @staticmethod
+@@ -112,7 +113,7 @@ def get_version(self) -> str:
+ 
+         return self.version_cache[which_prog]
+ 
+-    def compute(self, input_model: AtomicInput, config: "TaskConfig") -> AtomicResult:
++    def _compute(self, input_model: AtomicInput, config: "TaskConfig") -> AtomicResult:
+         """
+         Runs NWChem in executable mode
+         """
+@@ -132,6 +133,9 @@ def compute(self, input_model: AtomicInput, config: "TaskConfig") -> AtomicResul
+             dexe["outfiles"]["stderr"] = dexe["stderr"]
+             return self.parse_output(dexe["outfiles"], input_model)
+         else:
++            # Check if any of the errors are known
++            for error in all_errors:
++                error.detect_error(dexe)
+             raise UnknownError(dexe["stdout"])
+ 
+     def build_input(
+diff --git a/qcengine/programs/tests/test_nwchem.py b/qcengine/programs/tests/test_nwchem.py
+index 09ad21e67..f31679831 100644
+--- a/qcengine/programs/tests/test_nwchem.py
++++ b/qcengine/programs/tests/test_nwchem.py
+@@ -8,6 +8,46 @@
+ from qcengine.testing import using
+ 
+ 
++# Molecule where autoz fails
++_auto_z_problem = xyz = """C                    15.204188380000    -3.519180270000   -10.798726560000
++C                    15.097645630000    -2.650246400000    -8.505033680000
++C                    14.976892130000    -1.867030510000    -6.378827230000
++C                    14.827093540000    -1.105281910000    -4.239222620000
++C                    14.635399720000    -0.362921900000    -2.101035300000
++N                    14.357893440000     0.315376390000    -0.000359050000
++C                    16.031227020000     2.397930170000     0.801905280000
++C                    15.337300690000     2.925144860000     3.538890120000
++C                    14.742074760000     3.377413020000     5.886685850000
++C                    14.048167320000     3.904627710000     8.623670690000
++N                    12.688887320000     2.073331920000     9.820037400000
++C                    14.474640720000     6.115210430000     9.591909660000
++C                    14.946826580000     8.308766730000    10.603064320000
++C                    17.506555110000     9.181593430000    10.935939570000
++C                    18.224273090000    10.758664370000    12.778309160000
++O                    20.684526430000    11.555996510000    13.018002020000
++C                    20.952489590000    13.130270650000    14.964495520000
++C                    21.186059740000    14.590046290000    16.687812370000
++C                    21.422747940000    16.379824800000    18.663483240000
++C                    22.929993500000    15.902177630000    20.539319870000
++C                    24.426014080000    15.474645990000    22.431805000000
++N                    24.775991360000    13.082933010000    23.323528960000
++O                    18.709082330000     1.890803270000     0.670399240000
++O                    20.008439110000     4.184817400000     1.512272230000
++H                    16.847872170000    -3.183338140000   -11.974003930000
++H                    13.649907540000    -4.604695650000   -11.575422900000
++H                    15.665451630000     4.107792170000    -0.318135390000
++H                    13.044004660000     0.318248780000     9.124920540000
++H                    12.835662350000     2.164511200000    11.730569410000
++H                    13.401843200000     9.476598570000    11.281381510000
++H                    18.900965120000     8.515559460000     9.580741380000
++H                    16.945759980000    11.469295880000    14.211420760000
++H                    20.389540180000    18.145263640000    18.570527610000
++H                    25.288598470000    16.991453560000    23.511896860000
++H                    24.436823320000    11.711936710000    22.016121940000
++H                    26.442597520000    12.834282850000    24.246149950000
++H                    20.850425490000     3.414376060000     2.960577230000"""
++
++
+ @pytest.fixture
+ def nh2():
+     smol = """
+@@ -211,52 +251,20 @@ def test_geometry_bug():
+ def test_autoz_error():
+     """Test ability to turn off autoz"""
+     # Large molecule that leads to an AutoZ error
+-    xyz = """C                    15.204188380000    -3.519180270000   -10.798726560000
+-C                    15.097645630000    -2.650246400000    -8.505033680000
+-C                    14.976892130000    -1.867030510000    -6.378827230000
+-C                    14.827093540000    -1.105281910000    -4.239222620000
+-C                    14.635399720000    -0.362921900000    -2.101035300000
+-N                    14.357893440000     0.315376390000    -0.000359050000
+-C                    16.031227020000     2.397930170000     0.801905280000
+-C                    15.337300690000     2.925144860000     3.538890120000
+-C                    14.742074760000     3.377413020000     5.886685850000
+-C                    14.048167320000     3.904627710000     8.623670690000
+-N                    12.688887320000     2.073331920000     9.820037400000
+-C                    14.474640720000     6.115210430000     9.591909660000
+-C                    14.946826580000     8.308766730000    10.603064320000
+-C                    17.506555110000     9.181593430000    10.935939570000
+-C                    18.224273090000    10.758664370000    12.778309160000
+-O                    20.684526430000    11.555996510000    13.018002020000
+-C                    20.952489590000    13.130270650000    14.964495520000
+-C                    21.186059740000    14.590046290000    16.687812370000
+-C                    21.422747940000    16.379824800000    18.663483240000
+-C                    22.929993500000    15.902177630000    20.539319870000
+-C                    24.426014080000    15.474645990000    22.431805000000
+-N                    24.775991360000    13.082933010000    23.323528960000
+-O                    18.709082330000     1.890803270000     0.670399240000
+-O                    20.008439110000     4.184817400000     1.512272230000
+-H                    16.847872170000    -3.183338140000   -11.974003930000
+-H                    13.649907540000    -4.604695650000   -11.575422900000
+-H                    15.665451630000     4.107792170000    -0.318135390000
+-H                    13.044004660000     0.318248780000     9.124920540000
+-H                    12.835662350000     2.164511200000    11.730569410000
+-H                    13.401843200000     9.476598570000    11.281381510000
+-H                    18.900965120000     8.515559460000     9.580741380000
+-H                    16.945759980000    11.469295880000    14.211420760000
+-H                    20.389540180000    18.145263640000    18.570527610000
+-H                    25.288598470000    16.991453560000    23.511896860000
+-H                    24.436823320000    11.711936710000    22.016121940000
+-H                    26.442597520000    12.834282850000    24.246149950000
+-H                    20.850425490000     3.414376060000     2.960577230000"""
+-    mol = qcel.models.Molecule.from_data(xyz)
++    mol = qcel.models.Molecule.from_data(_auto_z_problem)
+     result = qcng.compute(
+-        {"molecule": mol, "model": {"method": "hf", "basis": "sto-3g"}, "driver": "energy"},
++        {
++            "molecule": mol,
++            "model": {"method": "hf", "basis": "sto-3g"},
++            "driver": "energy",
++            "protocols": {"error_correction": {"default_policy": False}},
++        },  # Turn off error correction
+         "nwchem",
+         raise_error=False,
+     )
+ 
+     assert not result.success
+-    assert "insufficient internal variables" in result.error.error_message
++    assert "Error when generating redundant atomic coordinates" in result.error.error_message
+ 
+     # Turn off autoz
+     result = qcng.compute(
+@@ -270,4 +278,26 @@ def test_autoz_error():
+         raise_error=False,
+     )
+ 
+-    assert "insufficient internal variables" not in result.error.error_message  # Ok if it crashes for other reasons
++    # Ok if it crashes for other reasons
++    assert "Error when generating redundant atomic coordinates" not in result.error.error_message
++
++
++@using("nwchem")
++def test_error_correction():
++    """See if error correction for autoz works"""
++
++    # Large molecule that leads to an AutoZ error
++    mol = qcel.models.Molecule.from_data(_auto_z_problem)
++    result = qcng.compute(
++        {
++            "molecule": mol,
++            "model": {"method": "hf", "basis": "sto-3g"},
++            "driver": "energy",
++            "keywords": {"scf__maxiter": 250, "scf__thresh": 1e-2},
++        },
++        "nwchem",
++        raise_error=True,
++    )
++
++    assert result.success
++    assert "geom_binvr" in result.extras["observed_errors"]

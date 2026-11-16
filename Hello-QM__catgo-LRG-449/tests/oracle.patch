@@ -1,0 +1,138 @@
+diff --git a/server/catgo/cli/server_link.py b/server/catgo/cli/server_link.py
+index 06232fcd6..270cf3ab3 100644
+--- a/server/catgo/cli/server_link.py
++++ b/server/catgo/cli/server_link.py
+@@ -70,8 +70,15 @@ def discover(cls) -> "ServerLink | None":
+                 return cls(base_url=url)
+         return None
+ 
+-    def push_structure(self, path, panel_id) -> dict:
+-        """POST /api/view/upload-and-load (multipart). Returns server JSON."""
++    def push_structure(self, path, panel_id, intent="edit") -> dict:
++        """POST /api/view/upload-and-load (multipart). Returns server JSON.
++
++        `intent` defaults to "edit" so a CLI push (`catgo view`/`catgo push`)
++        ALWAYS applies in place — repeated pushes to the External pane keep
++        showing the latest structure, ase-gui style. (The route's own default
++        is "load", which the frontend HOLDS once the pane is occupied; that is
++        for CatBot loading into a user's working tab, not an explicit CLI push.)
++        """
+         import os
+         from pathlib import Path
+         p = Path(path)
+@@ -84,8 +91,13 @@ def push_structure(self, path, panel_id) -> dict:
+         ).encode() + p.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+ 
+         url = f"{self.base_url}/api/view/upload-and-load"
++        params = []
+         if panel_id:
+-            url += f"?panel_id={panel_id}"
++            params.append(f"panel_id={panel_id}")
++        if intent:
++            params.append(f"intent={intent}")
++        if params:
++            url += "?" + "&".join(params)
+         req = urllib.request.Request(
+             url, data=body, method="POST",
+             headers={"Content-Type":
+diff --git a/server/catgo/routers/view_capture.py b/server/catgo/routers/view_capture.py
+index 44ed09aef..357fdd694 100644
+--- a/server/catgo/routers/view_capture.py
++++ b/server/catgo/routers/view_capture.py
+@@ -10,7 +10,7 @@
+ import logging
+ import uuid
+ from collections import deque
+-from typing import Any, Optional
++from typing import Annotated, Any, Optional
+ 
+ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+ from fastapi.responses import PlainTextResponse, StreamingResponse
+@@ -596,6 +596,16 @@ def _is_trajectory(content: str, filename: str) -> bool:
+ async def upload_and_load(
+     file: UploadFile = File(...),
+     panel_id: str = Query("default", description="Target panel; 'default' = External pane"),
++    intent: Annotated[
++        str,
++        Query(
++            description="'load' (default — fresh load; frontend may prompt "
++            "before overwriting an occupied pane) or 'edit' (apply in place, "
++            "always — used by the `catgo view`/`catgo push` CLI so REPEATED "
++            "pushes to the External pane keep showing the latest, ase-gui "
++            "style).",
++        ),
++    ] = "load",
+ ):
+     """Upload a structure file (multipart/form-data) and push it to the viewer.
+ 
+@@ -659,7 +669,7 @@ async def upload_and_load(
+     except Exception as exc:
+         raise HTTPException(status_code=400, detail=f"Parse failed: {exc}")
+ 
+-    view_state.push_structure(struct_dict, panel_id, intent="load")
++    view_state.push_structure(struct_dict, panel_id, intent=intent)
+     n = len(struct_dict.get("sites", []))
+     logger.info("upload-and-load: %s → panel '%s', %d sites", filename or "<unnamed>", panel_id, n)
+     return {
+diff --git a/server/tests/cli/test_server_link.py b/server/tests/cli/test_server_link.py
+index ca1855c9e..8ed9e1437 100644
+--- a/server/tests/cli/test_server_link.py
++++ b/server/tests/cli/test_server_link.py
+@@ -205,3 +205,20 @@ def _urlopen(req, timeout=None):
+     link.pull_structure(fmt="cif", panel_id=None)
+     assert "panel_id=" not in calls["url"]
+     assert "format=cif" in calls["url"]
++
++
++def test_push_structure_sends_intent_edit(monkeypatch, tmp_path):
++    """`catgo view` pushes with intent=edit so the External pane always
++    replaces (ase-gui), not held after the first push (regression: catgo
++    view只生效一次)."""
++    from catgo.cli import server_link
++    calls = {}
++    def _urlopen(req, timeout=None):
++        calls["url"] = req.full_url
++        return _FakeResponse(b'{"panel_id": "default", "num_sites": 2}')
++    monkeypatch.setattr(server_link.urllib.request, "urlopen", _urlopen)
++    p = tmp_path / "x.vasp"; p.write_bytes(b"POSCAR\n1.0\n")
++    link = server_link.ServerLink(base_url="http://localhost:8000")
++    link.push_structure(p, panel_id="default")
++    assert "intent=edit" in calls["url"]
++    assert "panel_id=default" in calls["url"]
+diff --git a/server/tests/test_push_intent.py b/server/tests/test_push_intent.py
+index 50adc2aa1..77240c437 100644
+--- a/server/tests/test_push_intent.py
++++ b/server/tests/test_push_intent.py
+@@ -154,3 +154,32 @@ def test_upload_and_load_route_tags_intent_load(monkeypatch):
+     assert res["status"] == "ok"
+     assert captured["intent"] == "load"
+     assert captured["pid"] == "default"
++
++
++def test_upload_and_load_route_intent_param_overrides(monkeypatch):
++    """`catgo view` / lab CLI pass `intent=edit` so REPEATED pushes to the
++    External pane always apply (ase-gui semantics) instead of being held by
++    the frontend load-gate after the first push. Default stays "load" so the
++    CatBot load-into-occupied-tab prompt is unchanged."""
++    import asyncio
++    import io
++
++    from starlette.datastructures import UploadFile
++
++    from catgo.routers import view_capture
++
++    captured = {}
++    monkeypatch.setattr(
++        view_capture.view_state, "push_structure",
++        lambda sd, pid, intent="edit", **kw: captured.update(intent=intent, pid=pid),
++    )
++
++    xyz = b"2\n\nH 0.0 0.0 0.0\nH 0.0 0.0 0.74\n"
++    uf = UploadFile(filename="mol.xyz", file=io.BytesIO(xyz))
++    res = asyncio.run(
++        view_capture.upload_and_load(file=uf, panel_id="default", intent="edit")
++    )
++
++    assert res["status"] == "ok"
++    assert captured["intent"] == "edit"
++    assert captured["pid"] == "default"

@@ -1,0 +1,183 @@
+diff --git a/src/densities.jl b/src/densities.jl
+index a8ba35e892..7da7263db5 100644
+--- a/src/densities.jl
++++ b/src/densities.jl
+@@ -105,9 +105,10 @@ end
+     T = promote_type(eltype(basis), real(eltype(ψ[1])))
+     τ = similar(ψ[1], T, (basis.fft_size..., basis.model.n_spin_components))
+     τ .= 0
+-    dαψnk_real = zeros(complex(eltype(basis)), basis.fft_size)
++    dαψnk_real = zeros_like(G_vectors(basis), complex(eltype(basis)), basis.fft_size...)
++    occupation = [to_cpu(oc) for oc in occupation]
+     for (ik, kpt) in enumerate(basis.kpoints)
+-        G_plus_k = [[p[α] for p in Gplusk_vectors_cart(basis, kpt)] for α = 1:3]
++        G_plus_k = [map(p -> p[α], Gplusk_vectors_cart(basis, kpt)) for α = 1:3]
+         for n = 1:size(ψ[ik], 2), α = 1:3
+             ifft!(dαψnk_real, basis, kpt, im .* G_plus_k[α] .* ψ[ik][:, n])
+             @. τ[:, :, :, kpt.spin] += occupation[ik][n] * basis.kweights[ik] / 2 * abs2(dαψnk_real)
+diff --git a/src/postprocess/forces.jl b/src/postprocess/forces.jl
+index ba5414f117..a8e985022f 100644
+--- a/src/postprocess/forces.jl
++++ b/src/postprocess/forces.jl
+@@ -25,8 +25,8 @@ function compute_forces_cart(basis::PlaneWaveBasis, ψ, occupation; kwargs...)
+ end
+ 
+ function compute_forces(scfres)
+-    compute_forces(scfres.basis, scfres.ψ, scfres.occupation; scfres.ρ)
++    compute_forces(scfres.basis, scfres.ψ, scfres.occupation; scfres.ρ, scfres.τ)
+ end
+ function compute_forces_cart(scfres)
+-    compute_forces_cart(scfres.basis, scfres.ψ, scfres.occupation; scfres.ρ)
+-end
++    compute_forces_cart(scfres.basis, scfres.ψ, scfres.occupation; scfres.ρ, scfres.τ)
++end
+\ No newline at end of file
+diff --git a/src/terms/Hamiltonian.jl b/src/terms/Hamiltonian.jl
+index 1588e700ef..3237c46c39 100644
+--- a/src/terms/Hamiltonian.jl
++++ b/src/terms/Hamiltonian.jl
+@@ -140,9 +140,17 @@ end
+     n_bands = size(ψ, 2)
+     iszero(n_bands) && return Hψ  # Nothing to do if ψ empty
+     have_divAgrad = !isnothing(H.divAgrad_op)
++    if have_divAgrad
++        # TODO: It is very beneficial to precompute G_plus_k here, rather than for each band.
++        #       Extra performance could probably be gained by storing this in the HamiltonianBlock
++        #       as a scratch array. Is it worth the complication and extra memory use?
++        # Precompute G_plus_k for DivAgradOperator
++        G_plus_k = [map(p -> p[α], Gplusk_vectors_cart(H.basis, H.kpoint)) for α = 1:3]
++    end
+ 
+     # Notice that we use unnormalized plans for extra speed
+-    potential = H.local_op.potential / prod(H.basis.fft_size)
++    potential = H.local_op.potential .* H.basis.fft_grid.fft_normalization .*
++                H.basis.fft_grid.ifft_normalization
+ 
+     parallel_loop_over_range(1:n_bands, H.scratch) do iband, storage
+         to = TimerOutput()  # Thread-local timer output
+@@ -159,7 +167,7 @@ end
+                 apply!((; fourier=Hψ[:, iband], real=nothing),
+                        H.divAgrad_op,
+                        (; fourier=ψ[:, iband], real=nothing);
+-                       ψ_scratch=ψ_real)
++                       ψ_real, G_plus_k) # overwrites ψ_real
+             end
+         end
+ 
+diff --git a/src/terms/operators.jl b/src/terms/operators.jl
+index 516dcfbbce..07b41c9a36 100644
+--- a/src/terms/operators.jl
++++ b/src/terms/operators.jl
+@@ -143,14 +143,24 @@ struct DivAgradOperator{T <: Real, AT} <: RealFourierOperator
+     A::AT
+ end
+ function apply!(Hψ, op::DivAgradOperator, ψ;
+-                ψ_scratch=zeros(complex(eltype(op.basis)), op.basis.fft_size...))
+-    # TODO: Performance improvements: Unscaled plans, avoid remaining allocations
+-    #       (which are only on the small k-point-specific Fourier grid
+-    G_plus_k = [[p[α] for p in Gplusk_vectors_cart(op.basis, op.kpoint)] for α = 1:3]
++                ψ_real=zeros_like(ψ.fourier, complex(eltype(op.basis)), op.basis.fft_size...),
++                G_plus_k=nothing)
++    # ψ_real is a pre-allocated buffer to hold temporary real-space representations of ψ,
++    # this function overwrites it.
++    if isnothing(G_plus_k)
++        # Note: it is wasteful to recompute G_plus_k on every call, ideally passed from outside
++        G_plus_k = [map(p -> p[α], Gplusk_vectors_cart(op.basis, op.kpoint)) for α = 1:3]
++    end
++
++    # use unnormalized FFT plans for speed
++    norm = op.basis.fft_grid.fft_normalization * op.basis.fft_grid.ifft_normalization
++    ψ_recip = similar(ψ.fourier)   # pre-allocate large array
+     for α = 1:3
+-        ∂αψ_real = ifft!(ψ_scratch, op.basis, op.kpoint, im .* G_plus_k[α] .* ψ.fourier)
+-        A∇ψ      = fft(op.basis, op.kpoint, ∂αψ_real .* op.A)
+-        Hψ.fourier .-= im .* G_plus_k[α] .* A∇ψ ./ 2
++        ψ_recip .= im .* G_plus_k[α] .* ψ.fourier .* norm   # ∂αψ
++        ifft!(ψ_real, op.basis, op.kpoint, ψ_recip; normalize=false)
++        ψ_real .*= op.A   # A∇ψ
++        fft!(ψ_recip, op.basis, op.kpoint, ψ_real; normalize=false)
++        Hψ.fourier .-= im .* G_plus_k[α] .* ψ_recip ./ 2
+     end
+ end
+ # TODO Implement  Base.Matrix(op::DivAgradOperator)
+diff --git a/test/external/atomsbase.jl b/test/external/atomsbase.jl
+index 577619d3d9..c79306ab4b 100644
+--- a/test/external/atomsbase.jl
++++ b/test/external/atomsbase.jl
+@@ -243,7 +243,7 @@ end
+     pos1 = [0.0, 0.0, 0.0]
+     pos2 = [1.35, 1.35, 1.35]
+     cell = [[5.4, 0.0, 0.0], [0.0, 5.4, 0.0], [0.0, 0.0, 5.4]]
+-    psp = PseudoFamily("cp2k.nc.sr.pbe.v0_1.largecore.gth")
++    psp = PseudoFamily("dojo.nc.sr.pbe.v0_4_1.standard.upf")
+ 
+     # Float64 positions, Float64 lattice
+     system_ff = periodic_system(
+diff --git a/test/forces.jl b/test/forces.jl
+index d10ada073e..e7276f2abc 100644
+--- a/test/forces.jl
++++ b/test/forces.jl
+@@ -192,3 +192,17 @@ end
+                            mixing=DielectricMixing(εr=10),
+                            atol=1e-7, temperature=1e-3)
+ end
++
++@testitem "Forces silicon SCAN" setup=[TestCases,TestForces] tags=[:forces] begin
++    using DFTK
++    using PseudoPotentialData
++    silicon = TestCases.silicon
++    test_forces = TestForces.test_forces
++
++    positions = [([1.01, 1.02, 1.03]) / 8, -ones(3) / 8]  # displace a bit from equilibrium
++    system = atomic_system(silicon.lattice, silicon.atoms, positions)
++
++    pseudopotentials = PseudoFamily("dojo.nc.sr.pbe.v0_4_1.standard.upf")
++    test_forces(system; pseudopotentials, functionals=SCAN(),
++                temperature=0.01, Ecut=10, kgrid=[2, 2, 2], atol=1e-7)
++end
+\ No newline at end of file
+diff --git a/test/gpu.jl b/test/gpu.jl
+index fd559d4658..34472b2f21 100644
+--- a/test/gpu.jl
++++ b/test/gpu.jl
+@@ -103,3 +103,40 @@ end
+         @test norm(compute_forces(scfres_cpu) - compute_forces(scfres_cuda)) < 1e-7
+     end
+ end
++
++@testitem "GPU magnesium mGGA test" tags=[:gpu] setup=[TestCases] begin
++    using DFTK
++    using CUDA
++    using AMDGPU
++    using LinearAlgebra
++    magnesium = TestCases.magnesium
++
++    function run_problem(; architecture)
++        Mg = ElementPsp(magnesium.atnum, load_psp(magnesium.psp_upf))
++        atoms = fill(Mg, length(magnesium.atoms))
++        model = model_DFT(magnesium.lattice, atoms, magnesium.positions;
++                          functionals=SCAN(), temperature=0.01)
++        basis = PlaneWaveBasis(model; Ecut=24, kgrid=(3, 3, 3), architecture)
++        self_consistent_field(basis; tol=1e-7, mixing=DielectricMixing())
++    end
++
++    scfres_cpu  = run_problem(; architecture=DFTK.CPU())
++    @testset "CUDA" begin
++    if CUDA.has_cuda() && CUDA.has_cuda_gpu()
++        scfres_cuda = run_problem(; architecture=DFTK.GPU(CuArray))
++        @test abs(scfres_cpu.energies.total - scfres_cuda.energies.total) < 1e-10
++        @test norm(scfres_cpu.ρ - Array(scfres_cuda.ρ)) < 5e-6
++        @test norm(compute_forces(scfres_cpu) - compute_forces(scfres_cuda)) < 1e-7
++    end
++    end
++
++    @testset "AMDGPU" begin
++    if AMDGPU.has_rocm_gpu()
++        scfres_rocm = run_problem(; architecture=DFTK.GPU(ROCArray))
++        @test scfres_rocm.ρ isa ROCArray
++        @test abs(scfres_cpu.energies.total - scfres_rocm.energies.total) < 1e-10
++        @test norm(scfres_cpu.ρ - Array(scfres_rocm.ρ)) < 5e-6
++        @test norm(compute_forces(scfres_cpu) - compute_forces(scfres_rocm)) < 1e-7
++    end
++    end
++end

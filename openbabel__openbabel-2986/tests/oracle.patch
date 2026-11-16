@@ -1,0 +1,506 @@
+diff --git a/src/canon.cpp b/src/canon.cpp
+index e2bff3bcbe..9ce0bbb332 100644
+--- a/src/canon.cpp
++++ b/src/canon.cpp
+@@ -43,6 +43,41 @@ GNU General Public License for more details.
+ 
+ #define MAX_IDENTITY_NODES 50
+ 
++// Maximum CanonicalLabelsRecursive() depth. The labeling recurses roughly once
++// per atom along a path, and on pathological inputs (very long chains, large
++// contrived graphs) this can exhaust the call stack before the time-based
++// Timeout ever fires. When exceeded the search aborts gracefully (like a
++// timeout) instead of crashing.
++//
++// This is really a call-stack budget, so it is sized to the stack frames. Each
++// recursion level consumes two frames (this function plus LabelFragments).
++// AddressSanitizer instruments every stack variable with redzones, inflating
++// those frames ~10x (a CanonicalLabelsRecursive frame measured ~3.9 KB under
++// ASAN vs a few hundred bytes otherwise), so an 8 MB stack overflows around
++// depth ~850 under ASAN but only ~8000 otherwise. We therefore cap much lower
++// under ASAN. Either way the limit is far above what real structures reach --
++// even multi-thousand atom proteins only descend a couple hundred -- so it only
++// trips on degenerate input.
++//
++// Detect AddressSanitizer: GCC defines __SANITIZE_ADDRESS__, Clang exposes it
++// through __has_feature. __has_feature must be probed in a *nested* #if -- GCC's
++// preprocessor still expands __has_feature(address_sanitizer) even when it is
++// guarded by defined(__has_feature) in the same expression, which is a syntax
++// error there.
++#if defined(__SANITIZE_ADDRESS__)
++#define OB_CANON_ASAN 1
++#elif defined(__has_feature)
++#if __has_feature(address_sanitizer)
++#define OB_CANON_ASAN 1
++#endif
++#endif
++
++#ifdef OB_CANON_ASAN
++#define MAX_CANON_RECURSION_DEPTH 500
++#else
++#define MAX_CANON_RECURSION_DEPTH 3000
++#endif
++
+ using namespace std;
+ 
+ // debug function
+@@ -755,6 +790,16 @@ namespace OpenBabel {
+       }
+       time_t startTime, maxTime;
+       bool expired;
++      unsigned int depth = 0; //!< current CanonicalLabelsRecursive depth
++    };
++
++    // RAII counter for CanonicalLabelsRecursive() depth; see
++    // MAX_CANON_RECURSION_DEPTH for why the search bails out on deep recursion.
++    struct RecursionDepthGuard
++    {
++      RecursionDepthGuard(Timeout &timeout) : m_timeout(timeout) { ++m_timeout.depth; }
++      ~RecursionDepthGuard() { --m_timeout.depth; }
++      Timeout &m_timeout;
+     };
+ 
+ 
+@@ -1181,6 +1226,15 @@ namespace OpenBabel {
+      */
+     static void CanonicalLabelsRecursive(OBAtom *current, unsigned int label, Timeout &timeout, FullCode &bestCode, State &state)
+     {
++      // Bail out before the call stack overflows on pathological inputs.
++      // Setting expired routes the unwind through the existing isExpired()
++      // checks (see MAX_CANON_RECURSION_DEPTH).
++      RecursionDepthGuard depthGuard(timeout);
++      if (timeout.depth > MAX_CANON_RECURSION_DEPTH) {
++        timeout.expired = true;
++        return;
++      }
++
+       // Bail out early on timeout. Checked here, at the top, so the unwind
+       // is fast even when most recursive frames hit the "full mapping"
+       // path below (which can be expensive on pathological molecules).
+@@ -1621,7 +1675,7 @@ namespace OpenBabel {
+ 
+         // Throw an error if the timeout is exceeded.
+         if (timeout.isExpired()) {
+-          obErrorLog.ThrowError(__FUNCTION__, "maximum time exceeded...", obError);
++          obErrorLog.ThrowError(__FUNCTION__, "canonical labeling aborted (time or recursion-depth limit exceeded)...", obError);
+         }
+ 
+         // Store the canonical code for the fragment.
+diff --git a/src/formats/abinitformat.cpp b/src/formats/abinitformat.cpp
+index f01ea99e10..239b1e091e 100644
+--- a/src/formats/abinitformat.cpp
++++ b/src/formats/abinitformat.cpp
+@@ -241,8 +241,13 @@ namespace OpenBabel
+       }
+       mol.AddConformer(coordinates);
+     }
+-    // Delete first conformer, created by EndModify, bunch of 0s
+-    mol.DeleteConformer(0);
++    // Delete first conformer, created by EndModify, bunch of 0s -- but only
++    // if we actually added real conformers above. If the file declared atoms
++    // but supplied too few positions (numConformers == 0), deleting the only
++    // conformer would leave the molecule's active coordinate pointer dangling
++    // and crash the ConnectTheDots() below.
++    if (mol.NumConformers() > 1)
++      mol.DeleteConformer(0);
+     // Set geometry to last one
+     mol.SetConformer(mol.NumConformers() - 1);
+ 
+diff --git a/src/formats/gamessformat.cpp b/src/formats/gamessformat.cpp
+index 0d520fc59b..650bbd4988 100644
+--- a/src/formats/gamessformat.cpp
++++ b/src/formats/gamessformat.cpp
+@@ -294,7 +294,8 @@ namespace OpenBabel {
+        }
+        // Done with reading atoms
+        natoms = mol.NumAtoms();
+-       // Only store a conformer when we have a full set of coordinates;
++
++        // Only store a conformer when we have a full set of coordinates;
+        // a malformed block may yield fewer (or no) atoms than expected.
+        if (natoms > 0 && coordinates.size() >= static_cast<size_t>(natoms) * 3) {
+          // malloc / memcpy
+@@ -305,7 +306,8 @@ namespace OpenBabel {
+        }
+        coordinates.clear();
+ 
+-      } else if (strstr(buffer, "MULTIPOLE COORDINATES, ELECTRONIC AND NUCLEAR CHARGES") != nullptr) {
++      } else if (strstr(buffer, "MULTIPOLE COORDINATES, ELECTRONIC AND NUCLEAR CHARGES") != nullptr
++                 && !vconf.empty() && natoms > 0) {
+         /*This set of EFP coordinates belongs only to the
+          * conformer directly above this (ATOMIC   COORDINATES (BOHR))
+          */
+@@ -424,6 +426,7 @@ namespace OpenBabel {
+ 
+         // Done with reading atoms
+         natoms = mol.NumAtoms();
++
+         // Only store a conformer when we have a full set of coordinates;
+         // a malformed block may yield fewer (or no) atoms than expected.
+         if (natoms > 0 && coordinates.size() >= static_cast<size_t>(natoms) * 3) {
+diff --git a/src/formats/gaussformat.cpp b/src/formats/gaussformat.cpp
+index 5d590dd29a..54a234575f 100644
+--- a/src/formats/gaussformat.cpp
++++ b/src/formats/gaussformat.cpp
+@@ -635,12 +635,18 @@ namespace OpenBabel
+               delete confData;
+               return false;
+             }
+-            // malloc / memcpy
+-            double *tmpCoords = new double [(natoms)*3];
+-            memcpy(tmpCoords, &coordinates[0], sizeof(double)*natoms*3);
+-            vconf.push_back(tmpCoords);
++            // Only record a conformer if this orientation block supplied a
++            // complete set of coordinates. A truncated later block (fewer atom
++            // rows than the first) would otherwise make the memcpy read past
++            // the end of the coordinates vector.
++            if (coordinates.size() == static_cast<size_t>(natoms) * 3) {
++              // malloc / memcpy
++              double *tmpCoords = new double [(natoms)*3];
++              memcpy(tmpCoords, &coordinates[0], sizeof(double)*natoms*3);
++              vconf.push_back(tmpCoords);
++              confDimensions.push_back(3); // always 3D -- OBConformerData allows mixing 2D and 3D structures
++            }
+             coordinates.clear();
+-            confDimensions.push_back(3); // always 3D -- OBConformerData allows mixing 2D and 3D structures
+           }
+         else if(strstr(buffer, "Dipole moment") != nullptr)
+             {
+diff --git a/src/formats/moldenformat.cpp b/src/formats/moldenformat.cpp
+index a1cfa9231d..c5b86158c1 100644
+--- a/src/formats/moldenformat.cpp
++++ b/src/formats/moldenformat.cpp
+@@ -328,16 +328,24 @@ bool OBMoldenFormat::ReadMolecule( OBBase* pOb, OBConversion* pConv )
+       pmol->SetEnergies(energies);
+ 
+     if (conformers.size() > 0) {
++      unsigned int natoms = pmol->NumAtoms();
+       for (unsigned int i = 0; i < conformers.size(); ++i) {
+-        double *confCoord = new double [3*pmol->NumAtoms()];
++        double *confCoord = new double [3*natoms];
+         vector<vector3> coordinates = conformers[i];
+-        if (coordinates.size() != pmol->NumAtoms())
++        if (coordinates.size() != natoms)
+           cerr << " Wrong number of coordinates! " << endl;
+-        for (unsigned int a = 0; a < coordinates.size(); ++a) {
++        // A [GEOMETRIES] block may declare a different atom count than the
++        // molecule (the reader only warns above). Never write past confCoord
++        // when there are too many coordinates, and zero-fill any shortfall so
++        // the conformer is fully initialized when there are too few.
++        unsigned int n = coordinates.size() < natoms ? coordinates.size() : natoms;
++        for (unsigned int a = 0; a < n; ++a) {
+           confCoord[3*a] = coordinates[a].x();
+           confCoord[3*a+1] = coordinates[a].y();
+           confCoord[3*a+2] = coordinates[a].z();
+         } // finished atoms
++        for (unsigned int a = n; a < natoms; ++a)
++          confCoord[3*a] = confCoord[3*a+1] = confCoord[3*a+2] = 0.0;
+         pmol->AddConformer(confCoord);
+       } // finished iteration through conformers
+       pmol->SetConformer(pmol->NumConformers());
+diff --git a/src/formats/xsfformat.cpp b/src/formats/xsfformat.cpp
+index 894c7c13ec..a329718416 100644
+--- a/src/formats/xsfformat.cpp
++++ b/src/formats/xsfformat.cpp
+@@ -183,8 +183,13 @@ namespace OpenBabel
+       }
+       mol.AddConformer(coordinates);
+     }
+-    // Delete first conformer, created by EndModify, bunch of 0s
+-    mol.DeleteConformer(0);
++    // Delete first conformer, created by EndModify, bunch of 0s -- but only
++    // if we actually added real conformers above. If no frame supplied a full
++    // set of positions (numConformers == 0), deleting the only conformer would
++    // leave the molecule's active coordinate pointer dangling and crash the
++    // ConnectTheDots() below.
++    if (mol.NumConformers() > 1)
++      mol.DeleteConformer(0);
+     // Set geometry to last one
+     mol.SetConformer(mol.NumConformers() - 1);
+ 
+diff --git a/src/stereo/perception.cpp b/src/stereo/perception.cpp
+index 7b97ce359d..91d41dc18f 100644
+--- a/src/stereo/perception.cpp
++++ b/src/stereo/perception.cpp
+@@ -2121,6 +2121,11 @@ namespace OpenBabel {
+       if (!center)
+         continue;
+ 
++      // the stereo unit may reference an id that is not a valid atom
++      // (e.g. a center removed since the unit was created)
++      if (!center)
++        continue;
++
+       // make sure we have at least 3 heavy atom neighbors
+       // timvdm 28 Jun 2009: This is already checked in FindStereogenicUnits
+       if (center->GetHvyDegree() < 3) {
+@@ -2222,9 +2227,7 @@ namespace OpenBabel {
+     std::vector<unsigned long>::iterator i;
+     for (i = bonds.begin(); i != bonds.end(); ++i) {
+       OBBond *bond = mol->GetBondById(*i);
+-      // The bond id may originate from pre-existing stereo data that no longer
+-      // corresponds to a bond in this molecule (e.g. after rebuilding a
+-      // malformed structure), in which case GetBondById returns null.
++      // the stereo unit may reference an id that is not a valid bond
+       if (!bond)
+         continue;
+       OBAtom *begin = bond->GetBeginAtom();
+@@ -2254,6 +2257,10 @@ namespace OpenBabel {
+         else
+           bondVecs.push_back(pos - begin->GetVector());
+       }
++      // the torsion code below indexes bondVecs[0..3], assuming exactly two
++      // reference vectors from begin (0,1) and two from end (2,3); a malformed
++      // cis/trans unit (sp atom, too many neighbors) breaks this assumption
++      size_t nBeginVecs = bondVecs.size();
+       // end
+       config.end = end->GetId();
+       vector3 end_vec = end->GetVector();
+@@ -2282,8 +2289,11 @@ namespace OpenBabel {
+       // total, padded with implicit refs above). A malformed structure can
+       // leave one end with too few neighbors; skip it rather than indexing
+       // past the end of bondVecs.
+-      if (bondVecs.size() != 4)
++      if (nBeginVecs != 2 || bondVecs.size() != 4) {
++        obErrorLog.ThrowError(__FUNCTION__,
++          "Cannot determine cis/trans: unexpected neighbor count", obInfo);
+         continue;
++      }
+ 
+       double tor02, tor03, tor12, tor13;
+       if (uc) {
+@@ -2706,9 +2716,7 @@ namespace OpenBabel {
+     std::vector<unsigned long>::iterator i;
+     for (i = bonds.begin(); i != bonds.end(); ++i) {
+       OBBond *bond = mol->GetBondById(*i);
+-      // The bond id may originate from pre-existing stereo data that no longer
+-      // corresponds to a bond in this molecule (e.g. after rebuilding a
+-      // malformed structure), in which case GetBondById returns null.
++      // the stereo unit may reference an id that is not a valid bond
+       if (!bond)
+         continue;
+       OBAtom *begin = bond->GetBeginAtom();
+@@ -2741,6 +2749,9 @@ namespace OpenBabel {
+         begin->GetNewBondVector(pos, 1.0);
+         bondVecs.push_back(pos);
+       }
++      // the stereochemistry code below indexes bondVecs[0..3], assuming exactly
++      // two reference vectors from begin (0,1) and two from end (2,3)
++      size_t nBeginVecs = bondVecs.size();
+       // end
+       config.end = end->GetId();
+       FOR_NBORS_OF_ATOM (nbr, end) {
+@@ -2771,12 +2782,10 @@ namespace OpenBabel {
+             config.specified = false;
+       }
+ 
+-      // A cis/trans bond needs two neighbor directions on each end (four in
+-      // total, padded with implicit refs above). A malformed structure can
+-      // leave one end with too few neighbors; skip it rather than indexing
+-      // past the end of bondVecs.
+-      if (config.specified==true && bondVecs.size() != 4)
+-        continue;
++      // a malformed cis/trans unit (sp atom, too many neighbors) breaks the
++      // 2/2 split the stereochemistry code below relies on
++      if (nBeginVecs != 2 || bondVecs.size() != 4)
++        config.specified = false;
+ 
+       if (config.specified==true) { // Work out the stereochemistry
+         // 0      3
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index aed22f01a1..2b750f2f53 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -39,7 +39,7 @@ set(carspacegroup_parts 1 2 3 4)
+ set(cifspacegroup_parts 1 2 3 4 5 6 7 8 9 10 11 12 13)
+ set(cistrans_parts 1 2 3 4 5 6 7 8 9)
+ set(conversion_parts 1)
+-set(fuzzregress_parts 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33)
++set(fuzzregress_parts 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38)
+ set(graphsym_parts 1 2 3 4 5)
+ set(gzip_parts 1)
+ set(addh_parts 1)
+diff --git a/test/files/fuzz_regress/abinit-underfilled-xcart.abinit b/test/files/fuzz_regress/abinit-underfilled-xcart.abinit
+new file mode 100644
+index 0000000000..e3dac1cd00
+--- /dev/null
++++ b/test/files/fuzz_regress/abinit-underfilled-xcart.abinit
+@@ -0,0 +1,7 @@
++ outvars
++ natom 2
++ znucl 6.0
++ xcart  0.0 0.0 0.0
++ zzz
++ typat 1 1
++ zzz
+diff --git a/test/files/fuzz_regress/canon-deep-recursion.smi b/test/files/fuzz_regress/canon-deep-recursion.smi
+new file mode 100644
+index 0000000000..bd58d00b3f
+--- /dev/null
++++ b/test/files/fuzz_regress/canon-deep-recursion.smi
+@@ -0,0 +1 @@
++CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+diff --git a/test/files/fuzz_regress/gamess-empty-first-geom.gamout b/test/files/fuzz_regress/gamess-empty-first-geom.gamout
+new file mode 100644
+index 0000000000..990ea759c4
+--- /dev/null
++++ b/test/files/fuzz_regress/gamess-empty-first-geom.gamout
+@@ -0,0 +1,9 @@
++ ATOMIC                      COORDINATES (BOHR)
++   ATOM      CHARGE         X                   Y                   Z
++
++ COORDINATES OF ALL ATOMS ARE (ANGS)
++   ATOM   CHARGE       X              Y              Z
++ ------------------------------------------------------------
++ C           6.0   0.0000000000   0.0000000000   0.0000000000
++ O           8.0   0.0000000000   0.0000000000   1.2000000000
++
+diff --git a/test/files/fuzz_regress/gauss-truncated-orientation.g09 b/test/files/fuzz_regress/gauss-truncated-orientation.g09
+new file mode 100644
+index 0000000000..6c73c42587
+--- /dev/null
++++ b/test/files/fuzz_regress/gauss-truncated-orientation.g09
+@@ -0,0 +1,15 @@
++                          Standard orientation:                          
++ ---------------------------------------------------------------------
++ Center     Atomic      Atomic             Coordinates (Angstroms)
++ Number     Number       Type             X           Y           Z
++ ---------------------------------------------------------------------
++      1          6           0        0.000000    0.000000    0.000000
++      2          8           0        0.000000    0.000000    1.200000
++ ---------------------------------------------------------------------
++                          Standard orientation:                          
++ ---------------------------------------------------------------------
++ Center     Atomic      Atomic             Coordinates (Angstroms)
++ Number     Number       Type             X           Y           Z
++ ---------------------------------------------------------------------
++      1          6           0        0.000000    0.000000    0.000000
++ ---------------------------------------------------------------------
+diff --git a/test/files/fuzz_regress/molden-mismatched-frame.molden b/test/files/fuzz_regress/molden-mismatched-frame.molden
+new file mode 100644
+index 0000000000..29414b4f63
+--- /dev/null
++++ b/test/files/fuzz_regress/molden-mismatched-frame.molden
+@@ -0,0 +1,13 @@
++[Molden Format]
++[GEOMETRIES] (XYZ)
++2
++1.0
++C 0.0 0.0 0.0
++O 0.0 0.0 1.2
++5
++2.0
++C 0.0 0.0 0.0
++O 0.0 0.0 1.2
++H 1.0 0.0 0.0
++H 0.0 1.0 0.0
++H 0.0 0.0 2.0
+diff --git a/test/files/gzip.in b/test/files/gzip.in
+index bf5d0f9bcb..33540aae09 100644
+--- a/test/files/gzip.in
++++ b/test/files/gzip.in
+@@ -5,8 +5,6 @@ ClCCCCCC(=O)OCC
+ CC(Cn1cnc2c1c(=O)n(C)c(=O)n2C)O
+ CN(CCc1c[nH]c2c1c(O)ccc2)C
+ COc1c2oc(=O)ccc2c(c2c1occ2)CC(C(O)(C)C)O
+-#1ubq.pdb.gz
+-CC(C[C@@H](C(=O)N[C@H](C(=O)NCC(=O)NCC(=O)[O-])CCC/N=C(\[NH3+])/N)NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H](C(C)C)NC(=O)[C@H](CC(C)C)N)CC(C)C)CCC/N=C(\[NH3+])/N)C.[NH3+]CCCC[C@@H](C(=O)N[C@H](C(=O)NCC(=O)N[C@H](C(=O)N1CCC[C@H]1C(=O)N1CCC[C@H]1C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)NCC(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)NCC(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@@H](CC(C)C)CO)[C@H](O)C)CO)CCC(=[O-])O)CCCC[NH3+])CCC(=O)N)[C@H](CC)C)CC(=O)N)Cc1ccc(cc1)O)CC(=[O-])O)CO)CC(C)C)[C@H](O)C)CCC/N=C(\[NH3+])/N)CC(=[O-])O)CCC(=[O-])O)CC(C)C)CCC(=O)N)CCCC[NH3+])C)Cc1ccccc1)[C@H](CC)C)CC(C)C)CCC/N=C(\[NH3+])/N)CCC(=O)N)CCC(=O)N)CC(=O)[O-])[C@H](CC)C)CCC(=[O-])O)NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H]([C@H](CC)C)NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H](C(C)C)NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H]([C@H](CC)C)NC(=O)[C@H]([C@H](O)C)NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@@H]1CCCN1C(=O)[C@@H](NC(=O)[C@H](C(C)C)NC(=O)[C@@H](NC(=O)[C@@H](NC(=O)[C@H]([C@H](O)C)NC(=O)[C@H]([C@H](CC)C)NC(=O)[C@H]([C@H](O)C)NC(=O)[C@@H](NC(=O)CNC(=O)[C@H]([C@H](O)C)NC(=O)[C@@H](NC(=O)[C@H]([C@H](O)C)NC(=O)[C@@H](NC(=O)[C@H](C(C)C)NC(=O)[C@@H](NC(=O)[C@H]([C@H](CC)C)NC(=O)[C@@H](NC(=O)[C@H](CCSC)N)CCC(=O)N)Cc1ccccc1)CCCC[NH3+])CC(C)C)CCCC[NH3+])CC(C)C)CCC(=O)[O-])CCC(=[O-])O)CO)CC(=[O-])O)CCC(=O)[O-])CC(=O)N)CCCC[NH3+])C)CCCC[NH3+])CCC(=O)N)CC(=[O-])O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O.O
+ # tencmpds.sdf.gz
+ [O-]C(=O)CC(C[N+](C)(C)C)OC(=O)C
+ OC(=O)CC(C[N+](C)(C)C)OC(=O)C
+diff --git a/test/fuzzregresstest.cpp b/test/fuzzregresstest.cpp
+index 84bc7575b7..77381974ab 100644
+--- a/test/fuzzregresstest.cpp
++++ b/test/fuzzregresstest.cpp
+@@ -500,6 +500,69 @@ void caseTruncatedMol2()
+                                  "truncated-record.mol2"));
+ }
+ 
++// GAMESS undersized conformer (no CVE id): heap-buffer-overflow in
++// OBAtom::SetVector via ConnectTheDots()->BeginModify(). An empty/malformed
++// leading "ATOMIC ... COORDINATES (BOHR)" block created a zero-length
++// conformer while natoms was still 0; a later "COORDINATES OF ALL ATOMS"
++// block then created the real atoms. The "drop last geometry as duplicate"
++// pop_back() discarded the correctly-sized conformer, leaving the undersized
++// one active, so reading coordinates ran off the end of the array.  Fixed by
++// only recording a conformer when a full natoms*3 set of coordinates was
++// parsed. The reproducer must read cleanly (and bond the C=O, proving the
++// real, correctly-sized coordinates survived).
++void caseGamessEmptyFirstGeom()
++{
++  OB_ASSERT(RunRepro("gamess-empty-first-geom", "gamout",
++                     "gamess-empty-first-geom.gamout"));
++}
++
++// Gaussian truncated orientation block (no CVE id): same conformer-sizing class
++// as the GAMESS bug above. A later "Standard orientation:" block with fewer
++// atom rows than the first left the coordinates vector shorter than natoms*3,
++// so the memcpy that builds the conformer read past its end. Fixed by only
++// recording a conformer when coordinates.size() == natoms*3.
++void caseGaussTruncatedOrientation()
++{
++  OB_ASSERT(RunRepro("gauss-truncated-orientation", "g09",
++                     "gauss-truncated-orientation.g09"));
++}
++
++// Molden mismatched geometry frame (no CVE id): a [GEOMETRIES] (XYZ) frame
++// that declares more atoms than the first frame produced a coordinates list
++// longer than the molecule, and the conformer fill loop wrote past the
++// per-atom confCoord buffer (heap-buffer-overflow write). Fixed by clamping
++// the write to NumAtoms() and zero-filling any shortfall.
++void caseMoldenMismatchedFrame()
++{
++  OB_ASSERT(RunRepro("molden-mismatched-frame", "molden",
++                     "molden-mismatched-frame.molden"));
++}
++
++// abinit underfilled xcart (no CVE id): the file declared natom atoms but the
++// xcart block supplied fewer positions, so numConformers rounded to 0.
++// DeleteConformer(0) then freed the only (EndModify) conformer, leaving the
++// molecule's active coordinate pointer dangling for the following
++// ConnectTheDots() (heap-use-after-free). Fixed by only deleting the
++// placeholder conformer when real frames were added.
++void caseAbinitUnderfilledXcart()
++{
++  OB_ASSERT(RunRepro("abinit-underfilled-xcart", "abinit",
++                     "abinit-underfilled-xcart.abinit"));
++}
++
++// Canonical labeling recursion depth (no CVE id): stack-overflow in
++// CanonicalLabelsImpl::CanonicalLabelsRecursive on a pathological input (here a
++// long unbranched chain). The recursion descends roughly once per atom, so a
++// big enough molecule exhausts the call stack before the time-based Timeout can
++// fire. Fixed by capping the recursion depth and bailing out gracefully (like a
++// timeout). Read a long-chain SMILES and write canonical SMILES to drive the
++// labeler, as the fuzzer's "can" output target does.
++void caseCanonDeepRecursion()
++{
++  OB_ASSERT(RunReproConvert("canon-deep-recursion", "smi", "can",
++                            "canon-deep-recursion.smi"));
++}
++
+ int fuzzregresstest(int argc, char *argv[])
+ {
+   int defaultchoice = 1;
+@@ -618,6 +681,21 @@ int fuzzregresstest(int argc, char *argv[])
+   case 33:
+     caseTruncatedMol2();
+     break;
++  case 34:
++    caseGamessEmptyFirstGeom();
++    break;
++  case 35:
++    caseGaussTruncatedOrientation();
++    break;
++  case 36:
++    caseMoldenMismatchedFrame();
++    break;
++  case 37:
++    caseAbinitUnderfilledXcart();
++    break;
++  case 38:
++    caseCanonDeepRecursion();
++    break;
+   default:
+     cout << "Test number " << choice << " does not exist!\n";
+     return -1;

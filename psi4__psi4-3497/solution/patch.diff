@@ -1,0 +1,1504 @@
+diff --git a/psi4/driver/procrouting/proc.py b/psi4/driver/procrouting/proc.py
+index c36db774052..a02d36790d9 100644
+--- a/psi4/driver/procrouting/proc.py
++++ b/psi4/driver/procrouting/proc.py
+@@ -1797,20 +1797,6 @@ def scf_helper(name, post_scf=True, **kwargs):
+         core.print_out("""  PE geometry must align with POTFILE keyword: """
+                        """resetting coordinates with fixed origin and orientation.\n""")
+ 
+-    # cuEST GPU-accelerated DFT (the XC potential/grid code path) does not yet
+-    # support symmetry-adapted (non-C1) wavefunctions; only the JK (HF exchange)
+-    # part of cuEST is symmetry-safe. Force C1 whenever cuEST is requested unless HF.
+-    # This builds upon REFERENCE set by scf_set_reference_local that uses needs_xc().
+-    _cuest_needs_c1 = (core.get_option("SCF", "USE_CUEST") and core.get_option('SCF', 'REFERENCE').endswith("KS"))
+-    if _cuest_needs_c1 and scf_molecule.schoenflies_symbol() != 'c1':
+-        c1_molecule = scf_molecule.clone()
+-        c1_molecule.reset_point_group('c1')
+-        c1_molecule.update_geometry()
+-
+-        scf_molecule = c1_molecule
+-        core.print_out("""  cuEST GPU acceleration does not yet support molecular symmetry for DFT: """
+-                       """further calculations in C1 point group.\n""")
+-
+     # SCF Banner data
+     banner = kwargs.pop('banner', None)
+     bannername = name
+diff --git a/psi4/src/CMakeLists.txt b/psi4/src/CMakeLists.txt
+index 82b09467dc3..5a99bc66ab6 100644
+--- a/psi4/src/CMakeLists.txt
++++ b/psi4/src/CMakeLists.txt
+@@ -66,6 +66,16 @@ target_sources(core
+     python_data_type.cc
+   )
+ 
++# GPU discovery/health checking and cuEST+CUDA handle lifetime, kept out of
++# core.cc. Only compiled when cuEST is enabled; core.cc includes
++# cuest_runtime.h unconditionally and gets no-op inline stubs otherwise.
++if(TARGET cuEST::cuEST)
++  target_sources(core
++    PRIVATE
++      cuest_runtime.cc
++    )
++endif()
++
+ get_property(psi4_binmodules GLOBAL PROPERTY LINKBINLIST)
+ get_property(psi4_libmodules GLOBAL PROPERTY LINKLIBLIST)
+ target_link_libraries(core
+diff --git a/psi4/src/core.cc b/psi4/src/core.cc
+index 4ee0e7a2d91..7dfc108eeb8 100644
+--- a/psi4/src/core.cc
++++ b/psi4/src/core.cc
+@@ -63,12 +63,7 @@
+ 
+ #include "python_data_type.h"
+ 
+-#ifdef USING_cuEST
+-#include "cuest.h"
+-#include "psi4/libfock/cuESTCommon.h"
+-#include <cusolverDn.h>
+-#include <cuda_runtime.h>
+-#endif
++#include "cuest_runtime.h"
+ 
+ #define STRINGIFY(x) #x
+ #define TOSTRING(x) STRINGIFY(x)
+@@ -147,164 +142,6 @@ void handleBrianOption(bool value) {
+ }
+ #endif
+ 
+-#ifdef USING_cuEST
+-#include <cuest.h>
+-
+-cusolverDnHandle_t cusolver_handle = 0;
+-cublasHandle_t cublas_handle = 0;
+-cuestHandle_t cuest_handle = 0;
+-cudaStream_t stream_handle = 0;
+-
+-void cuest_cleanup_noexcept() {
+-    if (cuest_handle != 0) {
+-        cuestDestroy(cuest_handle);
+-        cuest_handle = 0;
+-    }
+-    if (cusolver_handle != 0) {
+-        cusolverDnDestroy(cusolver_handle);
+-        cusolver_handle = 0;
+-    }
+-    if (cublas_handle != 0) {
+-        cublasDestroy(cublas_handle);
+-        cublas_handle = 0;
+-    }
+-    if (stream_handle != 0) {
+-        cudaStreamDestroy(stream_handle);
+-        stream_handle = 0;
+-    }
+-}
+-
+-void cuest_init() {
+-    if (stream_handle != 0) {
+-        throw PSIEXCEPTION("Attempting to reinitialize the stream_handle when it hasn't been released\n");
+-    }
+-    if (cublas_handle != 0) {
+-        throw PSIEXCEPTION("Attempting to reinitialize the cublas_handle when it hasn't been released\n");
+-    }
+-    if (cusolver_handle != 0) {
+-        throw PSIEXCEPTION("Attempting to reinitialize the cusolver_handle when it hasn't been released\n");
+-    }
+-    if (cuest_handle != 0) {
+-        throw PSIEXCEPTION("Attempting to reinitialize the cuEST module when it hasn't been released\n");
+-    }
+-
+-    int device_count = 0;
+-    cudaError_t cuda_err = cudaGetDeviceCount(&device_count);
+-    if (cuda_err != cudaSuccess) {
+-        throw PSIEXCEPTION(std::string("cuEST requested, but CUDA device discovery failed: ") +
+-                           cudaGetErrorString(cuda_err));
+-    }
+-    if (device_count == 0) {
+-        throw PSIEXCEPTION("cuEST requested, but no CUDA-capable GPU was found.");
+-    }
+-
+-    int device_id = 0;
+-    cuda_err = cudaGetDevice(&device_id);
+-    if (cuda_err != cudaSuccess) {
+-        throw PSIEXCEPTION(std::string("cuEST requested, but cudaGetDevice failed: ") +
+-                           cudaGetErrorString(cuda_err));
+-    }
+-    if (device_id < 0 || device_id >= device_count) {
+-        throw PSIEXCEPTION("cuEST requested, but CUDA reported an invalid active device.");
+-    }
+-
+-    cudaDeviceProp props;
+-    cuda_err = cudaGetDeviceProperties(&props, device_id);
+-    if (cuda_err != cudaSuccess) {
+-        throw PSIEXCEPTION(std::string("cuEST requested, but cudaGetDeviceProperties failed: ") +
+-                           cudaGetErrorString(cuda_err));
+-    }
+-    if (props.major < 8) {
+-        std::ostringstream msg;
+-        msg << "cuEST requires an NVIDIA GPU with compute capability 8.0 or higher; device " << device_id << " ("
+-            << props.name << ") has compute capability " << props.major << "." << props.minor << ".";
+-        throw PSIEXCEPTION(msg.str());
+-    }
+-
+-    // Unlike the failure paths above, nothing previously reported which GPU
+-    // was actually selected on success. On a multi-GPU node this is the only
+-    // thing that tells a user (short of externally polling nvidia-smi) which
+-    // physical device cuEST landed on -- e.g. via CUDA_VISIBLE_DEVICES/the
+-    // job scheduler, cuEST always uses whichever is "the current device"
+-    // (logical index 0 by default) and never scans device_count for others.
+-    outfile->Printf("  cuEST initializing on GPU device %d of %d visible (%s), compute capability %d.%d\n",
+-                    device_id, device_count, props.name, props.major, props.minor);
+-
+-    // Everything below this point can fail partway through (CUDA, cuBLAS,
+-    // cuSOLVER, or cuEST's own CHECK_CUEST-wrapped calls). Any such failure
+-    // must not leave stream_handle/cublas_handle/cusolver_handle non-null
+-    // while cuest_handle stays null -- that combination would permanently
+-    // "poison" cuest_init() for the rest of the process, since the
+-    // reinitialize guards at the top of this function would trip on the very
+-    // next attempt even after what may have been a transient failure.
+-    try {
+-        cudaError_t stream_err = cudaStreamCreate(&stream_handle);
+-        if (stream_err != cudaSuccess) {
+-            throw PSIEXCEPTION(std::string("cudaStreamCreate failed in cuest_init: ") +
+-                               cudaGetErrorString(stream_err));
+-        }
+-        cublasStatus_t cublas_status = cublasCreate(&cublas_handle);
+-        if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+-            throw PSIEXCEPTION("cublasCreate failed in cuest_init");
+-        }
+-        cusolverStatus_t cusolver_status = cusolverDnCreate(&cusolver_handle);
+-        if (cusolver_status != CUSOLVER_STATUS_SUCCESS) {
+-            throw PSIEXCEPTION("cusolverDnCreate failed in cuest_init");
+-        }
+-        cublasSetStream(cublas_handle, stream_handle);
+-        cusolverDnSetStream(cusolver_handle, stream_handle);
+-        // Declare & create the cuEST parameters and handle with reasonable defaults. Destroy param promptly.
+-        cuestHandleParameters_t handle_parameters;
+-        CHECK_CUEST(cuestParametersCreate(CUEST_HANDLE_PARAMETERS, &handle_parameters));
+-        CHECK_CUEST(cuestParametersConfigure(
+-            CUEST_HANDLE_PARAMETERS,
+-            handle_parameters,
+-            CUEST_HANDLE_PARAMETERS_CUDASTREAM,
+-            &stream_handle,
+-            sizeof(stream_handle)
+-        ));
+-        CHECK_CUEST(cuestParametersConfigure(
+-            CUEST_HANDLE_PARAMETERS,
+-            handle_parameters,
+-            CUEST_HANDLE_PARAMETERS_CUBLAS,
+-            &cublas_handle,
+-            sizeof(cublas_handle)
+-        ));
+-        CHECK_CUEST(cuestParametersConfigure(
+-            CUEST_HANDLE_PARAMETERS,
+-            handle_parameters,
+-            CUEST_HANDLE_PARAMETERS_CUSOLVER,
+-            &cusolver_handle,
+-            sizeof(cusolver_handle)
+-        ));
+-        CHECK_CUEST(cuestCreate(handle_parameters, &cuest_handle));
+-        CHECK_CUEST(cuestParametersDestroy(CUEST_HANDLE_PARAMETERS, handle_parameters));
+-    } catch (...) {
+-        cuest_cleanup_noexcept();
+-        throw;
+-    }
+-}
+-
+-void cuest_release() {
+-    if (cuest_handle == 0) {
+-        throw PSIEXCEPTION("Attempting to release the cuEST module when it hasn't been initialized\n");
+-    }
+-    cuest_cleanup_noexcept();
+-}
+-
+-namespace psi {
+-namespace cuest_common {
+-
+-void ensure_cuest_initialized() {
+-    if (cuest_handle == 0) {
+-        cuest_init();
+-    }
+-}
+-
+-}  // namespace cuest_common
+-}  // namespace psi
+-#endif
+-
+ // Python helper wrappers
+ void export_benchmarks(py::module&);
+ void export_blas_lapack(py::module&);
+@@ -1328,9 +1165,8 @@ void psi4_python_module_finalize() {
+     }
+ #endif
+ 
+-#ifdef USING_cuEST
+-    if (cuest_handle != 0) { cuest_release(); }
+-#endif
++    // No-op unless cuEST was built in and actually initialized on a GPU.
++    psi::cuest_runtime::shutdown();
+ 
+ #ifdef INTEL_Fortran_ENABLED
+     for_rtl_finish_();
+diff --git a/psi4/src/cuest_runtime.cc b/psi4/src/cuest_runtime.cc
+new file mode 100644
+index 00000000000..9a67227790a
+--- /dev/null
++++ b/psi4/src/cuest_runtime.cc
+@@ -0,0 +1,359 @@
++/*
++ * @BEGIN LICENSE
++ *
++ * Psi4: an open-source quantum chemistry software package
++ *
++ * Copyright (c) 2007-2026 The Psi4 Developers.
++ *
++ * The copyrights for code used from other parties are included in
++ * the corresponding files.
++ *
++ * This file is part of Psi4.
++ *
++ * Psi4 is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation, version 3.
++ *
++ * Psi4 is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License along
++ * with Psi4; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * @END LICENSE
++ */
++// The interface to cuEST was contributed by NVIDIA under the following terms:
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: LGPL-3.0-only
++
++/*! \file cuest_runtime.cc
++ *  \brief GPU discovery, health checking, and cuEST/CUDA handle lifetime.
++ *
++ *  Split out of core.cc, which is the pybind11 module definition and has no
++ *  business carrying several hundred lines of CUDA diagnostics.  CMake only
++ *  compiles this file when cuEST is enabled, but it is additionally guarded so
++ *  that it degrades to an empty translation unit rather than a wall of errors
++ *  if it is ever compiled without.
++ *
++ *  Initialization is *lazy*: nothing here runs at import time, so a build with
++ *  cuEST enabled still imports and runs normally on a machine with no GPU (or
++ *  with an unusable one).  The GPU is not touched until the first computation
++ *  that actually asks for cuEST calls ensure_cuest_initialized(), and a failure
++ *  at that point is a normal, catchable PsiException.
++ */
++
++#ifdef USING_cuEST
++
++#include <sstream>
++#include <string>
++
++#include <cublas_v2.h>
++#include <cuda_runtime.h>
++#include <cusolverDn.h>
++#include <cuest.h>
++
++#include "psi4/psi4-dec.h"
++#include "psi4/libfock/cuESTCommon.h"
++#include "psi4/libpsi4util/PsiOutStream.h"
++#include "psi4/libpsi4util/exception.h"
++
++#include "cuest_runtime.h"
++
++using namespace psi;
++
++// Process-global handles. Deliberately at global scope, not in a namespace:
++// they are declared `extern` at global scope by every consumer -- libfock
++// (cuESTCommon.h, cuESTJK.cc, cubature.cc, v.cc), libmints (basisset.cc,
++// mintshelper.cc), libciomr (dsyev_ascending.cc), libscf_solver (hf.cc),
++// libpsipcm (cuestpcm.cc), and scfgrad (jk_grad.cc).
++//
++// A zero handle means "not initialized", and consumers rely on that: the
++// cuSOLVER diagonalization in dsyev_ascending.cc falls back to CPU LAPACK on
++// cusolver_handle == 0 rather than failing, which is what keeps non-cuEST work
++// running in a cuEST-enabled build on a machine with no GPU.
++cusolverDnHandle_t cusolver_handle = 0;
++cublasHandle_t cublas_handle = 0;
++cuestHandle_t cuest_handle = 0;
++cudaStream_t stream_handle = 0;
++
++namespace {
++
++// Tear down whatever is up, in reverse order of creation, swallowing errors.
++// Used both for the ordinary shutdown path and to unwind a partially completed
++// initialization.
++void cuest_cleanup_noexcept() {
++    if (cuest_handle != 0) {
++        cuestDestroy(cuest_handle);
++        cuest_handle = 0;
++    }
++    if (cusolver_handle != 0) {
++        cusolverDnDestroy(cusolver_handle);
++        cusolver_handle = 0;
++    }
++    if (cublas_handle != 0) {
++        cublasDestroy(cublas_handle);
++        cublas_handle = 0;
++    }
++    if (stream_handle != 0) {
++        cudaStreamDestroy(stream_handle);
++        stream_handle = 0;
++    }
++}
++
++// Some CUDA status codes mean "this GPU or this node is broken/misprovisioned",
++// not "Psi4 or cuEST did something wrong". Reported as a bare "Fatal Error"
++// they send users hunting through inputs, keywords, and build flags for a
++// defect that does not exist -- an uncorrectable ECC fault, for instance, is
++// latched by the driver and fails every subsequent context/stream/allocation on
++// that device until it is physically reset, so it can even be inherited from an
++// unrelated job that ran earlier on the same card. For those codes, name the
++// culprit and give the exact command that confirms it.
++//
++// Returns an empty string for codes that are not known environmental faults.
++std::string cuda_unhealthy_environment_hint(cudaError_t err) {
++    switch (err) {
++        case cudaErrorECCUncorrectable:
++            return
++                "  The GPU reported an uncorrectable ECC (double-bit) memory error -- a hardware fault in\n"
++                "  the device's own memory. The driver latches this state and then fails every context,\n"
++                "  stream, and allocation on that GPU until it is physically reset, so the fault may well\n"
++                "  have been triggered by an earlier, unrelated job on the same card.\n"
++                "\n"
++                "  Confirm with:\n"
++                "      nvidia-smi -q -d ECC,ROW_REMAPPER\n"
++                "      dmesg | grep -i xid          # look for Xid 48, 63, 92, 94, 95, 171\n"
++                "  A non-zero 'DRAM Uncorrectable' count, or 'Remapped Rows ... Pending: Yes', confirms it.\n"
++                "\n"
++                "  Recovery needs 'nvidia-smi -r' (root, with the GPU idle) or a node reboot. Under a batch\n"
++                "  scheduler the faulty device often keeps being handed out: ask an administrator to reset\n"
++                "  or drain the node, and resubmit onto different hardware.";
++        case cudaErrorDevicesUnavailable:
++            return
++                "  Every visible GPU is busy or is refusing new contexts. Common causes: the device is in\n"
++                "  'Exclusive_Process' compute mode and already held by another process, MIG is enabled but\n"
++                "  no instance was assigned, or the scheduler granted a GPU that another job still occupies.\n"
++                "\n"
++                "  Confirm with:\n"
++                "      nvidia-smi --query-gpu=index,compute_mode,mig.mode.current --format=csv\n"
++                "      nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory --format=csv\n"
++                "  Also check that CUDA_VISIBLE_DEVICES matches what the scheduler actually granted.";
++        case cudaErrorSystemNotReady:
++            return
++                "  The CUDA system stack has not finished initializing. Typically the NVIDIA fabric manager\n"
++                "  is not running, or has not converged, on an NVLink/NVSwitch system.\n"
++                "\n"
++                "  Confirm with:\n"
++                "      systemctl status nvidia-fabricmanager\n"
++                "      nvidia-smi -q | grep -i -A2 Fabric\n"
++                "  This is a node provisioning problem for an administrator to resolve.";
++        case cudaErrorInsufficientDriver:
++        case cudaErrorSystemDriverMismatch:
++            return
++                "  The installed NVIDIA kernel driver is older than, or mismatched with, the CUDA runtime\n"
++                "  that Psi4/cuEST was built against. This usually means the compute node's driver differs\n"
++                "  from the build node's, or a driver upgrade landed without a reboot.\n"
++                "\n"
++                "  Confirm with:\n"
++                "      nvidia-smi --query-gpu=driver_version --format=csv\n"
++                "      cat /proc/driver/nvidia/version\n"
++                "  Rebuild against the deployed CUDA version, or ask an administrator to align the driver.";
++        case cudaErrorNoDevice:
++            return
++                "  The driver reports no CUDA-capable device at all. Either no GPU was allocated to this\n"
++                "  job, CUDA_VISIBLE_DEVICES is empty or names a nonexistent index, or the NVIDIA kernel\n"
++                "  module is not loaded on this node.\n"
++                "\n"
++                "  Confirm with:\n"
++                "      echo \"$CUDA_VISIBLE_DEVICES\"; nvidia-smi -L; lsmod | grep nvidia\n"
++                "  Under a batch scheduler, verify the job actually requested a GPU (e.g. Slurm --gres=gpu:1).";
++        default:
++            return std::string();
++    }
++}
++
++// Compose the text for a failed CUDA call during cuEST startup. `what` is the
++// ordinary human-readable description; when the status code is a known
++// environmental fault, the health diagnosis is appended. Deliberately returns
++// the string rather than throwing, so that PSIEXCEPTION still records the
++// caller's __FILE__/__LINE__ instead of a single spot inside this helper.
++std::string cuda_failure_message(const std::string& what, cudaError_t err, const std::string& device_desc = "") {
++    std::ostringstream msg;
++    msg << what << ": " << cudaGetErrorString(err);
++
++    const std::string hint = cuda_unhealthy_environment_hint(err);
++    if (hint.empty()) return msg.str();
++
++    msg << "\n\n"
++        << "  This is an unhealthy GPU or node, not a defect in Psi4 or cuEST. No change to the input\n"
++        << "  file, keywords, basis set, or Psi4 build will clear it.\n"
++        << "\n"
++        << "  CUDA status:  " << cudaGetErrorName(err) << " (" << static_cast<int>(err) << ")\n";
++    if (!device_desc.empty()) {
++        msg << "  Device:       " << device_desc << "\n";
++    }
++    msg << "\n" << hint << "\n";
++    return msg.str();
++}
++
++// Identify the device well enough that a user can quote it in a ticket: the
++// logical index alone is ambiguous under CUDA_VISIBLE_DEVICES remapping, so
++// include the model name and the PCI bus ID that nvidia-smi and the kernel log
++// also report.
++std::string describe_cuda_device(int device_id, const cudaDeviceProp& props) {
++    std::ostringstream desc;
++    desc << "index " << device_id << " (" << props.name;
++    char bus_id[64] = {0};
++    if (cudaDeviceGetPCIBusId(bus_id, static_cast<int>(sizeof(bus_id)), device_id) == cudaSuccess && bus_id[0] != '\0') {
++        desc << ", PCI " << bus_id;
++    }
++    desc << ")";
++    return desc.str();
++}
++
++// Bring up CUDA/cuBLAS/cuSOLVER/cuEST on the current device. Only ever reached
++// through ensure_cuest_initialized(), i.e. from the first computation that
++// actually wants cuEST -- never at import time.
++void cuest_init() {
++    if (stream_handle != 0) {
++        throw PSIEXCEPTION("Attempting to reinitialize the stream_handle when it hasn't been released\n");
++    }
++    if (cublas_handle != 0) {
++        throw PSIEXCEPTION("Attempting to reinitialize the cublas_handle when it hasn't been released\n");
++    }
++    if (cusolver_handle != 0) {
++        throw PSIEXCEPTION("Attempting to reinitialize the cusolver_handle when it hasn't been released\n");
++    }
++    if (cuest_handle != 0) {
++        throw PSIEXCEPTION("Attempting to reinitialize the cuEST module when it hasn't been released\n");
++    }
++
++    int device_count = 0;
++    cudaError_t cuda_err = cudaGetDeviceCount(&device_count);
++    if (cuda_err != cudaSuccess) {
++        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but CUDA device discovery failed", cuda_err));
++    }
++    if (device_count == 0) {
++        throw PSIEXCEPTION("cuEST requested, but no CUDA-capable GPU was found.");
++    }
++
++    int device_id = 0;
++    cuda_err = cudaGetDevice(&device_id);
++    if (cuda_err != cudaSuccess) {
++        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDevice failed", cuda_err));
++    }
++    if (device_id < 0 || device_id >= device_count) {
++        throw PSIEXCEPTION("cuEST requested, but CUDA reported an invalid active device.");
++    }
++
++    cudaDeviceProp props;
++    cuda_err = cudaGetDeviceProperties(&props, device_id);
++    if (cuda_err != cudaSuccess) {
++        throw PSIEXCEPTION(cuda_failure_message("cuEST requested, but cudaGetDeviceProperties failed", cuda_err));
++    }
++    if (props.major < 8) {
++        std::ostringstream msg;
++        msg << "cuEST requires an NVIDIA GPU with compute capability 8.0 or higher; device " << device_id << " ("
++            << props.name << ") has compute capability " << props.major << "." << props.minor << ".";
++        throw PSIEXCEPTION(msg.str());
++    }
++
++    // Unlike the failure paths above, nothing previously reported which GPU
++    // was actually selected on success. On a multi-GPU node this is the only
++    // thing that tells a user (short of externally polling nvidia-smi) which
++    // physical device cuEST landed on -- e.g. via CUDA_VISIBLE_DEVICES/the
++    // job scheduler, cuEST always uses whichever is "the current device"
++    // (logical index 0 by default) and never scans device_count for others.
++    outfile->Printf("  cuEST initializing on GPU device %d of %d visible (%s), compute capability %d.%d\n",
++                    device_id, device_count, props.name, props.major, props.minor);
++
++    // Everything below this point can fail partway through (CUDA, cuBLAS,
++    // cuSOLVER, or cuEST's own CHECK_CUEST-wrapped calls). Any such failure
++    // must not leave stream_handle/cublas_handle/cusolver_handle non-null
++    // while cuest_handle stays null -- that combination would permanently
++    // "poison" cuest_init() for the rest of the process, since the
++    // reinitialize guards at the top of this function would trip on the very
++    // next attempt even after what may have been a transient failure.
++    try {
++        // First call that actually establishes a CUDA context on the device, so
++        // this is where a sick GPU (bad ECC, exclusive-mode contention, driver
++        // mismatch) reveals itself -- the pure query calls above can all succeed
++        // on hardware that can no longer run anything.
++        cudaError_t stream_err = cudaStreamCreate(&stream_handle);
++        if (stream_err != cudaSuccess) {
++            throw PSIEXCEPTION(cuda_failure_message("cudaStreamCreate failed in cuest_init", stream_err,
++                                                    describe_cuda_device(device_id, props)));
++        }
++        cublasStatus_t cublas_status = cublasCreate(&cublas_handle);
++        if (cublas_status != CUBLAS_STATUS_SUCCESS) {
++            throw PSIEXCEPTION("cublasCreate failed in cuest_init");
++        }
++        cusolverStatus_t cusolver_status = cusolverDnCreate(&cusolver_handle);
++        if (cusolver_status != CUSOLVER_STATUS_SUCCESS) {
++            throw PSIEXCEPTION("cusolverDnCreate failed in cuest_init");
++        }
++        cublasSetStream(cublas_handle, stream_handle);
++        cusolverDnSetStream(cusolver_handle, stream_handle);
++        // Declare & create the cuEST parameters and handle with reasonable defaults. Destroy param promptly.
++        cuestHandleParameters_t handle_parameters;
++        CHECK_CUEST(cuestParametersCreate(CUEST_HANDLE_PARAMETERS, &handle_parameters));
++        CHECK_CUEST(cuestParametersConfigure(
++            CUEST_HANDLE_PARAMETERS,
++            handle_parameters,
++            CUEST_HANDLE_PARAMETERS_CUDASTREAM,
++            &stream_handle,
++            sizeof(stream_handle)
++        ));
++        CHECK_CUEST(cuestParametersConfigure(
++            CUEST_HANDLE_PARAMETERS,
++            handle_parameters,
++            CUEST_HANDLE_PARAMETERS_CUBLAS,
++            &cublas_handle,
++            sizeof(cublas_handle)
++        ));
++        CHECK_CUEST(cuestParametersConfigure(
++            CUEST_HANDLE_PARAMETERS,
++            handle_parameters,
++            CUEST_HANDLE_PARAMETERS_CUSOLVER,
++            &cusolver_handle,
++            sizeof(cusolver_handle)
++        ));
++        CHECK_CUEST(cuestCreate(handle_parameters, &cuest_handle));
++        CHECK_CUEST(cuestParametersDestroy(CUEST_HANDLE_PARAMETERS, handle_parameters));
++    } catch (...) {
++        cuest_cleanup_noexcept();
++        throw;
++    }
++}
++
++}  // namespace
++
++namespace psi {
++
++namespace cuest_common {
++
++// Declared in libfock/cuESTCommon.h and called from every cuEST entry point.
++void ensure_cuest_initialized() {
++    if (cuest_handle == 0) {
++        cuest_init();
++    }
++}
++
++}  // namespace cuest_common
++
++namespace cuest_runtime {
++
++void shutdown() {
++    // No-op when cuEST was never brought up: a machine without a GPU, or a run
++    // that simply never asked for cuEST, ends here with all four handles still
++    // zero.
++    if (cuest_handle == 0) return;
++    cuest_cleanup_noexcept();
++}
++
++}  // namespace cuest_runtime
++}  // namespace psi
++
++#endif  // USING_cuEST
+diff --git a/psi4/src/cuest_runtime.h b/psi4/src/cuest_runtime.h
+new file mode 100644
+index 00000000000..00fcb514816
+--- /dev/null
++++ b/psi4/src/cuest_runtime.h
+@@ -0,0 +1,86 @@
++/*
++ * @BEGIN LICENSE
++ *
++ * Psi4: an open-source quantum chemistry software package
++ *
++ * Copyright (c) 2007-2026 The Psi4 Developers.
++ *
++ * The copyrights for code used from other parties are included in
++ * the corresponding files.
++ *
++ * This file is part of Psi4.
++ *
++ * Psi4 is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation, version 3.
++ *
++ * Psi4 is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License along
++ * with Psi4; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ *
++ * @END LICENSE
++ */
++// The interface to cuEST was contributed by NVIDIA under the following terms:
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: LGPL-3.0-only
++
++#ifndef _psi_src_cuest_runtime_h_
++#define _psi_src_cuest_runtime_h_
++
++/*! \file cuest_runtime.h
++ *  \brief Psi4-module-lifetime interface to the cuEST/CUDA runtime.
++ *
++ *  This header is safe to include unconditionally: in a build without cuEST it
++ *  still declares the whole interface, with the entry points inlined away to
++ *  nothing.  Callers therefore never need an `#ifdef USING_cuEST` of their own.
++ *
++ *  The implementation lives in cuest_runtime.cc, which is only added to the
++ *  `core` target when cuEST is enabled.  Everything to do with GPU discovery,
++ *  compute-capability and device-health checking, and CUDA/cuBLAS/cuSOLVER/
++ *  cuEST handle lifetime is there rather than in core.cc.
++ */
++
++namespace psi {
++namespace cuest_runtime {
++
++/*! Whether Psi4 was *built* with cuEST support.
++ *
++ *  Compile-time only.  A build with cuEST says nothing about whether the
++ *  machine actually has a usable GPU -- that is not known until the first
++ *  cuEST-requiring computation triggers initialization, which is why this is
++ *  the only query offered here.
++ */
++constexpr bool built_with_cuest() {
++#ifdef USING_cuEST
++    return true;
++#else
++    return false;
++#endif
++}
++
++#ifdef USING_cuEST
++
++/*! Release the cuEST/CUDA handles held for the lifetime of the psi4 module.
++ *
++ *  Idempotent and safe on a machine that never brought cuEST up (no GPU, no
++ *  cuEST-requiring computation, or a failed initialization): initialization is
++ *  lazy, so in all those cases there is nothing to release and this returns
++ *  immediately.  Called from psi4_python_module_finalize().
++ */
++void shutdown();
++
++#else
++
++inline void shutdown() {}
++
++#endif  // USING_cuEST
++
++}  // namespace cuest_runtime
++}  // namespace psi
++
++#endif  // _psi_src_cuest_runtime_h_
+diff --git a/psi4/src/psi4/libfock/v.cc b/psi4/src/psi4/libfock/v.cc
+index dd7eaf63b56..92c20d126f4 100644
+--- a/psi4/src/psi4/libfock/v.cc
++++ b/psi4/src/psi4/libfock/v.cc
+@@ -232,6 +232,20 @@ void VBase::common_init() {
+     num_threads_ = omp_get_max_threads();
+ #endif
+ }
++void VBase::throw_if_cuest_unsupported(const std::string& what) const {
++#ifdef USING_cuEST
++    if (options_.get_bool("USE_CUEST")) {
++        throw PSIEXCEPTION(
++            what +
++            " has no cuEST implementation.\n"
++            "  cuEST builds the DFT quadrature grid on the GPU and skips the CPU-side grid\n"
++            "  post-processing, so there are no CPU grid blocks to integrate over.  Falling\n"
++            "  back to the CPU code here would silently produce a zero exchange-correlation\n"
++            "  contribution rather than a wrong-but-visible answer.\n"
++            "  Re-run this computation with USE_CUEST false.");
++    }
++#endif
++}
+ std::shared_ptr<VBase> VBase::build_V(std::shared_ptr<BasisSet> primary, std::shared_ptr<SuperFunctional> functional,
+                                       Options& options, const std::string& type) {
+     std::shared_ptr<VBase> v;
+@@ -912,6 +926,7 @@ std::vector<SharedMatrix> VBase::compute_fock_derivatives() {
+     throw PSIEXCEPTION("VBase: compute_fock_derivatives not implemented for this Vx instance.");
+ }
+ void VBase::set_grac_shift(double grac_shift) {
++    throw_if_cuest_unsupported("The GRAC asymptotic correction (DFT_GRAC_SHIFT)");
+     // Well this is a flaw in my plan
+     if (!grac_initialized_) {
+         double grac_alpha = options_.get_double("DFT_GRAC_ALPHA");
+@@ -989,6 +1004,11 @@ void VBase::finalize() { grid_.reset();
+ #endif
+ }
+ void VBase::build_collocation_cache(size_t memory) {
++    // No cuEST guard here, deliberately: this is called on every SCF init
++    // (scf_iterator.py), and it degrades safely under cuEST.  With an empty CPU
++    // grid, collocation_size() is 0 so stride clamps to 1, and the
++    // "stride > grid_->blocks().size()" early return below fires (1 > 0) before
++    // point_workers_ is ever indexed.  The result is simply an empty cache.
+     // Figure out many blocks to skip
+ 
+     size_t collocation_size = grid_->collocation_size();
+@@ -1368,6 +1388,7 @@ void SAP::print_header() const {
+     if (print_ > 2) grid_->print_details("outfile", print_);
+ }
+ void SAP::compute_V(std::vector<SharedMatrix> ret) {
++    throw_if_cuest_unsupported("The SAP guess");
+     timer_on("SAP: Form V");
+ 
+     if (ret.size() != 1) {
+@@ -1519,8 +1540,13 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+         if ((d_Cocc_noccs_.size() != 1)) {
+             throw PSIEXCEPTION("V: RKS should have only one Cocc Matrix");
+         }
++        // cuEST works exclusively in the dense AO basis, while ret[0] (Va_) may be an
++        // SO-basis, symmetry-blocked matrix.  Size every GPU buffer from nbf_ (the AO
++        // dimension set by set_D) rather than ret[0]->size(), which is Matrix::size(h=0)
++        // -- i.e. just the first irrep block -- and back-transform AO -> SO at the end.
++        const size_t nbf2 = (size_t)nbf_ * (size_t)nbf_;
+         double *d_Vxc = nullptr;
+-        cudaError_t err = cudaMalloc((void**)&d_Vxc, ret[0]->size() * sizeof(double));
++        cudaError_t err = cudaMalloc((void**)&d_Vxc, nbf2 * sizeof(double));
+         if (err != cudaSuccess) {
+             throw PSIEXCEPTION("cudaMalloc failed in RV::compute_V");
+         }
+@@ -1890,7 +1916,8 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+ 
+ 
+         cudaFree(d_Vxc_grid);
+-        err = cudaMemcpy(ret[0]->get_pointer(0), d_Vxc, ret[0]->size() * sizeof(double), cudaMemcpyDeviceToHost);
++        auto V_AO = std::make_shared<Matrix>("V AO Temp", nbf_, nbf_);
++        err = cudaMemcpy(V_AO->get_pointer(0), d_Vxc, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+         if (err != cudaSuccess) {
+             cudaFree(d_Vxc);
+             throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
+@@ -1961,17 +1988,26 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+             CHECK_CUEST(cuestParametersDestroy(CUEST_NONLOCALXCPOTENTIALRKSCOMPUTE_PARAMETERS, vv10_potential_compute_parameters));
+ 
+             // Add the VV10 contribution to Vxc
+-            SharedMatrix VV10 = ret[0]->clone();
+-            err = cudaMemcpy(VV10->get_pointer(0), d_Vxc, ret[0]->size() * sizeof(double), cudaMemcpyDeviceToHost);
++            auto VV10 = std::make_shared<Matrix>("VV10 AO Temp", nbf_, nbf_);
++            err = cudaMemcpy(VV10->get_pointer(0), d_Vxc, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+             if (err != cudaSuccess) {
+                 cudaFree(d_Vxc);
+                 throw PSIEXCEPTION("cudaMemcpy failed in RV::compute_V");
+             }
+-            ret[0]->add(VV10);
++            V_AO->add(VV10);
+             quad_values_["VV10"] = Evv10;
+         }
+ 
+         cudaFree(d_Vxc);
++
++        // Fold the dense AO-basis potential back into ret[0]'s (possibly
++        // symmetry-blocked) SO storage, exactly as the CPU path below does.
++        if (AO2USO_) {
++            ret[0]->apply_symmetry(V_AO, AO2USO_);
++        } else {
++            ret[0]->copy(V_AO);
++        }
++
+         timer_off("RV: Form V");
+         return;
+     }
+@@ -2143,6 +2179,7 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+ }
+ 
+ std::vector<SharedMatrix> RV::compute_fock_derivatives() {
++    throw_if_cuest_unsupported("RKS Fock derivatives (compute_fock_derivatives)");
+     timer_on("RV: Form Fx");
+ 
+     int natoms = primary_->molecule()->natom();
+@@ -2383,6 +2420,7 @@ std::vector<SharedMatrix> RV::compute_fock_derivatives() {
+ }
+ 
+ void RV::compute_Vx_full(std::vector<SharedMatrix> Dx, std::vector<SharedMatrix> ret, bool singlet) {
++    throw_if_cuest_unsupported("The RKS XC response kernel (compute_Vx; used by TDDFT and CPHF response properties)");
+     timer_on("RV: Form Vx");
+ 
+     // => Validate object / inputs <=
+@@ -3306,6 +3344,7 @@ SharedMatrix RV::compute_gradient() {
+ }
+ 
+ SharedMatrix RV::compute_hessian() {
++    throw_if_cuest_unsupported("The RKS analytic XC Hessian");
+     // => Validation <=
+     if (functional_->is_gga() || functional_->is_meta())
+         throw PSIEXCEPTION("Hessians for GGA and meta GGA functionals are not yet implemented.");
+@@ -3824,13 +3863,19 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+         if ((d_Cocc_noccs_.size() != 2)) {
+             throw PSIEXCEPTION("V: UKS should have only two Cocc Matrices");
+         }
++        // cuEST works exclusively in the dense AO basis, while ret[0]/ret[1] (Va_/Vb_)
++        // may be SO-basis, symmetry-blocked matrices.  Size every GPU buffer from nbf_
++        // (the AO dimension set by set_D) rather than ret[i]->size(), which is
++        // Matrix::size(h=0) -- i.e. just the first irrep block -- and back-transform
++        // AO -> SO at the end.
++        const size_t nbf2 = (size_t)nbf_ * (size_t)nbf_;
+         double *d_Vxc_a = nullptr;
+-        cudaError_t err = cudaMalloc((void**)&d_Vxc_a, ret[0]->size() * sizeof(double));
++        cudaError_t err = cudaMalloc((void**)&d_Vxc_a, nbf2 * sizeof(double));
+         if (err != cudaSuccess) {
+             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_V");
+         }
+         double *d_Vxc_b = nullptr;
+-        err = cudaMalloc((void**)&d_Vxc_b, ret[1]->size() * sizeof(double));
++        err = cudaMalloc((void**)&d_Vxc_b, nbf2 * sizeof(double));
+         if (err != cudaSuccess) {
+             throw PSIEXCEPTION("cudaMalloc failed in UV::compute_V");
+         }
+@@ -3931,7 +3976,9 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+         }
+         
+         int nbf = primary_->nbf();
+-        assert (nbf == ret[0]->colspi()[0] && nbf == ret[1]->colspi()[0]);
++        // NB: compare against nbf_ (the AO dimension), NOT ret[i]->colspi()[0], which is
++        // only the first irrep block for a symmetry-adapted Va_/Vb_.
++        assert (nbf == nbf_);
+ 
+         CHECK_CUEST(cuestXCDensityComputeWorkspaceQuery(
+             cuest_handle,
+@@ -4335,12 +4382,14 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+         cudaFree(d_weights);
+         cudaFree(d_Vxc_grid_a);
+         cudaFree(d_Vxc_grid_b);
+-        err = cudaMemcpy(ret[0]->get_pointer(0), d_Vxc_a, ret[0]->size() * sizeof(double), cudaMemcpyDeviceToHost);
++        auto Va_AO = std::make_shared<Matrix>("Va AO Temp", nbf_, nbf_);
++        auto Vb_AO = std::make_shared<Matrix>("Vb AO Temp", nbf_, nbf_);
++        err = cudaMemcpy(Va_AO->get_pointer(0), d_Vxc_a, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+         if (err != cudaSuccess) {
+             cudaFree(d_Vxc_a);
+             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
+         }
+-        err = cudaMemcpy(ret[1]->get_pointer(0), d_Vxc_b, ret[1]->size() * sizeof(double), cudaMemcpyDeviceToHost);
++        err = cudaMemcpy(Vb_AO->get_pointer(0), d_Vxc_b, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+         if (err != cudaSuccess) {
+             cudaFree(d_Vxc_b);
+             throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
+@@ -4417,18 +4466,29 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+             CHECK_CUEST(cuestParametersDestroy(CUEST_NONLOCALXCPOTENTIALUKSCOMPUTE_PARAMETERS, vv10_potential_compute_parameters));
+ 
+             // Add the VV10 contribution to Vxc
+-            SharedMatrix VV10 = ret[0]->clone();
+-            err = cudaMemcpy(VV10->get_pointer(0), d_Vxc_a, ret[0]->size() * sizeof(double), cudaMemcpyDeviceToHost);
++            auto VV10 = std::make_shared<Matrix>("VV10 AO Temp", nbf_, nbf_);
++            err = cudaMemcpy(VV10->get_pointer(0), d_Vxc_a, nbf2 * sizeof(double), cudaMemcpyDeviceToHost);
+             if (err != cudaSuccess) {
+                 throw PSIEXCEPTION("cudaMemcpy failed in UV::compute_V");
+             }
+-            ret[0]->add(VV10);
+-            ret[1]->add(VV10);
++            Va_AO->add(VV10);
++            Vb_AO->add(VV10);
+             quad_values_["VV10"] = Evv10;
+         }
+ 
+         cudaFree(d_Vxc_a);
+         cudaFree(d_Vxc_b);
++
++        // Fold the dense AO-basis potentials back into ret[0]/ret[1]'s (possibly
++        // symmetry-blocked) SO storage, exactly as the CPU path below does.
++        if (AO2USO_) {
++            ret[0]->apply_symmetry(Va_AO, AO2USO_);
++            ret[1]->apply_symmetry(Vb_AO, AO2USO_);
++        } else {
++            ret[0]->copy(Va_AO);
++            ret[1]->copy(Vb_AO);
++        }
++
+         timer_off("UV: Form V");
+         return;
+     }
+@@ -4748,6 +4808,7 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+     timer_off("UV: Form V");
+ }
+ std::vector<SharedMatrix> UV::compute_fock_derivatives() {
++    throw_if_cuest_unsupported("UKS Fock derivatives (compute_fock_derivatives)");
+     timer_on("UV: Form Fx");
+ 
+     int natoms = primary_->molecule()->natom();
+@@ -5057,6 +5118,7 @@ std::vector<SharedMatrix> UV::compute_fock_derivatives() {
+     return Vx;
+ }
+ void UV::compute_Vx(std::vector<SharedMatrix> Dx, std::vector<SharedMatrix> ret) {
++    throw_if_cuest_unsupported("The UKS XC response kernel (compute_Vx; used by TDDFT and CPHF response properties)");
+     timer_on("UV: Form Vx");
+ 
+     // => Validate object / inputs <=
+@@ -6608,6 +6670,7 @@ SharedMatrix UV::compute_gradient() {
+     return G;
+ }
+ SharedMatrix UV::compute_hessian() {
++    throw_if_cuest_unsupported("The UKS analytic XC Hessian");
+     // => Validation <=
+     if (functional_->is_gga() || functional_->is_meta())
+         throw PSIEXCEPTION("Hessians for GGA and meta GGA functionals are not yet implemented.");
+diff --git a/psi4/src/psi4/libfock/v.h b/psi4/src/psi4/libfock/v.h
+index 6d3506d2b88..a15639056c3 100644
+--- a/psi4/src/psi4/libfock/v.h
++++ b/psi4/src/psi4/libfock/v.h
+@@ -127,6 +127,18 @@ class PSI_API VBase {
+     /// Set things up
+     void common_init();
+ 
++    /// Guard for CPU-only XC routines that cuEST has no branch for.
++    ///
++    /// When USE_CUEST is set, the DFT quadrature grid is built on the GPU and
++    /// MolecularGrid's CPU-side post-processing is skipped entirely
++    /// (cubature.cc: "if (is_cuest) return;" before postProcess()), so
++    /// grid_->blocks() is empty and functional_workers_ is never populated.
++    /// Any CPU XC routine reached under cuEST would therefore either index an
++    /// empty vector (segfault) or loop over zero blocks and silently return a
++    /// zero XC contribution.  Routines without a cuEST implementation must call
++    /// this to fail loudly instead.  \p what names the operation for the user.
++    void throw_if_cuest_unsupported(const std::string& what) const;
++
+    public:
+     VBase(std::shared_ptr<SuperFunctional> functional, std::shared_ptr<BasisSet> primary, Options& options);
+     virtual ~VBase();
+diff --git a/tests/pytests/test_cuest.py b/tests/pytests/test_cuest.py
+index 645ce04cdf5..ea15c390119 100644
+--- a/tests/pytests/test_cuest.py
++++ b/tests/pytests/test_cuest.py
+@@ -1,3 +1,6 @@
++import subprocess
++import sys
++
+ import psi4
+ import pytest
+ import numpy as np
+@@ -374,3 +377,254 @@ def test_cuest_scf(inp, request):
+     G, wfn = psi4.gradient(inp['methodname'], return_wfn=True)
+     assert psi4.compare_values(inp["ref_energy"], wfn.get_energies("Total Energy"), 5e-6, f'{request.node.callspec.id} energy')
+     assert psi4.compare_values(inp["ref_gradient"], G, 5e-5, f'{request.node.callspec.id} gradient')
++
++
++# ===========================================================================
++# Molecular symmetry (non-C1) in the cuEST DFT XC path
++# ===========================================================================
++#
++# The methylamine geometry used above is effectively C1, so none of those cases
++# exercise a symmetry-blocked wavefunction.  cuEST's XC potential code
++# (RV/UV::compute_V) works in the dense AO basis, while Va_/Vb_ are SO-basis,
++# symmetry-blocked matrices; sizing the GPU buffers off ret[i]->size() picked up
++# only the first irrep block, and nothing back-transformed AO -> SO.  Any
++# nirrep() > 1 DFT wavefunction therefore died inside cuestXCPotentialCompute.
++#
++# That was worked around in the driver by forcing C1 for cuEST DFT, and is now
++# fixed properly in v.cc, so the workaround is gone.  These tests pin both
++# halves of that: cuEST must run in the *native* point group (not be silently
++# demoted to C1), and must give the same answer as the same geometry in C1.
++
++__symm_geoms = {
++    "water": """
++    0 1
++    O
++    H 1 0.9584
++    H 1 0.9584 2 104.45
++    """,
++    "water_cation": """
++    1 2
++    O
++    H 1 0.9584
++    H 1 0.9584 2 104.45
++    """,
++}
++
++# Reference energies from regular (non-cuEST) Psi4 in the native C2v point
++# group, same options as the test below.
++@pytest.mark.quick
++@uusing("cuest")
++@uusing("cuda_cc8")
++@pytest.mark.parametrize("inp", [
++
++    pytest.param({
++        "geom": "water",
++        "methodname": "hf",
++        "reference": "rhf",
++        "ref_energy": -75.9608932798,
++    }, id='water_c2v_rhf'),
++
++    pytest.param({
++        "geom": "water",
++        "methodname": "b3lyp",
++        "reference": "rhf",
++        "ref_energy": -76.3581721562,
++    }, id='water_c2v_rb3lyp'),
++
++    # VV10 functional: exercises the nonlocal-correlation branch of compute_V,
++    # which folds its contribution into the same AO -> SO round trip.
++    pytest.param({
++        "geom": "water",
++        "methodname": "b97m-v",
++        "reference": "rhf",
++        "ref_energy": -76.3299936452,
++    }, id='water_c2v_rb97m-v'),
++
++    pytest.param({
++        "geom": "water_cation",
++        "methodname": "hf",
++        "reference": "uhf",
++        "ref_energy": -75.5622929120,
++    }, id='water_cation_c2v_uhf'),
++
++    # Open shell: UV::compute_V is a separate code path from RV::compute_V and
++    # was broken in the same way (two Vxc buffers instead of one).
++    pytest.param({
++        "geom": "water_cation",
++        "methodname": "b3lyp",
++        "reference": "uhf",
++        "ref_energy": -75.9020172059,
++    }, id='water_cation_c2v_ub3lyp'),
++
++    pytest.param({
++        "geom": "water_cation",
++        "methodname": "m06",
++        "reference": "uhf",
++        "ref_energy": -75.8633697758,
++    }, id='water_cation_c2v_um06'),
++
++    pytest.param({
++        "geom": "water_cation",
++        "methodname": "b97m-v",
++        "reference": "uhf",
++        "ref_energy": -75.8758535607,
++    }, id='water_cation_c2v_ub97m-v'),
++])
++def test_cuest_symmetry(inp, request):
++    """cuEST must support non-C1 wavefunctions and be invariant to symmetry."""
++    psi4.core.set_num_threads(4)
++
++    psi4.set_options({
++        'scf_type': 'df',
++        'df_basis_scf': 'def2-universal-JKFIT',
++        'basis': 'def2-svp',
++        'puream': True,
++        'dft_nuclear_scheme': 'stratmann',  # To get cuEST and Psi4 to agree exactly for DFT
++        'dft_radial_points': 100,
++        'dft_spherical_points': 590,
++        'd_convergence': 9,
++        'maxiter': 300,
++        'use_cuest': True,
++        'reference': inp['reference'],
++    })
++
++    mol_symm = psi4.geometry(__symm_geoms[inp['geom']])
++    mol_symm.update_geometry()
++
++    # Identical geometry with symmetry switched off. This is exactly what the
++    # removed scf_helper() workaround used to do behind the user's back, so the
++    # two gradients are directly comparable element by element.
++    mol_c1 = mol_symm.clone()
++    mol_c1.reset_point_group('c1')
++    mol_c1.update_geometry()
++
++    G_symm, wfn_symm = psi4.gradient(inp['methodname'], molecule=mol_symm, return_wfn=True)
++    G_c1, wfn_c1 = psi4.gradient(inp['methodname'], molecule=mol_c1, return_wfn=True)
++
++    tid = request.node.callspec.id
++
++    # (1) cuEST really ran in the native point group. Before the v.cc fix, DFT
++    # here was silently demoted to C1 (nirrep 1) by the driver workaround, so
++    # this is the assertion that pins the workaround's removal.
++    assert compare_integers(4, wfn_symm.nirrep(), f'{tid} nirrep')
++    assert compare_strings('c2v', mol_symm.point_group().symbol(), f'{tid} point group')
++    assert compare_integers(1, wfn_c1.nirrep(), f'{tid} C1 reference nirrep')
++
++    # (2) Absolute energy against a non-cuEST Psi4 reference in native symmetry.
++    assert compare_values(inp['ref_energy'], wfn_symm.energy(), 5e-6, f'{tid} energy')
++
++    # (3) Symmetry invariance. These are the same physics, so agreement should
++    # be near machine precision; observed worst case is ~1e-9 (E) and ~3e-10
++    # (gradient) across these cases.
++    assert compare_values(wfn_c1.energy(), wfn_symm.energy(), 1e-7, f'{tid} energy symmetry invariance')
++    assert compare_values(np.array(G_c1), np.array(G_symm), 1e-7, f'{tid} gradient symmetry invariance')
++
++
++# ===========================================================================
++# DFT code paths that cuEST does not implement must fail loudly
++# ===========================================================================
++#
++# Under USE_CUEST the quadrature grid is built on the GPU and the CPU-side grid
++# post-processing is skipped entirely (cubature.cc: "if (is_cuest) return;"
++# before postProcess()), so grid_->blocks() is empty and functional_workers_ is
++# never populated. compute_V()/compute_gradient() have cuEST branches and are
++# fine, but compute_Vx(), compute_fock_derivatives(), SAP::compute_V() and
++# set_grac_shift() do not -- they used to fall through to the CPU code and index
++# an empty std::vector, terminating the process with SIGSEGV.
++#
++# Note that simply populating functional_workers_ is NOT a fix: with no grid
++# blocks the CPU routines integrate over nothing and silently return a *zero* XC
++# contribution. These paths must therefore raise, not "work".
++#
++# Each case runs in a subprocess on purpose. If the guard regresses, the failure
++# mode is a segfault, which would otherwise take down the whole pytest session
++# and report nothing useful; as a subprocess it shows up as a negative return
++# code that we can assert on and describe.
++
++_UNSUPPORTED_ROUTE_SCRIPT = """
++import sys
++import psi4
++
++route, outfile = sys.argv[1], sys.argv[2]
++psi4.core.set_output_file(outfile, False)
++psi4.set_options({
++    'scf_type': 'df',
++    'df_basis_scf': 'def2-universal-JKFIT',
++    'basis': 'def2-svp',
++    'puream': True,
++    'reference': 'rhf',
++    'dft_nuclear_scheme': 'stratmann',
++    'd_convergence': 8,
++    'save_jk': True,
++    'use_cuest': True,
++})
++mol = psi4.geometry('''
++0 1
++O
++H 1 0.9584
++H 1 0.9584 2 104.45
++symmetry c1
++''')
++
++try:
++    if route == 'tdscf':
++        _, wfn = psi4.energy('b3lyp', molecule=mol, return_wfn=True)
++        psi4.set_options({'tdscf_states': 2})
++        psi4.tdscf(wfn, states=2)
++    elif route == 'polarizability':
++        psi4.properties('b3lyp', properties=['DIPOLE_POLARIZABILITIES'], molecule=mol)
++    elif route == 'sap_guess':
++        psi4.set_options({'guess': 'sap'})
++        psi4.energy('b3lyp', molecule=mol)
++    elif route == 'grac':
++        psi4.set_options({'dft_grac_shift': 0.5})
++        psi4.energy('b3lyp', molecule=mol)
++    else:
++        raise SystemExit('unknown route ' + route)
++except Exception as exc:
++    print('CAUGHT ' + type(exc).__name__ + ': ' + ' '.join(str(exc).split()))
++else:
++    print('COMPLETED WITHOUT ERROR')
++"""
++
++
++@uusing("cuest")
++@uusing("cuda_cc8")
++@pytest.mark.parametrize("route,expected", [
++    # TDDFT and CPHF response properties both go through RV::compute_Vx.
++    pytest.param('tdscf', 'XC response kernel', id='tdscf'),
++    pytest.param('polarizability', 'XC response kernel', id='polarizability'),
++    pytest.param('sap_guess', 'SAP guess', id='sap_guess'),
++    pytest.param('grac', 'GRAC asymptotic correction', id='grac'),
++])
++def test_cuest_unsupported_route(route, expected, tmp_path):
++    """Unimplemented cuEST DFT paths raise a clear error instead of segfaulting."""
++    script = tmp_path / "cuest_unsupported_route.py"
++    script.write_text(_UNSUPPORTED_ROUTE_SCRIPT)
++
++    proc = subprocess.run(
++        [sys.executable, str(script), route, str(tmp_path / "psi.out")],
++        capture_output=True, text=True, timeout=1800,
++    )
++
++    # A negative return code means killed by signal; -11 (SIGSEGV) is precisely
++    # the pre-guard behaviour this test exists to prevent.
++    assert proc.returncode == 0, (
++        f"cuEST '{route}' subprocess exited with returncode {proc.returncode} "
++        f"(negative means killed by a signal; -11 is SIGSEGV).\n"
++        f"stdout:\n{proc.stdout}\nstderr tail:\n{proc.stderr[-2000:]}"
++    )
++
++    # Must actually have raised, rather than quietly returning XC-free numbers.
++    assert 'CAUGHT' in proc.stdout, (
++        f"cuEST '{route}' did not raise. A silent success here means the CPU "
++        f"fallback ran with an empty grid and returned a zero XC contribution.\n"
++        f"stdout:\n{proc.stdout}"
++    )
++
++    # And the error must be the informative cuEST guard, naming the operation.
++    assert 'has no cuEST implementation' in proc.stdout, f"unexpected error:\n{proc.stdout}"
++    assert expected in proc.stdout, (
++        f"cuEST '{route}' raised, but not from the expected guard "
++        f"(wanted {expected!r}).\nstdout:\n{proc.stdout}"
++    )
+diff --git a/tests/pytests/test_dft1.py b/tests/pytests/test_dft1.py
+new file mode 100644
+index 00000000000..cd0a2d236ff
+--- /dev/null
++++ b/tests/pytests/test_dft1.py
+@@ -0,0 +1,271 @@
++"""DFT functional energies across the internal (CPU) and cuEST (GPU) paths.
++
++This is the PsiAPI companion to the ctest ``dft1`` case, not a replacement for
++it.  ``tests/dft1/input.dat`` is a longstanding regression pinned to
++``SCF_TYPE DIRECT``, and it is left exactly as it is; an earlier attempt to
++parametrize that input over cuEST was reverted because the two engines cannot
++share its settings (see below), which forced the input to carry two disjoint
++reference sets and a conditional functional list.
++
++Here both legs instead run *identical* settings, chosen to give the two engines
++the best chance of producing the same number:
++
++  * ``SCF_TYPE DF``.  cuESTJK is density-fitted only -- ``jk.cc`` builds it for
++    MEM_DF/DISK_DF -- so the DIRECT of the ctest case is not available.
++  * ``DFT_NUCLEAR_SCHEME STRATMANN``.  cuEST reproduces internal Psi4 to ~1e-9
++    only under Stratmann nuclear partitioning.  With the default scheme the
++    meta-GGA drifts by ~5e-5, which is grid partitioning rather than a defect
++    in either engine.
++  * ``E_CONVERGENCE``/``D_CONVERGENCE`` of 1e-9, tighter than the ctest case's
++    1e-8, so that the SCF is converged well below the tolerance at which the
++    two engines are compared against each other.
++
++Every case is checked twice: against the stored reference for its own engine at
++a tight tolerance, and against the *internal* reference at a looser one.  The
++first is the regression check proper; the second is the cross-engine check, and
++is the reason the settings above are shared rather than tuned per engine.  On
++the internal leg the two comparisons coincide, which is harmless and keeps the
++test body uniform.
++
++Range-separated functionals (wB97, wB97X) used to be excluded from the cuEST
++leg -- ``cuESTJK`` computed J and K but not wK, so they silently converged
++1-2 Eh off.  cuEST now implements the long-range exchange and they are run on
++both legs, but the two engines agree only to ~3e-5 there rather than the ~1e-9
++seen everywhere else; see ``_ATOL_CROSS_LRC`` below.
++"""
++
++import pytest
++
++import psi4
++
++from addons import using
++from utils import compare_values
++
++pytestmark = [pytest.mark.psi, pytest.mark.api, pytest.mark.scf, pytest.mark.dft, pytest.mark.df]
++
++
++# Geometries as in tests/dft1/input.dat.
++_GEOMS = {
++    "water": """
++0 1
++O 0.000000000000  0.000000000000 -0.068516219310
++H 0.000000000000 -0.790689573744  0.543701060724
++H 0.000000000000  0.790689573744  0.543701060724
++no_com
++no_reorient
++""",
++    "water_cation": """
++1 2
++O
++H 1 1.0
++H 1 1.0 2 104.5
++""",
++    "water_anion": """
++-1 2
++O
++H 1 1.0
++H 1 1.0 2 104.5
++""",
++}
++
++# tag -> (label, geometry, reference, guess)
++_BLOCKS = {
++    "rks_neutral": ("RKS  0 1", "water", "rks", None),
++    "uks_neutral": ("UKS  0 1", "water", "uks", None),
++    "uks_cation": ("UKS  1 2", "water_cation", "uks", None),
++    "uks_anion": ("UKS -1 2", "water_anion", "uks", "sad"),
++}
++
++_FUNCTIONALS = ["svwn", "b3lyp", "wB97", "wB97X", "b86bpbe", "pw86pbe", "m05", "spw92"]
++
++# Range-separated (long-range-corrected) members of the list above.  They are
++# the only ones that exercise cuEST's long-range exchange, and the only ones
++# for which the two engines disagree by more than SCF convergence -- so they
++# carry their own cross-engine tolerance.  See _ATOL_CROSS_LRC.
++_LRC = ("wB97", "wB97X")
++
++_OPTIONS = {
++    "basis": "sto-3g",
++    "scf_type": "df",
++    "df_basis_scf": "def2-universal-JKFIT",
++    "dft_nuclear_scheme": "stratmann",
++    "dft_spherical_points": 302,
++    "dft_radial_points": 99,
++    "e_convergence": 9,
++    "d_convergence": 9,
++}
++
++# Reference energies, keyed (block tag, functional), each set produced by the
++# engine it is filed under with the settings above.
++_REFS = {
++    "internal": {
++        # RKS  0 1
++        ("rks_neutral", "svwn"):         -74.9361457674,
++        ("rks_neutral", "b3lyp"):        -75.3200834739,
++        ("rks_neutral", "wB97"):         -75.3189727239,
++        ("rks_neutral", "wB97X"):        -75.3132187890,
++        ("rks_neutral", "b86bpbe"):      -75.2981206541,
++        ("rks_neutral", "pw86pbe"):      -75.3503184102,
++        ("rks_neutral", "m05"):          -75.3214214214,
++        ("rks_neutral", "spw92"):        -74.7371639178,
++        # UKS  0 1
++        ("uks_neutral", "svwn"):         -74.9361457674,
++        ("uks_neutral", "b3lyp"):        -75.3200834739,
++        ("uks_neutral", "wB97"):         -75.3189727239,
++        ("uks_neutral", "wB97X"):        -75.3132187890,
++        ("uks_neutral", "b86bpbe"):      -75.2981206541,
++        ("uks_neutral", "pw86pbe"):      -75.3503184102,
++        ("uks_neutral", "m05"):          -75.3214214214,
++        ("uks_neutral", "spw92"):        -74.7371639178,
++        # UKS  1 2
++        ("uks_cation", "svwn"):          -74.5658273814,
++        ("uks_cation", "b3lyp"):         -74.9678744373,
++        ("uks_cation", "wB97"):          -74.9713472832,
++        ("uks_cation", "wB97X"):         -74.9636555640,
++        ("uks_cation", "b86bpbe"):       -74.9477314548,
++        ("uks_cation", "pw86pbe"):       -74.9997520073,
++        ("uks_cation", "m05"):           -74.9703623086,
++        ("uks_cation", "spw92"):         -74.3874998062,
++        # UKS -1 2
++        ("uks_anion", "svwn"):           -74.4319601928,
++        ("uks_anion", "b3lyp"):          -74.8158925335,
++        ("uks_anion", "wB97"):           -74.8016635922,
++        ("uks_anion", "wB97X"):          -74.7982781550,
++        ("uks_anion", "b86bpbe"):        -74.7908482778,
++        ("uks_anion", "pw86pbe"):        -74.8450791750,
++        ("uks_anion", "m05"):            -74.8016980089,
++        ("uks_anion", "spw92"):          -74.2143762266,
++    },
++    # Regenerated on an H100 (sm_90) once cuEST gained long-range exchange.
++    # The wB97/wB97X entries are new; the hybrids also moved in the last digit
++    # or two relative to the earlier L40S set, which is the INT8 mixed-precision
++    # exchange path (CUEST_MIXED_PRECISION, on by default) rather than a change
++    # in the answer -- with it off, cuEST reproduces the internal column below
++    # to ~3e-11 for every non-range-separated functional here.
++    "cuest": {
++        # RKS  0 1
++        ("rks_neutral", "svwn"):         -74.9361457674,
++        ("rks_neutral", "b3lyp"):        -75.3200834748,
++        ("rks_neutral", "wB97"):         -75.3189724178,
++        ("rks_neutral", "wB97X"):        -75.3132349424,
++        ("rks_neutral", "b86bpbe"):      -75.2981206541,
++        ("rks_neutral", "pw86pbe"):      -75.3503184102,
++        ("rks_neutral", "m05"):          -75.3214214216,
++        ("rks_neutral", "spw92"):        -74.7371639179,
++        # UKS  0 1
++        ("uks_neutral", "svwn"):         -74.9361457674,
++        ("uks_neutral", "b3lyp"):        -75.3200834748,
++        ("uks_neutral", "wB97"):         -75.3189724179,
++        ("uks_neutral", "wB97X"):        -75.3132349424,
++        ("uks_neutral", "b86bpbe"):      -75.2981206541,
++        ("uks_neutral", "pw86pbe"):      -75.3503184102,
++        ("uks_neutral", "m05"):          -75.3214214215,
++        ("uks_neutral", "spw92"):        -74.7371639179,
++        # UKS  1 2
++        ("uks_cation", "svwn"):          -74.5658273814,
++        ("uks_cation", "b3lyp"):         -74.9678744370,
++        ("uks_cation", "wB97"):          -74.9713427729,
++        ("uks_cation", "wB97X"):         -74.9636663602,
++        ("uks_cation", "b86bpbe"):       -74.9477314548,
++        ("uks_cation", "pw86pbe"):       -74.9997520074,
++        ("uks_cation", "m05"):           -74.9703623085,
++        ("uks_cation", "spw92"):         -74.3874998062,
++        # UKS -1 2
++        ("uks_anion", "svwn"):           -74.4319601928,
++        ("uks_anion", "b3lyp"):          -74.8158925334,
++        ("uks_anion", "wB97"):           -74.8016871060,
++        ("uks_anion", "wB97X"):          -74.7983082393,
++        ("uks_anion", "b86bpbe"):        -74.7908482778,
++        ("uks_anion", "pw86pbe"):        -74.8450791750,
++        ("uks_anion", "m05"):            -74.8016980094,
++        ("uks_anion", "spw92"):          -74.2143762266,
++    },
++}
++
++# Tolerance against a stored reference, per engine.
++#
++# The internal leg is plain CPU LAPACK/libxc and reproduces bit for bit, so it
++# only has to absorb the 10-dp rounding of the stored value (<= 5e-11).
++_ATOL_OWN = {
++    "internal": 1.0e-9,
++    # The cuEST leg is not bit-reproducible: exchange is built in INT8 slices
++    # by default (CUEST_MIXED_PRECISION), which is measurably noisy and, being
++    # a GPU-tensor-core path, not portable between architectures.  Measured
++    # over this 4-block x 8-functional matrix:
++    #
++    #   cuEST run-to-run, same H100     <= 6.0e-10   (worst: wB97)
++    #   rounding, refs stored to 10 dp  <= 5.0e-11
++    #   L40S -> H100, non-LRC hybrids   ~  9e-10     (b3lyp)
++    #
++    # 1e-8 is an order of magnitude above that budget.  It was 1e-9 when the
++    # references were L40S-only and there was no long-range exchange; both of
++    # those assumptions are now gone.  Setting CUEST_MIXED_PRECISION false
++    # collapses the run-to-run spread to ~1e-12, but the default is what users
++    # get, so the default is what is tested.
++    "cuest": 1.0e-8,
++}
++
++# Cross-engine, for everything except the range-separated functionals.  Worst
++# observed 9.0e-10 (b3lyp), which is the mixed-precision exchange path again.
++_ATOL_CROSS = 1.0e-8
++
++# Cross-engine, range-separated only.  Worst observed 3.0e-5 -- four orders of
++# magnitude looser than everything else, and deliberately so.
++#
++# This is not noise and not an SCF-convergence artifact: it is identical to
++# 1e-12 with CUEST_MIXED_PRECISION false, so it is not the INT8 path either.
++# The two engines simply make different density-fitting approximations for the
++# erf-attenuated (long-range) exchange, and with sto-3g/def2-universal-JKFIT
++# the fitting error itself is ~4e-4, so a ~3e-5 difference between two such
++# approximations is expected.  Confirmed by enlarging the auxiliary basis on
++# the neutral case, which is what shrinks the disagreement:
++#
++#   def2-universal-JKFIT   wB97 3.1e-07   wB97X 1.6e-05
++#   cc-pvtz-jkfit          wB97 1.1e-04   wB97X 9.7e-05
++#   aug-cc-pvqz-jkfit      wB97 6.4e-08   wB97X 1.4e-06
++#
++# So this check is a sanity bound, not a precision check -- its job is to catch
++# a long-range term that is missing, mis-scaled, or has the wrong omega, which
++# is a 1-2 Eh error (before cuEST had wK at all, wB97 here gave -73.264 against
++# -75.319).  The tight pin for these functionals is _ATOL_OWN["cuest"] above.
++_ATOL_CROSS_LRC = 1.0e-4
++
++
++def _run_case(tag, func, cuest):
++    """Run one (block, functional) case on the requested engine."""
++    label, geom, reference, guess = _BLOCKS[tag]
++
++    mol = psi4.geometry(_GEOMS[geom])
++
++    psi4.set_options(_OPTIONS)
++    psi4.set_options({"reference": reference, "use_cuest": cuest})
++    if guess:
++        psi4.set_options({"guess": guess})
++
++    return psi4.energy("scf", dft_functional=func, molecule=mol)
++
++
++def _cases():
++    for mode in ("internal", "cuest"):
++        mode_marks = [] if mode == "internal" else [*using("cuest"), *using("cuda_cc8")]
++
++        for tag in _BLOCKS:
++            for func in _FUNCTIONALS:
++                yield pytest.param(mode, tag, func, marks=list(mode_marks),
++                                   id=f"{mode}-{tag}-{func.lower()}")
++
++
++@pytest.mark.parametrize("mode,tag,func", list(_cases()))
++def test_dft1(mode, tag, func):
++    label = _BLOCKS[tag][0]
++    val = _run_case(tag, func, cuest=(mode == "cuest"))
++
++    name = f"{label} {func.upper():>7}"
++
++    # Regression check: this engine, against a reference this engine produced.
++    assert compare_values(_REFS[mode][tag, func], val, _ATOL_OWN[mode], f"{name} vs {mode} ref")
++
++    # Cross-engine check.  On the internal leg this repeats the line above and
++    # asserts nothing new; it is kept so the two legs read identically.
++    atol = _ATOL_CROSS_LRC if func in _LRC else _ATOL_CROSS
++    assert compare_values(_REFS["internal"][tag, func], val, atol, f"{name} vs internal")

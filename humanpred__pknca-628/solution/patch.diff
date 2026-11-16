@@ -1,0 +1,2052 @@
+diff --git a/NEWS.md b/NEWS.md
+index a0070b247..1040403bd 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -78,6 +78,30 @@ the dosing including dose amount and route.
+   [pk.nca()].  On a `PKNCAdata` object it uses that object's `group_ref` when
+   one is set (#76).
+ 
++* The units of a secondary parameter are composed from the units of the values
++  it was actually calculated from.  A renal clearance dividing a urine amount in
++  `mg` by a plasma AUC in `hr*ng/mL` is reported in `mg/(hr*ng/mL)`, not in the
++  urine group's own `mg/(hr*mg/L)`.  The composition happens in the units table,
++  which gains `<group column>_ref` columns and one row per pair of groups, and
++  results gain the same columns naming the group each secondary value took its
++  reference from.  No value is ever converted or made `NA` for unit reasons:
++  where the two sides of a quotient are convertible (a `ratio.*` of two analytes
++  reported in `ng/mL` and `mg/L`) the raw quotient is standardized to a
++  `PPSTRESU` of `"fraction"` through `PPSTRES`, and where they are not (a
++  bioavailability between an `mg` dose and a `mg/kg` dose) the composite units
++  stand and say so.  A per-group analysis with such a quotient therefore gains
++  `PPSTRES` and `PPSTRESU` result columns, which equal `PPORRES` and `PPORRESU`
++  for every other parameter (#76).
++
++* A new vignette, "Secondary Parameters"
++  (`vignette("v09-secondary-parameters")`), works through the parameters that
++  need two profiles:  linking intervals by hand, letting PKNCA derive the
++  reference, steering it with `group_ref`, writing the linkage with
++  `interval_add_secondary()`, bioavailability and its AUC bases, how exclusions
++  and differing units are handled, and what is not yet supported.
++  "Writing PKNCA Parameter Functions" gains a section on registering a
++  parameter that needs another interval (#76).
++
+ * Bug fix: requesting `clr.last`, `clr.obs`, or `clr.pred` without its AUC (and
+   without a reference interval) silently divided by zero and gave `Inf`.  The
+   reference interval is now derived from the data where it can be, and where it
+diff --git a/R/class-PKNCAresults.R b/R/class-PKNCAresults.R
+index f3d23261a..96ebd6052 100644
+--- a/R/class-PKNCAresults.R
++++ b/R/class-PKNCAresults.R
+@@ -94,8 +94,15 @@ as.data.frame.PKNCAresults <- function(x, ..., out_format = c('long', 'wide', 'c
+     }
+     # Since we moved the results into PPTESTCD and PPORRES regardless of what
+     # they really are in the source data, remove the extra units and unit
+-    # conversion columns to allow spread to work.
+-    ret <- ret[, setdiff(names(ret), c("PPSTRES", "PPSTRESU", "PPORRESU", "PPANMETH"))]
++    # conversion columns to allow spread to work.  The reference group of a
++    # secondary result (a `<group column>_ref` twin) describes that one
++    # parameter, so keeping it would split its interval's row in two.
++    ref_group_cols <- intersect(paste0(names(ret), "_ref"), names(ret))
++    ret <-
++      ret[, setdiff(
++        names(ret),
++        c("PPSTRES", "PPSTRESU", "PPORRESU", "PPANMETH", ref_group_cols)
++      )]
+     ret <- tidyr::spread(ret, key="PPTESTCD", value="PPORRES")
+   }
+   ret
+diff --git a/R/secondary-parameters.R b/R/secondary-parameters.R
+index 31d561a2e..978f4d120 100644
+--- a/R/secondary-parameters.R
++++ b/R/secondary-parameters.R
+@@ -925,48 +925,22 @@ stop_secondary_value_missing <- function(param, target, ref_id, group_values, si
+   )
+ }
+ 
+-# The units assigned to `param` for one group, or NA when the units table
+-# cannot answer.  Deliberately forgiving: an absent table, an absent parameter
+-# row, and an ambiguous match all give NA so that the interim mismatch warning
+-# never turns a units gap into an error.
+-secondary_units_lookup <- function(units, group_values, param) {
+-  if (!is.data.frame(units) || !all(c("PPTESTCD", "PPORRESU") %in% names(units))) {
+-    return(NA_character_)
+-  }
+-  m <- units$PPTESTCD %in% param
+-  for (col in intersect(names(units), names(group_values))) {
+-    m <- m & (units[[col]] %in% group_values[[col]])
+-  }
+-  ret <- unique(units$PPORRESU[m])
+-  if (length(ret) == 1) as.character(ret) else NA_character_
+-}
+-
+-# Interim warning for group-stratified units that differ between the interval's own group and
+-# the reference group.  PR 4 replaces this with reconciliation of the
+-# reference-side values; until then a difference means the reported units (which
+-# come from the interval's own group) do not describe the reference-side input.
+-#
+-# `seen` is the set of "<param>|<u_ref>|<u_home>" keys already warned about in
+-# this run; the updated set is returned.
+-secondary_warn_units <- function(units, param, targets, own_group, ref_group, seen) {
+-  for (target in targets) {
+-    u_home <- secondary_units_lookup(units, own_group, target)
+-    u_ref <- secondary_units_lookup(units, ref_group, target)
+-    if (!is.na(u_home) && !is.na(u_ref) && !identical(u_home, u_ref)) {
+-      key <- paste(param, u_ref, u_home, sep = "|")
+-      if (!(key %in% seen)) {
+-        seen <- c(seen, key)
+-        rlang::warn(
+-          sprintf(
+-            "Secondary parameter '%s': the units of '%s' differ between the reference group ('%s') and the interval's own group ('%s'); the reported result uses the interval's own units without converting the reference value.",
+-            param, target, u_ref, u_home
+-          ),
+-          class = "pknca_warning_secondary_units"
+-        )
++# The group values a secondary result took its reference side from, as the
++# `<group column>_ref` columns of the result row.  They make the linkage
++# machine-readable (`PPANMETH` says the same thing in prose) and are what the
++# units table keys its reference-side unit strings on.
++secondary_ref_group_cols <- function(template, ref_group, result_group_cols) {
++  for (col in result_group_cols) {
++    template[[paste0(col, "_ref")]] <-
++      if (is.null(ref_group)) {
++        # No reference was found, so there is no reference group to name.  The
++        # NA keeps the column's type and joins to the reference-free units row.
++        template[[col]][NA_integer_]
++      } else {
++        ref_group[[col]]
+       }
+-    }
+   }
+-  seen
++  template
+ }
+ 
+ # Compute deferred secondary parameters from the combined results and append
+@@ -996,7 +970,6 @@ pk_nca_secondary <- function(results, data_calc) {
+       c("start", "end", "PPTESTCD", "PPORRES", "PPANMETH", "exclude", keep_cols)
+     )
+   override_cols <- intersect(names(current_intervals), result_group_cols)
+-  units_seen <- character(0)
+   # Reasons an automatically linked parameter could not be calculated, by
+   # parameter:  one warning per parameter is raised for all of them together.
+   auto_reasons <- list()
+@@ -1093,23 +1066,19 @@ pk_nca_secondary <- function(results, data_calc) {
+           inputs[[formal]] <- found$value
+           excludes <- c(excludes, found$exclude)
+         }
+-        units_seen <-
+-          secondary_warn_units(
+-            data_calc$units, p, info$ref_args, own_group, ref_group, units_seen
+-          )
+-        # PR 4 inserts unit reconciliation of the ref-side inputs here.
+         if (is.null(failed_reason)) {
+           value <- do.call(info$fun, inputs)
+           excl <- combine_exclude_reasons(excludes, attr(value, "exclude"))
+           value <- as.numeric(value)
+         } else {
+           # An automatic link with a value missing degrades to NA with the
+-          # reason, and is counted into the one warning per parameter below.
++          # reason, and is counted into the one-per-parameter warning below.
+           value <- NA_real_
+           excl <- combine_exclude_reasons(c(excludes, failed_reason), NULL)
+           auto_reasons[[p]] <- c(auto_reasons[[p]], failed_reason)
+         }
+         template <- secondary_template(results, own_rows, own_group, result_group_cols)
++        template <- secondary_ref_group_cols(template, ref_group, result_group_cols)
+         template$PPTESTCD <- p
+         template$PPORRES <- value
+         template$PPANMETH <-
+@@ -1139,6 +1108,7 @@ pk_nca_secondary <- function(results, data_calc) {
+           secondary_template(
+             results, own_rows, instances[k, , drop = FALSE], result_group_cols
+           )
++        template <- secondary_ref_group_cols(template, NULL, result_group_cols)
+         template$PPTESTCD <- p
+         template$PPORRES <- NA_real_
+         template$PPANMETH <- NA_character_
+diff --git a/R/unit-support.R b/R/unit-support.R
+index 5c465f0e7..d28521ba9 100644
+--- a/R/unit-support.R
++++ b/R/unit-support.R
+@@ -18,6 +18,25 @@
+ #' @returns A unit conversion table with columns for "PPTESTCD" and "PPORRESU"
+ #'   if `conversions` is not given, and adding "PPSTRESU" and
+ #'   "conversion_factor" if `conversions` is given.
++#' @section Secondary parameters and reference groups:
++#'
++#'   A secondary parameter (renal clearance, bioavailability, a ratio; see
++#'   `vignette("v09-secondary-parameters")`) takes one value from the interval
++#'   requesting it and another from a reference interval, so its units are a
++#'   quotient of the two groups' units.  When the `PKNCAdata` method finds more
++#'   than one set of units among the groups, the table therefore gains a
++#'   `<group column>_ref` column for each of its group columns and, for each
++#'   secondary parameter, one row per pair of (own group, reference group) with
++#'   "PPORRESU" composed from the correct side of each.  Rows describing a
++#'   result that names no reference -- every primary parameter, and a secondary
++#'   parameter calculated without a reference -- hold `NA` in the `_ref`
++#'   columns, and results carrying no reference group join to them.  A quotient
++#'   whose two sides are convertible into one another is dimensionless, and such
++#'   a row also gets "PPSTRESU" of "fraction" with the "conversion_factor" that
++#'   turns the raw quotient into that number.
++#'
++#'   With one set of units for every group there is no reference side to name
++#'   and no `_ref` column is added.
+ #' @seealso The `units` argument for [PKNCAdata()]
+ #' @examples
+ #' pknca_units_table() # only parameters that are unitless
+@@ -148,14 +167,9 @@ pknca_units_table.default <- function(concu, doseu, amountu, timeu,
+     }
+     for (idx in which(is.na(conversions$conversion_factor))) {
+       conversions$conversion_factor[idx] <-
+-        as.numeric(
+-          units::set_units(
+-            units::set_units(
+-              1,
+-              conversions$PPORRESU[idx], mode="standard"
+-            ),
+-            conversions$PPSTRESU[idx], mode="standard"
+-          )
++        pknca_units_conversion_factor(
++          from = conversions$PPORRESU[idx],
++          to = conversions$PPSTRESU[idx]
+         )
+     }
+     unexpected_conversions <- setdiff(conversions$PPORRESU, ret$PPORRESU)
+@@ -271,6 +285,9 @@ pknca_units_table.PKNCAdata <- function(concu, ..., conversions = data.frame())
+   groups_cols <- setdiff(names(groups_units_tbl), all_unit_cols)
+ 
+   ret <- vector(mode = "list", length = nrow(groups_units_tbl))
++  # The same tables without their group columns, which is how the secondary
++  # composition below reads one unit set's answer for a source parameter
++  unit_tables <- vector(mode = "list", length = nrow(groups_units_tbl))
+   for (i in seq_len(nrow(groups_units_tbl))) {
+     pknca_units_tbl_args <- list(
+       concu = groups_units_tbl[[concu_col]][i],
+@@ -295,6 +312,7 @@ pknca_units_table.PKNCAdata <- function(concu, ..., conversions = data.frame())
+       # Remove parameters that require dose units since no dose was provided
+       pknca_units_tbl_i <- pknca_units_tbl_i[!is.na(pknca_units_tbl_i$PPORRESU), ]
+     }
++    unit_tables[[i]] <- pknca_units_tbl_i
+     if (length(groups_cols) > 0) {
+       groups_values <- groups_units_tbl[i, groups_cols, drop = FALSE]
+       row.names(groups_values) <- NULL
+@@ -304,7 +322,208 @@ pknca_units_table.PKNCAdata <- function(concu, ..., conversions = data.frame())
+     }
+   }
+ 
+-  as.data.frame(dplyr::bind_rows(ret))
++  ret <- as.data.frame(dplyr::bind_rows(ret))
++  # A secondary parameter takes one of its values from another group, so its
++  # units are only knowable once the groups can differ.  With a single unit set
++  # they cannot, and the table is exactly what it has always been.
++  if (length(groups_cols) > 0 && nrow(groups_units_tbl) > 1) {
++    groups_values <- groups_units_tbl[, groups_cols, drop = FALSE]
++    row.names(groups_values) <- NULL
++    ret <- pknca_units_table_secondary(ret, unit_tables, groups_values)
++  }
++  ret
++}
++
++# The two sides of the quotient a secondary parameter's units compose into,
++# named by the formal arguments of its calculation function:  the requesting
++# interval's own side over the reference interval's side.  A side naming two
++# formals is itself a quotient (bioavailability divides an AUC by a dose on each
++# side).  Any other secondary parameter -- one registered elsewhere, or one that
++# is secondary only because it depends on another -- has no known composition
++# and keeps the single-sided row of its own group.
++secondary_unit_sides <- function(param) {
++  switch(
++    get.interval.cols()[[param]]$FUN,
++    pk.calc.clr = list(own = "ae", ref = "auc"),
++    pk.calc.ratio = list(own = "test", ref = "reference"),
++    pk.calc.f = list(own = c("auc2", "dose2"), ref = c("auc1", "dose1")),
++    NULL
++  )
++}
++
++# One unit string divided by another, in the style of the rest of the table
++pknca_units_quotient <- function(numerator, denominator) {
++  if (is.na(numerator) || is.na(denominator)) {
++    NA_character_
++  } else {
++    sprintf(
++      "%s/%s",
++      pknca_units_add_paren(numerator), pknca_units_add_paren(denominator)
++    )
++  }
++}
++
++# The units of one side of a secondary parameter's quotient under one unit set.
++# `unit_table` is that unit set's table, `formals_used` names the side's formal
++# arguments, `args` maps every formal of that side to the parameter it takes its
++# value from, and `unit_column` chooses the original or the standardized units.
++secondary_unit_side <- function(unit_table, formals_used, args, unit_column) {
++  values <-
++    vapply(
++      X = args[formals_used],
++      FUN = function(target) {
++        ret <- unit_table[[unit_column]][unit_table$PPTESTCD %in% target]
++        if (length(ret) == 1) as.character(ret) else NA_character_
++      },
++      FUN.VALUE = ""
++    )
++  if (anyNA(values)) {
++    NA_character_
++  } else if (length(values) == 1) {
++    unname(values)
++  } else {
++    pknca_units_quotient(values[[1]], values[[2]])
++  }
++}
++
++# Add the reference-keyed unit rows that describe secondary parameters
++#
++# A secondary parameter combines a value from the interval requesting it with
++# one from a reference interval, so where units are group-stratified its units
++# are a quotient of the two groups' units rather than either group's alone.
++# Every row built from a single group therefore gains `<group column>_ref`
++# columns holding `NA` -- "this row describes a result that names no reference"
++# -- and one row per (own group, reference group) pair is added for each
++# secondary parameter whose composition is known.  [pknca_unit_conversion()]
++# joins on the `_ref` columns along with everything else, so a result finds the
++# row describing the pair of groups it actually came from.
++#
++# A quotient of two convertible sides is dimensionless, and that row also gets
++# `PPSTRESU` of "fraction" with the factor that turns the raw quotient into it.
++# A quotient of two sides that are not convertible (an `mg` dose against a
++# `mg/kg` dose) is reported in the composite units, which is the honest answer.
++#
++# @param units The table built from each unit set on its own
++# @param unit_tables That same table per unit set, without the group columns
++# @param group_values One row of group values per unit set, in the same order as
++#   `unit_tables`
++# @returns `units` with the `_ref` columns and the reference-keyed rows added
++# @keywords Internal
++# @noRd
++pknca_units_table_secondary <- function(units, unit_tables, group_values) {
++  ref_cols <- paste0(names(group_values), "_ref")
++  units[ref_cols] <- NA_character_
++  classification <- parameter_classification()
++  params <- names(classification$secondary)[classification$secondary]
++  has_composition <-
++    vapply(
++      X = params,
++      FUN = function(p) !is.null(secondary_unit_sides(p)),
++      FUN.VALUE = TRUE
++    )
++  params <- params[has_composition]
++  n_sets <- nrow(group_values)
++  has_std <- all(c("PPSTRESU", "conversion_factor") %in% names(units))
++  # The factor between one pair of unit strings is the same answer for every
++  # parameter and group pair that composes them
++  factors <- list()
++  new_rows <- list()
++  for (current_param in params) {
++    info <- secondary_param_info(current_param)
++    sides <- secondary_unit_sides(current_param)
++    own_units <-
++      vapply(
++        X = unit_tables,
++        FUN = secondary_unit_side,
++        FUN.VALUE = "",
++        formals_used = sides$own, args = info$own_args, unit_column = "PPORRESU"
++      )
++    ref_units <-
++      vapply(
++        X = unit_tables,
++        FUN = secondary_unit_side,
++        FUN.VALUE = "",
++        formals_used = sides$ref, args = info$ref_args, unit_column = "PPORRESU"
++      )
++    for (own_i in seq_len(n_sets)) {
++      own_table <- unit_tables[[own_i]]
++      base <- own_table[own_table$PPTESTCD %in% current_param, , drop = FALSE]
++      if (nrow(base) != 1) {
++        # The parameter has no units at all in this unit set (no dose data),
++        # and a composed quotient would have none either
++        next
++      }
++      for (ref_i in seq_len(n_sets)) {
++        u_own <- own_units[[own_i]]
++        u_ref <- ref_units[[ref_i]]
++        if (is.na(u_own) || is.na(u_ref) || identical(u_own, u_ref)) {
++          # Units the two sides do not both know, or a quotient of one unit by
++          # itself, say nothing the parameter's registered units do not
++          current <-
++            data.frame(
++              PPORRESU = base$PPORRESU,
++              PPTESTCD = current_param,
++              PPSTRESU = if (has_std) base$PPSTRESU else NA_character_,
++              conversion_factor = if (has_std) base$conversion_factor else NA_real_
++            )
++        } else {
++          composed <- pknca_units_quotient(u_own, u_ref)
++          key <- paste(u_own, u_ref, sep = "|")
++          if (is.null(factors[[key]])) {
++            factors[[key]] <- pknca_unit_reconcile_factor(from = u_own, to = u_ref)
++          }
++          standardized <- NA_character_
++          conversion_factor <- NA_real_
++          if (!is.na(factors[[key]])) {
++            # PPORRES carries `u_own/u_ref` and one u_own is `factors[[key]]`
++            # u_ref, so multiplying by it leaves the pure number the quotient of
++            # two convertible units is.
++            standardized <- "fraction"
++            conversion_factor <- factors[[key]]
++          } else if (has_std) {
++            # Not a fraction, but the sides may still have preferred units of
++            # their own, and the quotient of those is the composite's
++            standardized <-
++              pknca_units_quotient(
++                secondary_unit_side(own_table, sides$own, info$own_args, "PPSTRESU"),
++                secondary_unit_side(unit_tables[[ref_i]], sides$ref, info$ref_args, "PPSTRESU")
++              )
++            conversion_factor <- pknca_unit_reconcile_factor(from = composed, to = standardized)
++          }
++          current <-
++            data.frame(
++              PPORRESU = composed,
++              PPTESTCD = current_param,
++              PPSTRESU = standardized,
++              conversion_factor = conversion_factor
++            )
++        }
++        own_values <- group_values[own_i, , drop = FALSE]
++        ref_values <- group_values[ref_i, , drop = FALSE]
++        names(ref_values) <- ref_cols
++        row.names(own_values) <- row.names(ref_values) <- NULL
++        new_rows[[length(new_rows) + 1L]] <- cbind(own_values, ref_values, current)
++      }
++    }
++  }
++  new_rows <- dplyr::bind_rows(new_rows)
++  if (!has_std && all(is.na(new_rows$PPSTRESU))) {
++    # Nothing standardizes, so the table keeps the two columns it never had
++    new_rows$PPSTRESU <- NULL
++    new_rows$conversion_factor <- NULL
++  } else {
++    if (!has_std) {
++      units$PPSTRESU <- units$PPORRESU
++      units$conversion_factor <- 1
++    }
++    # As in pknca_units_table(): units without a conversion of their own -- and
++    # composites with no conversion to be had -- are already the units to
++    # report, and a factor of 1 keeps them
++    mask_unconverted <- is.na(new_rows$PPSTRESU) | is.na(new_rows$conversion_factor)
++    new_rows$PPSTRESU[mask_unconverted] <- new_rows$PPORRESU[mask_unconverted]
++    new_rows$conversion_factor[mask_unconverted] <- 1
++  }
++  as.data.frame(dplyr::bind_rows(units, new_rows))
+ }
+ 
+ pknca_units_table_unitless <- function() {
+@@ -564,6 +783,57 @@ pknca_units_add_paren <- function(unit) {
+   ifelse(mask_paren, yes=paste0("(", unit, ")"), no=unit)
+ }
+ 
++#' Find the factor converting a value from one unit to another
++#'
++#' @param from,to Single unit strings, as they appear in the "PPORRESU" and
++#'   "PPSTRESU" columns of a unit conversion table
++#' @returns The number that a value in `from` units is multiplied by to express
++#'   it in `to` units.  Units that the `units` package cannot convert between
++#'   are an error.
++#' @keywords Internal
++pknca_units_conversion_factor <- function(from, to) {
++  as.numeric(
++    units::set_units(
++      units::set_units(1, from, mode = "standard"),
++      to, mode = "standard"
++    )
++  )
++}
++
++#' Find the conversion factor between two units, when there is one
++#'
++#' The conversions of [pknca_units_table()] are requested by the user and so
++#' fail loudly when they cannot be made.  This answers the different question of
++#' whether two units PKNCA derived itself can be reconciled -- units that are
++#' unrelated (a concentration and an amount) or outside udunits (`"IU/mL"`) are
++#' an expected answer of "no" rather than a mistake.
++#'
++#' @inheritParams pknca_units_conversion_factor
++#' @returns The number that a value in `from` units is multiplied by to express
++#'   it in `to` units, or `NA_real_` when the two are not convertible or the
++#'   `units` package is not installed.
++#' @seealso [pknca_units_table()]
++#' @keywords Internal
++pknca_unit_reconcile_factor <- function(from, to) {
++  if (length(from) != 1 || length(to) != 1 || is.na(from) || is.na(to)) {
++    NA_real_
++  } else if (identical(as.character(from), as.character(to))) {
++    # Identical units need no conversion, so an analysis whose two sides already
++    # agree does not need the `units` package installed.
++    1
++  } else if (!requireNamespace("units", quietly = TRUE)) {
++    # Reached only where the Suggests-level `units` package is not installed
++    NA_real_ # nocov
++  } else {
++    ret <- try(pknca_units_conversion_factor(from = from, to = to), silent = TRUE)
++    if (inherits(ret, "try-error") || length(ret) != 1 || !is.finite(ret)) {
++      NA_real_
++    } else {
++      ret
++    }
++  }
++}
++
+ #' Perform unit conversion (if possible) on PKNCA results
+ #'
+ #' @param result The results data.frame
+@@ -575,6 +845,13 @@ pknca_units_add_paren <- function(unit) {
+ pknca_unit_conversion <- function(result, units, allow_partial_missing_units = FALSE) {
+   ret <- result
+   if (!is.null(units)) {
++    # A result that names no reference group (nothing linked two intervals, or a
++    # secondary parameter was calculated within one interval) can only be
++    # described by the rows that name no reference either.  Matching it against
++    # the reference-keyed rows as well would give it one row per reference group.
++    for (col in setdiff(grep("_ref$", names(units), value = TRUE), names(ret))) {
++      units <- units[is.na(units[[col]]), setdiff(names(units), col), drop = FALSE]
++    }
+     ret <-
+       dplyr::left_join(
+         ret, units,
+diff --git a/design/secondary-parameters-plan.md b/design/secondary-parameters-plan.md
+index 8cfec9a73..396857e2a 100644
+--- a/design/secondary-parameters-plan.md
++++ b/design/secondary-parameters-plan.md
+@@ -39,7 +39,7 @@ these):
+ | 5 | **Explicit links fail loud; automatic links degrade.**  When an explicit link cannot supply a value (missing reference instance or missing source value), `pk.nca()` aborts (`pknca_error_secondary_ref_value_missing`).  When the automatic path fails (no unique reference found, or an auto-linked value is missing), the affected results are `NA` with an `exclude` reason and a warning (`pknca_warning_secondary_auto_reference`). |
+ | 6 | Reference-group steering: `PKNCAdata()` gains `group_ref`, a **data.frame** of group values (e.g. `data.frame(PCSPEC = "PLASMA")`) that constrains — and can by itself direct — the automatic finder.  `interval_add_secondary()`'s `reference` argument is likewise a data.frame. |
+ | 7 | Ratio starter set: `ratio.cmax`, `ratio.auclast`, `ratio.aucinf.obs`, `ratio.aucinf.pred`, `ratio.aucint.last`, `ratio.aucint.all`.  Bioavailability names its AUC basis: `f` is renamed `f.obs` (AUCinf,obs-based) and gains `f.pred`, `f.last`, `f.int.last`, `f.int.all`, `f.int.obs`, `f.int.pred`. |
+-| 8 | **Unit reconciliation is in scope** and is the final PR (PR 4): reference-side input values are converted into the home group's units before the calculation; non-convertible units give `NA` + reason + `pknca_warning_secondary_units`.  §6.1; the text to post on issue 76 is Appendix A. |
++| 8 | **Superseded by section 6.4** (maintainer direction, 2026-08-31): secondary units go through the units table and its one join, keyed by `_ref`-suffixed group columns with source-composed unit strings, instead of section 6.1's calculation-time value conversion.  Appendix A's issue text describes the superseded approach; post section 6.4's summary instead. |
+ | 9 | Sparse data (`is_sparse_pk(data)` is `TRUE`) with any secondary parameter requested aborts with `pknca_error_secondary_sparse_unsupported`.  Lifting this is a to-do (§8). |
+ | 10 | Aggregated (across-subject) references are **not** planned: parallel-design comparisons of that kind are bioavailability-style analyses already served by the existing bioavailability/`be_assess()` calculation methods. |
+ 
+@@ -129,7 +129,6 @@ New condition classes (all follow the existing `pknca_error_*` /
+ | `pknca_error_group_ref_value` | error | A `group_ref` column contains a value that appears nowhere in that column of the concentration data. |
+ | `pknca_warning_secondary_ref_exists` | warning | `interval_add_secondary()` skips a test row that already has a different pointer. |
+ | `pknca_warning_secondary_auto_reference` | warning | The **automatic** path failed for some instances (no unique reference; auto-linked value missing); results are `NA` with reasons. |
+-| `pknca_warning_secondary_units` | warning | PR 1–3: group-stratified units differ between home and reference for a source parameter.  PR 4 narrows it to: the units differ and are **not convertible** (result `NA` + reason). |
+ | `pknca_message_secondary_ref_created` | message | The finder derived and created/linked a reference interval. |
+ | `pknca_message_secondary_created_interval` | message | `interval_add_secondary()` created reference rows / assigned ids (visible). |
+ 
+@@ -138,6 +137,12 @@ reference interval (either ephemerally by the engine or visibly by the
+ helper): silently calculating what a requested parameter depends on is default
+ PKNCA behavior.
+ 
++There is also deliberately **no** condition for units that differ between the
++two profiles.  Sections 6.1/6.3 raised `pknca_warning_secondary_units` when the
++two sides could not be reconciled; section 6.4 removed both the reconciliation
++and the class, because units that differ are not a failure — the result keeps
++the composite units of the values it was calculated from.
++
+ ---
+ 
+ ## 3. PR 1 — engine and explicit linkage
+@@ -1617,6 +1622,250 @@ Tests (extend `test-secondary-parameters.R`):
+ 6. Post the Appendix A text as a comment on issue 76 (maintainer action —
+    the `gh` credential in this environment is read-only).
+ 
++### 6.3 As built (PR 4, section 6.1's reconciliation — historical)
++
++**Superseded before merge by section 6.4.**  The reconciliation described here
++was implemented, reviewed, and then replaced on the same branch;
++`secondary_reconcile_units()`, `secondary_units_lookup()`, and
++`pknca_warning_secondary_units` no longer exist.  What survives is
++`pknca_unit_reconcile_factor()` and `pknca_units_conversion_factor()`, which
++the units builder now uses.  The list below is kept as the record of what was
++built and why, not as a description of the code.
++
++PR 4 landed with these differences from the section-6 text above; trust the
++code over the sketches:
++
++* **The exclusion reason and the warning say "this interval"**, not "the home
++  group", following the naming decision of section 5.9.  The reason is
++  `"Units of '<target>' differ between the reference ('<u_ref>') and this
++  interval ('<u_own>') and are not convertible"`.
++* **The fast path is tighter than "the units table has no group columns"**:
++  reconciliation is skipped unless the units table has a group column that the
++  reference *overrides*.  The reference group differs from the requesting
++  interval's own group only in the override columns, so a units table
++  stratified by anything else gives both sides the same row and has nothing to
++  reconcile either.
++* **A units gap is not a linkage failure.**  It gives `NA` with its reason and
++  its own `pknca_warning_secondary_units`, and is deliberately kept out of the
++  `pknca_warning_secondary_auto_reference` count, which is about references
++  that could not be found.  `pk_nca_secondary()` therefore carries two reason
++  variables into one `NA` arm rather than reusing `failed_reason`.
++* `pknca_units_conversion_factor(from, to)` is the extracted
++  `units::set_units()` machinery, kept fail-loud because a `conversions`
++  argument is user-declared and a silent `NA` there would become a conversion
++  factor of 1.  `pknca_unit_reconcile_factor()` wraps it: identical units give
++  1 without consulting the `units` package at all, and anything the package
++  cannot do (a unit outside udunits, two units of different dimensions, a
++  package that is not installed) gives `NA_real_`.
++* Conversion factors are memoized per `<param>|<target>|<u_ref>|<u_own>` key
++  across the whole pass, alongside the set of keys already warned about, so a
++  fixture with many instances converts once and warns once.
++* **The `units`-unavailable branch is `# nocov`.**  The suite has no mocking
++  pattern for optional packages (only `skip_if_not_installed()`), and the
++  package already treats the same `requireNamespace("units")` branch in
++  `pknca_units_table()` that way.
++* **`PPSTRES` needed no change**, and a test pins why:  the reference-side
++  value arrives in the requesting group's `PPORRESU`, so the requesting group's
++  `conversion_factor` — the one the standard join applies — is coherent with
++  it.  The two conversions compose.
++* **The vignette is `vignettes/v09-secondary-parameters.Rmd`.**  Section 6.2's
++  suggested `v22` is taken (`v22-time-to-steady-state.Rmd`); `v09` is the first
++  free number and follows the core series the topic belongs with (`v03`
++  interval selection, `v07` unit conversion, `v08` imputation).
++* The vignette defines a small `kable_intervals()` helper, because
++  `check.interval.specification()` fills in every registered parameter and an
++  interval specification printed whole is a few hundred columns wide.
++  `interval_longer()` would say it better but is not exported.
++* The vignette's bioavailability example uses lower test-treatment
++  concentrations than the section 3.14 test fixture, so that `f.obs` is below
++  1;  a worked example showing 113% bioavailability distracts from the point.
++  Renal clearance keeps the fixture's numbers, which the text derives by hand.
++* Section 6.2's "wrappers (accumulation ratio, metabolite ratio)" are spelled
++  through `interval_add_secondary()` (section 4.6 removed the wrappers):  the
++  accumulation ratio as a `reference` of `start`/`end`, the metabolite ratio
++  through `group_ref`.
++* `_pkgdown.yml` still lists no vignettes or reference index, so it is
++  unchanged as section 6.2 item 3 anticipated.
++* **`as.data.frame(filter_requested = TRUE)` shows the linkage columns, and
++  that is the intended behavior** (maintainer clarification, 2026-08-31):
++  the join deliberately returns the interval-level metadata columns
++  (`impute` and the grouping columns are intentional in that output), and
++  `interval_id` and the pointer columns behave identically -- they describe
++  the interval row, so a pointer also appears beside the row's other
++  parameters (`clr.last_ref` next to `ae`), just as a shared `impute` does.
++  An implementation report initially miscategorized this as a leak; it is
++  not, and there is nothing to fix.  The vignette selects display columns
++  for narrative width only.
++
++### 6.4 Revision: units through reference-suffixed group columns
++
++**Supersedes section 6.1's calculation-time reconciliation** (maintainer
++direction, 2026-08-31): secondary units should work like every other unit in
++PKNCA — declaratively, through the units table and its one join — rather than
++by converting values at calculation time.  The mechanism is the `_ref` suffix
++the linkage already uses, extended to group columns.
++
++#### The mechanism
++
++1. **Secondary result rows carry the reference group.**  `pk_nca_secondary()`
++   adds a `<group column>_ref` column for every result group column to the
++   rows it creates, holding the reference instance's value (it already
++   computes `ref_group`); primary rows hold `NA` in those columns.  This also
++   makes the linkage machine-readable in the results, where `PPANMETH` today
++   is prose (keep `PPANMETH` — it is the human-readable form).
++2. **The units table gains reference-keyed rows for secondary parameters.**
++   For each secondary parameter, `pknca_units_table()` emits one row per
++   (own-group unit set x reference-group unit set) pair, keyed by the group
++   columns plus their `_ref` twins, with `PPORRESU` composed from the correct
++   sides:
++
++   | Family | `PPORRESU` composition |
++   |---|---|
++   | `clr.*` | `amountu_own / (timeu_ref * concu_ref)` (the AUC's units are the reference profile's) |
++   | `ratio.<x>` | `<x>u_own / <x>u_ref` |
++   | `f.*` | `(aucu_own / doseu_own) / (aucu_ref / doseu_ref)` |
++
++   When the composed quotient is dimensionally unitless (convertible sides),
++   also emit `PPSTRESU = "fraction"` with the `conversion_factor` computed by
++   `pknca_unit_reconcile_factor()` (repurposed from PR 4 — it stays; only the
++   calculation-time value conversion goes).  When it is not, the composite
++   string stands as the honest original units and no factor is emitted.
++   Primary parameters' rows carry `NA` in every `_ref` column.
++3. **The join does not change.**  `pknca_unit_conversion()` already joins by
++   the intersection of column names, and `dplyr::left_join()`'s default
++   `na_matches = "na"` pairs primary rows with the `NA`-`_ref` units rows and
++   secondary rows with their pair rows (verified empirically).  A
++   hand-supplied units table without `_ref` columns degrades gracefully: the
++   intersection excludes them and secondary rows join by their own group as
++   every row does today.
++4. **Delete the calculation-time reconciliation** (`secondary_reconcile_units()`
++   and its call): `PPORRES` stays the raw computed value and `PPORRESU`
++   describes it truthfully; `PPSTRES` conversion happens in the join as for
++   every parameter.  `pknca_warning_secondary_units` disappears —
++   non-convertible units are no longer a failure but a result in honest
++   composite units (the standard `allow_partial_missing_units` behavior
++   covers a units row that cannot be built at all).
++
++#### Why this is better than 6.1
++
++- One unit system: same table, same join, same user override (a user can edit
++  or supply the `_ref` rows, the standard PKNCA escape hatch that
++  calculation-time conversion had no equivalent of).
++- The label follows the sources instead of the value being converted to fit a
++  single-group label; nothing is `NA`'d for unit reasons.
++- Dimensional honesty catches real mistakes: a cross-group `f.*` between a
++  `mg` dose and a `mg/kg` dose composes to a non-unitless quotient and shows
++  it, where a blanket `"fraction"` label silently passed.
++
++#### Holes found in review, and their resolutions
++
++- **Composition needs own/ref annotations that `unit_type` alone does not
++  carry** (`renal_clearance` = amount/(time*conc) does not say which side
++  each factor is from).  Resolution: implement the three families above
++  explicitly in the units builder, driven by the registration's `pknca_ref()`
++  arguments; a third-party secondary parameter without a known composition
++  falls back to today's own-group single-side row, and a general registry
++  hook (a declared unit expression with own/ref sides) is a follow-up if
++  demand appears.
++- **`select_minimal_grouping_cols()` interplay**: the minimal-grouping
++  reduction of the units table must keep the columns that distinguish
++  reference unit sets; the builder must run the reduction over own and `_ref`
++  columns together.  Implementation checkpoint with a test (two unit sets
++  distinguished only by a column the reduction would otherwise drop).
++- **Which pairs to emit**: all distinct own x ref unit-set pairs (small in
++  practice; the join selects), because the auto-built table is constructed
++  before links are resolved.
++- **Extra columns in results**: `<group col>_ref` appears on all rows (NA for
++  primary), consistent with the intentional interval-metadata columns;
++  `summary()` and the CDISC translation must be verified to tolerate and
++  ignore them (checkpoint with tests).
++- **Name collisions**: a group column may not be named after a parameter
++  (already enforced), so `<group col>_ref` cannot collide with a
++  `<parameter>_ref` pointer; a user group column that itself ends in `_ref`
++  gets a `_ref_ref` twin — legal, ugly, documented.
++- **`timeu` across groups**: the AUC composition uses the reference group's
++  `timeu`; groups reporting time in different units is rare but real, and the
++  composition above handles it by construction.
++
++#### Migration
++
++The open PR 4 branch carries the 6.1 reconciliation.  Recommended: rework it
++on the same branch before merge (replace the reconciliation commit's engine
++change, keep `pknca_unit_reconcile_factor()`, rewrite the 6.1 unit tests to
++the compositions above, and update the NEWS bullet), so the superseded
++behavior never ships.  Alternative: merge PR 4 as-is and follow with a PR 5 —
++worse, because NEWS would describe convert-then-un-convert behavior across
++two entries of one release.
++
++The recommended path is the one taken: the reconciliation was removed on the
++same branch and replaced with the mechanism above before merge.
++
++#### As built (the 6.4 rework)
++
++Differences from the section-6.4 text above; trust the code over the sketches:
++
++* **`pknca_unit_conversion()` did need one change**, where item 3 above says it
++  needs none.  A results table with *no* `_ref` columns — nothing linked two
++  intervals, either because no secondary parameter was requested or because one
++  was calculated inside a single interval by the legacy same-interval path —
++  would otherwise match every reference-keyed row of a stratified table and be
++  duplicated once per reference group.  The join now drops the units rows that
++  name a reference the results have no column to describe, and then joins
++  exactly as before.  The other direction (a hand-supplied table with no `_ref`
++  columns) needed nothing, as the plan said.
++* **The composition is driven by the calculation function, not by parameter
++  names.**  `secondary_unit_sides()` returns the two sides of the quotient as
++  formal arguments of `pk.calc.clr`, `pk.calc.ratio`, and `pk.calc.f`, and
++  `secondary_param_info()` maps those formals to the parameters whose units they
++  take.  All three families of the table above fall out of one rule
++  (`own side / ref side`, each side itself a quotient for `f.*`); any other
++  secondary parameter keeps the single-sided row of its own group, as the
++  "holes found in review" section anticipated.
++* **`clr.last.dn`, `clr.obs.dn`, and `clr.pred.dn` get no composed row.**  They
++  are secondary only because they depend on `clr.*`, they carry no
++  `pknca_ref()` argument, and `secondary_param_info()` rejects them outright
++  (`pk.calc.dn`'s `dose` is not a parameter result), so no result row for them
++  can exist for a composed row to describe.  Calculating them across a link is
++  §8 work, not units work.
++* **A pair whose two sides compose to the same unit string keeps today's row.**
++  A `ratio.*` or `f.*` within one unit set would otherwise read
++  `(ng/mL)/(ng/mL)` where `fraction` is exact and already right; a `clr.*`
++  within one unit set composes to exactly the string the `renal_clearance` unit
++  type produces anyway.  A side whose units are unknown (`NA` — no dose units,
++  for instance) likewise keeps today's row instead of degrading it to `NA`.
++* **The (own group = reference group) pairs are emitted, not just the
++  off-diagonal ones.**  An accumulation ratio references another interval of the
++  *same* group, and its result row names that group on both sides.
++* **`PPSTRESU`/`conversion_factor` are added to the whole table as soon as any
++  composed quotient standardizes.**  Following `pknca_units_table()`'s own rule,
++  every row without a conversion of its own gets `PPSTRESU = PPORRESU` and a
++  factor of 1.  A stratified analysis whose groups report convertible
++  concentrations therefore gains `PPSTRES`/`PPSTRESU` result columns it did not
++  have before; every value in them equals the original except the standardized
++  quotients.
++* **Preferred units compose too.**  When the table already standardizes (a
++  scalar `timeu` with `timeu_pref` alongside column-based concentration units)
++  and the composed quotient is *not* dimensionless, `PPSTRESU` is composed from
++  the two sides' `PPSTRESU` values and the factor is the conversion between the
++  two composites; where that conversion does not exist the composite is its own
++  standardized unit.
++* **`as.data.frame(out_format = "wide")` had to drop the `_ref` columns.**  The
++  checkpoint above names `summary()` and the CDISC translation as the reporting
++  paths to verify; both ignore the new columns as it expected, but the wide
++  layout makes every remaining column a row key, so a reference group split its
++  interval's row in two (a urine collection's `ae` on one row and its
++  `clr.last` on another).  It now drops them where it already drops `PPANMETH`
++  and the units columns.
++* **The minimal-grouping reduction is run once and applied symmetrically.**  The
++  `_ref` columns are the twins of the columns the reduction kept, not of every
++  group column.  The checkpoint above reads as though a second, wider reduction
++  were needed, but the group-to-unit-set map is the same function on both sides:
++  a column set that determines the own unit set determines the reference unit
++  set as well.  Results still carry `_ref` twins of *every* group column, and
++  the join takes the intersection.  The checkpoint's test earns its place all
++  the same — it pins that a dropped group column stays dropped in the table
++  while both subjects still get the composed units.
++
+ ---
+ 
+ ## 7. Definition of done (every PR)
+diff --git a/inst/WORDLIST b/inst/WORDLIST
+index 281f4b4f2..8ace8abdb 100644
+--- a/inst/WORDLIST
++++ b/inst/WORDLIST
+@@ -199,3 +199,4 @@ lmer
+ varIdent
+ swR
+ swT
++udunits
+diff --git a/man/pknca_unit_reconcile_factor.Rd b/man/pknca_unit_reconcile_factor.Rd
+new file mode 100644
+index 000000000..75e1dbc97
+--- /dev/null
++++ b/man/pknca_unit_reconcile_factor.Rd
+@@ -0,0 +1,28 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/unit-support.R
++\name{pknca_unit_reconcile_factor}
++\alias{pknca_unit_reconcile_factor}
++\title{Find the conversion factor between two units, when there is one}
++\usage{
++pknca_unit_reconcile_factor(from, to)
++}
++\arguments{
++\item{from, to}{Single unit strings, as they appear in the "PPORRESU" and
++"PPSTRESU" columns of a unit conversion table}
++}
++\value{
++The number that a value in \code{from} units is multiplied by to express
++it in \code{to} units, or \code{NA_real_} when the two are not convertible or the
++\code{units} package is not installed.
++}
++\description{
++The conversions of \code{\link[=pknca_units_table]{pknca_units_table()}} are requested by the user and so
++fail loudly when they cannot be made.  This answers the different question of
++whether two units PKNCA derived itself can be reconciled -- units that are
++unrelated (a concentration and an amount) or outside udunits (\code{"IU/mL"}) are
++an expected answer of "no" rather than a mistake.
++}
++\seealso{
++\code{\link[=pknca_units_table]{pknca_units_table()}}
++}
++\keyword{Internal}
+diff --git a/man/pknca_units_conversion_factor.Rd b/man/pknca_units_conversion_factor.Rd
+new file mode 100644
+index 000000000..9b7b78702
+--- /dev/null
++++ b/man/pknca_units_conversion_factor.Rd
+@@ -0,0 +1,21 @@
++% Generated by roxygen2: do not edit by hand
++% Please edit documentation in R/unit-support.R
++\name{pknca_units_conversion_factor}
++\alias{pknca_units_conversion_factor}
++\title{Find the factor converting a value from one unit to another}
++\usage{
++pknca_units_conversion_factor(from, to)
++}
++\arguments{
++\item{from, to}{Single unit strings, as they appear in the "PPORRESU" and
++"PPSTRESU" columns of a unit conversion table}
++}
++\value{
++The number that a value in \code{from} units is multiplied by to express
++it in \code{to} units.  Units that the \code{units} package cannot convert between
++are an error.
++}
++\description{
++Find the factor converting a value from one unit to another
++}
++\keyword{Internal}
+diff --git a/man/pknca_units_table.Rd b/man/pknca_units_table.Rd
+index cd5a0867b..f339c97de 100644
+--- a/man/pknca_units_table.Rd
++++ b/man/pknca_units_table.Rd
+@@ -49,6 +49,28 @@ This data.frame is typically used for the \code{units} argument for \code{\link[
+ If a unit is not given, then all of the units derived from that unit will be
+ \code{NA}.
+ }
++\section{Secondary parameters and reference groups}{
++
++
++A secondary parameter (renal clearance, bioavailability, a ratio; see
++\code{vignette("v09-secondary-parameters")}) takes one value from the interval
++requesting it and another from a reference interval, so its units are a
++quotient of the two groups' units.  When the \code{PKNCAdata} method finds more
++than one set of units among the groups, the table therefore gains a
++\verb{<group column>_ref} column for each of its group columns and, for each
++secondary parameter, one row per pair of (own group, reference group) with
++"PPORRESU" composed from the correct side of each.  Rows describing a
++result that names no reference -- every primary parameter, and a secondary
++parameter calculated without a reference -- hold \code{NA} in the \verb{_ref}
++columns, and results carrying no reference group join to them.  A quotient
++whose two sides are convertible into one another is dimensionless, and such
++a row also gets "PPSTRESU" of "fraction" with the "conversion_factor" that
++turns the raw quotient into that number.
++
++With one set of units for every group there is no reference side to name
++and no \verb{_ref} column is added.
++}
++
+ \examples{
+ pknca_units_table() # only parameters that are unitless
+ pknca_units_table(
+diff --git a/tests/testthat/test-secondary-parameters.R b/tests/testthat/test-secondary-parameters.R
+index 1f58943d3..3f3f07c62 100644
+--- a/tests/testthat/test-secondary-parameters.R
++++ b/tests/testthat/test-secondary-parameters.R
+@@ -492,20 +492,342 @@ test_that("a linked secondary result is given units", {
+   expect_equal(d_res$PPORRES[d_res$PPTESTCD %in% "clr.last"], 350/144)
+ })
+ 
+-# 17b: group-stratified units that differ between the two sides are announced
+-# (PR 4 replaces the warning with conversion of the reference-side value)
+-test_that("units differing between the requesting interval and reference groups warn", {
++# The renal-clearance fixture with units given per group:  the plasma
++# concentrations are reported in `plasma_concu` and the urine collection in
++# mg/L, so the AUC the renal clearance divides by is not in the concentration
++# units of the group the result is reported on.
++# The unit arguments of PKNCAconc() name DATA COLUMNS here (concu = "conc_units"
++# reads each row's units from the conc_units column), which is how units are
++# stratified per group; a value with no matching column is the unit itself.
++o_data_units_sec <- function(plasma_concu, subjects = 1) {
++  d_conc_u <- do.call(rbind, lapply(subjects, function(s) transform(d_conc_sec, subject = s)))
++  d_conc_u$conc_units <- ifelse(d_conc_u$PCSPEC %in% "plasma", plasma_concu, "mg/L")
++  d_conc_u$time_units <- "hr"
++  d_conc_u$amount_units <- "mg"
++  o_conc_u <-
++    PKNCAconc(
++      d_conc_u, conc~time|PCSPEC+subject, volume = "vol",
++      concu = "conc_units", timeu = "time_units", amountu = "amount_units"
++    )
++  PKNCAdata(o_conc_u, intervals = intervals_sec, options = list(auc.method = "linear"))
++}
++
++# 6.4-1: a renal clearance divides a urine amount by a plasma AUC, so its units
++# name the plasma group's concentration and not the urine group's
++test_that("a secondary result takes its units from the groups its values came from", {
++  expect_no_warning(res <- pk.nca(o_data_units_sec("ng/mL")))
++  d_res <- as.data.frame(res)
++  # The value is the raw quotient:  nothing is converted to make one group's
++  # units fit a value that did not come from one group
++  expect_equal(d_res$PPORRES[d_res$PPTESTCD %in% "clr.last"], 350/144)
++  expect_equal(d_res$PPORRESU[d_res$PPTESTCD %in% "clr.last"], "mg/(hr*ng/mL)")
++  # The composite is not dimensionless, so it is its own standardized unit
++  expect_equal(d_res$PPSTRESU[d_res$PPTESTCD %in% "clr.last"], "mg/(hr*ng/mL)")
++  expect_equal(d_res$PPSTRES[d_res$PPTESTCD %in% "clr.last"], 350/144)
++  # ... and each source keeps the units of the group it was calculated in
++  expect_equal(d_res$PPORRES[d_res$PPTESTCD %in% "auclast"], 144)
++  expect_equal(d_res$PPORRESU[d_res$PPTESTCD %in% "auclast"], "hr*ng/mL")
++  expect_equal(d_res$PPORRESU[d_res$PPTESTCD %in% "ae"], "mg")
++})
++
++# 6.4-6: the reference group is on the result row, which is what the units
++# table keys the composed units on
++test_that("a secondary result names the group its reference came from", {
++  d_res <- as.data.frame(pk.nca(o_data_sec))
++  mask_secondary <- d_res$PPTESTCD %in% "clr.last"
++  expect_equal(d_res$PCSPEC_ref[mask_secondary], "plasma")
++  expect_equal(d_res$subject_ref[mask_secondary], 1)
++  # A result that took nothing from another interval names no reference
++  expect_true(all(is.na(d_res$PCSPEC_ref[!mask_secondary])))
++  expect_true(all(is.na(d_res$subject_ref[!mask_secondary])))
++})
++
++# 6.4-2a: the units table itself, which is where the composition happens
++test_that("pknca_units_table() composes secondary units from both sides", {
++  units_tbl <- o_data_units_sec("ng/mL")$units
++  mask_clr_pair <-
++    units_tbl$PPTESTCD %in% "clr.last" &
++    units_tbl$PCSPEC %in% "urine" & units_tbl$PCSPEC_ref %in% "plasma"
++  expect_equal(units_tbl$PPORRESU[mask_clr_pair], "mg/(hr*ng/mL)")
++  # The row for a renal clearance that names no reference is the single-group
++  # row the table has always had
++  mask_clr_alone <-
++    units_tbl$PPTESTCD %in% "clr.last" &
++    units_tbl$PCSPEC %in% "urine" & is.na(units_tbl$PCSPEC_ref)
++  expect_equal(units_tbl$PPORRESU[mask_clr_alone], "mg/(hr*mg/L)")
++  # A quotient of two convertible concentrations is a pure number:  PPORRES
++  # carries mg/L over ng/mL, and one mg/L is 1000 ng/mL
++  mask_ratio_pair <-
++    units_tbl$PPTESTCD %in% "ratio.cmax" &
++    units_tbl$PCSPEC %in% "urine" & units_tbl$PCSPEC_ref %in% "plasma"
++  expect_equal(units_tbl$PPORRESU[mask_ratio_pair], "(mg/L)/(ng/mL)")
++  expect_equal(units_tbl$PPSTRESU[mask_ratio_pair], "fraction")
++  expect_equal(units_tbl$conversion_factor[mask_ratio_pair], 1000)
++  # A ratio of a group against itself is the fraction it has always been
++  mask_ratio_same <-
++    units_tbl$PPTESTCD %in% "ratio.cmax" &
++    units_tbl$PCSPEC %in% "urine" & units_tbl$PCSPEC_ref %in% "urine"
++  expect_equal(units_tbl$PPORRESU[mask_ratio_same], "fraction")
++  expect_equal(units_tbl$conversion_factor[mask_ratio_same], 1)
++})
++
++# 6.4-2b: a ratio of two analytes reported in different concentration units is
++# the raw quotient in composite units, standardized to the number it is
++test_that("a convertible ratio is reported raw and standardized to a fraction", {
++  d_conc_ratio <-
++    data.frame(
++      subject = 1,
++      Analyte = rep(c("parent", "metabolite"), each = 3),
++      time = rep(c(0, 12, 24), times = 2),
++      conc = c(4, 10, 2, 8000, 20000, 4000),
++      conc_units = rep(c("mg/L", "ng/mL"), each = 3),
++      time_units = "hr"
++    )
++  o_conc_ratio <-
++    PKNCAconc(d_conc_ratio, conc~time|Analyte+subject, concu = "conc_units", timeu = "time_units")
++  intervals_ratio <-
++    data.frame(
++      Analyte = c("parent", "metabolite"),
++      start = 0, end = 24,
++      interval_id = c("parent024", NA),
++      cmax = TRUE,
++      ratio.cmax = c(FALSE, TRUE),
++      ratio.cmax_ref = c(NA, "parent024")
++    )
++  o_data_ratio <-
++    PKNCAdata(
++      o_conc_ratio, intervals = intervals_ratio, options = list(auc.method = "linear")
++    )
++  d_res <- as.data.frame(pk.nca(o_data_ratio))
++  d_ratio <- d_res[d_res$PPTESTCD %in% "ratio.cmax", ]
++  # 20000 ng/mL against 10 mg/L, each side in the units it is reported in
++  expect_equal(d_ratio$PPORRES, 2000)
++  expect_equal(d_ratio$PPORRESU, "(ng/mL)/(mg/L)")
++  expect_equal(d_ratio$Analyte_ref, "parent")
++  # One ng/mL is 0.001 mg/L, so the true ratio is 2000*0.001
++  expect_equal(pknca_unit_reconcile_factor("ng/mL", "mg/L"), 0.001)
++  expect_equal(d_ratio$PPSTRESU, "fraction")
++  expect_equal(d_ratio$PPSTRES, 2)
++})
++
++# 6.4-4: with one set of units for every group there is no reference side to
++# name, and the table is what it has always been
++test_that("uniform units add no reference rows and change no result", {
++  o_conc_u <-
++    PKNCAconc(
++      d_conc_sec, conc~time|PCSPEC+subject, volume = "vol",
++      concu = "ng/mL", timeu = "hr", amountu = "mg"
++    )
++  o_data_u <-
++    PKNCAdata(o_conc_u, intervals = intervals_sec, options = list(auc.method = "linear"))
++  expect_false(any(grepl("_ref$", names(o_data_u$units))))
++  d_united <- as.data.frame(pk.nca(o_data_u))
++  d_unitless <- as.data.frame(pk.nca(o_data_sec))
++  expect_equal(d_united[, names(d_unitless)], d_unitless)
++  expect_equal(d_united$PPORRESU[d_united$PPTESTCD %in% "clr.last"], "mg/(hr*ng/mL)")
++})
++
++# 6.4-3: units that cannot be reconciled are not a failure -- the value is the
++# same quotient it always was, reported in the units it is actually in
++test_that("a secondary result in units that do not reconcile is still reported", {
++  expect_no_warning(res <- pk.nca(o_data_units_sec("IU/mL")))
++  d_res <- as.data.frame(res)
++  expect_equal(d_res$PPORRES[d_res$PPTESTCD %in% "clr.last"], 350/144)
++  expect_equal(d_res$PPORRESU[d_res$PPTESTCD %in% "clr.last"], "mg/(hr*IU/mL)")
++  expect_true(is.na(d_res$exclude[d_res$PPTESTCD %in% "clr.last"]))
++  # Nothing in these units reduces to a fraction, so nothing standardizes
++  expect_false("PPSTRESU" %in% names(d_res))
++  expect_equal(d_res$PPORRES[d_res$PPTESTCD %in% "ae"], 350)
++})
++
++# 6.4-5: a bioavailability between a dose in mg and a dose in mg/kg is not a
++# fraction, and its units say so instead of calling it one
++test_that("a bioavailability across incompatible dose units keeps composite units", {
++  # The crossover fixture of test 9, with the hand-computable trapezoids
++  # auclast(ref) = 41 and auclast(test) = 24.5
++  d_conc_u <-
++    data.frame(
++      treatment = rep(c("ref", "test"), each = 5),
++      subject = 1,
++      time = rep(c(0, 1, 2, 4, 8), 2),
++      conc = c(0, 10, 8, 5, 2, 0, 6, 5, 3, 1),
++      conc_units = "ng/mL",
++      time_units = "hr"
++    )
++  d_dose_u <-
++    data.frame(
++      treatment = c("ref", "test"), subject = 1, time = 0, dose = c(100, 50),
++      du = c("mg", "mg/kg")
++    )
++  o_conc_u <-
++    PKNCAconc(d_conc_u, conc~time|treatment+subject, concu = "conc_units", timeu = "time_units")
++  o_dose_u <- PKNCAdose(d_dose_u, dose~time|treatment+subject, doseu = "du")
++  intervals_f <-
++    data.frame(
++      treatment = c("ref", "test"),
++      start = 0, end = Inf,
++      interval_id = c("refprofile", NA),
++      auclast = TRUE,
++      totdose = TRUE,
++      f.last = c(FALSE, TRUE),
++      f.last_ref = c(NA, "refprofile")
++    )
++  o_data_f <-
++    PKNCAdata(
++      o_conc_u, o_dose_u, intervals = intervals_f, options = list(auc.method = "linear")
++    )
++  d_res <- as.data.frame(pk.nca(o_data_f))
++  d_f <- d_res[d_res$PPTESTCD %in% "f.last", ]
++  expect_equal(d_f$PPORRES, (24.5/50)/(41/100))
++  expect_equal(d_f$PPORRESU, "((hr*ng/mL)/(mg/kg))/((hr*ng/mL)/mg)")
++  # mg and mg/kg are not the same dimension, so the quotient is not a fraction
++  expect_false("PPSTRESU" %in% names(d_res))
++  expect_equal(d_f$treatment_ref, "ref")
++})
++
++# A preferred unit applies to a composite the same way it applies to any other:
++# each side is standardized and the quotient of those is what the composite
++# standardizes to
++test_that("preferred units reach the composed units of a secondary parameter", {
+   d_conc_u <- d_conc_sec
+-  d_conc_u$cu <- ifelse(d_conc_u$PCSPEC %in% "plasma", "ng/mL", "mg/L")
+-  d_conc_u$tu <- "hr"
+-  d_conc_u$au <- "mg"
++  # concu and amountu name data columns (see o_data_units_sec); timeu = "hr"
++  # matches no column and so is the unit itself
++  d_conc_u$conc_units <- ifelse(d_conc_u$PCSPEC %in% "plasma", "ng/mL", "mg/L")
++  d_conc_u$amount_units <- "mg"
+   o_conc_u <-
+     PKNCAconc(
+       d_conc_u, conc~time|PCSPEC+subject, volume = "vol",
+-      concu = "cu", timeu = "tu", amountu = "au"
++      concu = "conc_units", timeu = "hr", amountu = "amount_units", timeu_pref = "day"
++    )
++  o_data_u <-
++    PKNCAdata(o_conc_u, intervals = intervals_sec, options = list(auc.method = "linear"))
++  d_res <- as.data.frame(pk.nca(o_data_u))
++  mask_clr <- d_res$PPTESTCD %in% "clr.last"
++  expect_equal(d_res$PPORRES[mask_clr], 350/144)
++  expect_equal(d_res$PPORRESU[mask_clr], "mg/(hr*ng/mL)")
++  # A day is 24 hours, so the same clearance per day is 24 times the number
++  expect_equal(d_res$PPSTRESU[mask_clr], "mg/(day*ng/mL)")
++  expect_equal(d_res$PPSTRES[mask_clr], 350/144*24)
++})
++
++# 6.4-7: the units table keys the reference side on the columns its minimal
++# grouping kept, and a group column it dropped stays dropped
++test_that("the reference columns follow the minimal grouping of the units table", {
++  o_data_two <- o_data_units_sec("ng/mL", subjects = 1:2)
++  expect_equal(grep("_ref$", names(o_data_two$units), value = TRUE), "PCSPEC_ref")
++  d_res <- as.data.frame(pk.nca(o_data_two))
++  d_clr <- d_res[d_res$PPTESTCD %in% "clr.last", ]
++  expect_equal(nrow(d_clr), 2L)
++  expect_equal(d_clr$PPORRES, rep(350/144, 2))
++  expect_equal(d_clr$PPORRESU, rep("mg/(hr*ng/mL)", 2))
++  # The results still name every one of the reference's group columns, and the
++  # subject the units table dropped is each result's own
++  expect_equal(d_clr$subject, c(1, 2))
++  expect_equal(d_clr$subject_ref, c(1, 2))
++})
++
++# A stratified units table carries a row for every pair of groups whether or not
++# anything links two intervals.  A renal clearance calculated inside a single
++# interval names no reference group, so it must join the row that names none --
++# matching the pairs as well would report it once per candidate reference.
++test_that("a same-interval secondary result joins the units row that names no reference", {
++  d_conc_leg <-
++    data.frame(
++      subject = 1,
++      PCSPEC = rep(c("urine", "feces"), each = 3),
++      time = rep(c(0, 12, 24), times = 2),
++      conc = c(2, 1, 0.5, 4, 2, 1),
++      vol = c(100, 150, 200, 50, 75, 100),
++      conc_units = rep(c("mg/L", "ng/mL"), each = 3),
++      time_units = "hr",
++      amount_units = "mg"
++    )
++  o_conc_leg <-
++    PKNCAconc(
++      d_conc_leg, conc~time|PCSPEC+subject, volume = "vol",
++      concu = "conc_units", timeu = "time_units", amountu = "amount_units"
+     )
+-  o_data_u <- PKNCAdata(o_conc_u, intervals = intervals_sec, options = list(auc.method = "linear"))
+-  expect_warning(pk.nca(o_data_u), class = "pknca_warning_secondary_units")
++  o_data_leg <-
++    PKNCAdata(
++      o_conc_leg,
++      intervals = data.frame(start = 0, end = 24, ae = TRUE, auclast = TRUE, clr.last = TRUE),
++      options = list(auc.method = "linear")
++    )
++  expect_true("PCSPEC_ref" %in% names(o_data_leg$units))
++  d_res <- as.data.frame(pk.nca(o_data_leg))
++  expect_false(any(grepl("_ref$", names(d_res))))
++  d_clr <- d_res[d_res$PPTESTCD %in% "clr.last", ]
++  expect_equal(nrow(d_clr), 2L)
++  expect_equal(d_clr$PPORRES[d_clr$PCSPEC %in% "urine"], 450/27)
++  expect_equal(d_clr$PPORRESU[d_clr$PCSPEC %in% "urine"], "mg/(hr*mg/L)")
++  expect_equal(d_clr$PPORRES[d_clr$PCSPEC %in% "feces"], 450/54)
++  expect_equal(d_clr$PPORRESU[d_clr$PCSPEC %in% "feces"], "mg/(hr*ng/mL)")
++})
++
++# 6.4-3': a units table given by hand carries no reference rows and needs none:
++# every result joins by its own group as it always has
++test_that("a units table without reference columns describes results by their own group", {
++  units_flat <-
++    pknca_units_table(
++      concu = "ng/mL", doseu = NA_character_, amountu = "mg", timeu = "hr"
++    )
++  expect_false(any(grepl("_ref$", names(units_flat))))
++  o_data_flat <-
++    PKNCAdata(
++      as_PKNCAconc(o_data_units_sec("ng/mL")), intervals = intervals_sec,
++      units = units_flat, options = list(auc.method = "linear")
++    )
++  d_res <- as.data.frame(pk.nca(o_data_flat))
++  expect_equal(d_res$PPORRES[d_res$PPTESTCD %in% "clr.last"], 350/144)
++  expect_equal(d_res$PPORRESU[d_res$PPTESTCD %in% "clr.last"], "mg/(hr*ng/mL)")
++  # The urine group's own concentration units are irrelevant to a table that
++  # does not stratify by group
++  expect_equal(d_res$PPORRESU[d_res$PPTESTCD %in% "auclast"], "hr*ng/mL")
++  # The reference columns are still on the results; the join simply ignores them
++  expect_equal(d_res$PCSPEC_ref[d_res$PPTESTCD %in% "clr.last"], "plasma")
++})
++
++# The reference columns are extra result columns that every reporting path
++# ignores
++test_that("summary() and the CDISC output ignore the reference group columns", {
++  res <- pk.nca(o_data_units_sec("ng/mL"))
++  d_summary <- as.data.frame(summary(res))
++  expect_false(any(grepl("_ref$", names(d_summary))))
++  # The summary heads each column with the parameter's pretty name and units,
++  # which for a secondary parameter are the composed ones
++  clr_column <- "Renal clearance (from AUClast) (mg/(hr*ng/mL))"
++  expect_true(clr_column %in% names(d_summary))
++  expect_equal(d_summary[[clr_column]][d_summary$PCSPEC %in% "urine"], "2.43")
++  d_cdisc <- as.data.frame(res, out_format = "cdisc")
++  expect_true("RENALCL" %in% d_cdisc$PPTESTCD)
++  d_requested <- as.data.frame(res, filter_requested = TRUE)
++  expect_equal(sort(unique(d_requested$PPTESTCD)), c("ae", "auclast", "clr.last"))
++  # The wide layout gives one row per interval, so the reference group cannot be
++  # a row key there:  the urine collection's amount and clearance share a row
++  d_wide <- as.data.frame(res, out_format = "wide")
++  expect_false(any(grepl("_ref$", names(d_wide))))
++  expect_equal(nrow(d_wide), 2L)
++  mask_urine <- d_wide$PCSPEC %in% "urine"
++  expect_equal(d_wide[["ae (mg)"]][mask_urine], 350)
++  expect_equal(d_wide[["clr.last (mg/(hr*ng/mL))"]][mask_urine], 350/144)
++})
++
++# 6.1-4: the factor between two unit strings, or NA when there is not one
++test_that("pknca_unit_reconcile_factor() converts what it can and refuses the rest", {
++  skip_if_not_installed("units")
++  expect_equal(pknca_unit_reconcile_factor("ng/mL", "mg/L"), 0.001)
++  expect_equal(pknca_unit_reconcile_factor("hr*ng/mL", "hr*mg/L"), 0.001)
++  expect_equal(pknca_unit_reconcile_factor("mg/L", "ng/mL"), 1000)
++  # Identical units need no conversion, and are answered without the units package
++  expect_equal(pknca_unit_reconcile_factor("hr*ng/mL", "hr*ng/mL"), 1)
++  # A unit udunits does not know
++  expect_equal(pknca_unit_reconcile_factor("hr*IU/mL", "hr*mg/L"), NA_real_)
++  # Two units it knows, of different dimensions
++  expect_equal(pknca_unit_reconcile_factor("mg", "hr*mg/L"), NA_real_)
++  # A units table that cannot answer gives NA rather than an error
++  expect_equal(pknca_unit_reconcile_factor(NA_character_, "mg"), NA_real_)
++  expect_equal(pknca_unit_reconcile_factor("mg", NA_character_), NA_real_)
++  expect_equal(pknca_unit_reconcile_factor(character(0), "mg"), NA_real_)
+ })
+ 
+ # 18: a linked secondary parameter is summarized like any other
+diff --git a/tests/testthat/test-unit-support.R b/tests/testthat/test-unit-support.R
+index 6a6a65926..8e62ee961 100644
+--- a/tests/testthat/test-unit-support.R
++++ b/tests/testthat/test-unit-support.R
+@@ -139,6 +139,14 @@ test_that("pknca_units_add_paren", {
+   expect_equal(pknca_units_add_paren("mg*kg"), "(mg*kg)")
+ })
+ 
++test_that("pknca_units_quotient divides one unit by another", {
++  expect_equal(pknca_units_quotient("mg", "hr*ng/mL"), "mg/(hr*ng/mL)")
++  expect_equal(pknca_units_quotient("ng/mL", "mg/L"), "(ng/mL)/(mg/L)")
++  # Units that are not known compose into units that are not known
++  expect_equal(pknca_units_quotient(NA_character_, "mg"), NA_character_)
++  expect_equal(pknca_units_quotient("mg", NA_character_), NA_character_)
++})
++
+ test_that("pknca_units_table treats missing, NULL, and NA the same", {
+   expect_equal(
+     pknca_units_table(),
+@@ -372,13 +380,20 @@ test_that("pknca_units_table for PKNCAdata", {
+   o_data <- PKNCAdata(o_conc, o_dose)
+   units_table <- expect_no_error(pknca_units_table(o_data))
+ 
++  # A primary parameter is described by one row per stratum, naming no
++  # reference group.  The standardization columns come from the secondary
++  # parameters whose composed units reduce to a fraction.
+   expect_equal(
+     units_table[units_table$PPTESTCD == "cmax",],
+     data.frame(
+       specimen = c("blood", "urine", "blood", "urine"),
+       analyte = rep(c("A", "B"), each = 2),
+       PPORRESU = c("ng/mL", "pg/mL", "ug/mL", "pg/mL"),
+-      PPTESTCD = "cmax"
++      PPTESTCD = "cmax",
++      specimen_ref = NA_character_,
++      analyte_ref = NA_character_,
++      PPSTRESU = c("ng/mL", "pg/mL", "ug/mL", "pg/mL"),
++      conversion_factor = 1
+     ), ignore_attr = TRUE
+   )
+ 
+@@ -394,7 +409,8 @@ test_that("pknca_units_table for PKNCAdata", {
+       data.frame(
+         treatment = c("drug1", "drug2"),
+         PPORRESU = c("mg", "ug"),
+-        PPTESTCD = "totdose"
++        PPTESTCD = "totdose",
++        treatment_ref = NA_character_
+       ), ignore_attr = TRUE
+     )
+ 
+diff --git a/vignettes/v09-secondary-parameters.Rmd b/vignettes/v09-secondary-parameters.Rmd
+new file mode 100644
+index 000000000..87369440d
+--- /dev/null
++++ b/vignettes/v09-secondary-parameters.Rmd
+@@ -0,0 +1,701 @@
++---
++title: "Secondary Parameters (Renal Clearance, Bioavailability, and Ratios)"
++output:
++  rmarkdown::html_vignette:
++    toc: yes
++    toc_depth: 6
++vignette: >
++  %\VignetteIndexEntry{Secondary Parameters (Renal Clearance, Bioavailability, and Ratios)}
++  %\VignetteEngine{knitr::rmarkdown}
++  %\VignetteEncoding{UTF-8}
++---
++
++```{r setup, include = FALSE}
++knitr::opts_chunk$set(
++  collapse = TRUE,
++  comment = "#>"
++)
++```
++
++```{r libraries}
++library(PKNCA)
++library(knitr)
++```
++
++# What a secondary parameter is
++
++Almost every NCA parameter is calculated from the concentrations and doses
++within one interval of one profile.  A few cannot be:
++
++* Renal clearance divides the amount excreted into a urine collection by the
++  plasma AUC over the same times.  The amount and the AUC are measured on
++  different profiles.
++* Bioavailability compares the dose-normalized exposure of one administration
++  with a reference administration.
++* A ratio (an accumulation ratio, a metabolite ratio) compares a parameter with
++  the same parameter somewhere else.
++
++PKNCA calls these **secondary parameters** and calculates them by linking two
++intervals together.  `pknca_parameter_table()` says which parameters are
++secondary:
++
++```{r secondary-parameter-list}
++d_params <- pknca_parameter_table()
++kable(
++  d_params[d_params$secondary, c("parameter", "concept", "sample_type")],
++  row.names = FALSE
++)
++```
++
++Two words are used throughout:
++
++* The **requesting interval** is the intervals row that asks for the parameter.
++  The result is reported there:  on that row's group and that row's times.
++* The **reference interval** is the row that supplies the value from the other
++  profile.
++
++Secondary parameters are never selected automatically by
++`pknca_interval_table()` or the default interval specification, because one
++interval cannot say what the other profile is.  They are requested by name, like
++any other parameter.
++
++# Linking two intervals by hand
++
++Two columns of the interval specification make the link:
++
++| Column | Meaning |
++|---|---|
++| `interval_id` | A name for this row, so that another row can point at it.  `NA` on rows nothing points at. |
++| `<parameter>_ref` | The `interval_id` of the interval supplying the cross-profile value for `<parameter>`. |
++
++The identifiers may be character names, factors, or numbers such as row indices.
++Whatever they are, `interval_id` and the pointer columns must be comparable with
++each other, so that a pointer can be matched to an identifier.
++
++## Renal clearance, start to finish
++
++These data have one subject with a plasma profile and a urine collection.  For
++the urine rows, `conc` is the concentration measured in the collection and `vol`
++is the collection volume:
++
++```{r renal-data}
++d_conc <- data.frame(
++  subject = 1,
++  PCSPEC = rep(c("plasma", "urine"), times = c(3, 2)),
++  time = c(0, 12, 24, 0, 12),
++  conc = c(10, 6, 2, 2, 1),
++  vol  = c(NA, NA, NA, 100, 150)
++)
++o_conc <- PKNCAconc(d_conc, conc~time|PCSPEC+subject, volume = "vol")
++```
++
++The plasma row is given an `interval_id`, and the urine row requests `clr.last`
++pointing at it:
++
++```{r renal-intervals}
++intervals_linked <-
++  data.frame(
++    PCSPEC = c("plasma", "urine"),
++    start = 0, end = 24,
++    interval_id = c("plasma024", NA),
++    auclast = c(TRUE, FALSE),
++    ae = c(FALSE, TRUE),
++    clr.last = c(FALSE, TRUE),
++    clr.last_ref = c(NA, "plasma024")
++  )
++kable(intervals_linked)
++```
++
++```{r renal-calculate}
++o_data <-
++  PKNCAdata(
++    o_conc, intervals = intervals_linked,
++    options = list(auc.method = "linear")
++  )
++results_linked <- pk.nca(o_data)
++kable(as.data.frame(results_linked))
++```
++
++Every number can be checked by hand.  With linear trapezoids the plasma AUC is
++$(10+6)/2 \times 12 + (6+2)/2 \times 12 = 144$, the amount excreted is
++$2 \times 100 + 1 \times 150 = 350$, and the renal clearance is
++$350/144 = `r signif(350/144, 4)`$.
++
++Note where the result is reported:  on the urine row, which requested it, and
++not on the plasma row that supplied the AUC.
++
++## The reference interval gains what the link needs
++
++`auclast` was requested explicitly above to make the arithmetic visible, but it
++did not have to be.  A reference interval gains whatever the link reads from it,
++the same way any parameter's dependencies are calculated, and without
++announcement:
++
++```{r renal-silent}
++intervals_implicit <- intervals_linked
++intervals_implicit$auclast <- c(FALSE, FALSE)
++intervals_implicit$cmax <- c(TRUE, FALSE)
++o_data_implicit <-
++  PKNCAdata(
++    o_conc, intervals = intervals_implicit,
++    options = list(auc.method = "linear")
++  )
++results_implicit <- pk.nca(o_data_implicit)
++kable(as.data.frame(results_implicit))
++```
++
++The `auclast` row is in the results because it was calculated, but it was not
++one of the parameters asked for.  `filter_requested = TRUE` reports only the
++requests:
++
++```{r renal-filter-requested}
++d_requested <- as.data.frame(results_implicit, filter_requested = TRUE)
++kable(d_requested[, c("PCSPEC", "subject", "start", "end", "PPTESTCD", "PPORRES")])
++```
++
++# Letting PKNCA find the reference interval
++
++Naming the reference by hand is not usually necessary.  When a secondary
++parameter is requested with no pointer and no way to calculate it within its own
++interval, PKNCA derives the reference from the data.  Here the specification
++asks only about the urine collection:
++
++```{r auto-intervals}
++intervals_urine <-
++  data.frame(PCSPEC = "urine", start = 0, end = 24, ae = TRUE, clr.last = TRUE)
++o_data_auto <-
++  PKNCAdata(
++    o_conc, intervals = intervals_urine,
++    options = list(auc.method = "linear")
++  )
++results_auto <- pk.nca(o_data_auto)
++kable(as.data.frame(results_auto))
++```
++
++The message reports the interval that was derived, and the answer is the one the
++hand-written linkage gives.  The derivation is mechanical rather than a list of
++special cases:  the parameter is measured over an interval collection while
++everything it references is a spot sample (this is what renal clearance is), the
++concentration data declare a collection `volume`, and so the reference is looked
++for among the profiles that have no collection volume.  Of those, each interval
++takes the one differing from its own group in the fewest columns.
++
++Derived intervals are used for the calculation only.  The intervals that come
++back with the results are the ones that went in:
++
++```{r auto-ephemeral}
++identical(results_auto$data$intervals, check.interval.specification(intervals_urine))
++```
++
++## When more than one profile could be the reference
++
++Adding a second spot-sample profile leaves no single nearest reference.  Rather
++than guessing or stopping the analysis, PKNCA reports `NA` with the reason:
++
++```{r auto-ambiguous}
++d_conc_serum <-
++  rbind(
++    d_conc,
++    data.frame(
++      subject = 1, PCSPEC = "serum", time = c(0, 12, 24), conc = c(9, 5, 2),
++      vol = NA_real_
++    )
++  )
++o_conc_serum <-
++  PKNCAconc(d_conc_serum, conc~time|PCSPEC+subject, volume = "vol")
++intervals_three <-
++  data.frame(
++    PCSPEC = c("urine", "plasma", "serum"),
++    start = 0, end = 24,
++    ae = c(TRUE, FALSE, FALSE),
++    auclast = c(FALSE, TRUE, TRUE),
++    clr.last = c(TRUE, FALSE, FALSE)
++  )
++o_data_ambiguous <-
++  PKNCAdata(
++    o_conc_serum, intervals = intervals_three,
++    options = list(auc.method = "linear")
++  )
++d_ambiguous <- as.data.frame(pk.nca(o_data_ambiguous))
++kable(d_ambiguous[d_ambiguous$PPTESTCD %in% "clr.last", ])
++```
++
++Everything else in the analysis is still calculated.  One warning is raised per
++parameter, however many intervals it affected, and the reason for each result is
++in its `exclude` column.
++
++## Steering the choice with `group_ref`
++
++`PKNCAdata(group_ref = )` says which profiles may be references.  It settles the
++ambiguity above:
++
++```{r group-ref}
++o_data_steered <-
++  PKNCAdata(
++    o_conc_serum, intervals = intervals_three,
++    options = list(auc.method = "linear"),
++    group_ref = data.frame(PCSPEC = "plasma")
++  )
++d_steered <- as.data.frame(pk.nca(o_data_steered))
++kable(d_steered[d_steered$PPTESTCD %in% "clr.last", ])
++```
++
++`group_ref` also directs comparisons that the data cannot tell apart at all.
++Nothing in a data set says which analyte is the parent and which the metabolite,
++so a metabolite ratio has to be told:
++
++```{r group-ref-parameter-specific}
++d_conc_two <-
++  rbind(
++    data.frame(
++      Analyte = rep(c("parent", "metabolite"), each = 5),
++      PCSPEC = "plasma", subject = 1,
++      time = rep(c(0, 1, 2, 4, 8), 2),
++      conc = c(0, 10, 8, 5, 2, 0, 4, 3.5, 2, 0.8),
++      vol = NA_real_, dur = 0
++    ),
++    data.frame(
++      Analyte = rep(c("parent", "metabolite"), each = 2),
++      PCSPEC = "urine", subject = 1,
++      time = rep(c(0, 12), 2),
++      conc = c(2, 1, 1, 0.5),
++      vol = rep(c(100, 150), 2), dur = 12
++    )
++  )
++o_conc_two <-
++  PKNCAconc(
++    d_conc_two, conc~time|Analyte+PCSPEC+subject,
++    volume = "vol", duration = "dur"
++  )
++intervals_two <-
++  data.frame(
++    Analyte = c("parent", "metabolite", "parent", "metabolite"),
++    PCSPEC = c("urine", "urine", "plasma", "plasma"),
++    start = 0,
++    end = c(24, 24, Inf, Inf),
++    ae = c(TRUE, TRUE, FALSE, FALSE),
++    clr.last = c(TRUE, TRUE, FALSE, FALSE),
++    aucinf.obs = c(FALSE, FALSE, TRUE, FALSE),
++    ratio.aucinf.obs = c(FALSE, FALSE, FALSE, TRUE)
++  )
++```
++
++Renal clearance and the metabolite ratio need to be steered by different
++columns:  the renal clearance of each analyte belongs with the plasma profile of
++the same analyte, while the ratio compares one analyte with the other.  A
++`parameter` column says which rows apply to which parameter, and the columns a
++parameter's row leaves `NA` do not constrain it:
++
++```{r group-ref-table}
++group_ref_by_param <-
++  data.frame(
++    parameter = c("clr.last", "ratio.aucinf.obs"),
++    PCSPEC = c("plasma", NA),
++    Analyte = c(NA, "parent")
++  )
++kable(group_ref_by_param)
++```
++
++```{r group-ref-two-contrasts}
++o_data_two <-
++  PKNCAdata(
++    o_conc_two, intervals = intervals_two,
++    options = list(auc.method = "linear"),
++    group_ref = group_ref_by_param
++  )
++d_two <- as.data.frame(pk.nca(o_data_two))
++kable(d_two[d_two$PPTESTCD %in% c("clr.last", "ratio.aucinf.obs"), ])
++```
++
++A named list of data.frames, one per parameter, says the same thing:
++
++```{r group-ref-list, eval = FALSE}
++PKNCAdata(
++  o_conc_two, intervals = intervals_two,
++  options = list(auc.method = "linear"),
++  group_ref =
++    list(
++      clr.last = data.frame(PCSPEC = "plasma"),
++      ratio.aucinf.obs = data.frame(Analyte = "parent")
++    )
++)
++```
++
++A plain data.frame with no `parameter` column applies to every secondary
++parameter.
++
++# Writing the linkage into the intervals
++
++`interval_add_secondary()` writes the same linkage the engine derives, but
++visibly, into the intervals it returns.  Use it to see the linkage, to edit it,
++or to link something the derivation cannot reach.
++
++What it returns has been through `check.interval.specification()`, which fills
++in every registered parameter, so it is a few hundred columns wide.  These
++examples show only the columns that say something:
++
++```{r display-helper}
++kable_intervals <- function(intervals) {
++  says_something <-
++    vapply(
++      X = intervals,
++      FUN = function(x) !is.logical(x) || any(x, na.rm = TRUE),
++      FUN.VALUE = TRUE
++    )
++  kable(intervals[, says_something, drop = FALSE])
++}
++```
++
++```{r add-secondary}
++intervals_plain <-
++  data.frame(
++    PCSPEC = c("plasma", "urine"),
++    start = 0, end = 24,
++    auclast = c(TRUE, FALSE),
++    ae = c(FALSE, TRUE)
++  )
++kable_intervals(
++  interval_add_secondary(
++    intervals_plain,
++    param = "clr.last",
++    reference = data.frame(PCSPEC = "plasma")
++  )
++)
++```
++
++The plasma row was given an identifier, the urine row was given the request and
++the pointer, and nothing else changed.
++
++`reference` is a data.frame describing the reference interval:  each of its
++columns must match (and), and any of its rows may match (or).  When nothing
++matches, the reference interval is created and the creation is reported:
++
++```{r add-secondary-create}
++intervals_urine_only <-
++  data.frame(PCSPEC = "urine", start = 0, end = 24, ae = TRUE)
++kable_intervals(
++  interval_add_secondary(
++    intervals_urine_only,
++    param = "clr.last",
++    reference = data.frame(PCSPEC = "plasma")
++  )
++)
++```
++
++The created plasma row requests `auclast`, which is what the link reads from it.
++
++Because `reference` can name `start` and `end`, the same call links intervals in
++time rather than across groups.  An accumulation ratio compares a dosing
++interval with the first one:
++
++```{r accumulation-ratio}
++d_conc_acc <-
++  data.frame(
++    subject = 1,
++    time = c(0, 6, 12, 24, 30, 36, 48),
++    conc = c(0, 8, 5, 2, 12, 8, 3)
++  )
++d_dose_acc <- data.frame(subject = 1, time = c(0, 24), dose = 100)
++intervals_acc <-
++  interval_add_secondary(
++    data.frame(start = c(0, 24), end = c(24, 48), aucint.last = TRUE),
++    param = "ratio.aucint.last",
++    reference = data.frame(start = 0, end = 24)
++  )
++kable_intervals(intervals_acc)
++```
++
++```{r accumulation-ratio-calculate}
++o_data_acc <-
++  PKNCAdata(
++    PKNCAconc(d_conc_acc, conc~time|subject),
++    PKNCAdose(d_dose_acc, dose~time|subject),
++    intervals = intervals_acc,
++    options = list(auc.method = "linear")
++  )
++kable(as.data.frame(pk.nca(o_data_acc)))
++```
++
++An interval that already names a different reference is left alone with a
++warning, so the helper never silently re-points an analysis.
++
++# Bioavailability
++
++Bioavailability compares two administrations, so its reference is the other
++treatment rather than another specimen.  Both the dose and the AUC come from the
++reference interval:
++
++```{r bioavailability}
++d_conc_f <-
++  data.frame(
++    treatment = rep(c("ref", "test"), each = 5),
++    subject = 1,
++    time = rep(c(0, 1, 2, 4, 8), 2),
++    conc = c(0, 10, 8, 5, 2, 0, 4, 3.5, 2, 0.8)
++  )
++d_dose_f <-
++  data.frame(treatment = c("ref", "test"), subject = 1, time = 0, dose = c(100, 50))
++intervals_f <-
++  data.frame(
++    treatment = c("ref", "test"),
++    start = 0, end = Inf,
++    interval_id = c("refprofile", NA),
++    aucinf.obs = TRUE,
++    totdose = TRUE,
++    f.obs = c(FALSE, TRUE),
++    f.obs_ref = c(NA, "refprofile")
++  )
++o_data_f <-
++  PKNCAdata(
++    PKNCAconc(d_conc_f, conc~time|treatment+subject),
++    PKNCAdose(d_dose_f, dose~time|treatment+subject),
++    intervals = intervals_f
++  )
++d_f <- as.data.frame(pk.nca(o_data_f))
++kable(d_f[d_f$PPTESTCD %in% c("totdose", "aucinf.obs", "f.obs"), ])
++```
++
++The result is the ratio of the dose-normalized exposures:
++
++```{r bioavailability-check}
++value_of <- function(param, trt) {
++  d_f$PPORRES[d_f$PPTESTCD %in% param & d_f$treatment %in% trt]
++}
++(value_of("aucinf.obs", "test")/value_of("totdose", "test")) /
++  (value_of("aucinf.obs", "ref")/value_of("totdose", "ref"))
++```
++
++Bioavailability names the AUC it is built on, because which AUC was used changes
++the answer and is not recoverable from the number:
++
++```{r bioavailability-bases}
++f_params <-
++  c("f.obs", "f.pred", "f.last", "f.int.obs", "f.int.pred",
++    "f.int.last", "f.int.all")
++kable(
++  data.frame(
++    parameter = f_params,
++    `AUC basis` =
++      vapply(
++        X = f_params,
++        FUN = function(x) get.interval.cols()[[x]]$formalsmap$auc2,
++        FUN.VALUE = ""
++      ),
++    check.names = FALSE
++  ),
++  row.names = FALSE
++)
++```
++
++The `ratio.*` parameters are named the same way:  `ratio.cmax`,
++`ratio.auclast`, `ratio.aucinf.obs`, `ratio.aucinf.pred`, `ratio.aucint.last`,
++and `ratio.aucint.all` each compare the parameter they are named for.
++
++# Exclusions cross the link
++
++An exclusion on a value that feeds a secondary parameter reaches the result.
++Here the plasma profile has too few points for a half-life, so the `aucinf.obs`
++that extrapolates with it is excluded, and the renal clearance built on that AUC
++inherits the reason:
++
++```{r exclusion-data}
++d_conc_x <-
++  data.frame(
++    subject = 1,
++    PCSPEC = rep(c("plasma", "urine"), times = c(3, 2)),
++    time = c(0, 2, 4, 0, 6),
++    conc = c(10, 8, 7, 2, 1),
++    vol  = c(NA, NA, NA, 100, 150)
++  )
++intervals_x <-
++  data.frame(
++    PCSPEC = c("plasma", "urine"),
++    start = 0, end = 6,
++    interval_id = c("plasma06", NA),
++    aucinf.obs = c(TRUE, FALSE),
++    ae = c(FALSE, TRUE),
++    clr.obs = c(FALSE, TRUE),
++    clr.obs_ref = c(NA, "plasma06")
++  )
++o_data_x <-
++  PKNCAdata(
++    PKNCAconc(d_conc_x, conc~time|PCSPEC+subject, volume = "vol"),
++    intervals = intervals_x,
++    options = list(auc.method = "linear")
++  )
++d_x <- as.data.frame(pk.nca(o_data_x))
++kable(
++  d_x[
++    d_x$PPTESTCD %in% c("half.life", "aucinf.obs", "ae", "clr.obs"),
++    c("PCSPEC", "PPTESTCD", "PPORRES", "exclude")
++  ]
++)
++```
++
++This is the property that post-hoc division of a results table does not have:
++an excluded input cannot quietly become a reported clearance.
++
++# Units that differ between the two profiles
++
++A secondary parameter takes one value from the interval requesting it and
++another from the reference interval, so when units are given per group its units
++are a quotient of the two groups' units.  The urine collection below is reported
++in mg/L and the plasma profile in ng/mL:
++
++```{r units-data}
++d_conc_u <- d_conc
++d_conc_u$cu <- ifelse(d_conc_u$PCSPEC %in% "plasma", "ng/mL", "mg/L")
++d_conc_u$tu <- "hr"
++d_conc_u$au <- "mg"
++o_conc_u <-
++  PKNCAconc(
++    d_conc_u, conc~time|PCSPEC+subject, volume = "vol",
++    concu = "cu", timeu = "tu", amountu = "au"
++  )
++o_data_u <-
++  PKNCAdata(
++    o_conc_u, intervals = intervals_linked,
++    options = list(auc.method = "linear")
++  )
++d_u <- as.data.frame(pk.nca(o_data_u))
++kable(d_u[, c("PCSPEC", "PCSPEC_ref", "PPTESTCD", "PPORRES", "PPORRESU")])
++```
++
++The renal clearance is still $350/144 = `r signif(350/144, 4)`$ -- no value is
++converted -- and its units are `mg/(hr*ng/mL)`:  the `mg` from the urine
++collection that supplied the amount, and the `hr*ng/mL` from the plasma profile
++that supplied the AUC.  Reporting it as `mg/(hr*mg/L)`, the urine group's own
++units, would describe a different number.
++
++Two things make that work.  Each secondary result names the group its reference
++came from in a `<group column>_ref` column (above, `PCSPEC_ref` is `plasma` on
++the renal clearance and `NA` on everything else), and the units table carries a
++row for each pair of groups:
++
++```{r units-table}
++u <- o_data_u$units
++kable(u[u$PPTESTCD %in% c("auclast", "ae", "clr.last"), ], row.names = FALSE)
++```
++
++The rows with `NA` in `PCSPEC_ref` describe results that took nothing from
++another interval;  the rest describe each pair.  The table is an ordinary
++`PKNCAdata(units = )` argument, so these rows can be edited or replaced like any
++other unit assignment.
++
++## A ratio standardizes to a fraction
++
++When both sides of the quotient are convertible into one another the quotient is
++dimensionless, and the table also gives it a `PPSTRESU` of `fraction` with the
++factor that turns the raw quotient into the number it stands for.  Here the
++metabolite is reported in ng/mL and the parent in mg/L:
++
++```{r units-ratio}
++d_conc_r <-
++  data.frame(
++    subject = 1,
++    Analyte = rep(c("parent", "metabolite"), each = 3),
++    time = rep(c(0, 12, 24), times = 2),
++    conc = c(4, 10, 2, 8000, 20000, 4000),
++    cu = rep(c("mg/L", "ng/mL"), each = 3),
++    tu = "hr"
++  )
++intervals_r <-
++  data.frame(
++    Analyte = c("parent", "metabolite"),
++    start = 0, end = 24,
++    interval_id = c("parent024", NA),
++    cmax = TRUE,
++    ratio.cmax = c(FALSE, TRUE),
++    ratio.cmax_ref = c(NA, "parent024")
++  )
++o_data_r <-
++  PKNCAdata(
++    PKNCAconc(d_conc_r, conc~time|Analyte+subject, concu = "cu", timeu = "tu"),
++    intervals = intervals_r,
++    options = list(auc.method = "linear")
++  )
++d_r <- as.data.frame(pk.nca(o_data_r))
++kable(
++  d_r[, c("Analyte", "Analyte_ref", "PPTESTCD", "PPORRES", "PPORRESU",
++          "PPSTRES", "PPSTRESU")]
++)
++```
++
++`PPORRES` is 20000 divided by 10, in `(ng/mL)/(mg/L)`.  One ng/mL is 0.001 mg/L,
++so the ratio those measurements stand for is $20000/10 \times 0.001 = 2$, which
++is `PPSTRES`.
++
++## A quotient that is not a fraction
++
++Calling every ratio a fraction hides a real mistake.  A bioavailability between
++a dose in mg and a dose in mg/kg is not dimensionless, and the units say so
++instead of reporting the number as a `fraction`:
++
++```{r units-bioavailability}
++d_conc_fu <- d_conc_f
++d_conc_fu$cu <- "ng/mL"
++d_conc_fu$tu <- "hr"
++d_dose_fu <- d_dose_f
++d_dose_fu$du <- c("mg", "mg/kg")
++o_data_fu <-
++  PKNCAdata(
++    PKNCAconc(d_conc_fu, conc~time|treatment+subject, concu = "cu", timeu = "tu"),
++    PKNCAdose(d_dose_fu, dose~time|treatment+subject, doseu = "du"),
++    intervals = intervals_f
++  )
++d_fu <- as.data.frame(pk.nca(o_data_fu))
++kable(d_fu[d_fu$PPTESTCD %in% "f.obs", c("treatment", "treatment_ref", "PPORRES", "PPORRESU")])
++```
++
++The number is the same one `pk.calc.f()` has always computed;  the units are now
++what it is a number of.  Dividing a mg/kg dose by a mg dose needs a body weight
++that PKNCA was never given.
++
++Units the `units` package cannot reconcile -- `IU/mL` against `mg/L`, or two
++units of different dimensions -- behave the same way:  the value is reported and
++the composite units stand.  Nothing is `NA` for unit reasons.
++
++# Reporting
++
++`PPANMETH` discloses the reference interval on every linked result:  how it
++differs from the interval reporting the result, and its times.
++
++```{r ppanmeth}
++d_linked <- as.data.frame(results_linked)
++d_linked$PPANMETH[d_linked$PPTESTCD %in% "clr.last"]
++```
++
++Secondary parameters are summarized like any other parameter, on the interval
++that requested them.  Rows that did not request the parameter are `.`:
++
++```{r summary}
++kable(as.data.frame(summary(results_linked)))
++```
++
++`as.data.frame(filter_requested = TRUE)` reports only the parameters the
++interval specification asked for, dropping the source values calculated to
++support a link.
++
++# Limitations
++
++* Sparse concentration data (`PKNCAconc(sparse = TRUE)`) with any secondary
++  parameter requested is an error.  Supporting it is planned.
++* The reference for an absolute bioavailability is not yet derived from the
++  route of administration; give it with `group_ref`, a `f.obs_ref` pointer, or
++  `interval_add_secondary()`.
++* The CDISC `PPTESTCD` of a ratio does not yet depend on what the ratio compares
++  (accumulation against metabolite ratio).
++* `exclude()` and the `exclude_nca_*()` functions work on a finished
++  `PKNCAresults` and cannot reach across groups, so an exclusion applied after
++  the calculation does not propagate along a link the way one set during the
++  calculation does.
++* Molecular-weight adjustment of a metabolite ratio (a molar conversion) is a
++  units-layer feature that is not yet available.
++
++# See also
++
++* `vignette("v03-selection-of-calculation-intervals")` for interval
++  specifications generally.
++* `vignette("v07-unit-conversion")` for how units are assigned and converted.
++* `vignette("v80-writing-parameter-functions")` for writing a parameter that
++  needs another interval.
+diff --git a/vignettes/v80-writing-parameter-functions.Rmd b/vignettes/v80-writing-parameter-functions.Rmd
+index 0474bb7dd..043ca0399 100644
+--- a/vignettes/v80-writing-parameter-functions.Rmd
++++ b/vignettes/v80-writing-parameter-functions.Rmd
+@@ -83,6 +83,31 @@ Two related points:
+ * A constant is not a calculation dependency, so it does not appear in `get.parameter.deps(recursive=TRUE)` and does not affect whether PKNCA reports the parameter as needing dose or volume information.
+ * Mapping an argument to `NULL` (as with `lambda.z` and `clast` above) drops it from the call so that it keeps its default.  Do this for any argument whose name matches an NCA parameter that this parameter does not use.  An argument named `lambda.z` that is left out of the `formalsmap` is filled from the calculated `lambda.z` when one exists, and otherwise from the interval column of the same name, which is the `TRUE`/`FALSE` requesting the parameter rather than a value.
+ 
++## Parameters That Need Another Interval
++
++A few parameters cannot be calculated from one interval of one profile.  Renal clearance divides an amount excreted into a urine collection by the plasma AUC over the same times, and bioavailability compares two administrations.  Wrapping a `formalsmap` value in `pknca_ref` says that the argument takes its value from the *reference* interval -- the one named by the `<parameter>_ref` column of the interval specification -- instead of from the interval being calculated:
++
++    add.interval.col("clr.last",
++                     FUN="pk.calc.clr",
++                     values=c(FALSE, TRUE),
++                     unit_type="renal_clearance",
++                     pretty_name="Renal clearance (from AUClast)",
++                     formalsmap=list(auc=pknca_ref("auclast")),
++                     depends="ae",
++                     desc="Renal clearance, AUClast",
++                     selection = list(secondary = TRUE))
++
++A `pknca_ref` anywhere in the `formalsmap` makes the parameter *secondary*, whether or not `selection` says so.  `pknca_parameter_table` reports which parameters are secondary, and the vignette "Secondary Parameters" (`vignette("v09-secondary-parameters", package="PKNCA")`) covers requesting and linking them.
++
++A secondary parameter is calculated after every interval has been calculated, from the results rather than from the concentrations, so its function may take only NCA parameter values as inputs.  That imposes two requirements, which `add.interval.col` does not check when the parameter is registered (the parameters it names may not be registered yet) but which are checked, with an error naming the parameter, the first time it is calculated:
++
++* Every formal of the function other than `...` must be covered:  either it is named in the `formalsmap`, or it is itself the name of a registered NCA parameter and is filled from the interval being calculated.  A formal that is neither -- `conc`, `time`, `options`, or a name of your own -- cannot be filled, because the data and the options are no longer at hand.  `I()` constants and `NULL` mappings work as they do for any parameter, since neither needs a value looked up.
++* Every argument taken from the interval being calculated must be listed in `depends`, so that it is calculated there before the secondary calculation reads it.  In the registration above, `ae` is a formal of `pk.calc.clr` named after a parameter, so it is filled from the interval calculating `clr.last` and appears in `depends`.  `auc` comes from the reference interval and does not.
++
++Exclusions cross the link with no help from the function.  As for any parameter, the `exclude` reasons of all of the inputs -- from either interval -- are joined with `"; "`, the `exclude` attribute the function set on its own return value is added to them, and `"DO NOT EXCLUDE"` on the return value clears all of them.  An excluded plasma AUC therefore cannot quietly become a reported renal clearance.
++
++Units are the one thing a new secondary parameter does not get for free.  Where units are given per group, the two intervals can report theirs differently, and `pknca_units_table` composes the units of `pk.calc.clr`, `pk.calc.ratio`, and `pk.calc.f` from both sides for that reason.  A parameter built on a calculation function of your own is given the units of its `unit_type` under its own interval's group, as any primary parameter is;  supply a `units` table to `PKNCAdata` if that is not what its two sides mean.
++
+ # Tell PKNCA How to Summarize the Parameter
+ 
+ For any parameter, PKNCA needs to know how to summarize it for the `summary` function of the `PKNCAresults` class.  To tell PKNCA how to summarize a parameter, use the `PKNCA.set.summary` function.  It takes at least these four arguments:

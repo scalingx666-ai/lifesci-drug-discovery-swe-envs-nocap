@@ -1,0 +1,562 @@
+diff --git a/ersilia/cli/commands/serve.py b/ersilia/cli/commands/serve.py
+index 03a3ac6ec..9773b8cea 100644
+--- a/ersilia/cli/commands/serve.py
++++ b/ersilia/cli/commands/serve.py
+@@ -70,14 +70,18 @@ def serve(
+         maxmemory,
+     ):
+         output_source = None
++        cache_status = "Disabled"
+         if local_cache_only:
+             output_source = OutputSource.LOCAL_ONLY
+             enable_local_cache = True
++            cache_status = "Local Only"
+         if cloud_cache_only:
+             output_source = OutputSource.CLOUD_ONLY
++            cache_status = "Cloud Only"
+         if cache_only:
+             output_source = OutputSource.CACHE_ONLY
+             enable_local_cache = True
++            cache_status = "Hybrid"
+         mdl = ErsiliaModel(
+             model,
+             output_source=output_source,
+@@ -118,6 +122,13 @@ def serve(
+         echo(":person_tipping_hand: Information:", fg="blue")
+         echo("   - info", fg="blue")
+         echo("")
++        echo("🔄 Cache fetching Mode:", fg="blue")
++        echo(
++            f"   - status: {cache_status}", fg="red"
++        ) if cache_status == "Disabled" else echo(
++            f"   - status: {cache_status}", fg="green"
++        )
++        echo("")
+         echo(":floppy_disk: Local cache:", fg="blue")
+         echo("   - Enabled", fg="green") if redis_setup._is_amenable()[0] else echo(
+             "   - Disabled", fg="red"
+diff --git a/ersilia/io/output.py b/ersilia/io/output.py
+index 08724dfb2..c9ece7785 100644
+--- a/ersilia/io/output.py
++++ b/ersilia/io/output.py
+@@ -152,7 +152,7 @@ def write_text(self, file_name: str, delimiter: str = None):
+         """
+         if delimiter is None:
+             delimiter = self._get_delimiter(file_name)
+-        none_str = "None"
++        none_str = ""
+         with open(file_name, "w", newline="") as f:
+             f.write(delimiter.join(self.columns) + "\n")
+             for row in self.data:
+@@ -458,7 +458,8 @@ def _sinlge_cast(self, val, dtype):
+             return dtype(val)
+         if not isinstance(val, list) and val is None:
+             return val
+-        return [dtype(v) if v is not None else v for v in val]
++        out = [dtype(v) if (v is not None and v != "") else None for v in val]
++        return out
+ 
+     def _cast_values_from_github_metadata(self, values, dtype):
+         return [self._sinlge_cast(val, dtype) for val in values]
+diff --git a/ersilia/store/api.py b/ersilia/store/api.py
+index 670fbe448..955d8b6cc 100644
+--- a/ersilia/store/api.py
++++ b/ersilia/store/api.py
+@@ -1,9 +1,13 @@
+ import json
++import os
+ import sys
+ import time
++import traceback
+ import uuid
+ from pathlib import Path
+ 
++from click.exceptions import Abort
++
+ from ersilia.core.base import ErsiliaBase
+ from ersilia.default import API_BASE, DEFAULT_API_NAME, EOS_TMP, INFERENCE_STORE_API_URL
+ from ersilia.io.input import GenericInputAdapter
+@@ -19,14 +23,16 @@
+     echo_intro,
+     echo_job_submitted,
+     echo_job_succeeded,
+-    echo_local_sample_warning,
++    echo_local_fetched_cache_szie,
++    echo_local_only_empty_cache,
++    echo_local_sample_warning_,
+     echo_merged_saved,
+-    echo_redis_fetched_missed,
++    echo_redis_file_saved,
+     echo_redis_job_submitted,
+-    echo_redis_local_completed,
+     echo_small_sample_warning,
+     echo_status,
+     echo_submitting_job,
++    echo_sys_exited,
+     echo_upload_complete,
+     echo_uploading_inputs,
+ )
+@@ -73,9 +79,10 @@ def __init__(
+         self.fetch_type = "all"
+         self.generic_output_adapter = GenericOutputAdapter(model_id=model_id)
+         self.schema = self.generic_output_adapter._fetch_schema_from_github()
+-        cols = self.schema[0]
++        assert self.schema is not None, "Model schema can not be fetched from github."
++        self.cols = self.schema[0]
+         self.dtype = self.schema[1]
+-        self.header = ["key", "input"] + cols
++        self.header = ["key", "input"] + self.cols
+         self.output_path = Path(output) if output else Path(f"{model_id}_precalc.csv")
+         self.input_adapter = GenericInputAdapter(model_id=model_id)
+         self.click = click_iface or ClickInterface()
+@@ -103,91 +110,135 @@ def get_precalculations(self, inputs: list) -> str:
+         RuntimeError
+             If the job fails, no shards are returned, or polling times out.
+         """
+-        echo_intro(self.click)
+-        if self.output_source == OutputSource.LOCAL_ONLY:
+-            return self._handle_strict_local(inputs)
++        try:
++            echo_intro(self.click, self.output_source)
++            if os.path.exists(self.local_cache_csv_path):
++                os.remove(self.local_cache_csv_path)
++            if self.output_source == OutputSource.LOCAL_ONLY:
++                return self._handle_strict_local(inputs)
++
++            shards = self._submit_and_get_shards(inputs)
++            return self._merge_shards(shards)
++
++        except Abort:
++            echo_sys_exited(self.click)
++            sys.exit(0)
+ 
+-        shards = self._submit_and_get_shards(inputs)
+-        return self._merge_shards(shards)
++        except Exception as e:
++            traceback.print_exc()
++            raise RuntimeError(
++                "Precalculations workflow failed. See traceback above for details."
++            ) from e
+ 
+     def _handle_strict_local(self, inputs: list) -> str:
+         self.dump_local.init_redis()
+-        echo_redis_job_submitted(self.click)
+-
+         if inputs:
+-            self.dump_local.fetch_cached_results(self.model_id, inputs)
+-            results = self.dump_local.get_cached(self.model_id, inputs, self.dtype)
++            echo_redis_job_submitted(self.click, f"Input size: {len(inputs)}")
++            results, _ = self.dump_local.get_cached(
++                self.model_id, inputs, self.dtype, cols=self.cols
++            )
++            results = self.dump_local._standardize_output(
++                inputs, results, str(self.output_path), None
++            )
++            none_count = self._get_none_size(results)
++            cache_size = len(inputs) - none_count
++            echo_local_fetched_cache_szie(self.click, cache_size, none_count)
+         else:
++            ns = self.n_samples if self.n_samples != -1 else "all"
++            echo_redis_job_submitted(self.click, f"Sample size: {ns}")
+             results, inputs = self.dump_local.fetch_all_cached(
+-                self.model_id, self.dtype
++                self.model_id, self.dtype, cols=self.cols
+             )
++            if not results:
++                echo_local_only_empty_cache(self.click)
++                echo_sys_exited(self.click)
++                sys.exit(1)
++            results = self.dump_local._standardize_output(
++                inputs, results, str(self.output_path), None, self.n_samples
++            )
++            cache_size = len(results)
++            echo_local_fetched_cache_szie(self.click, cache_size, 0)
+ 
+-        results = self.dump_local._standardize_output(
+-            inputs, results, str(self.output_path), None, self.n_samples
+-        )
+         self.generic_output_adapter._adapt_generic(
+             json.dumps(results), str(self.output_path), self.model_id, DEFAULT_API_NAME
+         )
++        echo_redis_file_saved(self.click, str(self.output_path))
+         sys.exit(1)
+         return str(self.output_path)
+ 
+-    def _handle_local(self, inputs: list) -> str:
++    def _handle_local(self, inputs: list) -> tuple:
+         self.dump_local.init_redis()
+-        echo_redis_job_submitted(self.click)
+         missing_inputs = []
++
+         if inputs:
+-            self.dump_local.fetch_cached_results(self.model_id, inputs)
+-            results, _missing_inputs = self.dump_local.get_cached(
+-                self.model_id, inputs, self.dtype
++            echo_redis_job_submitted(self.click, f"Input size: {len(inputs)}")
++            results, missing_inputs = self.dump_local.get_cached(
++                self.model_id, inputs, self.dtype, cols=self.cols
+             )
+-            missing_inputs.extend(_missing_inputs)
+             results = self.dump_local._standardize_output(
+-                inputs, results, str(self.output_path), None, self.n_samples
+-            )
+-            echo_redis_fetched_missed(self.click, len(results), len(missing_inputs))
+-            if len(results) + 1 >= len(inputs) and not missing_inputs:
+-                self.generic_output_adapter._adapt_generic(
+-                    json.dumps(results),
+-                    str(self.output_path),
+-                    self.model_id,
+-                    DEFAULT_API_NAME,
+-                )
+-                echo_redis_local_completed(self.click)
+-                sys.exit(1)
+-            self.generic_output_adapter._adapt_generic(
+-                json.dumps(results),
+-                self.local_cache_csv_path,
+-                self.model_id,
+-                DEFAULT_API_NAME,
++                inputs, results, str(self.output_path), None
+             )
++            cache_size = len(results) - self._get_none_size(results)
+         else:
++            ns = self.n_samples if self.n_samples != -1 else "all"
++            echo_redis_job_submitted(self.click, f"Sample size: {ns}")
+             results, inputs = self.dump_local.fetch_all_cached(
+-                self.model_id, self.dtype
++                self.model_id, self.dtype, cols=self.cols
+             )
+-            if len(results) > self.n_samples:
++            results = self.dump_local._standardize_output(
++                inputs, results, str(self.output_path), None, self.n_samples
++            )
++            cache_size = len(results)
++            if isinstance(self.n_samples, int) and len(results) > self.n_samples:
+                 results = results[: self.n_samples]
+-            if len(results) < self.n_samples:
+-                self.n_samples = self.n_samples - len(results)
+-                results = self.dump_local._standardize_output(
+-                    inputs, results, str(self.output_path), None, self.n_samples
+-                )
+-                self.generic_output_adapter._adapt_generic(
+-                    json.dumps(results),
+-                    self.local_cache_csv_path,
+-                    self.model_id,
+-                    DEFAULT_API_NAME,
+-                )
++
++        proceed = echo_local_sample_warning_(
++            self.click,
++            len(inputs) or self.n_samples,
++            cache_size,
++        )
++        if not proceed:
++            echo_sys_exited(self.click)
++            sys.exit(0)
++
++        if cache_size == 0:
++            return results, missing_inputs
++
++        if not missing_inputs:
++            target_path = str(self.output_path)
++        else:
++            target_path = self.local_cache_csv_path
++
++        self.generic_output_adapter._adapt_generic(
++            json.dumps(results),
++            target_path,
++            self.model_id,
++            DEFAULT_API_NAME,
++        )
++
++        if target_path == str(self.output_path):
++            echo_redis_file_saved(self.click, target_path)
++
+         return results, missing_inputs
+ 
++    def _get_none_size(self, res):
++        size = 0
++        for r in res:
++            vals = list(r["output"].values())
++            if isinstance(vals[0], list):
++                if "" in vals[0]:
++                    size += 1
++            if isinstance(vals, list):
++                if "" in vals or None in vals:
++                    size += 1
++        return size
++
+     def _submit_and_get_shards(self, inputs: list) -> list:
+         if self.output_source == OutputSource.CACHE_ONLY:
+-            results, missing_input = self._handle_local(inputs)
+-            echo_local_sample_warning(self.click, self.n_samples, len(results))
++            _, missing_input = self._handle_local(inputs)
+             inputs = missing_input if len(missing_input) >= 1 else inputs
+-
+-        s = self.n_samples if inputs is None else len(inputs)
+-
+-        echo_small_sample_warning(self.click, s)
++        ns = self.n_samples if inputs is None else len(inputs)
++        echo_small_sample_warning(self.click, ns)
+         self.request_id = str(uuid.uuid4())
+ 
+         if (
+@@ -209,6 +260,7 @@ def _submit_and_get_shards(self, inputs: list) -> list:
+             "modelid": self.model_id,
+             "fetchtype": self.fetch_type,
+             "nsamples": self.n_samples,
++            "dim": len(self.cols),
+         }
+         job_id = self.api.post_json(f"{API_BASE}/submit", json=payload)["jobId"]
+         echo_job_submitted(self.click, job_id)
+diff --git a/ersilia/store/dump.py b/ersilia/store/dump.py
+index e2308e489..5d1e653d0 100644
+--- a/ersilia/store/dump.py
++++ b/ersilia/store/dump.py
+@@ -24,7 +24,7 @@ def init_redis(self):
+     def generate_redis_key(self, raw_string):
+         return hashlib.md5(raw_string.encode()).hexdigest()
+ 
+-    def fetch_cached_results(self, model_id, data):
++    def fetch_cached_results(self, model_id, data, dim):
+         hash_key = f"cache:{model_id}"
+         fields = [
+             item["input"] if isinstance(item, dict) and "input" in item else item
+@@ -36,6 +36,7 @@ def fetch_cached_results(self, model_id, data):
+             if val:
+                 results.append(json.loads(val))
+             else:
++                results.append([""] * dim)
+                 missing.append(item)
+         return results, missing
+ 
+@@ -50,7 +51,7 @@ def cache_missing_results(self, model_id, missing_inputs, computed_results):
+         pipe.expire(hash_key, REDIS_EXPIRATION)
+         pipe.execute()
+ 
+-    def fetch_all_cached(self, model_id, dtype):
++    def fetch_all_cached(self, model_id, dtype, cols):
+         def dict_to_lists(d):
+             keys = list(d.keys())
+             values = list(d.values())
+@@ -58,10 +59,14 @@ def dict_to_lists(d):
+ 
+         hash_key = f"cache:{model_id}"
+         header = self.fetch_or_cache_header(model_id)
++        header = header or cols
++        assert (
++            header is not None
++        ), "Headers can not be empty! This might happened either the header is not cached or resolved from model schema."
+         raw = redis_client.hgetall(hash_key)
+         results = {field: json.loads(val) for field, val in raw.items()}
+         inputs, results = dict_to_lists(results)
+-        if not isinstance(inputs[0], dict):
++        if inputs and not isinstance(inputs[0], dict):
+             inputs = [
+                 {"input": input, "key": hashlib.md5(input.encode()).hexdigest()}
+                 for input in inputs
+@@ -81,11 +86,16 @@ def fetch_or_cache_header(self, model_id, computed_headers=None):
+             return computed_headers
+         return None
+ 
+-    def get_cached(self, model_id, data, dtype, computed_headers=None):
++    def get_cached(self, model_id, data, dtype, cols, computed_headers=None):
+         if not self.init_redis():
+             return [], None
+-        results, missing = self.fetch_cached_results(model_id, data)
++
++        results, missing = self.fetch_cached_results(model_id, data, len(cols))
+         header = self.fetch_or_cache_header(model_id, computed_headers)
++        header = header or cols
++        assert (
++            header is not None
++        ), "Headers can not be empty! This might happened either the header is not cached or resolved from model schema."
+         results = self.orient_to_json(results, header, data, "records", dtype)
+         return results, missing
+ 
+diff --git a/ersilia/store/utils.py b/ersilia/store/utils.py
+index 8b8bfaf97..260a093d3 100644
+--- a/ersilia/store/utils.py
++++ b/ersilia/store/utils.py
+@@ -29,34 +29,44 @@ def log_prefix():
+ """
+ 
+ 
+-def echo_intro(click_iface):
++def echo_intro(click_iface, mode):
+     width = 120
++    mode = (
++        "Hybrid [Local + Cloud]"
++        if mode == "cache-only"
++        else mode.replace("-", " ").capitalize()
++    )
+     click_iface.echo(f"{title:^{width}}", fg="red", bold=True)
+-    version_text = "[Version 1.0.0]"
+-    click_iface.echo(f"{version_text:^{width}}", fg="red", bold=True)
++    mode_text = f"⚙️ Fetch Mode: {mode}"
++    version_text = "🏷️ [Version 0.1.0] 🏷️"
++    click_iface.echo(f"{version_text:^{width}}", fg="cyan", bold=True)
++    click_iface.echo(f"{mode_text:^{width}}", fg="cyan", bold=True)
+     click_iface.echo("")
+ 
+ 
+-def echo_redis_job_submitted(click_iface):
++def echo_redis_job_submitted(click_iface, message):
+     click_iface.echo(
+-        f"{log_prefix()}Job submitted to Redis caching system", fg="blue", bold=False
++        f"{log_prefix()}Job submitted to Redis caching system. {message}",
++        fg="blue",
++        bold=False,
+     )
+ 
+ 
+ def echo_redis_fetched_missed(click_iface, size_res, size_missing):
+     click_iface.echo(
+         f"{log_prefix()}Results size of {size_res} fetched from local cache. Missing inputs: {size_missing}",
+-        fg="cyan",
++        fg="blue",
+         bold=False,
+     )
+ 
+ 
+ def echo_redis_local_completed(click_iface):
+     click_iface.echo(
+-        f"{log_prefix()}All inputs has results in local caches and won't processed further query. Exiting the system with output file",
++        f"{log_prefix()}All inputs has results in local caches and won't processed further query.",
+         fg="blue",
+         bold=False,
+     )
++    echo_sys_exited(click_iface)
+ 
+ 
+ def echo_uploading_inputs(click_iface):
+@@ -65,6 +75,20 @@ def echo_uploading_inputs(click_iface):
+     )
+ 
+ 
++def echo_local_fetched_cache_szie(click_iface, cache_size, none_count):
++    if cache_size != 0:
++        click_iface.echo(
++            f"{log_prefix()}Found cache size of {cache_size} from local Redis cache. Post processing started!",
++            fg="blue",
++            bold=False,
++        )
++    else:
++        echo_local_only_empty_cache(click_iface)
++        echo_redis_null_output(click_iface)
++    if none_count != 0:
++        echo_redis_null_output(click_iface)
++
++
+ def echo_upload_complete(click_iface):
+     click_iface.echo(f"{log_prefix()}Upload completed.", fg="blue", bold=False)
+ 
+@@ -77,27 +101,90 @@ def echo_submitting_job(click_iface, model_id):
+     )
+ 
+ 
++def echo_sys_exited(click_iface):
++    click_iface.echo(
++        f"{log_prefix()}System exits with exit code 1",
++        fg="blue",
++        bold=False,
++    )
++
++
++def echo_redis_null_output(click_iface):
++    click_iface.echo(
++        f"{log_prefix()}Beware that output file may contain None or empty values!",
++        fg="yellow",
++        bold=True,
++    )
++
++
+ def echo_job_submitted(click_iface, job_id: str):
+     click_iface.echo(
+         f"{log_prefix()}Job submitted with a job id: {job_id}", fg="blue", bold=False
+     )
+ 
+ 
+-def echo_local_sample_warning(click_iface, n: int, cache_size: int):
++def echo_local_only_empty_cache(click_iface):
++    click_iface.echo(
++        f"{log_prefix()}Ooopps! No cached results found in local Redis system for the model! Try cloud caching!",
++        fg="white",
++        blink=False,
++        bold=True,
++        bg="yellow",
++    )
++
++
++def echo_local_sample_warning_(click_iface, n: int, cache_size: int) -> bool:
++    prompt = "Do you want to continue to cloud for fetching?"
++
++    if cache_size == 0:
++        echo_local_only_empty_cache(click_iface)
++        return click.confirm(prompt)
++
+     d = n - cache_size
+     if cache_size >= n:
+-        message = "This is more or equal to a sample size you requested!"
++        bg = "cyan"
++        message = "This is more or equal to the sample size you requested!"
+     else:
+-        message = f"This is less than a sample size you requested by {d}!"
++        bg = "yellow"
++        message = f"This is less than the sample size you requested by {d}!"
+ 
+     click_iface.echo(
+-        f"{log_prefix()}Cache size of {cache_size} fetched from local Redis caching. {message}!",
++        f"{log_prefix()}Cache size of {cache_size} fetched from local Redis caching. {message}",
+         fg="white",
+         blink=False,
+         bold=True,
+-        bg="blue",
++        bg=bg,
+     )
+-    click.confirm("Do you want to continue to cloud for fetching?", abort=True)
++    return click.confirm(prompt)
++
++
++def echo_local_sample_warning(click_iface, n: int, cache_size: int):
++    prompt = "Do you want to continue to cloud for fetching?"
++
++    if cache_size == 0:
++        echo_local_only_empty_cache(click_iface)
++        if not click.confirm(prompt):
++            echo_sys_exited(click_iface)
++            sys.exit(0)
++    else:
++        d = n - cache_size
++        if cache_size >= n:
++            bg = "cyan"
++            message = "This is more or equal to the sample size you requested!"
++        else:
++            bg = "yellow"
++            message = f"This is less than the sample size you requested by {d}!"
++
++        click_iface.echo(
++            f"{log_prefix()}Cache size of {cache_size} fetched from local Redis caching. {message}",
++            fg="white",
++            blink=False,
++            bold=True,
++            bg=bg,
++        )
++        if not click.confirm(prompt):
++            echo_sys_exited(click_iface)
++            sys.exit(0)
+ 
+ 
+ def echo_small_sample_warning(click_iface, n: int):
+@@ -150,6 +237,12 @@ def echo_merged_saved(click_iface, output_path: Path):
+     )
+ 
+ 
++def echo_redis_file_saved(click_iface, output_path: Path):
++    click_iface.echo(
++        f"{log_prefix()}Output file is saved to: {output_path}", fg="blue", bold=False
++    )
++
++
+ def merge_csvs_stdlib(files, output):
+     with open(output, "w", newline="") as fout:
+         writer = None

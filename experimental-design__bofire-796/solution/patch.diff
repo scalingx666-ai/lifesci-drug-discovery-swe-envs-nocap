@@ -1,0 +1,263 @@
+diff --git a/bofire/data_models/domain/features.py b/bofire/data_models/domain/features.py
+index 7c284b472..9b4812c67 100644
+--- a/bofire/data_models/domain/features.py
++++ b/bofire/data_models/domain/features.py
+@@ -569,6 +569,7 @@ def get_categorical_combinations(
+         exclude: Union[
+             Type, List[Type]
+         ] = None,  # ty: ignore[invalid-parameter-default]
++        include_semicontinuous: bool = True,
+     ) -> list[tuple[tuple[str, float] | tuple[str, str], ...]]:
+         """Get a list of tuples pairing the feature keys with a list of valid categories
+ 
+@@ -576,6 +577,16 @@ def get_categorical_combinations(
+             include (Feature, optional): Features to be included. Defaults to Input.
+             exclude (Feature, optional): Features to be excluded, e.g. subclasses
+                 of the included features. Defaults to None.
++            include_semicontinuous (bool, optional): When True (default), each
++                semi-continuous feature (`ContinuousInput` with `allow_zero=True`
++                and a positive lower bound, un-fixed) doubles the number of
++                combinations via its on/off enumeration. When False,
++                semi-continuous features are excluded from the enumeration --
++                useful when the caller handles them via a post-optimisation
++                pruning step rather than by AF-time enumeration. Mirrors the
++                flag of the same name on
++                `get_number_of_categorical_combinations`; the two must be
++                passed the same value to stay consistent.
+ 
+         Returns:
+             List[(str, List[str])]: Returns a list of tuples pairing the feature
+@@ -602,11 +613,14 @@ def get_categorical_combinations(
+         cat_and_discrete_values = cat_values + discrete_values
+         all_combos = list(itertools.product(*cat_and_discrete_values))
+ 
+-        conditional_conts = [
+-            f
+-            for f in self.get(includes=include, excludes=exclude)
+-            if (isinstance(f, ContinuousInput) and f.is_semicontinuous)
+-        ]
++        if include_semicontinuous:
++            conditional_conts = [
++                f
++                for f in self.get(includes=include, excludes=exclude)
++                if (isinstance(f, ContinuousInput) and f.is_semicontinuous)
++            ]
++        else:
++            conditional_conts = []
+ 
+         conditional_values = [[(d.key, 0.0), (d.key, None)] for d in conditional_conts]
+ 
+diff --git a/bofire/strategies/predictives/acqf_optimization.py b/bofire/strategies/predictives/acqf_optimization.py
+index e2a562458..2be1414e7 100644
+--- a/bofire/strategies/predictives/acqf_optimization.py
++++ b/bofire/strategies/predictives/acqf_optimization.py
+@@ -729,7 +729,9 @@ def _get_arguments_for_optimizer(
+                 fixed_features_list=self.get_categorical_combinations(domain),
+             )
+         elif optimizer == OptimizerEnum.OPTIMIZE_ACQF_LIST:
+-            n_combos = domain.inputs.get_number_of_categorical_combinations()
++            n_combos = domain.inputs.get_number_of_categorical_combinations(
++                include_semicontinuous=not is_pruning_applicable(domain),
++            )
+             return _OptimizeAcqfListInput(
+                 acq_function_list=acqfs,
+                 bounds=bounds,
+@@ -786,7 +788,17 @@ def get_categorical_combinations(
+         """
+         fixed_basis = self.get_fixed_features(domain=domain)
+ 
+-        combos = domain.inputs.get_categorical_combinations()
++        # Must use the same `include_semicontinuous` value as
++        # `_determine_optimizer`: when pruning is applicable, semi-continuous
++        # features are resolved by the post-AF pruning step, so enumerating
++        # their on/off states here would handle them twice. It would also
++        # produce a `fixed_features_list` in which some entries pin *every*
++        # tensor column while others do not -- `optimize_acqf_mixed` stacks
++        # the per-entry acqf values and the all-fixed shortcut in botorch
++        # collapses the restart dimension, so the stack fails.
++        combos = domain.inputs.get_categorical_combinations(
++            include_semicontinuous=not is_pruning_applicable(domain),
++        )
+         # now build up the fixed feature list
+         if len(combos) == 1:
+             return [fixed_basis]
+diff --git a/tests/bofire/data_models/domain/test_inputs.py b/tests/bofire/data_models/domain/test_inputs.py
+index b864ecf6d..8ffef1b1e 100644
+--- a/tests/bofire/data_models/domain/test_inputs.py
++++ b/tests/bofire/data_models/domain/test_inputs.py
+@@ -130,6 +130,41 @@ def test_inputs_get_categorical_combinations_conditional():
+     )
+ 
+ 
++def test_inputs_get_categorical_combinations_exclude_semicontinuous():
++    """`include_semicontinuous=False` must drop the on/off enumeration of
++    semi-continuous features, staying consistent with the flag of the same
++    name on `get_number_of_categorical_combinations`.
++    """
++    inputs = Inputs(
++        features=[
++            CategoricalInput(key="f1", categories=["c11", "c12"]),
++            ContinuousInput(key="f2", bounds=(1, 2), allow_zero=True),
++            ContinuousInput(key="f3", bounds=(1, 2), allow_zero=True),
++        ],
++    )
++    expected = [(("f1", "c11"),), (("f1", "c12"),)]
++    assert inputs.get_categorical_combinations(include_semicontinuous=False) == expected
++    assert inputs.get_number_of_categorical_combinations(
++        include_semicontinuous=False
++    ) == len(expected)
++
++    # the two must agree for both values of the flag
++    for include_semicontinuous in [True, False]:
++        assert len(
++            inputs.get_categorical_combinations(
++                include_semicontinuous=include_semicontinuous
++            )
++        ) == inputs.get_number_of_categorical_combinations(
++            include_semicontinuous=include_semicontinuous
++        )
++
++    # purely continuous: no combinations left at all
++    continuous_inputs = inputs.get(includes=ContinuousInput)
++    assert continuous_inputs.get_categorical_combinations(
++        include_semicontinuous=False
++    ) == [()]
++
++
+ def test_inputs_is_fulfilled():
+     inputs = Inputs(
+         features=[
+diff --git a/tests/bofire/strategies/test_acqf_optimization.py b/tests/bofire/strategies/test_acqf_optimization.py
+index 8bbc35b8a..96ee143e1 100644
+--- a/tests/bofire/strategies/test_acqf_optimization.py
++++ b/tests/bofire/strategies/test_acqf_optimization.py
+@@ -1,6 +1,7 @@
+ import unittest
+ from typing import cast
+ 
++import pandas as pd
+ import torch
+ from botorch.acquisition.acquisition import AcquisitionFunction
+ from botorch.utils.testing import MockAcquisitionFunction
+@@ -20,6 +21,10 @@
+ from bofire.data_models.strategies.predictives.acqf_optimization import (
+     BotorchOptimizer as BotorchOptimizerModel,
+ )
++from bofire.data_models.strategies.predictives.sobo import (
++    SoboStrategy as SoboStrategyModel,
++)
++from bofire.strategies.api import SoboStrategy
+ from bofire.strategies.predictives.acqf_optimization import (
+     BotorchOptimizer,
+     OptimizerEnum,
+@@ -238,6 +243,24 @@ def get_bounds(domain: Domain) -> torch.Tensor:
+         bounds=get_bounds(domain),
+     )
+     assert optimizer_args.fixed_features == {1: 0.5}
++
++    # Semi-continuous features are handled by post-AF pruning, so they must not
++    # cause optimize_acqf_list to receive a fixed_features_list.
++    semi_feature = domain.inputs.get_by_key("x_2")
++    assert isinstance(semi_feature, ContinuousInput)
++    semi_feature.bounds = (1.0, 2.0)
++    semi_feature.allow_zero = True
++    optimizer_args = optimizer._get_arguments_for_optimizer(
++        optimizer=OptimizerEnum.OPTIMIZE_ACQF_LIST,
++        domain=domain,
++        candidate_count=2,
++        acqfs=[simple_acqf, simple_acqf],
++        bounds=get_bounds(domain),
++    )
++    assert isinstance(optimizer_args, _OptimizeAcqfListInput)
++    assert optimizer_args.fixed_features == {1: 0.5}
++    assert optimizer_args.fixed_features_list is None
++
+     domain.inputs.features.append(
+         CategoricalInput(key="x_cat", categories=[f"cat_{i}" for i in range(2)])
+     )
+@@ -302,3 +325,85 @@ def test_base_get_categorical_combinations():
+             {1: 0.5, 6: 1, 7: 2},
+         ],
+     )
++
++
++def _semicontinuous_categorical_domain() -> Domain:
++    """Domain of issue #795 plus a categorical, which forces the mixed
++    optimizer while pruning handles the semi-continuous features.
++    """
++    return Domain.from_lists(
++        inputs=[
++            ContinuousInput(key=f"x{i}", bounds=(1.0, 20.0), allow_zero=True)
++            for i in (1, 2, 3)
++        ]
++        + [CategoricalInput(key="c", categories=["a", "b"])],
++        outputs=[ContinuousOutput(key="y")],
++    )
++
++
++def test_get_categorical_combinations_excludes_semicontinuous_when_pruning():
++    """Regression test for #795.
++
++    When pruning is applicable, the semi-continuous features are resolved by
++    the post-AF pruning step, so their on/off states must not additionally be
++    enumerated into the `fixed_features_list`. Enumerating them yields
++    combinations that pin *every* tensor column (all features off) next to
++    combinations that do not; `optimize_acqf_mixed` stacks the per-combination
++    acqf values, and botorch's all-features-fixed shortcut collapses the
++    restart dimension, so the stack raises
++    `RuntimeError: stack expects each tensor to be equal size`.
++    """
++    domain = _semicontinuous_categorical_domain()
++    optimizer = BotorchOptimizer(BotorchOptimizerModel())
++
++    combinations = optimizer.get_categorical_combinations(domain)
++
++    # only the two categorical levels, not 2 (categories) * 2**3 (on/off)
++    assert combinations == [{3: 0}, {3: 1}]
++
++    # and no combination pins every tensor column
++    n_columns = sum(len(idx) for idx in optimizer._features2idx(domain).values())
++    assert all(len(combo) < n_columns for combo in combinations)
++
++    # consistent with the count the optimizer routing is based on
++    assert len(combinations) == domain.inputs.get_number_of_categorical_combinations(
++        include_semicontinuous=False,
++    )
++
++
++def test_ask_with_semicontinuous_and_categorical():
++    """End-to-end regression test for #795: `ask` must not blow up in
++    `optimize_acqf_mixed` for a domain mixing `allow_zero` inputs with a
++    categorical input.
++    """
++    domain = _semicontinuous_categorical_domain()
++    experiments = pd.DataFrame(
++        {
++            "x1": [5.0, 10.0, 15.0, 18.0],
++            "x2": [5.0, 10.0, 15.0, 8.0],
++            "x3": [5.0, 10.0, 15.0, 12.0],
++            "c": ["a", "b", "a", "b"],
++            "y": [1.0, 2.0, 3.0, 4.0],
++            "valid_y": [1, 1, 1, 1],
++        },
++    )
++
++    data_model = SoboStrategyModel(domain=domain, seed=42)
++    strategy = SoboStrategy(data_model=data_model)
++    assert (
++        strategy.acqf_optimizer._determine_optimizer(domain, n_acqfs=1)
++        == OptimizerEnum.OPTIMIZE_ACQF_MIXED
++    )
++
++    strategy.tell(experiments)
++    candidates = strategy.ask(candidate_count=2)
++
++    assert len(candidates) == 2
++    for key in ["x1", "x2", "x3"]:
++        feat = cast(ContinuousInput, domain.inputs.get_by_key(key))
++        values = candidates[key]
++        # pruning resolves every semi-continuous feature to either zero or
++        # a value inside its bounds -- never into the forbidden gap
++        assert (
++            (values == 0.0) | ((values >= feat.bounds[0]) & (values <= feat.bounds[1]))
++        ).all()

@@ -1,0 +1,336 @@
+diff --git a/api/c/indigo/src/indigo.cpp b/api/c/indigo/src/indigo.cpp
+index 0d29d84528..56e4a7ae83 100644
+--- a/api/c/indigo/src/indigo.cpp
++++ b/api/c/indigo/src/indigo.cpp
+@@ -21,9 +21,11 @@
+ #include "indigo_version.h"
+ #include <atomic>
+ #include <clocale>
++#include <mutex>
+ 
+ #include "base_cpp/output.h"
+ #include "base_cpp/profiling.h"
++#include "molecule/elements.h"
+ #include "molecule/molecule_fingerprint.h"
+ #include "molecule/molecule_json_saver.h"
+ #include "molecule/molfile_saver.h"
+@@ -161,6 +163,14 @@ void Indigo::init()
+     ignore_bad_valence = false;
+     valence_mode = ValenceMode::BIOVIA_2009;
+ 
++    // Install once-per-process hook so Element::calcValence-family static
++    // helpers used in contexts without molecule references (substructure
++    // matching, query parsing, abbreviation/name parsers) pick up the
++    // current TLS Indigo session's valence_mode instead of a hardcoded default.
++    // Per-Molecule operations pass _valence_mode explicitly and bypass this.
++    static std::once_flag valence_mode_provider_installed;
++    std::call_once(valence_mode_provider_installed, []() { Element::setDefaultValenceModeProvider([]() { return indigoGetInstance().valence_mode; }); });
++
+     // Update global index
+     static std::atomic<int> global_id;
+     _indigo_id = global_id++;
+diff --git a/api/c/indigo/src/indigo_options.cpp b/api/c/indigo/src/indigo_options.cpp
+index 73b7cc64c2..005ba9937f 100644
+--- a/api/c/indigo/src/indigo_options.cpp
++++ b/api/c/indigo/src/indigo_options.cpp
+@@ -44,12 +44,12 @@ static void indigoGetMolfileSavingMode(Array<char>& value)
+ static void indigoSetValenceMode(const char* mode)
+ {
+     Indigo& self = indigoGetInstance();
+-    if (strcmp(mode, "biovia-2009") == 0 || strcmp(mode, "pre-2014") == 0 || strcmp(mode, "default") == 0)
++    if (strcmp(mode, "biovia-2009") == 0 || strcmp(mode, "default") == 0)
+         self.valence_mode = ValenceMode::BIOVIA_2009;
+-    else if (strcmp(mode, "biovia-2017") == 0 || strcmp(mode, "post-2014") == 0)
++    else if (strcmp(mode, "biovia-2017") == 0)
+         self.valence_mode = ValenceMode::BIOVIA_2017;
+     else
+-        throw IndigoError("invalid valence mode: '%s' (expected 'biovia-2009', 'biovia-2017', 'pre-2014', or 'post-2014')", mode);
++        throw IndigoError("invalid valence mode: '%s' (expected 'biovia-2009', 'biovia-2017', or 'default')", mode);
+ }
+ 
+ static void indigoGetValenceMode(Array<char>& value)
+diff --git a/api/c/tests/unit/tests/valence.cpp b/api/c/tests/unit/tests/valence.cpp
+index 9ba45766e2..7b24c01733 100644
+--- a/api/c/tests/unit/tests/valence.cpp
++++ b/api/c/tests/unit/tests/valence.cpp
+@@ -693,6 +693,56 @@ TEST_F(ValenceModeApiTest, Smiles_BypassesValenceMode)
+     EXPECT_EQ(hyd_post, hyd_pre) << "SMILES loading must give same result regardless of valence-mode";
+ }
+ 
++// Substructure match through the public C API: target Al MOL has 3 implicit
++// H under BIOVIA_2009 and 0 H under BIOVIA_2017. A SMARTS query that pins
++// H count must therefore match under one mode and not the other. This
++// exercises the QueryMolecule + Element::calcValence static path that fix #4
++// closes — the provider hook installed by Indigo::init() inside indigo.dll
++// makes substructure matching read the current TLS session's valence-mode.
++TEST_F(ValenceModeApiTest, SubstructureMatch_HonorsSessionMode)
++{
++    // Under BIOVIA_2017 Al has 0 H — [Al;H0] must match
++    indigoSetOption("valence-mode", "biovia-2017");
++    const int target_2017 = indigoLoadMoleculeFromString(kAlMol);
++    ASSERT_NE(target_2017, -1);
++    const int query_2017 = indigoLoadQueryMoleculeFromString("[Al;H0]");
++    ASSERT_NE(query_2017, -1);
++    const int matcher_2017 = indigoSubstructureMatcher(target_2017, "");
++    ASSERT_NE(matcher_2017, -1);
++    const int match_2017 = indigoMatch(matcher_2017, query_2017);
++    EXPECT_NE(match_2017, 0) << "[Al;H0] must match Al MOL under BIOVIA_2017 (target H=0)";
++
++    // Under BIOVIA_2009 Al has 3 H — [Al;H0] must NOT match
++    indigoSetOption("valence-mode", "biovia-2009");
++    const int target_2009 = indigoLoadMoleculeFromString(kAlMol);
++    ASSERT_NE(target_2009, -1);
++    const int query_2009 = indigoLoadQueryMoleculeFromString("[Al;H0]");
++    ASSERT_NE(query_2009, -1);
++    const int matcher_2009 = indigoSubstructureMatcher(target_2009, "");
++    ASSERT_NE(matcher_2009, -1);
++    const int match_2009 = indigoMatch(matcher_2009, query_2009);
++    EXPECT_EQ(match_2009, 0) << "[Al;H0] must NOT match Al MOL under BIOVIA_2009 (target H=3)";
++}
++
++// Explicit-mode parameter bypasses the provider hook: callers that hold a
++// Molecule reference pass the molecule's stored mode regardless of the
++// current TLS session. This isolates per-molecule operations from later
++// session-mode changes.
++TEST_F(ValenceModeApiTest, ExplicitMode_OverridesSessionProvider)
++{
++    int valence = 0, hyd = 0;
++
++    // Session set to one mode...
++    indigoSetOption("valence-mode", "biovia-2017");
++
++    // ...but caller explicitly passes the other → explicit wins.
++    Element::calcValence(ELEM_Al, 0, 0, 0, valence, hyd, false, nullptr, ValenceMode::BIOVIA_2009);
++    EXPECT_EQ(hyd, 3) << "Explicit BIOVIA_2009 must win over session BIOVIA_2017";
++
++    Element::calcValence(ELEM_Al, 0, 0, 0, valence, hyd, false, nullptr, ValenceMode::BIOVIA_2017);
++    EXPECT_EQ(hyd, 0) << "Explicit BIOVIA_2017 must win over session BIOVIA_2017 (sanity)";
++}
++
+ // Option getter/setter roundtrip
+ TEST_F(ValenceModeApiTest, OptionRoundtrip)
+ {
+@@ -704,16 +754,7 @@ TEST_F(ValenceModeApiTest, OptionRoundtrip)
+     const char* val2 = indigoGetOption("valence-mode");
+     EXPECT_STREQ(val2, "biovia-2009");
+ 
+-    // Backward compatibility: old names still accepted
+-    indigoSetOption("valence-mode", "post-2014");
+-    const char* val3 = indigoGetOption("valence-mode");
+-    EXPECT_STREQ(val3, "biovia-2017") << "'post-2014' is an alias for 'biovia-2017'";
+-
+-    indigoSetOption("valence-mode", "pre-2014");
+-    const char* val4 = indigoGetOption("valence-mode");
+-    EXPECT_STREQ(val4, "biovia-2009") << "'pre-2014' is an alias for 'biovia-2009'";
+-
+     indigoSetOption("valence-mode", "default");
+-    const char* val5 = indigoGetOption("valence-mode");
+-    EXPECT_STREQ(val5, "biovia-2009") << "'default' is an alias for 'biovia-2009'";
++    const char* val3 = indigoGetOption("valence-mode");
++    EXPECT_STREQ(val3, "biovia-2009") << "'default' is an alias for 'biovia-2009'";
+ }
+diff --git a/api/http/tests/test_indigo_http.py b/api/http/tests/test_indigo_http.py
+index 7b55015c70..7a928f283c 100644
+--- a/api/http/tests/test_indigo_http.py
++++ b/api/http/tests/test_indigo_http.py
+@@ -533,6 +533,77 @@ def test_indigo_options(  # pylint: disable=too-many-arguments
+             assert options_response.json()["data"]["attributes"] == message
+ 
+ 
++# ---------------------------------------------------------------------------
++# valence-mode option (BIOVIA 2009 vs 2017)
++# ---------------------------------------------------------------------------
++
++
++def _convert_request(
++    structure: str, options: Optional[Dict[str, Any]] = None
++) -> Dict[str, Any]:
++    attributes: Dict[str, Any] = {
++        "compound": {"structure": structure, "format": "auto"},
++        "outputFormat": "smiles",
++    }
++    if options is not None:
++        attributes["options"] = options
++    return {"data": {"type": "convert", "attributes": attributes}}
++
++
++@pytest.mark.parametrize("mode", ["biovia-2009", "biovia-2017"])
++def test_valence_mode_accepted(mode: str) -> None:
++    response = client.post(
++        "/indigo/convert",
++        json=_convert_request("CCO", {"valence-mode": mode}),
++    )
++    assert response.status_code == 200, response.text
++
++
++def test_valence_mode_invalid_value_rejected() -> None:
++    # The options dict is forwarded generically to Indigo.setOption(); an
++    # unknown value is rejected at the C layer and surfaces as 400 via the
++    # IndigoException handler in indigo_http.py.
++    response = client.post(
++        "/indigo/convert",
++        json=_convert_request("CCO", {"valence-mode": "not-a-mode"}),
++    )
++    assert response.status_code == 400
++    assert "valence mode" in response.text
++
++
++def test_valence_mode_isolated_between_requests() -> None:
++    # Request A picks biovia-2017 explicitly. Request B omits the option.
++    # If the option leaked across the per-request Indigo() instance, request B
++    # would still see biovia-2017 on its session — which would not be detectable
++    # via the response payload alone, so this test guards the contract by
++    # asserting both succeed and that B uses the default schema (no `options`
++    # echoed back).
++    response_a = client.post(
++        "/indigo/convert",
++        json=_convert_request("CCO", {"valence-mode": "biovia-2017"}),
++    )
++    response_b = client.post(
++        "/indigo/convert",
++        json=_convert_request("CCO"),
++    )
++    assert response_a.status_code == 200, response_a.text
++    assert response_b.status_code == 200, response_b.text
++
++
++def test_unknown_options_still_passed_through() -> None:
++    # Backward compatibility: clients send arbitrary legacy option keys
++    # (smart-layout, ignore-stereochemistry-errors, etc.). IndigoOptions
++    # uses `extra = "allow"` so unknown keys reach setOption().
++    response = client.post(
++        "/indigo/convert",
++        json=_convert_request(
++            "C1[C@@H]=CC=[C@H]C=1",
++            {"ignore-stereochemistry-errors": True},
++        ),
++    )
++    assert response.status_code == 200, response.text
++
++
+ # TODO: /indigo/render with alternative responses types
+ # def render_request(
+ #     structure: str, output_format: str, options: Dict = None
+diff --git a/core/indigo-core/molecule/elements.h b/core/indigo-core/molecule/elements.h
+index ee3a4085db..6676acea28 100644
+--- a/core/indigo-core/molecule/elements.h
++++ b/core/indigo-core/molecule/elements.h
+@@ -21,9 +21,11 @@
+ 
+ #include <array>
+ #include <map>
++#include <optional>
+ 
+ #include "base_c/defs.h"
+ #include "base_cpp/exception.h"
++#include "molecule/valence_model.h"
+ 
+ #ifdef _MSC_VER
+ #pragma warning(push)
+@@ -216,7 +218,19 @@ namespace indigo
+         static int radicalElectrons(int radical);
+         static int radicalOrbitals(int radical);
+ 
+-        static bool calcValence(int elem, int charge, int radical, int conn, int& valence, int& hyd, bool to_throw, bool* nonStandard = nullptr);
++        // Static valence calculation. Optional `mode` overrides the model:
++        //   - explicit value  → that ValenceModel is used
++        //   - std::nullopt    → ValenceModeProvider hook (registered by api/c
++        //                       at init to read the current TLS Indigo session),
++        //                       falling back to BIOVIA_2009 if no provider set
++        // Callers with molecule context should pass the molecule's stored mode
++        // explicitly; callers without context (parsers, query atoms, etc.)
++        // rely on the provider to follow the current Indigo session.
++        static bool calcValence(int elem, int charge, int radical, int conn, int& valence, int& hyd, bool to_throw, bool* nonStandard = nullptr,
++                                std::optional<ValenceMode> mode = std::nullopt);
++        static ValenceResult calcValenceResult(int elem, int charge, int radical, int conn, std::optional<ValenceMode> mode = std::nullopt);
++
++        // Mode-independent electron-counting helpers (do not consult ValenceModel).
+         static int calcValenceOfAromaticAtom(int elem, int charge, int n_arom, int min_conn);
+         static int calcValenceMinusHyd(int elem, int charge, int radical, int conn);
+ 
+@@ -226,7 +240,12 @@ namespace indigo
+         static int orbitals(int elem, bool use_d_orbital);
+         static int electrons(int elem, int charge);
+         static int baseValence(int eff);
+-        static ValenceResult calcValenceResult(int elem, int charge, int radical, int conn);
++
++        // Provider hook used by calcValence/calcValenceResult when no explicit
++        // mode is passed. api/c registers a function reading the current TLS
++        // session's valence_mode. nullptr (default) → BIOVIA_2009.
++        using ValenceModeProvider = ValenceMode (*)();
++        static void setDefaultValenceModeProvider(ValenceModeProvider provider);
+ 
+         static int group(int element);
+         static int period(int period);
+diff --git a/core/indigo-core/molecule/src/elements.cpp b/core/indigo-core/molecule/src/elements.cpp
+index fbc9fb2d04..2d26694738 100644
+--- a/core/indigo-core/molecule/src/elements.cpp
++++ b/core/indigo-core/molecule/src/elements.cpp
+@@ -34,6 +34,28 @@ using namespace indigo;
+ 
+ IMPL_ERROR(Element, "element");
+ 
++namespace
++{
++    // Provider hook installed by api/c so that core-level static valence
++    // calculations can pick up the current Indigo TLS session's valence_mode
++    // when the caller has no molecule reference to read it from.
++    Element::ValenceModeProvider g_default_mode_provider = nullptr;
++
++    ValenceMode resolveValenceMode(std::optional<ValenceMode> explicit_mode)
++    {
++        if (explicit_mode)
++            return *explicit_mode;
++        if (g_default_mode_provider)
++            return g_default_mode_provider();
++        return ValenceMode::BIOVIA_2009;
++    }
++} // namespace
++
++void Element::setDefaultValenceModeProvider(ValenceModeProvider provider)
++{
++    g_default_mode_provider = provider;
++}
++
+ const Element& Element::_instance()
+ {
+     static Element instance;
+@@ -335,9 +357,10 @@ int Element::calcValenceOfAromaticAtom(int elem, int charge, int n_arom, int min
+     return -1;
+ }
+ 
+-bool Element::calcValence(int elem, int charge, int radical, int conn, int& valence, int& hyd, bool to_throw, bool* nonStandard)
++bool Element::calcValence(int elem, int charge, int radical, int conn, int& valence, int& hyd, bool to_throw, bool* nonStandard,
++                          std::optional<ValenceMode> mode)
+ {
+-    return ValenceModel::instance().calcValence(elem, charge, radical, conn, valence, hyd, to_throw, nonStandard);
++    return ValenceModel::instance(resolveValenceMode(mode)).calcValence(elem, charge, radical, conn, valence, hyd, to_throw, nonStandard);
+ }
+ 
+ int Element::calcValenceMinusHyd(int elem, int charge, int radical, int conn)
+@@ -573,10 +596,10 @@ int Element::baseValence(int eff)
+     return (eff <= 4) ? eff : (8 - eff);
+ }
+ 
+-ValenceResult Element::calcValenceResult(int elem, int charge, int radical, int conn)
++ValenceResult Element::calcValenceResult(int elem, int charge, int radical, int conn, std::optional<ValenceMode> mode)
+ {
+     ValenceResult r;
+-    r.valid = calcValence(elem, charge, radical, conn, r.valence, r.implicit_h, false, &r.nonStandard);
++    r.valid = calcValence(elem, charge, radical, conn, r.valence, r.implicit_h, false, &r.nonStandard, mode);
+     return r;
+ }
+ 
+diff --git a/core/indigo-core/molecule/src/molecule_layered_molecules.cpp b/core/indigo-core/molecule/src/molecule_layered_molecules.cpp
+index 2c94b5fc7d..10f1155dba 100644
+--- a/core/indigo-core/molecule/src/molecule_layered_molecules.cpp
++++ b/core/indigo-core/molecule/src/molecule_layered_molecules.cpp
+@@ -649,7 +649,7 @@ void LayeredMolecules::_calcPiLabels(int layerFrom, int layerTo)
+             int conn = _connectivity[v_idx][l];
+             int valence;
+             int impl_h;
+-            Element::calcValence(_proto.getAtomNumber(v_idx), _proto.getAtomCharge(v_idx), 0, conn, valence, impl_h, false);
++            Element::calcValence(_proto.getAtomNumber(v_idx), _proto.getAtomCharge(v_idx), 0, conn, valence, impl_h, false, nullptr, _proto.getValenceMode());
+             conn += impl_h;
+ 
+             if (arom_bonds[l] != 0)

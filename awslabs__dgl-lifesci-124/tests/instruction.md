@@ -1,0 +1,14 @@
+# Issue
+
+**Title:** [fix] AttentiveFPBondFeaturizer
+
+## Description
+
+*Description of changes: Docs update*
+
+
+By submitting this pull request, I confirm that you can use, modify, copy, and redistribute this contribution, under the terms of your choice.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `c5b8a6282cfd`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,704 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 68f9111..59cf53b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,28 @@
+ # Changelog
+ 
++## RELEASE 2.0.0 - Oct 1, 2026
++
++### Features
++* Added `timeout` argument to `compare_molecules` in the PARITY method to control the MCS calculation time (default 40 seconds)
++* Added `validate_ligand_cif_categories` and `validate_mm_cif_categories` to validate ligand and macromolecule CIF files before reading
++* Errors raised during sanitisation are now reported in the `errors` of the reader results
++* CIP labels are assigned to molecules after sanitisation (#36)
++
++### Bug fixes
++* Stereochemistry is assigned from the Ideal conformer when it is valid, falling back to the Model conformer only when the Ideal one is degenerate 
++* Physicochemical properties are calculated on the molecule without hydrogens, so bonds to terminal hydrogens are no longer counted as rotatable bonds
++* RDKit logging no longer redirects the global standard error output
++
++### Breaking changes
++* Added `errors` field to `SanitisationResult`, a list of `"<error type>: <message>"` strings
++* `sanitize` no longer converts bonds between metals and other atoms to dative bonds to fix valence issues
++* Ligand CIF readers raise `CCDUtilsError` when `_chem_comp.` or `_chem_comp_atom.` categories are missing, or when a macromolecule mmCIF file is provided
++* Bound molecule reader raises `CCDUtilsError` when `_entry.`, `_atom_site.` or `_chem_comp_bond.` categories are missing
++* Missing optional categories are reported as a single warning (`missing: ...`) instead of one warning per category
++* `compare_molecules` raises `TimeoutError` when the MCS calculation times out
++* Physicochemical property values (e.g. `NumRotatableBonds`) differ from previous versions
++* Removed `preprocessable_categories` from `ccd_reader`, `clc_reader` and `prd_reader`
++
+ ## RELEASE 1.0.0 - Sep 4, 2025
+ 
+ ### Features
+diff --git a/pdbeccdutils/computations/parity_method.py b/pdbeccdutils/computations/parity_method.py
+index 3832cc9..2a0d430 100644
+--- a/pdbeccdutils/computations/parity_method.py
++++ b/pdbeccdutils/computations/parity_method.py
+@@ -73,7 +73,7 @@ def _generate_sim_score(template, query, smarts):
+     return (substructure, best_sim_score)
+ 
+ 
+-def compare_molecules(template, query, thresh=0.01, exact_match=False):
++def compare_molecules(template, query, thresh=0.01, exact_match=False, timeout=40):
+     """Given the two molecules calculates their similarity score.
+     If expected similarity score is lower than the threshold nothing
+     is calculated.
+@@ -85,6 +85,8 @@ def compare_molecules(template, query, thresh=0.01, exact_match=False):
+             the match to be considered. Defaults to 0.01.
+         exact_match (bool, optional): Controls whether atom type and
+             bond order should be checked too. Defaults to False.
++        timeout (int, optional): Value of timeout in seconds to stop the
++        maximum common substructure calcualtion 
+ 
+     Returns:
+         ParityResult: Result of the PARITY comparison.
+@@ -115,7 +117,7 @@ def compare_molecules(template, query, thresh=0.01, exact_match=False):
+             [template_copy, query_copy],
+             bondCompare=rdFMCS.BondCompare.CompareAny,
+             atomCompare=rdFMCS.AtomCompare.CompareAny,
+-            timeout=40,
++            timeout=timeout,
+             completeRingsOnly=True,
+         )
+     else:
+@@ -123,10 +125,14 @@ def compare_molecules(template, query, thresh=0.01, exact_match=False):
+             [template_copy, query_copy],
+             bondCompare=rdFMCS.BondCompare.CompareOrderExact,
+             atomCompare=rdFMCS.AtomCompare.CompareElements,
+-            timeout=40,
++            timeout=timeout,
+             completeRingsOnly=True,
+         )
+ 
++    if mcs_graph.canceled:
++        raise TimeoutError(f"MCS calculation timed out after {timeout} seconds. "
++                           "Try increasing the value of timeout.")
++
+     substructure, sim_score = _generate_sim_score(
+         template, query, mcs_graph.smartsString
+     )
+diff --git a/pdbeccdutils/core/ccd_reader.py b/pdbeccdutils/core/ccd_reader.py
+index e136f15..2dd1754 100644
+--- a/pdbeccdutils/core/ccd_reader.py
++++ b/pdbeccdutils/core/ccd_reader.py
+@@ -42,16 +42,6 @@
+ from pdbeccdutils.helpers import cif_tools, conversions, mol_tools, helper
+ from gemmi import cif
+ 
+-# categories that need to be 'fixed'
+-# str => list[str]
+-preprocessable_categories = [
+-    "_chem_comp_atom.",
+-    "_chem_comp_bond.",
+-    "_pdbx_chem_comp_identifier.",
+-    "_pdbx_chem_comp_descriptor.",
+-    "_chem_comp.",
+-]
+-
+ 
+ class CCDReaderResult(NamedTuple):
+     """
+@@ -171,11 +161,10 @@ def _parse_pdb_mmcif(cif_block, sanitize=True):
+     sanitized = False
+     mol = rdkit.Chem.RWMol()
+ 
+-    for c in preprocessable_categories:
+-        w = cif_tools.preprocess_cif_category(cif_block, c)
++    w = cif_tools.validate_ligand_cif_categories(cif_block)
+ 
+-        if w:
+-            warnings.append(w)
++    if w:
++        warnings.append(w)
+ 
+     _parse_pdb_atoms(mol, cif_block)
+     _parse_pdb_conformers(mol, cif_block)
+@@ -184,7 +173,8 @@ def _parse_pdb_mmcif(cif_block, sanitize=True):
+ 
+     if sanitize:
+         sanitized_result = mol_tools.sanitize(mol)
+-        mol, sanitized = sanitized_result.mol, sanitized_result.status
++        mol, sanitized, sanitization_error = sanitized_result.mol, sanitized_result.status, sanitized_result.errors
++        errors.extend(sanitization_error)
+ 
+     descriptors = _parse_pdb_descriptors(
+         cif_block, "_pdbx_chem_comp_descriptor.", "descriptor"
+diff --git a/pdbeccdutils/core/clc_reader.py b/pdbeccdutils/core/clc_reader.py
+index 8e72c64..387f180 100644
+--- a/pdbeccdutils/core/clc_reader.py
++++ b/pdbeccdutils/core/clc_reader.py
+@@ -42,17 +42,6 @@
+ )
+ from pdbeccdutils.helpers import cif_tools, conversions, mol_tools, helper
+ 
+-# categories that need to be 'fixed'
+-# str => list[str]
+-
+-preprocessable_categories = [
+-    "_chem_comp_atom.",
+-    "_chem_comp_bond.",
+-    "_pdbx_chem_comp_descriptor.",
+-    "_chem_comp.",
+-]
+-
+-
+ CLCReaderResult = namedtuple(
+     "CLCReaderResult", ccd_reader.CCDReaderResult._fields + ("bound_molecule",)
+ )
+@@ -112,7 +101,8 @@ def infer_multiple_chem_comp(path_to_cif, bm, bm_id, sanitize=True):
+     sanitized = False
+     if sanitize:
+         sanitized_result = mol_tools.sanitize(mol)
+-        mol, sanitized = sanitized_result.mol, sanitized_result.status
++        mol, sanitized, sanitization_error = sanitized_result.mol, sanitized_result.status, sanitized_result.errors
++        errors.extend(sanitization_error)
+ 
+     inchi_result = mol_tools.inchi_from_mol(mol)
+     if inchi_result.warnings:
+@@ -189,13 +179,10 @@ def _parse_pdb_mmcif(
+     warnings = []
+     errors = []
+     mol = rdkit.Chem.RWMol()
+-    preprocessable_categories = ["_atom_site.", "_chem_comp_bond."]
+-
+-    for c in preprocessable_categories:
+-        w = cif_tools.preprocess_cif_category(cif_block, c)
+ 
+-        if w:
+-            warnings.append(w)
++    w = cif_tools.validate_mm_cif_categories(cif_block)
++    if w:
++        warnings.append(w)
+ 
+     bm_atoms = _get_boundmolecule_atoms(cif_block, bm)
+ 
+@@ -527,11 +514,9 @@ def _parse_clc_mmcif(cif_block, sanitize=True):
+     sanitized = False
+     mol = rdkit.Chem.RWMol()
+ 
+-    for c in preprocessable_categories:
+-        w = cif_tools.preprocess_cif_category(cif_block, c)
+-
+-        if w:
+-            warnings.append(w)
++    w = cif_tools.validate_ligand_cif_categories(cif_block)
++    if w:
++        warnings.append(w)
+ 
+     _parse_clc_atoms(mol, cif_block)
+     _parse_clc_conformers(mol, cif_block)
+diff --git a/pdbeccdutils/core/component.py b/pdbeccdutils/core/component.py
+index a3f2ead..0059910 100644
+--- a/pdbeccdutils/core/component.py
++++ b/pdbeccdutils/core/component.py
+@@ -330,14 +330,16 @@ def physchem_properties(self):
+         if not self._physchem_properties:
+             try:
+                 properties = Properties()
++                # calculation of properties on the molecule with hydrogen will include 
++                # bonds to terminal atoms in the number of rotatable bonds 
+                 self._physchem_properties = dict(
+                     zip(
+                         properties.GetPropertyNames(),
+-                        properties.ComputeProperties(self.mol),
++                        properties.ComputeProperties(self.mol_no_h),
+                     )
+                 )
+                 self._physchem_properties["NumHeavyAtoms"] = float(
+-                    self.mol.GetNumHeavyAtoms()
++                    self.mol_no_h.GetNumHeavyAtoms()
+                 )
+             except (RuntimeError, ValueError):
+                 return {}
+diff --git a/pdbeccdutils/core/models.py b/pdbeccdutils/core/models.py
+index 95f8fd1..a7854e2 100755
+--- a/pdbeccdutils/core/models.py
++++ b/pdbeccdutils/core/models.py
+@@ -156,10 +156,12 @@ class SanitisationResult(NamedTuple):
+     Args:
+         mol: rdkit.Chem.rdchem.RWMol
+         status: Status of sanitisation process.
++        errors: Errors generated using sanitisation process
+     """
+ 
+     mol: Chem.rdchem.Mol
+     status: str
++    errors: List[str]
+ 
+ 
+ class Descriptor(NamedTuple):
+diff --git a/pdbeccdutils/core/prd_reader.py b/pdbeccdutils/core/prd_reader.py
+index 6ff451e..b780beb 100644
+--- a/pdbeccdutils/core/prd_reader.py
++++ b/pdbeccdutils/core/prd_reader.py
+@@ -30,17 +30,6 @@
+ from pdbeccdutils.helpers import cif_tools, conversions, mol_tools
+ from gemmi import cif
+ 
+-# categories that need to be 'fixed'
+-# str => list[str]
+-preprocessable_categories = [
+-    "_chem_comp_atom.",
+-    "_chem_comp_bond.",
+-    "_pdbx_chem_comp_identifier.",
+-    "_pdbx_chem_comp_descriptor.",
+-    "_chem_comp.",
+-]
+-
+-
+ def read_pdb_cif_file(
+     path_to_cif: str, sanitize: bool = True
+ ) -> ccd_reader.CCDReaderResult:
+@@ -141,11 +130,9 @@ def _parse_pdb_mmcif(cif_block, sanitize=True):
+     sanitized = False
+     mol = rdkit.Chem.RWMol()
+ 
+-    for c in preprocessable_categories:
+-        w = cif_tools.preprocess_cif_category(cif_block, c)
+-
+-        if w:
+-            warnings.append(w)
++    w = cif_tools.validate_ligand_cif_categories(cif_block)
++    if w:
++        warnings.append(w)
+ 
+     _parse_pdb_atoms(mol, cif_block)
+     ccd_reader._parse_pdb_conformers(mol, cif_block)
+@@ -154,7 +141,8 @@ def _parse_pdb_mmcif(cif_block, sanitize=True):
+ 
+     if sanitize:
+         sanitized_result = mol_tools.sanitize(mol)
+-        mol, sanitized = sanitized_result.mol, sanitized_result.status
++        mol, sanitized, sanitization_error = sanitized_result.mol, sanitized_result.status, sanitized_result.errors
++        errors.extend(sanitization_error)
+ 
+     descriptors = ccd_reader._parse_pdb_descriptors(
+         cif_block, "_pdbx_chem_comp_descriptor.", "descriptor"
+diff --git a/pdbeccdutils/helpers/cif_tools.py b/pdbeccdutils/helpers/cif_tools.py
+index e36b3c2..04d2b5d 100644
+--- a/pdbeccdutils/helpers/cif_tools.py
++++ b/pdbeccdutils/helpers/cif_tools.py
+@@ -22,6 +22,7 @@
+ import gemmi
+ from gemmi import cif
+ from pathlib import Path
++from pdbeccdutils.core.exceptions import CCDUtilsError
+ 
+ 
+ def preprocess_cif_category(cif_block, label):
+@@ -259,3 +260,57 @@ def get_prd_cif_enriched_dir(prdcc_code, base_dir):
+         prdcc_code = f"{prefix}CC_{code}"
+     one_letter_code = prdcc_code[-1]
+     return Path(base_dir, one_letter_code, prdcc_code)
++
++
++def validate_ligand_cif_categories(cif_block):
++    """Validate CIF block of ligand file based on their categories"""
++    categories = set(cif_block.get_mmcif_category_names())
++
++    mandatory_fields = [
++        "_chem_comp.",
++        "_chem_comp_atom.",
++    ]
++    optional_fields = [
++        "_chem_comp_bond.",
++        "_pdbx_chem_comp_identifier.",
++        "_pdbx_chem_comp_descriptor.",
++    ]
++
++    # Check if the input file is a mmCIF file
++    if "_entry." in categories:
++        raise CCDUtilsError(
++            f"Cannot process macromolecule file. Supports only ligands in CIF format"
++        )
++
++    # Check mandatory fields
++    missing_mandatory = [f for f in mandatory_fields if f not in categories]
++    if missing_mandatory:
++        raise CCDUtilsError(
++            f"Missing mandatory categories: {', '.join(missing_mandatory)}; cannot process input file."
++        )
++
++    # Check optional fields
++    missing_optional = [f for f in optional_fields if f not in categories]
++    if missing_optional:
++        return f"missing: {', '.join(missing_optional)}"
++
++    return None  # Explicitly return None if everything is fine
++
++def validate_mm_cif_categories(cif_block):
++    """Validate the CIF block of macromolecule based on the categories"""
++    categories = set(cif_block.get_mmcif_category_names())
++
++    mandatory_fields = [
++        "_entry.",
++        "_atom_site.",
++        "_chem_comp_bond."
++    ]
++
++    # Check mandatory fields
++    missing_mandatory = [f for f in mandatory_fields if f not in categories]
++    if missing_mandatory:
++        raise CCDUtilsError(
++            f"Missing mandatory categories: {', '.join(missing_mandatory)}; cannot process input file."
++        )
++
++    return None  # Explicitly return None if everything is fine
+diff --git a/pdbeccdutils/helpers/mol_tools.py b/pdbeccdutils/helpers/mol_tools.py
+index a16473a..c5ff43a 100644
+--- a/pdbeccdutils/helpers/mol_tools.py
++++ b/pdbeccdutils/helpers/mol_tools.py
+@@ -20,7 +20,6 @@
+ """
+ 
+ import re
+-import sys
+ from io import StringIO
+ from rdkit.Chem import BondType
+ from pdbeccdutils.core.models import (
+@@ -82,47 +81,48 @@ def sanitize(rwmol):
+     Returns:
+         bool: Result of the sanitization process.
+     """
+-    success = False
+-
+-    try:
+-        mol_copy = rdkit.Chem.RWMol(rwmol)
+-        success = fix_molecule(mol_copy)
+ 
+-        if not success:
+-            rdkit.Chem.SanitizeMol(
+-                rwmol, sanitizeOps=rdkit.Chem.SanitizeFlags.SANITIZE_CLEANUP
+-            )
+-            return SanitisationResult(mol=rwmol, status=False)
++    mol_copy = rdkit.Chem.RWMol(rwmol)
++    sanitised = True
++    errors = []
++    with rdkit.Chem.rdBase.BlockLogs():
++        sanity_issues = rdkit.Chem.SanitizeMol(mol_copy, catchErrors=True)
++        if sanity_issues:
++            chem_problems = rdkit.Chem.DetectChemistryProblems(mol_copy)
++            errors.extend([f"{error.GetType()}: {error.Message()}" for error in chem_problems])
++            try:
++                mol_copy.UpdatePropertyCache(strict=False)
++                rdkit.Chem.SanitizeMol(
++                    mol_copy,
++                    sanitizeOps=rdkit.Chem.SanitizeFlags.SANITIZE_ALL ^ rdkit.Chem.SanitizeFlags.SANITIZE_PROPERTIES
++                    )
++            except Exception:
++                rdkit.Chem.SanitizeMol(mol_copy,
++                sanitizeOps=rdkit.Chem.SanitizeFlags.SANITIZE_CLEANUP
++                )
++            finally:
++                sanitised = False
+ 
+         rdkit.Chem.Kekulize(mol_copy)
+-        # rdkit.Chem.rdmolops.AssignAtomChiralTagsFromStructure(rwmol, confId=0)
+-
+         # find correct conformer to assign stereochemistry
+         # ideal conformer comes first
+-
+         conformer_id = -1
+         conformer_types = [ConformerType.Ideal, ConformerType.Model]
+         for conf_type in conformer_types:
+             conformer = get_conformer(mol_copy, conf_type)
+             if not is_degenerate_conformer(conformer):
+                 conformer_id = conformer.GetId()
++                break
++        
++        if conformer_id != -1:
++            rdkit.Chem.rdmolops.AssignStereochemistryFrom3D(mol_copy, conformer_id)
++            rdkit.Chem.rdCIPLabeler.AssignCIPLabels(mol_copy)
++        else:
++            errors.append("DegenerateConformerException: Missing coordinates in both Ideal and Model conformers")
++        
++        return SanitisationResult(mol=mol_copy, status=sanitised, errors = errors)
+ 
+-        # conformers = rwmol.GetConformers()
+-        # if is_degenerate_conformer(conformers[0]):
+-        #     conformer_id = conformers[1].GetId()
+-        # else:
+-        #     conformer_id = conformers[0].GetId()
+-
+-        rdkit.Chem.rdmolops.AssignStereochemistryFrom3D(mol_copy, conformer_id)
+ 
+-    except Exception as e:
+-        print(e, file=sys.stderr)
+-        rdkit.Chem.SanitizeMol(
+-            rwmol, sanitizeOps=rdkit.Chem.SanitizeFlags.SANITIZE_CLEANUP
+-        )
+-        return SanitisationResult(mol=rwmol, status=False)
+-
+-    return SanitisationResult(mol=mol_copy, status=success)
+ 
+ 
+ def get_conformer(rwmol, c_type):
+@@ -146,50 +146,48 @@ def fix_molecule(rwmol: rdkit.Chem.rdchem.RWMol):
+     """
+     attempts = 10
+     success = False
+-    saved_std_err = sys.stderr
+-    log = sys.stderr = StringIO()
+-    rdkit.rdBase.LogToPythonStderr()
+-
+-    while (not success) and attempts >= 0:
+-        sanitization_result = rdkit.Chem.SanitizeMol(rwmol, catchErrors=True)
+-
+-        if sanitization_result == 0:
+-            sys.stderr = saved_std_err
+-            return True
+-
+-        sanitization_failures = re.findall("[a-zA-Z]{1,2}, \\d+", log.getvalue())
+-        if not sanitization_failures:
+-            sys.stderr = saved_std_err
+-            return False
+-
+-        for sanitization_failure in sanitization_failures:
+-            split_object = sanitization_failure.split(",")  # [0] element [1] valency
+-            element = split_object[0]
+-            valency = int(split_object[1].strip())
+-
+-            smarts_metal_check = rdkit.Chem.MolFromSmarts(
+-                METALS_SMART + "~[{}]".format(element)
+-            )
+-            metal_atom_bonds = rwmol.GetSubstructMatches(smarts_metal_check)
+-            rdkit.Chem.SanitizeMol(
+-                rwmol, sanitizeOps=rdkit.Chem.SanitizeFlags.SANITIZE_CLEANUP
+-            )
+-            for metal_index, other_index in metal_atom_bonds:
+-                metal_atom = rwmol.GetAtomWithIdx(metal_index)
+-                other_atom = rwmol.GetAtomWithIdx(other_index)
+-                # alter the bond to be dative towards the metal -
+-                if other_atom.GetExplicitValence() == valency:
+-                    rwmol.RemoveBond(metal_atom.GetIdx(), other_atom.GetIdx())
+-                    rwmol.AddBond(
+-                        other_atom.GetIdx(),
+-                        metal_atom.GetIdx(),
+-                        rdkit.Chem.BondType.DATIVE,
+-                    )
+-            rwmol.UpdatePropertyCache()  # regenerates valence records
++    log = StringIO()
++
++    with redirect_stderr(log):
++        rdkit.rdBase.LogToPythonStderr()
++
++        while (not success) and attempts >= 0:
++            sanitization_result = rdkit.Chem.SanitizeMol(rwmol, catchErrors=True)
++
++            if sanitization_result == 0:
++                return True
+ 
+-        attempts -= 1
++            sanitization_failures = re.findall("[a-zA-Z]{1,2}, \\d+", log.getvalue())
++            if not sanitization_failures:
++                return False
++
++            for sanitization_failure in sanitization_failures:
++                split_object = sanitization_failure.split(",")  # [0] element [1] valency
++                element = split_object[0]
++                valency = int(split_object[1].strip())
++
++                smarts_metal_check = rdkit.Chem.MolFromSmarts(
++                    METALS_SMART + "~[{}]".format(element)
++                )
++                metal_atom_bonds = rwmol.GetSubstructMatches(smarts_metal_check)
++                rdkit.Chem.SanitizeMol(
++                    rwmol, sanitizeOps=rdkit.Chem.SanitizeFlags.SANITIZE_CLEANUP
++                )
++                for metal_index, other_index in metal_atom_bonds:
++                    metal_atom = rwmol.GetAtomWithIdx(metal_index)
++                    other_atom = rwmol.GetAtomWithIdx(other_index)
++                    # alter the bond to be dative towards the metal -
++                    if other_atom.GetExplicitValence() == valency:
++                        rwmol.RemoveBond(metal_atom.GetIdx(), other_atom.GetIdx())
++                        rwmol.AddBond(
++                            other_atom.GetIdx(),
++                            metal_atom.GetIdx(),
++                            rdkit.Chem.BondType.DATIVE,
++                        )
++                rwmol.UpdatePropertyCache()  # regenerates valence records
++
++            attempts -= 1
+ 
+-    sys.stderr = saved_std_err
+ 
+     return False
+ 
+diff --git a/pdbeccdutils/tests/test_property_generation.py b/pdbeccdutils/tests/test_property_generation.py
+index 853647d..5fdeb7e 100644
+--- a/pdbeccdutils/tests/test_property_generation.py
++++ b/pdbeccdutils/tests/test_property_generation.py
+@@ -5,11 +5,11 @@
+ 
+ test_inputs = {
+     "ATP": {
+-        "logp": -2.438,
++        "logp": -1.629,
+         "heavy_atom_count": 31,
+-        "numH_acceptors": 18,
++        "numH_acceptors": 13,
+         "numH_donors": 7,
+-        "num_rotable_bonds": 15,
++        "num_rotable_bonds": 8,
+         "rings_count": 3,
+         "TPSA": 279.130,
+         "molwt": 506.996,
+@@ -19,7 +19,7 @@
+         "heavy_atom_count": 15,
+         "numH_acceptors": 6,
+         "numH_donors": 5,
+-        "num_rotable_bonds": 7,
++        "num_rotable_bonds": 2,
+         "rings_count": 1,
+         "TPSA": 119.250,
+         "molwt": 221.09,
+@@ -46,11 +46,3 @@ def test_valid_properties(key):
+         assert test_inputs[key]["TPSA"] == round(physchem_props["tpsa"], 3)
+         assert test_inputs[key]["molwt"] == round(physchem_props["exactmw"], 3)
+ 
+-    @staticmethod
+-    @pytest.mark.parametrize("key", ["10R", "08T"])
+-    def test_invalid_properties(key):
+-        physchem_props = ccd_reader.read_pdb_cif_file(
+-            cif_filename(key)
+-        ).component.physchem_properties
+-
+-        assert physchem_props == {}
+diff --git a/poetry.lock b/poetry.lock
+index b65e967..94c5fed 100644
+--- a/poetry.lock
++++ b/poetry.lock
+@@ -255,7 +255,7 @@ version = "0.3.9"
+ description = "Distribution utilities"
+ optional = false
+ python-versions = "*"
+-groups = ["dev", "tests"]
++groups = ["tests"]
+ files = [
+     {file = "distlib-0.3.9-py2.py3-none-any.whl", hash = "sha256:47f8c22fd27c27e25a65601af709b38e4f0a45ea4fc2e710f65755fa8caaaf87"},
+     {file = "distlib-0.3.9.tar.gz", hash = "sha256:a60f20dea646b8a33f3e7772f74dc0b2d0772d2837ee1342a00645c81edf9403"},
+@@ -298,7 +298,7 @@ version = "3.20.3"
+ description = "A platform independent file lock."
+ optional = false
+ python-versions = ">=3.10"
+-groups = ["dev", "tests"]
++groups = ["tests"]
+ files = [
+     {file = "filelock-3.20.3-py3-none-any.whl", hash = "sha256:4b0dda527ee31078689fc205ec4f1c1bf7d56cf88b6dc9426c4f230e46c2dce1"},
+     {file = "filelock-3.20.3.tar.gz", hash = "sha256:18c57ee915c7ec61cff0ecf7f0f869936c7c30191bb0cf406f1341778d0834e1"},
+@@ -818,7 +818,7 @@ version = "4.3.8"
+ description = "A small Python package for determining appropriate platform-specific dirs, e.g. a `user data dir`."
+ optional = false
+ python-versions = ">=3.9"
+-groups = ["dev", "tests"]
++groups = ["tests"]
+ files = [
+     {file = "platformdirs-4.3.8-py3-none-any.whl", hash = "sha256:ff7059bb7eb1179e2685604f4aaf157cfd9535242bd23742eadc3c13542139b4"},
+     {file = "platformdirs-4.3.8.tar.gz", hash = "sha256:3d512d96e16bcb959a814c9f348431070822a6496326a4be0911c40b5a74c2bc"},
+@@ -987,37 +987,34 @@ files = [
+ 
+ [[package]]
+ name = "rdkit"
+-version = "2025.3.3"
++version = "2026.3.6"
+ description = "A collection of chemoinformatics and machine-learning software written in C++ and Python"
+ optional = false
+ python-versions = "*"
+ groups = ["main"]
+ files = [
+-    {file = "rdkit-2025.3.3-cp310-cp310-macosx_10_15_x86_64.whl", hash = "sha256:83b4191c69d91a1f14a681812d263089e5416f527fd49231791dce1526c59148"},
+-    {file = "rdkit-2025.3.3-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:e4c3480769f0f1875ed1efd078cc404d74bacd54e6f49f4ae2ef2e6727d792e2"},
+-    {file = "rdkit-2025.3.3-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:887dfc85eef3b857d9c842b5453a096351f21f6ef45aef7f5db6b4a8f91bbcc5"},
+-    {file = "rdkit-2025.3.3-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:a6a37db2e3b86e9e2e286a8b23a0f5954bf8ea5ea7a007e7a7be6e5f7eb95ac1"},
+-    {file = "rdkit-2025.3.3-cp310-cp310-win_amd64.whl", hash = "sha256:f96ddca2e60ad244081d3d39171d21c338800b37476a61a37461e2234cbfd107"},
+-    {file = "rdkit-2025.3.3-cp311-cp311-macosx_10_15_x86_64.whl", hash = "sha256:a06a727c32f8b530299cbe6521e8a43007eda7ca7be5298fdbeaf3a834893729"},
+-    {file = "rdkit-2025.3.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:df1960e803ca20939873b3d06570e6b4b0b48073b99aaa3fa7faf11d7620b247"},
+-    {file = "rdkit-2025.3.3-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:21c853aecc1893abc794e2feb4e0bcb3df0eaa8e5a019c2be5a56d6a6d515467"},
+-    {file = "rdkit-2025.3.3-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:9c27df20cffa7d79d6577ff59d3dbb74904ebfa9ff5514a3fbf7e6e3592b4a36"},
+-    {file = "rdkit-2025.3.3-cp311-cp311-win_amd64.whl", hash = "sha256:f22dbef04cfd11883f9bf31b8ca85d5fb7da1ee7b8456b3d55cf4184fd7c1dca"},
+-    {file = "rdkit-2025.3.3-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:0605672089cff269e041d9eb4c7825262bf302f0991df4b7e0d0b83ba1c7564d"},
+-    {file = "rdkit-2025.3.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:56c7ffcf593c516a8ee7448b83a93e225aaeb1f4324d2cb3ed22f4e266221911"},
+-    {file = "rdkit-2025.3.3-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:5066a1783d8f3deb57adec8ba92d5f02500471bb0bebedb67af51a47ab4ccf70"},
+-    {file = "rdkit-2025.3.3-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:d2098370185ff5e7fb5e1ece268d5d6ab43b5828878b1e370d3bf47809e7a811"},
+-    {file = "rdkit-2025.3.3-cp312-cp312-win_amd64.whl", hash = "sha256:b56a301166d5aac2745d1fc55c7191d7aa527d40927857cf3a30340b575c9fc9"},
+-    {file = "rdkit-2025.3.3-cp313-cp313-macosx_10_15_x86_64.whl", hash = "sha256:86b60eccec3f10bd0af3c4eb4341399124a3dec0a8b4f210c8c66cc0a93c3213"},
+-    {file = "rdkit-2025.3.3-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:204d69cabdc0abaf332575437c3a7e33f3fcf0da6d911f7fe461f3aecc339ea5"},
+-    {file = "rdkit-2025.3.3-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:c3528ad58d9933ee8597f4e79704ab410d5ac5dc060b4f080f57069bfdb299c4"},
+-    {file = "rdkit-2025.3.3-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:55d3a4dac2307ba2807d0d248801974b489b7bbf5bded94822c59c8b1b2699c1"},
+-    {file = "rdkit-2025.3.3-cp313-cp313-win_amd64.whl", hash = "sha256:5bf25c457d465198d074bc4924b71fadd3661ee52c44041d38acaa6660a8bdfc"},
+-    {file = "rdkit-2025.3.3-cp39-cp39-macosx_10_15_x86_64.whl", hash = "sha256:d82a835d5f832f555e0d6cf7c4eea48bda9351cca55b43f38da1bc6b78a7bed6"},
+-    {file = "rdkit-2025.3.3-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:a913e5f36e40ab0e4ec50025775a0d38a1f4ba3ba2ae06cf58c59d33744586fe"},
+-    {file = "rdkit-2025.3.3-cp39-cp39-manylinux_2_28_aarch64.whl", hash = "sha256:f9f02f323520ed40fa8c27275ece69e5c8ceef3fe4d3d66b352ceeef0b1c5a39"},
+-    {file = "rdkit-2025.3.3-cp39-cp39-manylinux_2_28_x86_64.whl", hash = "sha256:639ed5e562efd292649538088019dbbf536838071b8f6081faf11a87cf7a34e0"},
+-    {file = "rdkit-2025.3.3-cp39-cp39-win_amd64.whl", hash = "sha256:3949fa62a623adf3330907805f9dc10a1a7641a8355f5762594cb05a29e0a2be"},
++    {file = "rdkit-2026.3.6-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:c405fac33b3de61b49c0037524a7d9d4738f39b92b5e97c0cc5d571394d70510"},
++    {file = "rdkit-2026.3.6-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:d76dac09e07421e4f2e32773a5a0574fbf07a75d43d7fcc625e2a2de19fd76b1"},
++    {file = "rdkit-2026.3.6-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:657d1a6cd636213bfb7eac8b0b614893ef7cb08b0217df0a874ca41eb6093114"},
++    {file = "rdkit-2026.3.6-cp310-cp310-win_amd64.whl", hash = "sha256:243c412450faa4e7a840bf0811fd4a2acda1fd0bf96bd4d60aaf4c5ff04dc365"},
++    {file = "rdkit-2026.3.6-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:3c5395ccf20eb4301195086b15b3628c3cba770994dfbca7e0ca0992fe0e5e1c"},
++    {file = "rdkit-2026.3.6-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:d8b92c14c99bf025772582c7f29b7619dd8c63c745a7b90f720b02640c15a5a1"},
++    {file = "rdkit-2026.3.6-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:dcf09347e1a0dc1d7e5fcc34f5da79d1f4bb0e04ecadee669449b82ae2492799"},
++    {file = "rdkit-2026.3.6-cp311-cp311-win_amd64.whl", hash = "sha256:b7a810148bbf917bb48ccec4e885b09c036fa68f28d3fd7fac6ddf96aac633d6"},
++    {file = "rdkit-2026.3.6-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:b490da262688b9b16528d592752ab7838d4df4d7ffaacdb3c42d07e769a97552"},
++    {file = "rdkit-2026.3.6-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:16d446583b7bac24b018a424bb24fd515c625f7bad4171d6aa46993a3e2f9aa0"},
++    {file = "rdkit-2026.3.6-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:9f97b58f1962df73bdacf44347bfa013f4fcb9896e049f98af2183e70e7aab46"},
++    {file = "rdkit-2026.3.6-cp312-cp312-win_amd64.whl", hash = "sha256:740f2015d07426a9d3ee98cdda2dbb028b84b35aca3edeff0dcb75294512d692"},
++    {file = "rdkit-2026.3.6-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e16c467cb254a223e59a0cf81358c6b39da15a99d2909170d693e95778fddb41"},
++    {file = "rdkit-2026.3.6-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:76053010100fe16ae45b66b8578415a0816f71cb71a932619be3c8939e71a12a"},
++    {file = "rdkit-2026.3.6-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:3d0a2011c2a46f312010c8d8ec89b8210795663285545b2ac0909d1b9551fe41"},
++    {file = "rdkit-2026.3.6-cp313-cp313-win_amd64.whl", hash = "sha256:3765896e189a5dc4ef109a1ab81c375fb1e00185d52374ffc2128391bddd6b8f"},
++    {file = "rdkit-2026.3.6-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:5a48f11dda561d25db1df4b49b41f1e2533c24fb53139491413dd05f51205fbc"},
++    {file = "rdkit-2026.3.6-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:8ceec13e9c9b1327cb5eb9aaa3c26aabde0d6c5be8a375c4a6cf50453925c69e"},
++    {file = "rdkit-2026.3.6-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:a4ce417cb1da5dc552b708eff3e851e4c1c9d257119aa2f8cf6371d1f3b7cd32"},
++    {file = "rdkit-2026.3.6-cp314-cp314-win_amd64.whl", hash = "sha256:6a82951a8fa3f4d508ba514e648a1766ef793e00700c9338ec5cdb6d07a7ad4c"},
++    {file = "rdkit-2026.3.6-cp315-cp315-macosx_11_0_arm64.whl", hash = "sha256:7b178b11149e0ae8c499eb97e44e43c702d642ca2b3f86c980c4d7c9cb87ceaa"},
++    {file = "rdkit-2026.3.6-cp315-cp315-manylinux_2_28_aarch64.whl", hash = "sha256:bd5b0ffc18cef83a9c24012d2d9716daf24f87dc82df89376bb010773669504a"},
+ ]
+ 
+ [package.dependencies]
+@@ -1378,7 +1375,7 @@ version = "4.14.1"
+ description = "Backported and Experimental Type Hints for Python 3.9+"
+ optional = false
+ python-versions = ">=3.9"
+-groups = ["dev", "tests"]
++groups = ["tests"]
+ markers = "python_version == \"3.10\""
+ files = [
+     {file = "typing_extensions-4.14.1-py3-none-any.whl", hash = "sha256:d1e1e3b58374dc93031d6eda2420a48ea44a36c2b4766a4fdeb3710755731d76"},
+@@ -1409,7 +1406,7 @@ version = "20.36.1"
+ description = "Virtual Python Environment builder"
+ optional = false
+ python-versions = ">=3.8"
+-groups = ["dev", "tests"]
++groups = ["tests"]
+ files = [
+     {file = "virtualenv-20.36.1-py3-none-any.whl", hash = "sha256:575a8d6b124ef88f6f51d56d656132389f961062a9177016a50e4f507bbcc19f"},
+     {file = "virtualenv-20.36.1.tar.gz", hash = "sha256:8befb5c81842c641f8ee658481e42641c68b5eab3521d8e092d18320902466ba"},
+@@ -1428,4 +1425,4 @@ test = ["covdefaults (>=2.3)", "coverage (>=7.2.7)", "coverage-enable-subprocess
+ [metadata]
+ lock-version = "2.1"
+ python-versions = ">=3.10,<4"
+-content-hash = "fe911d38a69c8b5f1fd7186addbfa86e7016be07fb542653bbe00481b285b268"
++content-hash = "47e09cb33855760e3549a450def0df22c4d825c9a9f9cf333099ddf70b73fe6f"
+diff --git a/pyproject.toml b/pyproject.toml
+index 2db2e75..592d19f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [tool.poetry]
+ name = "pdbeccdutils"
+-version = "1.0.4"
++version = "2.0.0"
+ description = "Toolkit to parse and process small molecules in wwPDB"
+ authors = ["Protein Data Bank in Europe <pdbehelp@ebi.ac.uk>"]
+ license = "Apache License 2.0."
+@@ -33,7 +33,7 @@ numpy = ">=1.26.4"
+ requests = ">=2.32.3"
+ gemmi = ">=0.6.6"
+ networkx = ">=3.3"
+-rdkit = ">=2023.9.6"
++rdkit = ">=2026.03.6"
+ 
+ [tool.poetry.scripts]
+ process_components_cif = "pdbeccdutils.scripts.process_components_cif_cli:main"

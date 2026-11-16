@@ -1,0 +1,787 @@
+diff --git a/examples/Francoeur2020/PDBbind2016-Crystal/plot.py b/examples/Francoeur2020/PDBbind2016-Crystal/plot.py
+index 5ab7527..50d47a1 100644
+--- a/examples/Francoeur2020/PDBbind2016-Crystal/plot.py
++++ b/examples/Francoeur2020/PDBbind2016-Crystal/plot.py
+@@ -64,7 +64,6 @@
+     df_inference["fold"] = fold
+ 
+     df = pd.concat((df_inference, df_types), axis=1)
+-    print(df)
+ 
+     # assert np.allclose( df_inference["affinity_exp"].to_numpy(), np.abs(df_types["affinity"].to_numpy()))
+ 
+diff --git a/examples/Ragoza2017/plot.py b/examples/Ragoza2017/plot.py
+index f79788e..e97ede8 100644
+--- a/examples/Ragoza2017/plot.py
++++ b/examples/Ragoza2017/plot.py
+@@ -19,8 +19,6 @@
+ 
+         df_all = df_all.append(df, ignore_index=True)
+ 
+-# print(df_all)
+-
+ sns.lineplot(
+     x="Epoch", y="ROC-AUC", hue="Augmentation", style="Phase", data=df_all, markers=True
+ )
+diff --git a/gnina/inference.py b/gnina/inference.py
+index 6ea3d55..d543ac9 100644
+--- a/gnina/inference.py
++++ b/gnina/inference.py
+@@ -11,7 +11,7 @@
+ from ignite.engine import Events
+ from ignite.handlers import Checkpoint
+ 
+-from gnina import models, setup, training, utils
++from gnina import metrics, models, setup, training, utils
+ from gnina.dataloaders import GriddedExamplesLoader
+ 
+ 
+@@ -159,7 +159,7 @@ def inference(args):
+ 
+     # TODO: Allow prediction for systems without known pose or affinity
+     # Setup metrics but do not compute losses
+-    allmetrics = training._setup_metrics(
++    allmetrics = metrics.setup_metrics(
+         affinity,
+         pose_loss=None,
+         affinity_loss=None,
+diff --git a/gnina/metrics.py b/gnina/metrics.py
+new file mode 100644
+index 0000000..ca39c09
+--- /dev/null
++++ b/gnina/metrics.py
+@@ -0,0 +1,122 @@
++from typing import Any, Dict
++
++import torch
++from ignite import metrics
++from ignite.contrib.metrics import ROC_AUC
++from torch import nn
++
++from gnina import transforms
++
++
++def setup_metrics(
++    affinity: bool,
++    pose_loss: nn.Module,
++    affinity_loss: nn.Module,
++    roc_auc: bool,
++    device: torch.device,
++) -> Dict[str, Any]:
++    """
++    Define metrics to be computed at the end of an epoch (evaluation).
++
++    Parameters
++    ----------
++    affinity: bool
++        Flag for affinity prediction (in addition to pose prediction)
++    pose_loss: nn.Module
++        Pose loss
++    affinity_loss: nn.Module
++        Affinity loss
++    roc_auc: bool
++        Flag for computing ROC AUC
++    device: torch.device
++        Device
++
++    Returns
++    -------
++    Dict[str, ignite.metrics.Metric]
++        Dictionary of PyTorch Ignite metrics
++
++    Notes
++    -----
++    The computation of the ROC AUC for pose prediction can be disabled. This is useful
++    when the computation is expected to fail because all poses belong to the same class
++    (e.g. all poses are "good" poses). This situations happens when working with crystal
++    structures, for which the pose is a "good" pose by definition.
++
++    Loss functions need to be set up as metrics in order to be correctly accumulated.
++    Using :code:`evaluator.state.output` to compute the loss does not work since the
++    output only contain the last batch (to avoid RAM saturation).
++    """
++    # Check that affinity_loss and affinity arguments are consistent
++    if affinity_loss is not None:
++        assert affinity
++
++    # Pose prediction metrics
++    m: Dict[str, Any] = {
++        # Accuracy can be used directly without binarising the data since we are not
++        # performing binary classification (Linear(out_features=1)) but we are
++        # performing multiclass classification with 2 classes (Linear(out_features=2))
++        "Accuracy": metrics.Accuracy(
++            output_transform=transforms.output_transform_select_pose
++        ),
++        # Balanced accuracy is the average recall over all classes
++        # https://scikit-learn.org/stable/modules/generated/sklearn.metrics.balanced_accuracy_score.html
++        "Balanced accuracy": metrics.Recall(
++            average=True, output_transform=transforms.output_transform_select_pose
++        ),
++    }
++
++    if pose_loss is not None:
++        # For the loss function, log_softmax is needed as opposed to softmax
++        # Use transforms.output_transform_select_log_pose instead of
++        # transforms.output_transform_select_pose
++        m.update(
++            {
++                "Loss (pose)": metrics.Loss(
++                    pose_loss,
++                    output_transform=transforms.output_transform_select_log_pose,
++                )
++            }
++        )
++
++    if roc_auc:
++        m.update(
++            {
++                "ROC AUC": ROC_AUC(
++                    output_transform=lambda output: transforms.output_transform_ROC(
++                        output
++                    ),
++                    device=device,
++                ),
++            }
++        )
++
++    # Affinity prediction metrics
++    if affinity:
++        # Affinities have negative values for bad poses
++        # In order to compute metrics, the absolute value is returned
++        m.update(
++            {
++                "MAE": metrics.MeanAbsoluteError(
++                    output_transform=transforms.output_transform_select_affinity_abs
++                ),
++                "RMSE": metrics.RootMeanSquaredError(
++                    output_transform=transforms.output_transform_select_affinity_abs
++                ),
++            }
++        )
++
++        if affinity_loss is not None:
++            # Affinities have negative values for bad poses
++            # The loss function uses the sign to distinguish good from bad poses
++            m.update(
++                {
++                    "Loss (affinity)": metrics.Loss(
++                        affinity_loss,
++                        output_transform=transforms.output_transform_select_affinity,
++                    )
++                }
++            )
++
++    # Return dictionary with all metrics
++    return m
+diff --git a/gnina/training.py b/gnina/training.py
+index 8ccd5fa..0dd1acf 100644
+--- a/gnina/training.py
++++ b/gnina/training.py
+@@ -5,19 +5,17 @@
+ import argparse
+ import os
+ import sys
+-from typing import Any, Dict, List, Optional, Tuple
++from typing import List, Optional
+ 
+ import molgrid
+ import numpy as np
+ import torch
+-from ignite import metrics
+ from ignite.contrib.handlers import ProgressBar
+-from ignite.contrib.metrics import ROC_AUC
+ from ignite.engine import Engine, Events
+ from ignite.handlers import Checkpoint
+ from torch import nn, optim
+ 
+-from gnina import setup, utils
++from gnina import metrics, setup, utils
+ from gnina.dataloaders import GriddedExamplesLoader
+ from gnina.losses import AffinityLoss
+ from gnina.models import models_dict
+@@ -128,7 +126,7 @@ def options(args: Optional[List[str]] = None):
+         "--iteration_scheme",
+         type=str,
+         default="small",
+-        help="molgrid iteration sheme",
++        help="molgrid iteration scheme",
+         choices=setup._iteration_schemes.keys(),
+     )
+     # lr_dynamic, originally called --dynamic
+@@ -219,7 +217,7 @@ def _train_step_pose(
+     model:
+         PyTorch model
+     optimizer:
+-        Pytorch optimizer
++        PyTorch optimizer
+     pose_loss:
+         Loss function for pose prediction
+     clip_gradients:
+@@ -276,7 +274,7 @@ def _train_step_pose_and_affinity(
+     model:
+         PyTorch model
+     optimizer:
+-        Pytorch optimizer
++        PyTorch optimizer
+     pose_loss:
+         Loss function for pose prediction
+     affinity_loss:
+@@ -437,8 +435,8 @@ def _evaluation_step_pose(evaluator: Engine, batch, model):
+     of the output with the same key used in :fun:`_evaluation_step_pose_and_affinity`.
+     This allows to simplify the code of the learning rate scheduler function. This
+     function also allows consistency in allowing the use of
+-    :fun:`_output_transform_select_pose` for both pose prediction only and binding pose
+-    prediction with bindign affinity prediction.
++    :fun:`transforms.output_transform_select_pose` for both pose prediction only and
++    binding pose prediction with binding affinity prediction.
+     """
+     model.eval()
+     with torch.no_grad():
+@@ -490,7 +488,7 @@ def _setup_evaluator(model, metrics, affinity: bool = False) -> Engine:
+         )
+ 
+     # Add metrics to the evaluator engine
+-    # Metrics need an output_tranform method in order to select the correct ouput
++    # Metrics need an output_tranform method in order to select the correct output
+     # from _evaluation_step_pose_and_affinity
+     for name, metric in metrics.items():
+         metric.attach(evaluator, name)
+@@ -498,258 +496,6 @@ def _setup_evaluator(model, metrics, affinity: bool = False) -> Engine:
+     return evaluator
+ 
+ 
+-def _output_transform_select_log_pose(
+-    output: Dict[str, torch.Tensor]
+-) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """
+-    Select pose :code:`log_softmax` output and labels from output dictionary.
+-
+-    Parameters
+-    ----------
+-    output: Dict[str, ignite.metrics.Metric]
+-        Engine output
+-
+-    Notes
+-    -----
+-    This function is used as :code:`output_transform` in
+-    :class:`ignite.metrics.metric.Metric` and allow to select pose results from
+-    what the evaluator returns (that is,
+-    :code:`(pose_log, affinities_pred, labels, affinities)` when :code:`affinity=True`).
+-    See return of :fun:`_output_transform_pose_and_affinity`.
+-
+-    The output is not activated, i.e. the :code:`log_softmax` output is returned
+-    unchanged
+-    """
+-    # Return pose class probabilities and true labels
+-    # log_softmax is transformed into softmax to get the class probabilities
+-    return output["pose_log"], output["labels"]
+-
+-
+-def _output_transform_select_pose(
+-    output: Dict[str, torch.Tensor]
+-) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """
+-    Select pose :code:`softmax` output and labels from output dictionary.
+-
+-    Parameters
+-    ----------
+-    output: Dict[str, ignite.metrics.Metric]
+-        Engine output
+-
+-    Notes
+-    -----
+-    This function is used as :code:`output_transform` in
+-    :class:`ignite.metrics.metric.Metric` and allow to select pose results from
+-    what the evaluator returns (that is,
+-    :code:`(pose_log, affinities_pred, labels, affinities)` when :code:`affinity=True`).
+-    See return of :fun:`_output_transform_pose_and_affinity`.
+-
+-    The output is activated, i.e. the :code:`log_softmax` output is transformed into
+-    :code:`softmax`.
+-    """
+-    # print("DEBUG:", output)
+-    # Return pose class probabilities and true labels
+-    # log_softmax is transformed into softmax to get the class probabilities
+-    return torch.exp(output["pose_log"]), output["labels"]
+-
+-
+-def _output_transform_select_affinity(
+-    output: Dict[str, torch.Tensor]
+-) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """
+-    Select predicted affinities output and experimental (target) affinities from output
+-    dictionary.
+-
+-    Parameters
+-    ----------
+-    output: Dict[str, ignite.metrics.Metric]
+-        Engine output
+-
+-    Returns
+-    -------
+-    Tuple[torch.Tensor, torch.Tensor]
+-        Predicted binding affnity and experimental binding affinity
+-
+-    Notes
+-    -----
+-    This function is used as :code:`output_transform` in
+-    :class:`ignite.metrics.metric.Metric` and allow to select affinity predictions from
+-    what the evaluator returns (that is,
+-    :code:`(pose_log, affinities_pred, labels, affinities)` when :code:`affinity=True`).
+-    See return of :fun:`_output_transform_pose_and_affinity`.
+-    """
+-    # Return pose class probabilities and true labels
+-    return output["affinities_pred"], output["affinities"]
+-
+-
+-def _output_transform_select_affinity_abs(
+-    output: Dict[str, torch.Tensor]
+-) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """
+-    Select predicted affinities output and experimental (target) affinities from output
+-    dictionary.
+-
+-    Parameters
+-    ----------
+-    output: Dict[str, ignite.metrics.Metric]
+-        Engine output
+-
+-    Returns
+-    -------
+-    Tuple[torch.Tensor, torch.Tensor]
+-        Predicted binding affnity and experimental binding affinity
+-
+-    Notes
+-    -----
+-    This function is used as :code:`output_transform` in
+-    :class:`ignite.metrics.metric.Metric` and allow to select affinity predictions from
+-    what the evaluator returns (that is,
+-    :code:`(pose_log, affinities_pred, labels, affinities)` when :code:`affinity=True`).
+-    See return of :fun:`_output_transform_pose_and_affinity`.
+-
+-    Affinities can have negative values when they are associated to bad poses. The sign
+-    is used by :class:`AffinityLoss`, but in order to compute standard metrics the
+-    absolute value is needed, which is returned here.
+-    """
+-    # Return pose class probabilities and true labels
+-    return output["affinities_pred"], torch.abs(output["affinities"])
+-
+-
+-def _output_transform_ROC(output) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """
+-    Output transform for the ROC curve.
+-
+-    Parameters
+-    ----------
+-    output:
+-        Engine output
+-    affinity: bool
+-        Flag for binding affinity prediction
+-
+-    Returns
+-    -------
+-    Tuple[torch.Tensor, torch.Tensor]
+-        Positive class probabilities and associated labels.
+-
+-    Notes
+-    -----
+-    https://pytorch.org/ignite/generated/ignite.contrib.metrics.ROC_AUC.html#roc-auc
+-    """
+-    # Select pose prediction
+-    pose, labels = _output_transform_select_pose(output)
+-
+-    # Return probability estimates of the positive class
+-    return pose[:, -1], labels
+-
+-
+-def _setup_metrics(
+-    affinity: bool,
+-    pose_loss: nn.Module,
+-    affinity_loss: nn.Module,
+-    roc_auc: bool,
+-    device: torch.device,
+-) -> Dict[str, Any]:
+-    """
+-    Define metrics to be computed at the end of an epoch (evaluation).
+-
+-    Parameters
+-    ----------
+-    affinity: bool
+-        Flag for affinity prediction (in addition to pose prediction)
+-    pose_loss: nn.Module
+-        Pose loss
+-    affinity_loss: nn.Module
+-        Affinity loss
+-    roc_auc: bool
+-        Flag for computing ROC AUC
+-    device: torch.device
+-        Device
+-
+-    Returns
+-    -------
+-    Dict[str, ignite.metrics.Metric]
+-        Dictionary of PyTorch Ignite metrics
+-
+-    Notes
+-    -----
+-    The computation of the ROC AUC for pose prediction can be disabled. This is useful
+-    when the computation is expected to fail because all poses belong to the same class
+-    (e.g. all poses are "good" poses). This situations happens when working with crystal
+-    structures, for which the pose is a "good" pose by definition.
+-
+-    Loss functions need to be set up as metrics in order to be correctly accumulated.
+-    Using :code:`evaluator.state.output` to compute the loss does not work since the
+-    output only contain the last batch (to avoid RAM saturation).
+-    """
+-    # Check that affinity_loss and affinity arguments are consistent
+-    if affinity_loss is not None:
+-        assert affinity
+-
+-    # Pose prediction metrics
+-    m: Dict[str, Any] = {
+-        # Accuracy can be used directly without binarising the data since we are not
+-        # performing binary classification (Linear(out_features=1)) but we are
+-        # performing multiclass classification with 2 classes (Linear(out_features=2))
+-        "Accuracy": metrics.Accuracy(output_transform=_output_transform_select_pose),
+-        # Balanced accuracy is the average recall over all classes
+-        # https://scikit-learn.org/stable/modules/generated/sklearn.metrics.balanced_accuracy_score.html
+-        "Balanced accuracy": metrics.Recall(
+-            average=True, output_transform=_output_transform_select_pose
+-        ),
+-    }
+-
+-    if pose_loss is not None:
+-        # For the loss function, log_softmax is needed as opposed to softmax
+-        # Use _output_transform_select_log_pose instead of _output_transform_select_pose
+-        m.update(
+-            {
+-                "Loss (pose)": metrics.Loss(
+-                    pose_loss, output_transform=_output_transform_select_log_pose
+-                )
+-            }
+-        )
+-
+-    if roc_auc:
+-        m.update(
+-            {
+-                "ROC AUC": ROC_AUC(
+-                    output_transform=lambda output: _output_transform_ROC(output),
+-                    device=device,
+-                ),
+-            }
+-        )
+-
+-    # Affinity prediction metrics
+-    if affinity:
+-        # Affinities have negative values for bad poses
+-        # In order to compute metrics, the absolute value is returned
+-        m.update(
+-            {
+-                "MAE": metrics.MeanAbsoluteError(
+-                    output_transform=_output_transform_select_affinity_abs
+-                ),
+-                "RMSE": metrics.RootMeanSquaredError(
+-                    output_transform=_output_transform_select_affinity_abs
+-                ),
+-            }
+-        )
+-
+-        if affinity_loss is not None:
+-            # Affinities have negative values for bad poses
+-            # The loss function uses the sign to distinguish good from bad poses
+-            m.update(
+-                {
+-                    "Loss (affinity)": metrics.Loss(
+-                        affinity_loss,
+-                        output_transform=_output_transform_select_affinity,
+-                    )
+-                }
+-            )
+-
+-    # Return dictionary with all metrics
+-    return m
+-
+-
+ def training(args):
+     """
+     Main function for training GNINA scoring function.
+@@ -858,7 +604,7 @@ def training(args):
+         clip_gradients=args.clip_gradients,
+     )
+ 
+-    allmetrics = _setup_metrics(
++    allmetrics = metrics.setup_metrics(
+         affinity, pose_loss, affinity_loss, args.roc_auc, device
+     )
+     evaluator = _setup_evaluator(model, allmetrics, affinity=affinity)
+@@ -885,7 +631,7 @@ def log_training_results(trainer):
+             verbose=False,
+         )
+ 
+-        # TODO: Define handle elsewhere and attach using input argumnets
++        # TODO: Define handle elsewhere and attach using input arguments
+         # TODO: Save lr history
+         # Event.COMPLETED since we want the full evaluation to be completed
+         @evaluator.on(Events.COMPLETED)
+@@ -902,7 +648,11 @@ def scheduler(evaluator):
+             torch_scheduler.step(loss)
+ 
+             assert len(optimizer.param_groups) == 1
+-            print(f"    Learning rate: {optimizer.param_groups[0]['lr']}")
++            for oustream in outstreams:
++                print(
++                    f"    Learning rate: {optimizer.param_groups[0]['lr']}",
++                    file=oustream,
++                )
+ 
+     if args.testfile is not None:
+ 
+diff --git a/gnina/transforms.py b/gnina/transforms.py
+new file mode 100644
+index 0000000..4304b93
+--- /dev/null
++++ b/gnina/transforms.py
+@@ -0,0 +1,156 @@
++"""
++PyTorch-Ignite output transformations.
++
++Note
++----
++PyTorch-Ignite :code:`output_transform` arguments allow to transform the
++:code:`Engine.state.output` for the intendend use (by `ignite.metrics` and
++`ignite.handlers`).
++"""
++
++from typing import Dict, Tuple
++
++import torch
++
++
++def output_transform_select_log_pose(
++    output: Dict[str, torch.Tensor]
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Select pose :code:`log_softmax` output and labels from output dictionary.
++
++    Parameters
++    ----------
++    output: Dict[str, ignite.metrics.Metric]
++        Engine output
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor]
++        Logarithm of the pose class probabilities (:code:`log_softmax`) and class label
++
++    Notes
++    -----
++    This function is used as :code:`output_transform` in
++    :class:`ignite.metrics.metric.Metric` and allow to select pose results from
++    the dictionary that the evaluator returns.
++
++    The output is not activated, i.e. the :code:`log_softmax` output is returned
++    unchanged
++    """
++    # Return pose class probabilities and true labels
++    # log_softmax is transformed into softmax to get the class probabilities
++    return output["pose_log"], output["labels"]
++
++
++def output_transform_select_pose(
++    output: Dict[str, torch.Tensor]
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Select pose :code:`softmax` output and labels from output dictionary.
++
++    Parameters
++    ----------
++    output: Dict[str, ignite.metrics.Metric]
++        Engine output
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor]
++        Class probabilities and class labels
++
++    Notes
++    -----
++    This function is used as :code:`output_transform` in
++    :class:`ignite.metrics.metric.Metric` and allow to select pose results from
++    the dictionary that the evaluator returns.
++
++    The output is activated, i.e. the :code:`log_softmax` output is transformed into
++    :code:`softmax`.
++    """
++    # Return pose class probabilities and true labels
++    # log_softmax is transformed into softmax to get the class probabilities
++    return torch.exp(output["pose_log"]), output["labels"]
++
++
++def output_transform_select_affinity(
++    output: Dict[str, torch.Tensor]
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Select predicted affinities output and experimental (target) affinities from output
++    dictionary.
++
++    Parameters
++    ----------
++    output: Dict[str, ignite.metrics.Metric]
++        Engine output
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor]
++        Predicted binding affinity and experimental (target) binding affinity
++
++    Notes
++    -----
++    This function is used as :code:`output_transform` in
++    :class:`ignite.metrics.metric.Metric` and allow to select affinity predictions from
++    the dictionary that the evaluator returns.
++    """
++    # Return pose class probabilities and true labels
++    return output["affinities_pred"], output["affinities"]
++
++
++def output_transform_select_affinity_abs(
++    output: Dict[str, torch.Tensor]
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Select predicted affinities (in absolute value) and experimental (target) affinities
++    from output dictionary.
++
++    Parameters
++    ----------
++    output: Dict[str, ignite.metrics.Metric]
++        Engine output
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor]
++        Predicted binding affinity (absolute value) and experimental binding affinity
++
++    Notes
++    -----
++    This function is used as :code:`output_transform` in
++    :class:`ignite.metrics.metric.Metric` and allow to select affinity predictions from
++    the dictionary that the evaluator returns.
++
++    Affinities can have negative values when they are associated to bad poses. The sign
++    is used by :class:`AffinityLoss`, but in order to compute standard metrics the
++    absolute value is needed, which is returned here.
++    """
++    # Return pose class probabilities and true labels
++    return output["affinities_pred"], torch.abs(output["affinities"])
++
++
++def output_transform_ROC(output) -> Tuple[torch.Tensor, torch.Tensor]:
++    """
++    Output transform for the ROC curve.
++
++    Parameters
++    ----------
++    output:
++        Engine output
++
++    Returns
++    -------
++    Tuple[torch.Tensor, torch.Tensor]
++        Positive class probability and associated labels.
++
++    Notes
++    -----
++    https://pytorch.org/ignite/generated/ignite.contrib.metrics.ROC_AUC.html#roc-auc
++    """
++    # Select pose prediction
++    pose, labels = output_transform_select_pose(output)
++
++    # Return probability estimates of the positive class
++    return pose[:, -1], labels
+diff --git a/tests/test_transforms.py b/tests/test_transforms.py
+new file mode 100644
+index 0000000..70defde
+--- /dev/null
++++ b/tests/test_transforms.py
+@@ -0,0 +1,81 @@
++import pytest
++import torch
++
++from gnina import transforms
++
++
++@pytest.fixture
++def batch_size():
++    return 64
++
++
++@pytest.fixture
++def pose_log(batch_size, device):
++    return torch.normal(mean=0, std=1, size=(batch_size, 2), device=device)
++
++
++@pytest.fixture
++def labels(batch_size, device):
++    return torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
++
++
++@pytest.fixture
++def affinity_pred(batch_size, device):
++    return torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
++
++
++@pytest.fixture
++def affinity_exp(batch_size, device):
++    return torch.normal(mean=0.0, std=1.0, size=(batch_size,), device=device)
++
++
++@pytest.fixture
++def output(pose_log, labels, affinity_pred, affinity_exp):
++    return {
++        "pose_log": pose_log,
++        "labels": labels,
++        "affinities_pred": affinity_pred,
++        "affinities": affinity_exp,
++    }
++
++
++def test_output_transform_select_log_pose(pose_log, labels, output):
++    pl, ll = transforms.output_transform_select_log_pose(output)
++
++    assert torch.allclose(pl, pose_log)
++    assert torch.allclose(ll, labels)
++
++
++def test_output_transform_select_pose(pose_log, labels, output):
++    p, ll = transforms.output_transform_select_pose(output)
++
++    pose = torch.exp(pose_log)
++
++    assert torch.allclose(p, pose)
++    assert torch.allclose(ll, labels)
++
++
++def test_output_transform_affinity(affinity_pred, affinity_exp, output):
++    ap, ae = transforms.output_transform_select_affinity(output)
++
++    assert torch.allclose(ap, affinity_pred)
++    assert torch.allclose(ae, affinity_exp)
++
++
++def test_output_transform_affinity_abs(affinity_pred, affinity_exp, output):
++    # The experimental (target) affinity is returned as absolute value
++    # This takes care of the negative sign used to denote affinities of bad poses
++    ap, ae = transforms.output_transform_select_affinity_abs(output)
++
++    assert torch.allclose(ap, affinity_pred)
++    assert torch.allclose(ae, torch.abs(affinity_exp))
++
++
++def test_output_transform_ROC(pose_log, labels, output):
++    pp, ll = transforms.output_transform_ROC(output)
++
++    # ROC calculations requite only the probability of the positive class
++    pose_positive_class = torch.exp(pose_log)[:, -1]
++
++    assert torch.allclose(pp, pose_positive_class)
++    assert torch.allclose(ll, labels)

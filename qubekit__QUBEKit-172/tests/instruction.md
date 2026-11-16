@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Fixed rounding errors to avoid MM blow-ups.
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `da5f6dfe10e9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,705 @@
+diff --git a/server/catgo/routers/build.py b/server/catgo/routers/build.py
+index 1d3662da4..bbec75a0b 100644
+--- a/server/catgo/routers/build.py
++++ b/server/catgo/routers/build.py
+@@ -94,6 +94,30 @@ class SubstitutionRequest(StructureInput):
+     max_structures: int = 500  # Safety cap
+ 
+ 
++class RandomDopantModel(BaseModel):
++    """A dopant element and how many sites it should occupy."""
++
++    element: str
++    count: int = 0
++
++
++class RandomSubstitutionRequest(StructureInput):
++    """Random concentration-based substitution.
++
++    Picks a pool of candidate sites (by host element or explicit indices),
++    then randomly assigns the requested number of each dopant to distinct
++    sites. Generates up to ``n_samples`` independent random arrangements.
++    """
++
++    host_element: Optional[str] = None
++    target_indices: Optional[list[int]] = None
++    dopants: list[RandomDopantModel]
++    n_samples: int = 10
++    deduplicate: bool = True
++    seed: Optional[int] = None
++    max_structures: int = 500  # Safety cap
++
++
+ class BuildResult(BaseModel):
+     structures: list[dict]  # List of pymatgen Structure.as_dict()
+     labels: list[str]  # Description labels for each structure
+@@ -414,3 +438,89 @@ def combinatorial_substitution(req: SubstitutionRequest):
+         labels.append(f"[{i+1}] " + " + ".join(label_parts))
+ 
+     return BuildResult(structures=results, labels=labels, count=len(results))
++
++
++@router.post("/random-substitution", response_model=BuildResult)
++def random_substitution(req: RandomSubstitutionRequest):
++    """Randomly substitute a fixed count of each dopant into a host pool.
++
++    Example: replace 8 of 25 Mo atoms with 5 Nb + 3 Ta at random positions,
++    generating up to ``n_samples`` distinct random arrangements.
++    """
++    import random as _random
++
++    structure = _parse_structure(req.structure)
++
++    # Resolve the candidate site pool: explicit indices win over host element.
++    if req.target_indices:
++        invalid = [i for i in req.target_indices if i < 0 or i >= len(structure)]
++        if invalid:
++            raise HTTPException(
++                400,
++                f"Invalid site indices: {invalid} "
++                f"(structure has {len(structure)} atoms)",
++            )
++        pool = list(dict.fromkeys(req.target_indices))  # de-dup, keep order
++    elif req.host_element:
++        pool = [
++            i
++            for i, site in enumerate(structure)
++            if str(site.specie) == req.host_element
++            or (hasattr(site.specie, "element") and str(site.specie.element) == req.host_element)
++            or (hasattr(site.specie, "symbol") and site.specie.symbol == req.host_element)
++        ]
++        if not pool:
++            raise HTTPException(400, f"No {req.host_element} atoms found in structure")
++    else:
++        raise HTTPException(400, "Either host_element or target_indices must be provided")
++
++    # Validate dopant counts.
++    dopants = [(d.element, int(d.count)) for d in req.dopants if int(d.count) > 0]
++    if not dopants:
++        raise HTTPException(400, "At least one dopant with count > 0 is required")
++    total_replace = sum(c for _, c in dopants)
++    if total_replace > len(pool):
++        raise HTTPException(
++            400,
++            f"Requested {total_replace} substitutions but the pool only has "
++            f"{len(pool)} sites",
++        )
++
++    n_samples = max(1, min(req.n_samples, req.max_structures))
++    rng = _random.Random(req.seed)
++
++    results: list[dict] = []
++    labels: list[str] = []
++    seen: set[tuple] = set()
++    dopant_summary = " + ".join(f"{el}×{c}" for el, c in dopants)
++
++    # Draw enough attempts to reach n_samples unique arrangements; cap attempts
++    # so a tiny pool (few possible arrangements) can't spin forever.
++    max_attempts = n_samples * 50 if req.deduplicate else n_samples
++    attempts = 0
++    while len(results) < n_samples and attempts < max_attempts:
++        attempts += 1
++        chosen = rng.sample(pool, total_replace)
++        assignment: list[tuple[int, str]] = []
++        cursor = 0
++        for el, c in dopants:
++            for site_idx in chosen[cursor : cursor + c]:
++                assignment.append((site_idx, el))
++            cursor += c
++
++        if req.deduplicate:
++            key = tuple(sorted(assignment))
++            if key in seen:
++                continue
++            seen.add(key)
++
++        s = structure.copy()
++        for site_idx, el in assignment:
++            s.replace(site_idx, el)
++        results.append(s.as_dict())
++        labels.append(f"[{len(results)}] random: {dopant_summary}")
++
++    if not results:
++        raise HTTPException(400, "Failed to generate any substitution samples")
++
++    return BuildResult(structures=results, labels=labels, count=len(results))
+diff --git a/src/lib/api/build.ts b/src/lib/api/build.ts
+index e60abafdb..bd567a7c0 100644
+--- a/src/lib/api/build.ts
++++ b/src/lib/api/build.ts
+@@ -61,6 +61,22 @@ export interface SubstitutionParams {
+   max_structures?: number
+ }
+ 
++export interface RandomDopant {
++  element: string
++  count: number
++}
++
++export interface RandomSubstitutionParams {
++  structure: Record<string, unknown>
++  host_element?: string        // pool = all sites of this element
++  target_indices?: number[]    // OR explicit candidate pool (overrides host_element)
++  dopants: RandomDopant[]
++  n_samples?: number
++  deduplicate?: boolean
++  seed?: number | null
++  max_structures?: number
++}
++
+ // === Helper ===
+ 
+ async function handle_response<T>(response: Response): Promise<T> {
+@@ -126,3 +142,12 @@ export async function combinatorial_substitution(params: SubstitutionParams): Pr
+   })
+   return handle_response(response)
+ }
++
++export async function random_substitution(params: RandomSubstitutionParams): Promise<BuildResult> {
++  const response = await fetch(`${API_BASE}/build/random-substitution`, {
++    method: `POST`,
++    headers: { 'Content-Type': `application/json` },
++    body: JSON.stringify(params),
++  })
++  return handle_response(response)
++}
+diff --git a/src/lib/i18n/en/structure.ts b/src/lib/i18n/en/structure.ts
+index 350f70d63..e42987f70 100644
+--- a/src/lib/i18n/en/structure.ts
++++ b/src/lib/i18n/en/structure.ts
+@@ -1286,6 +1286,27 @@ const structure: Record<string, string> = {
+   doping_err_no_group: `Add at least one group with targets and replacement elements`,
+   how_to_use: `How to use`,
+   got_it: `Got it`,
++  // -- Random concentration doping --
++  mode_combinatorial: `Combinatorial`,
++  mode_random: `Random`,
++  random_dopants_label: `Random dopants`,
++  random_help_1: `Pick the <b>host pool</b> — all atoms of an element, or capture a selection from the 3D viewer.`,
++  random_help_2: `Click elements in the <b>Periodic Table</b> to add dopants, then set how many of each (by count or percent).`,
++  random_help_3: `Generate <b>N</b> random arrangements (deduplicated), then <b>Open as Trajectory</b> to browse them.`,
++  random_pool: `Pool: {n} {el} atoms`,
++  random_pool_generic: `pool`,
++  amount_by: `Amount by:`,
++  by_count: `Count`,
++  by_percent: `Percent`,
++  random_pick_dopants: `Click elements in the periodic table to add dopants`,
++  atoms_unit: `atoms`,
++  random_n_samples: `Samples:`,
++  random_dedup: `Deduplicate identical arrangements`,
++  random_seed: `Seed:`,
++  random_seed_ph: `random`,
++  random_preview: `Replace <strong>{replace}</strong> of {pool} {el} at random → {remain} remain`,
++  random_over_pool: `{replace} substitutions exceed the pool of {pool} sites`,
++  random_err_invalid: `Pick a host pool and at least one dopant (total must not exceed the pool)`,
+   // -- Moiré Bilayer pane --
+   moire_bilayer: `Moiré Bilayer`,
+   moire_builder_title: `Moiré Bilayer Builder`,
+diff --git a/src/lib/i18n/zh/structure.ts b/src/lib/i18n/zh/structure.ts
+index 60b7b728c..d5f455daf 100644
+--- a/src/lib/i18n/zh/structure.ts
++++ b/src/lib/i18n/zh/structure.ts
+@@ -1286,6 +1286,27 @@ const structure: Record<string, string> = {
+   doping_err_no_group: `请至少添加一个包含目标原子和替换元素的组`,
+   how_to_use: `如何使用`,
+   got_it: `知道了`,
++  // -- 按浓度随机掺杂 --
++  mode_combinatorial: `组合`,
++  mode_random: `随机`,
++  random_dopants_label: `随机掺杂元素`,
++  random_help_1: `选择<b>替换池</b>——某个元素的全部原子，或在 3D 查看器中捕获选区。`,
++  random_help_2: `在<b>元素周期表</b>中点击元素以添加掺杂元素，再设定各自数量（按个数或百分比）。`,
++  random_help_3: `生成 <b>N</b> 个随机排布（自动去重），然后<b>作为轨迹打开</b>逐一浏览。`,
++  random_pool: `替换池：{n} 个 {el} 原子`,
++  random_pool_generic: `替换池`,
++  amount_by: `数量按：`,
++  by_count: `个数`,
++  by_percent: `百分比`,
++  random_pick_dopants: `在元素周期表中点击元素以添加掺杂元素`,
++  atoms_unit: `个`,
++  random_n_samples: `样本数：`,
++  random_dedup: `去除重复排布`,
++  random_seed: `随机种子：`,
++  random_seed_ph: `随机`,
++  random_preview: `从 {pool} 个 {el} 中随机替换 <strong>{replace}</strong> 个 → 剩余 {remain} 个`,
++  random_over_pool: `替换数 {replace} 超过了替换池的 {pool} 个位点`,
++  random_err_invalid: `请选择替换池并至少添加一个掺杂元素（总数不能超过替换池）`,
+   // -- 莫尔超晶格面板 --
+   moire_bilayer: `莫尔双层`,
+   moire_builder_title: `莫尔双层构建器`,
+diff --git a/src/lib/structure/DopingPane.svelte b/src/lib/structure/DopingPane.svelte
+index d19be0cdf..8f68e6ebe 100644
+--- a/src/lib/structure/DopingPane.svelte
++++ b/src/lib/structure/DopingPane.svelte
+@@ -2,7 +2,8 @@
+   import type { PymatgenStructure } from '$lib/structure'
+   import type { ElementSymbol } from '$lib'
+   import { PeriodicTable } from '$lib/periodic-table'
+-  import { combinatorial_substitution } from '$lib/api/build'
++  import { combinatorial_substitution, random_substitution } from '$lib/api/build'
++  import type { RandomSubstitutionParams } from '$lib/api/build'
+   import type { TrajectoryType } from '$lib/trajectory'
+   import { normalize_pymatgen_frame_structure } from '$lib/trajectory/parsers/json'
+   import { t, load_i18n_module } from '$lib/i18n/index.svelte'
+@@ -34,6 +35,10 @@
+ 
+   // --- Exported functions for PT panel interaction ---
+   export function toggle_element(sym: string) {
++    if (pane_mode === `random`) {
++      toggle_random_dopant(sym)
++      return
++    }
+     const g = groups[active_group_idx]
+     if (!g) return
+     if (g.replacement_elements.includes(sym)) {
+@@ -45,6 +50,10 @@
+   }
+ 
+   export function add_element(sym: string) {
++    if (pane_mode === `random`) {
++      if (!rnd_dopants.some((d) => d.element === sym)) toggle_random_dopant(sym)
++      return
++    }
+     const g = groups[active_group_idx]
+     if (!g || g.replacement_elements.includes(sym)) return
+     g.replacement_elements = [...g.replacement_elements, sym]
+@@ -71,6 +80,92 @@
+   // --- Generation settings ---
+   let max_structures = $state(500)
+ 
++  // --- Pane mode: combinatorial product vs. concentration-based random doping ---
++  type PaneMode = `combinatorial` | `random`
++  let pane_mode = $state<PaneMode>(`combinatorial`)
++
++  // --- Random doping state ---
++  type RandomDopantRow = { id: number; element: string; count: number; percent: number }
++  let rnd_target_mode = $state<SelectionMode>(`by_element`)
++  let rnd_host_element = $state(``)
++  let rnd_captured_indices = $state<number[]>([])
++  let rnd_dopants = $state<RandomDopantRow[]>([])
++  let rnd_input_style = $state<`count` | `percent`>(`count`)
++  let rnd_n_samples = $state(10)
++  let rnd_dedup = $state(true)
++  let rnd_seed = $state<number | null>(null) // null = fresh random each run
++  let rnd_next_id = $state(1)
++
++  // Candidate site pool for random mode (by host element or captured indices)
++  let rnd_pool = $derived.by(() => {
++    if (!structure?.sites) return [] as number[]
++    if (rnd_target_mode === `by_element` && rnd_host_element) {
++      return structure.sites
++        .map((s, i) => (s.species[0]?.element === rnd_host_element ? i : -1))
++        .filter((i) => i >= 0)
++    }
++    return rnd_captured_indices
++  })
++  let rnd_pool_size = $derived(rnd_pool.length)
++  let rnd_total_replace = $derived(rnd_dopants.reduce((a, d) => a + (d.count || 0), 0))
++  let rnd_valid = $derived(
++    rnd_pool_size > 0 && rnd_total_replace > 0 && rnd_total_replace <= rnd_pool_size,
++  )
++
++  // Default the random host element to the first element present
++  $effect(() => {
++    if (structure_elements.length > 0 && !rnd_host_element) {
++      rnd_host_element = structure_elements[0]
++    }
++  })
++
++  // Keep count/percent columns consistent when the pool size changes (e.g. host
++  // element switched). The active input style is authoritative for re-derivation.
++  $effect(() => {
++    const size = rnd_pool_size
++    if (size <= 0) return
++    let changed = false
++    const next = rnd_dopants.map((d) => {
++      if (rnd_input_style === `percent`) {
++        const count = Math.round((d.percent / 100) * size)
++        if (count !== d.count) { changed = true; return { ...d, count } }
++      } else {
++        const percent = +((d.count / size) * 100).toFixed(1)
++        if (percent !== d.percent) { changed = true; return { ...d, percent } }
++      }
++      return d
++    })
++    if (changed) rnd_dopants = next
++  })
++
++  function toggle_random_dopant(sym: string) {
++    if (rnd_dopants.some((d) => d.element === sym)) {
++      rnd_dopants = rnd_dopants.filter((d) => d.element !== sym)
++    } else {
++      const percent = rnd_pool_size > 0 ? +((1 / rnd_pool_size) * 100).toFixed(1) : 0
++      rnd_dopants = [...rnd_dopants, { id: rnd_next_id++, element: sym, count: 1, percent }]
++    }
++  }
++
++  function set_dopant_count(id: number, value: number) {
++    const count = Math.max(0, Math.floor(value || 0))
++    rnd_dopants = rnd_dopants.map((d) =>
++      d.id === id
++        ? { ...d, count, percent: rnd_pool_size > 0 ? +((count / rnd_pool_size) * 100).toFixed(1) : 0 }
++        : d,
++    )
++  }
++
++  function set_dopant_percent(id: number, value: number) {
++    const percent = Math.max(0, value || 0)
++    const count = rnd_pool_size > 0 ? Math.round((percent / 100) * rnd_pool_size) : 0
++    rnd_dopants = rnd_dopants.map((d) => (d.id === id ? { ...d, percent, count } : d))
++  }
++
++  function remove_dopant(id: number) {
++    rnd_dopants = rnd_dopants.filter((d) => d.id !== id)
++  }
++
+   // --- Status ---
+   let status = $state<`idle` | `running` | `complete` | `error`>(`idle`)
+   let error_message = $state<string | null>(null)
+@@ -100,6 +195,11 @@
+ 
+   // Update PT state for parent split-view panel
+   $effect(() => {
++    if (pane_mode === `random`) {
++      pt_highlight_symbols = rnd_dopants.map((d) => d.element)
++      pt_group_label = t('structure.random_dopants_label')
++      return
++    }
+     const g = groups[active_group_idx]
+     pt_highlight_symbols = g?.replacement_elements ?? []
+     pt_group_label = t('structure.group_n', { n: active_group_idx + 1 })
+@@ -185,6 +285,41 @@
+     }
+   }
+ 
++  // --- Generate (random concentration mode) ---
++  async function generate_random() {
++    if (!structure || !rnd_valid) {
++      error_message = t('structure.random_err_invalid')
++      return
++    }
++    on_push_undo?.()
++    status = `running`
++    error_message = null
++
++    try {
++      const params: RandomSubstitutionParams = {
++        structure: structure as unknown as Record<string, unknown>,
++        dopants: rnd_dopants
++          .filter((d) => d.count > 0)
++          .map((d) => ({ element: d.element, count: d.count })),
++        n_samples: rnd_n_samples,
++        deduplicate: rnd_dedup,
++        seed: rnd_seed == null || Number.isNaN(rnd_seed) ? null : rnd_seed,
++      }
++      if (rnd_target_mode === `by_element`) params.host_element = rnd_host_element
++      else params.target_indices = [...rnd_captured_indices]
++
++      const result = await random_substitution(params)
++      result_structures = result.structures
++      result_labels = result.labels
++      result_total = result.count
++      result_capped = false
++      status = `complete`
++    } catch (err) {
++      status = `error`
++      error_message = err instanceof Error ? err.message : String(err)
++    }
++  }
++
+   function open_as_trajectory() {
+     if (result_structures.length === 0) return
+     // `combinatorial_substitution` returns raw `pymatgen.Structure.as_dict()`
+@@ -220,12 +355,26 @@
+ <!-- svelte-ignore a11y_no_static_element_interactions -->
+ <div class="doping-pane">
+   <div class="dp-title-row">
++    <div class="dp-mode-toggle">
++      <button
++        class="dp-mode-tab"
++        class:active={pane_mode === `combinatorial`}
++        onclick={() => (pane_mode = `combinatorial`)}
++      >{t('structure.mode_combinatorial')}</button>
++      <button
++        class="dp-mode-tab"
++        class:active={pane_mode === `random`}
++        onclick={() => (pane_mode = `random`)}
++      >{t('structure.mode_random')}</button>
++    </div>
+     <button class="dp-help-btn" onclick={() => show_help = !show_help} title={t('structure.how_to_use')}>?</button>
+   </div>
+ 
+-  <!-- Inline periodic table -->
+-  {#if groups[active_group_idx]}
+-    {@const ag = groups[active_group_idx]}
++  <!-- Inline periodic table (shared by both modes) -->
++  {#if structure}
++    {@const pt_active = pane_mode === `random`
++      ? rnd_dopants.map((d) => d.element)
++      : (groups[active_group_idx]?.replacement_elements ?? [])}
+     <div class="dp-pt-container" role="presentation" onclick={(event) => {
+       const tile = (event.target as HTMLElement).closest(`.element-tile`)
+       if (tile) {
+@@ -236,7 +385,7 @@
+     }}>
+       <PeriodicTable
+         active_element={null}
+-        active_elements={ag.replacement_elements as ElementSymbol[]}
++        active_elements={pt_active as ElementSymbol[]}
+         tile_props={{ show_symbol: true, show_number: false, show_name: false }}
+         gap="0.5cqw"
+         show_color_bar={false}
+@@ -246,18 +395,28 @@
+ 
+   {#if show_help}
+     <div class="dp-help-box">
+-      <strong>{t('structure.combinatorial_doping')}</strong>
+-      <ol>
+-        <li>{@html t('structure.doping_help_1')}</li>
+-        <li>{@html t('structure.doping_help_2')}</li>
+-        <li>{@html t('structure.doping_help_3')}</li>
+-        <li>{@html t('structure.doping_help_4')}</li>
+-      </ol>
++      {#if pane_mode === `random`}
++        <strong>{t('structure.mode_random')}</strong>
++        <ol>
++          <li>{@html t('structure.random_help_1')}</li>
++          <li>{@html t('structure.random_help_2')}</li>
++          <li>{@html t('structure.random_help_3')}</li>
++        </ol>
++      {:else}
++        <strong>{t('structure.combinatorial_doping')}</strong>
++        <ol>
++          <li>{@html t('structure.doping_help_1')}</li>
++          <li>{@html t('structure.doping_help_2')}</li>
++          <li>{@html t('structure.doping_help_3')}</li>
++          <li>{@html t('structure.doping_help_4')}</li>
++        </ol>
++      {/if}
+       <button class="dp-help-close" onclick={() => show_help = false}>{t('structure.got_it')}</button>
+     </div>
+   {/if}
+ 
+-  <!-- Groups -->
++  <!-- Groups (combinatorial mode) -->
++  {#if pane_mode === `combinatorial`}
+   {#each groups as group, gi (group.id)}
+     {@const targets = resolve_targets(group)}
+     <section
+@@ -344,9 +503,116 @@
+   {/each}
+ 
+   <button class="dp-add-group-btn" onclick={add_group}>{t('structure.add_group')}</button>
++  {/if}
++
++  <!-- Random concentration mode -->
++  {#if pane_mode === `random`}
++    <section class="dp-group active">
++      <!-- Host pool selection -->
++      <div class="dp-mode-row">
++        <label class="dp-radio">
++          <input
++            type="radio"
++            checked={rnd_target_mode === `by_element`}
++            onchange={() => (rnd_target_mode = `by_element`)}
++          />
++          {t('structure.by_element')}
++        </label>
++        <label class="dp-radio">
++          <input
++            type="radio"
++            checked={rnd_target_mode === `by_indices`}
++            onchange={() => (rnd_target_mode = `by_indices`)}
++          />
++          {t('structure.by_selection')}
++        </label>
++      </div>
++
++      {#if rnd_target_mode === `by_element`}
++        <select
++          class="dp-select"
++          value={rnd_host_element}
++          onchange={(e) => (rnd_host_element = e.currentTarget.value)}
++        >
++          {#each structure_elements as el}
++            <option value={el}>{el}</option>
++          {/each}
++        </select>
++        <div class="dp-hint">
++          {t('structure.random_pool', { n: rnd_pool_size, el: rnd_host_element })}
++        </div>
++      {:else}
++        {#if rnd_captured_indices.length > 0}
++          <div class="dp-hint">
++            {t('structure.n_captured', { n: rnd_captured_indices.length })} {rnd_captured_indices.slice(0, 8).join(`, `)}{rnd_captured_indices.length > 8 ? `...` : ``}
++          </div>
++          <button class="dp-capture-btn" onclick={() => (rnd_captured_indices = [])}>{t('common.clear')}</button>
++        {:else}
++          <div class="dp-hint">
++            {selected_sites.length > 0
++              ? `${t('structure.n_in_viewer', { n: selected_sites.length })} ${selected_sites.slice(0, 6).join(`, `)}${selected_sites.length > 6 ? `...` : ``}`
++              : t('structure.click_atoms_in_viewer')}
++          </div>
++          <button
++            class="dp-capture-btn"
++            disabled={selected_sites.length === 0}
++            onclick={() => (rnd_captured_indices = [...selected_sites])}
++          >{t('structure.capture_selection', { n: selected_sites.length })}</button>
++        {/if}
++      {/if}
++
++      <!-- Dopant rows: element + count/percent -->
++      <div class="dp-input-style-row">
++        <span class="dp-hint">{t('structure.amount_by')}</span>
++        <button class="dp-style-tab" class:active={rnd_input_style === `count`} onclick={() => (rnd_input_style = `count`)}>{t('structure.by_count')}</button>
++        <button class="dp-style-tab" class:active={rnd_input_style === `percent`} onclick={() => (rnd_input_style = `percent`)}>{t('structure.by_percent')}</button>
++      </div>
++
++      {#if rnd_dopants.length === 0}
++        <span class="dp-hint">{t('structure.random_pick_dopants')}</span>
++      {/if}
++      {#each rnd_dopants as d (d.id)}
++        <div class="dp-dopant-row">
++          <span class="dp-chip">{d.element}</span>
++          {#if rnd_input_style === `count`}
++            <input
++              type="number" class="dp-input-num" min={0} max={rnd_pool_size}
++              value={d.count}
++              oninput={(e) => set_dopant_count(d.id, e.currentTarget.valueAsNumber)}
++            />
++            <span class="dp-hint">{t('structure.atoms_unit')} ({rnd_pool_size > 0 ? d.percent : 0}%)</span>
++          {:else}
++            <input
++              type="number" class="dp-input-num" min={0} max={100} step={0.1}
++              value={d.percent}
++              oninput={(e) => set_dopant_percent(d.id, e.currentTarget.valueAsNumber)}
++            />
++            <span class="dp-hint">% (= {d.count} {t('structure.atoms_unit')})</span>
++          {/if}
++          <button class="dp-chip-x dp-dopant-remove" onclick={() => remove_dopant(d.id)}>&times;</button>
++        </div>
++      {/each}
++
++      <!-- Sample settings -->
++      <div class="dp-max-row">
++        <span class="dp-hint">{t('structure.random_n_samples')}</span>
++        <input type="number" class="dp-input-num" bind:value={rnd_n_samples} min={1} max={500} />
++      </div>
++      <div class="dp-max-row">
++        <label class="dp-radio">
++          <input type="checkbox" bind:checked={rnd_dedup} />
++          {t('structure.random_dedup')}
++        </label>
++      </div>
++      <div class="dp-max-row">
++        <span class="dp-hint">{t('structure.random_seed')}</span>
++        <input type="number" class="dp-input-num" bind:value={rnd_seed} placeholder={t('structure.random_seed_ph')} />
++      </div>
++    </section>
++  {/if}
+ 
+   <!-- Preview -->
+-  {#if combo_count > 0}
++  {#if pane_mode === `combinatorial` && combo_count > 0}
+     <section class="dp-section">
+       <h5 class="dp-label">{t('common.preview')}</h5>
+       <div class="dp-preview">
+@@ -363,6 +629,23 @@
+     </section>
+   {/if}
+ 
++  {#if pane_mode === `random` && rnd_total_replace > 0}
++    <section class="dp-section">
++      <h5 class="dp-label">{t('common.preview')}</h5>
++      <div class="dp-preview">
++        {@html t('structure.random_preview', {
++          replace: rnd_total_replace,
++          pool: rnd_pool_size,
++          remain: Math.max(0, rnd_pool_size - rnd_total_replace),
++          el: rnd_target_mode === `by_element` ? rnd_host_element : t('structure.random_pool_generic'),
++        })}
++      </div>
++      {#if rnd_total_replace > rnd_pool_size}
++        <div class="dp-warning">{t('structure.random_over_pool', { replace: rnd_total_replace, pool: rnd_pool_size })}</div>
++      {/if}
++    </section>
++  {/if}
++
+   <!-- Actions -->
+   <section class="dp-section">
+     {#if error_message}
+@@ -371,8 +654,8 @@
+ 
+     <button
+       class="dp-btn-generate"
+-      onclick={generate}
+-      disabled={status === `running` || valid_groups.length === 0}
++      onclick={pane_mode === `random` ? generate_random : generate}
++      disabled={status === `running` || (pane_mode === `random` ? !rnd_valid : valid_groups.length === 0)}
+     >
+       {status === `running` ? t('structure.generating') : t('structure.generate_structures')}
+     </button>
+@@ -403,6 +686,63 @@
+     gap: 6px;
+   }
+ 
++  /* ─── Mode toggle (Combinatorial / Random) ─── */
++  .dp-mode-toggle {
++    display: flex;
++    gap: 2px;
++    padding: 2px;
++    border: 1px solid var(--border-color);
++    border-radius: 6px;
++    background: var(--input-bg, rgba(0, 0, 0, 0.15));
++  }
++  .dp-mode-tab {
++    padding: 3px 10px;
++    border: none;
++    border-radius: 4px;
++    background: none;
++    color: var(--text-color-muted, #94a3b8);
++    font-size: 0.8em;
++    font-weight: 600;
++    cursor: pointer;
++  }
++  .dp-mode-tab.active {
++    background: var(--accent-color, #3b82f6);
++    color: white;
++  }
++
++  /* ─── Random mode: count/percent toggle + dopant rows ─── */
++  .dp-input-style-row {
++    display: flex;
++    align-items: center;
++    gap: 6px;
++    margin-top: 4px;
++  }
++  .dp-style-tab {
++    padding: 2px 8px;
++    border: 1px solid var(--border-color);
++    border-radius: 4px;
++    background: none;
++    color: var(--text-color-muted, #94a3b8);
++    font-size: 0.75em;
++    cursor: pointer;
++  }
++  .dp-style-tab.active {
++    border-color: var(--accent-color, #3b82f6);
++    color: var(--accent-color, #3b82f6);
++  }
++  .dp-dopant-row {
++    display: flex;
++    align-items: center;
++    gap: 6px;
++  }
++  .dp-dopant-remove {
++    color: var(--text-color-dim, #64748b);
++    margin-left: auto;
++  }
++  .dp-dopant-remove:hover {
++    color: var(--error-color, #ef4444);
++  }
++
+   /* ─── Inline periodic table container ─── */
+   .dp-pt-container {
+     margin-bottom: 6px;

@@ -1,0 +1,217 @@
+diff --git a/environment-gpu.yml b/environment-gpu.yml
+index 2abb6ad1..0659bfcb 100644
+--- a/environment-gpu.yml
++++ b/environment-gpu.yml
+@@ -26,4 +26,5 @@ dependencies:
+   - mypy
+   - pip:
+     - huggingface_hub
++    - pytorch-pfn-extras
+     - gpu4pyscf-cuda12x >=1.6,<1.8,!=1.7.1,!=1.7.2
+diff --git a/pyproject.toml b/pyproject.toml
+index ecccf263..bfb8fc26 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -116,4 +116,7 @@ filterwarnings = [
+     'ignore:using cupy as the tensor contraction engine\.:UserWarning',
+     # Deprecation warning in huggingface_hub package
+     'ignore:hf_xet\.download_files\(\) is deprecated\. Use XetSession\(\)\.new_file_download_group\(\)\.start_download_file\(\) instead\.:DeprecationWarning',
++    # Upstream deprecations in PySCF / GPU4PySCF are outside this project's control.
++    'ignore::DeprecationWarning:pyscf\..*',
++    'ignore::DeprecationWarning:gpu4pyscf\..*',
+ ]
+diff --git a/src/skala/gpu4pyscf/__init__.py b/src/skala/gpu4pyscf/__init__.py
+index 3ceca911..60942300 100644
+--- a/src/skala/gpu4pyscf/__init__.py
++++ b/src/skala/gpu4pyscf/__init__.py
+@@ -31,9 +31,26 @@
+         "GPU4PySCF is not installed. Please install it with `pip install gpu4pyscf`."
+     ) from e
+ 
+-# Reset the default CuPy memory allocator to avoid memory leak issues
+-# that seem to arise when combining the custom allocator of gpu4pyscf with DLPack usage.
+-cupy.cuda.set_allocator(cupy.get_default_memory_pool().malloc)
++try:
++    import pytorch_pfn_extras
++except ModuleNotFoundError as e:
++    if e.name != "pytorch_pfn_extras":
++        raise
++
++    import warnings
++
++    warnings.warn(
++        "pytorch_pfn_extras is not installed. This may lead to additional memory usage. "
++        "Please install it with `pip install pytorch-pfn-extras`.",
++        stacklevel=2,
++    )
++
++    # Reset the default CuPy memory allocator to avoid memory leak issues
++    # that seem to arise when combining the custom allocator of gpu4pyscf with DLPack usage.
++    cupy.cuda.set_allocator(cupy.get_default_memory_pool().malloc)
++else:
++    pytorch_pfn_extras.cuda.use_torch_mempool_in_cupy()
++
+ 
+ from pyscf import gto
+ 
+diff --git a/tests/test_gpu4pyscf_gradients.py b/tests/test_gpu4pyscf_gradients.py
+index e5520e32..c0ad4010 100644
+--- a/tests/test_gpu4pyscf_gradients.py
++++ b/tests/test_gpu4pyscf_gradients.py
+@@ -2,16 +2,31 @@
+ 
+ import pytest
+ import torch
+-from pyscf import gto
+ 
+ if not torch.cuda.is_available():
+     pytest.skip(
+         "Skipping gpu4pyscf gradients tests, because CUDA is not available.",
+         allow_module_level=True,
+     )
++try:
++    import cupy
++except ModuleNotFoundError:
++    pytest.skip(
++        "Skipping gpu4pyscf gradients tests, because CuPy is not available.",
++        allow_module_level=True,
++    )
++
++try:
++    import pytorch_pfn_extras
++except ModuleNotFoundError:
++    pytest.skip(
++        "Skipping gpu4pyscf gradients tests, because pytorch_pfn_extras is not installed.",
++        allow_module_level=True,
++    )
+ 
+ from _ridders import num_grad_ridders
+ from gpu4pyscf import dft, scf
++from pyscf import gto
+ from test_pyscf_gradients import FULL_GRAD_REF
+ 
+ from skala.functional.base import ExcFunctionalBase
+@@ -398,3 +413,123 @@ def test_full_grad(
+         f"Reference: {ref_grad}\n"
+         f"Difference: {ana_grad - ref_grad}"
+     )
++
++
++def test_cuda_kernel_memory_stability() -> None:
++    """Checks that repeated calls do not increase Torch's allocated CUDA memory."""
++
++    mol = mol_min_bas("HF")
++    grid, rdm1 = get_grid_and_rdm1(mol)
++
++    class TestFunc(ExcFunctionalBase):
++        def __init__(self) -> None:
++            super().__init__()
++            self.features = ["grad", "grid_weights"]
++
++        def get_exc(self, mol: dict[str, torch.Tensor]) -> torch.Tensor:
++            return (
++                (mol["grad"] ** 2 @ mol["grid_weights"])
++                @ torch.tensor(
++                    [1.0, 2.0, 3.0],
++                    dtype=torch.float64,
++                    device=mol["grad"].device,
++                )
++            ).sum()
++
++    exc_test = TestFunc()
++
++    # Warmup to avoid counting one-time allocations from CUDA runtime/libraries.
++    for _ in range(2):
++        veff = veff_and_expl_nuc_grad(
++            exc_test, mol, grid, rdm1, nuc_grad_feats={"grad"}
++        )[0]
++        _ = 2 * nuc_grad_from_veff(mol, veff, rdm1)
++
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++
++    allocations: list[int] = []
++    torch.cuda.reset_peak_memory_stats()
++    for _ in range(5):
++        veff = veff_and_expl_nuc_grad(
++            exc_test, mol, grid, rdm1, nuc_grad_feats={"grad"}
++        )[0]
++        _ = 2 * nuc_grad_from_veff(mol, veff, rdm1)
++        torch.cuda.synchronize()
++        allocations.append(torch.cuda.memory_allocated())
++
++    max_growth_bytes = max(allocations) - min(allocations)
++    assert max_growth_bytes < 16 * 1024**2, (
++        "CUDA kernel memory use appears unstable across repeated calls. "
++        f"Observed growth: {max_growth_bytes / 1024**2:.2f} MiB"
++    )
++
++
++def test_cuda_allocator_smoke() -> None:
++    """Smoke test that both allocator modes stay numerically consistent."""
++
++    mol = mol_min_bas("HF")
++
++    class TestFunc(ExcFunctionalBase):
++        def __init__(self) -> None:
++            super().__init__()
++            self.features = ["grad", "grid_weights"]
++
++        def get_exc(self, mol: dict[str, torch.Tensor]) -> torch.Tensor:
++            return (
++                (mol["grad"] ** 2 @ mol["grid_weights"])
++                @ torch.tensor(
++                    [1.0, 2.0, 3.0],
++                    dtype=torch.float64,
++                    device=mol["grad"].device,
++                )
++            ).sum()
++
++    def run_mode(mode: str) -> tuple[float, int]:
++        cupy.cuda.set_allocator(cupy.get_default_memory_pool().malloc)
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        cupy.get_default_memory_pool().free_all_blocks()
++
++        if mode == "pfn":
++            pytorch_pfn_extras.cuda.use_torch_mempool_in_cupy()
++        elif mode == "cupy":
++            cupy.cuda.set_allocator(cupy.get_default_memory_pool().malloc)
++        else:
++            raise ValueError(f"Unknown allocator mode: {mode}")
++
++        grid, rdm1 = get_grid_and_rdm1(mol)
++        exc_test = TestFunc()
++
++        for _ in range(2):
++            veff = veff_and_expl_nuc_grad(
++                exc_test, mol, grid, rdm1, nuc_grad_feats={"grad"}
++            )[0]
++            _ = 2 * nuc_grad_from_veff(mol, veff, rdm1)
++
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats()
++
++        signature = 0.0
++        peak_device_used = 0
++        for _ in range(2):
++            veff = veff_and_expl_nuc_grad(
++                exc_test, mol, grid, rdm1, nuc_grad_feats={"grad"}
++            )[0]
++            grad = 2 * nuc_grad_from_veff(mol, veff, rdm1)
++            signature += float(grad.detach().double().sum().item())
++            free_b, total_b = cupy.cuda.runtime.memGetInfo()
++            peak_device_used = max(peak_device_used, int(total_b - free_b))
++
++        torch.cuda.synchronize()
++        free_f, total_f = cupy.cuda.runtime.memGetInfo()
++        peak_device_used = max(peak_device_used, int(total_f - free_f))
++        return signature, peak_device_used
++
++    cupy_signature, cupy_peak_device = run_mode("cupy")
++    pfn_signature, pfn_peak_device = run_mode("pfn")
++
++    assert pfn_signature == pytest.approx(cupy_signature, rel=1e-10, abs=1e-8)
++    assert pfn_peak_device > 0
++    assert cupy_peak_device > 0

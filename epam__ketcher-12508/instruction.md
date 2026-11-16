@@ -1,0 +1,42 @@
+# Issue
+
+**Title:** Backmerge: #12125 – Preview tooltip glitch problem
+
+## Description
+
+* #12125 – Preview tooltip glitch problem
+
+* #12125 - update preview tooltip snapshot
+
+* #12125 – Store no preview instead of an empty monomer preview when it is hidden
+
+(cherry picked from commit 67847eb4af912f23e1de8f71fa181e78ba64842e)
+
+## How the feature works? / How did you fix the issue?
+
+(Screenshots, videos, or GIFs, if applicable)
+
+## PR type
+
+Tick the row that matches this PR. The full contract is in `.memory-bank/review-workflow.md`.
+
+- [ ] Bug fix: linked issue and a regression test
+- [ ] Feature: OpenSpec change in `openspec/changes/<change>/` and tests
+- [ ] Large-scale change: opened with `?template=large-scale-change.md`
+- [ ] Archive of an OpenSpec change: no unchecked tasks
+
+## Check list
+
+- [ ] unit-tests written
+- [ ] e2e-tests written
+- [ ] memory bank updated (name the file), or not needed
+- [ ] PR name follows the pattern `#1234 - issue name`
+- [ ] branch name doesn't contain '#'
+- [ ] PR is linked with the issue
+- [ ] base branch (master or release/xx) is correct
+- [ ] task status changed to "Code review"
+- [ ] reviewers are notified about the pull request
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `6c14997997a2`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

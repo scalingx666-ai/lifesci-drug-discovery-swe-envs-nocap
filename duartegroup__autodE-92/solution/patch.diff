@@ -1,0 +1,413 @@
+diff --git a/autode/__init__.py b/autode/__init__.py
+index 117fd7b7a..baa6cbfe0 100644
+--- a/autode/__init__.py
++++ b/autode/__init__.py
+@@ -5,6 +5,7 @@
+ from autode.reactions.multistep import MultiStepReaction
+ from autode.atoms import Atom
+ from autode.species.molecule import (Reactant,  Product, Molecule, Species)
++from autode.species.complex import NCIComplex
+ from autode.config import Config
+ from autode.units import KcalMol
+ from autode.units import KjMol
+@@ -49,6 +50,7 @@
+     'Reactant',
+     'Product',
+     'Molecule',
++    'NCIComplex',
+     'Config',
+     'KcalMol',
+     'Calculation',
+diff --git a/autode/conformers/conformers.py b/autode/conformers/conformers.py
+index cda456ed2..e8e9ac1fe 100644
+--- a/autode/conformers/conformers.py
++++ b/autode/conformers/conformers.py
+@@ -5,6 +5,7 @@
+ from autode.values import Distance, Energy
+ from autode.atoms import Atom
+ from autode.config import Config
++from autode.mol_graphs import make_graph, is_isomorphic
+ from autode.geom import calc_heavy_atom_rmsd
+ from autode.log import logger
+ 
+@@ -19,6 +20,23 @@ def _calc_conformer(conformer, calc_type, method, keywords, n_cores=1):
+ 
+ class Conformers(list):
+ 
++    @property
++    def lowest_energy(self) -> Optional['autode.conformers.Conformer']:
++        """
++        Return the lowest energy conformer state from this set. If no
++        conformers have an energy then return None
++
++        -----------------------------------------------------------------------
++        Returns:
++            (autode.conformers.Conformer | None): Conformer
++        """
++        if all(c.energy is None for c in self):
++            logger.error('Have no conformers with an energy, so no lowest')
++            return None
++
++        energies = [c.energy if c.energy is not None else np.inf for c in self]
++        return self[np.argmin(energies)]
++
+     def prune(self,
+               e_tol:            Union[Energy, float] = Energy(1, units='kJ mol-1'),
+               rmsd_tol:         Union[Distance, float, None] = None,
+@@ -155,6 +173,32 @@ def prune_on_rmsd(self,
+         logger.info(f'Pruned to {len(self)} unique conformer(s) on RMSD')
+         return None
+ 
++    def prune_diff_graph(self,
++                         graph: 'networkx.Graph') -> None:
++        """
++        Remove conformers with a different molecular graph to a defined
++        reference. Although all conformers should have the same molecular
++        graph there are situations where not pruning these is useful
++
++        -----------------------------------------------------------------------
++
++        Arguments:
++            graph (networkx.Graph): Reference graph
++        """
++        n_prev_confs = len(self)
++
++        for idx in reversed(range(len(self))):
++            conformer = self[idx]
++            make_graph(conformer)
++
++            if not is_isomorphic(conformer.graph, graph,
++                                 ignore_active_bonds=True):
++                logger.warning('Conformer had a different graph. Ignoring')
++                del self[idx]
++
++        logger.info(f'Pruned on connectivity {n_prev_confs} -> {len(self)}')
++        return None
++
+     def _parallel_calc(self, calc_type, method, keywords):
+         """
+         Run a set of calculations (single point energy evaluations or geometry
+diff --git a/autode/species/species.py b/autode/species/species.py
+index 10641b61b..1f1a5adc5 100644
+--- a/autode/species/species.py
++++ b/autode/species/species.py
+@@ -16,9 +16,8 @@
+ from autode.wrappers.keywords import Keywords
+ from autode.config import Config
+ from autode.input_output import atoms_to_xyz_file
+-from autode.mol_graphs import is_isomorphic, reorder_nodes
++from autode.mol_graphs import make_graph, reorder_nodes
+ from autode.methods import get_lmethod, get_hmethod, ElectronicStructureMethod
+-from autode.mol_graphs import make_graph
+ from autode.hessians import Hessian
+ from autode.units import ha_per_ang_sq, ha_per_ang
+ from autode.thermochemistry.symmetry import symmetry_number
+@@ -647,35 +646,14 @@ def _run_hess_calculation(self, method):
+     def _set_lowest_energy_conformer(self):
+         """Set the species energy and atoms as those of the lowest energy
+         conformer"""
+-        lowest_energy = None
++        conformer = self.conformers.lowest_energy
+ 
+-        for conformer in self.conformers:
+-            if conformer.energy is None or conformer.atoms is None:
+-                continue
+-
+-            # Conformers don't have a molecular graph, so make it
+-            make_graph(conformer)
+-
+-            if not is_isomorphic(conformer.graph, self.graph,
+-                                 ignore_active_bonds=True):
+-                logger.warning('Conformer had a different graph. Ignoring')
+-                continue
+-
+-            # If the conformer retains the same connectivity, up the the active
+-            # atoms in the species graph
+-
+-            if lowest_energy is None:
+-                lowest_energy = conformer.energy
+-
+-            if conformer.energy <= lowest_energy:
+-                self.atoms = conformer.atoms
+-                self.energy = conformer.energy
+-                lowest_energy = conformer.energy
+-
+-        if lowest_energy is None:
++        if conformer is None:
+             raise RuntimeError("Failed to set the lowest energy conformer as "
+                                "no suitable conformers were present")
+ 
++        self.atoms = conformer.atoms.copy()
++        self.energy = conformer.energy
+         return None
+ 
+     def populate_conformers(self, *args, **kwargs):
+@@ -986,15 +964,29 @@ def single_point(self,
+ 
+     @work_in('conformers')
+     def find_lowest_energy_conformer(self,
+-                                     lmethod: Optional[ElectronicStructureMethod] = None,
+-                                     hmethod: Optional[ElectronicStructureMethod] = None) -> None:
++                                     lmethod:                    Optional[ElectronicStructureMethod] = None,
++                                     hmethod:                    Optional[ElectronicStructureMethod] = None,
++                                     allow_connectivity_changes: bool = False
++                                     ) -> None:
+         """
+-        For a molecule object find the lowest conformer in energy and set the
+-        molecule.atoms and molecule.energy
++        Find the lowest energy conformer of this species. Populates
++        species.conformers and sets species.atoms and species.energy. By
++        default will only optimise at a low-level method
+ 
+-        Arguments:
+-            lmethod (autode.wrappers.ElectronicStructureMethod):
+-            hmethod (autode.wrappers.ElectronicStructureMethod):
++        -----------------------------------------------------------------------
++        Keyword Arguments:
++            lmethod (autode.wrappers.ElectronicStructureMethod): Low-level
++                     method to use.
++
++            hmethod (autode.wrappers.ElectronicStructureMethod): High-level
++                     method to use.
++
++            allow_connectivity_changes (bool): Allow changes in connectivity,
++                                               although not (by definition) a
++                                               conformer it is useful to allow
++
++        Raises:
++            (RuntimeError): If no conformers (with energies) can be generated
+         """
+         logger.info('Finding lowest energy conformer')
+ 
+@@ -1030,8 +1022,10 @@ def find_lowest_energy_conformer(self,
+                 # Otherwise run a full optimisation
+                 self.conformers.optimise(hmethod)
+ 
+-        self._set_lowest_energy_conformer()
++        if not allow_connectivity_changes:
++            self.conformers.prune_diff_graph(self.graph)
+ 
++        self._set_lowest_energy_conformer()
+         logger.info(f'Lowest energy conformer found. E = {self.energy}')
+         return None
+ 
+diff --git a/doc/common/na_h2o_3.py b/doc/common/na_h2o_3.py
+new file mode 100644
+index 000000000..14c5cbba1
+--- /dev/null
++++ b/doc/common/na_h2o_3.py
+@@ -0,0 +1,14 @@
++import autode as ade
++ade.Config.n_cores = 8
++
++
++h2o = ade.Molecule(smiles='O')
++na_ion = ade.Molecule(smiles='[Na+]')
++
++# Initialise the [Na(H2O)3]+ complex and search 'conformers'
++na_h2o_3 = ade.NCIComplex(na_ion, h2o, h2o, h2o)
++na_h2o_3.find_lowest_energy_conformer(allow_connectivity_changes=True)
++
++# Print .xyz files of all the generated conformers
++for idx, conformer in enumerate(na_h2o_3.conformers):
++    conformer.print_xyz_file(filename=f'conf{idx}.xyz')
+diff --git a/doc/common/na_h2o_3_confomers.png b/doc/common/na_h2o_3_confomers.png
+new file mode 100644
+index 000000000..66e655cc6
+Binary files /dev/null and b/doc/common/na_h2o_3_confomers.png differ
+diff --git a/doc/common/water_trimer.py b/doc/common/water_trimer.py
+index 22aaea9dd..2fe29f48c 100644
+--- a/doc/common/water_trimer.py
++++ b/doc/common/water_trimer.py
+@@ -1,15 +1,19 @@
+ import autode as ade
+-from autode.species import NCIComplex
+-
+-ade.Config.num_complex_sphere_points = 5
+-ade.Config.num_complex_random_rotations = 3
+ xtb = ade.methods.XTB()
+ 
++# Number of points on the surface of the sphere for each component
++ade.Config.num_complex_sphere_points = 5                                 # N_s
++
++# and the number of rotations to perform per point on the sphere
++ade.Config.num_complex_random_rotations = 3                              # N_r
++
++# Total number of conformers will be (N_s × N_r) ^ (N-1) for N molecules => 225
++
+ # Make a water molecule and optimise at the XTB level
+ water = ade.Molecule(name='water', smiles='O')
+ water.optimise(method=xtb)
+ 
+ # Make the NCI complex and find the lowest energy structure
+-trimer = NCIComplex(water, water, water, name='water_trimer')
++trimer = ade.NCIComplex(water, water, water, name='water_trimer')
+ trimer.find_lowest_energy_conformer(lmethod=xtb)
+ trimer.print_xyz_file()
+diff --git a/doc/common/water_trimer_expl.png b/doc/common/water_trimer_expl.png
+new file mode 100644
+index 000000000..d6bc29d79
+Binary files /dev/null and b/doc/common/water_trimer_expl.png differ
+diff --git a/doc/examples/nci.rst b/doc/examples/nci.rst
+index d6672c5bd..288375452 100644
+--- a/doc/examples/nci.rst
++++ b/doc/examples/nci.rst
+@@ -3,11 +3,43 @@ Non-covalent Interaction Complexes
+ **********************************
+ 
+ **autodE** allows for the systematic search of a NCI complexes conformational
+-space. For example, to find the lowest energy structure of the water trimer
++space. For example, to find the lowest energy structure of the water trimer:
+ 
+ .. literalinclude:: ../common/water_trimer.py
+ 
++
+ Out (visualised)
+ 
+ .. image:: ../common/water_trimer.png
++   :width: 650
++
++
++|
++
++The parameters (:code:`num_complex_sphere_points` and :code:`num_complex_random_rotations`)
++define the number of generated conformers, up to :code:`ade.Config.max_num_complex_conformers`.
++
++
++.. image:: ../common/water_trimer_expl.png
++   :width: 550
++   :align: center
++
++|
++|
++
++By default, **autodE** will exclude any conformers with differing connectivity, thus
++may not generate any conformers of e.g. a [M(H\ :sub:`2`\O)\ :sub:`m`\]\ :sub:`n+`\  system.
++Complexes of systems with dative bonds can be generated by including
++:code:`allow_connectivity_changes=True`. For example, with a
++[Na(H\ :sub:`2`\O)\ :sub:`3`\]\ :sup:`+`\ system:
++
++.. literalinclude:: ../common/na_h2o_3.py
++
++
++Out (visualised)
++
++.. image:: ../common/na_h2o_3_confomers.png
++   :width: 550
++   :align: center
++
+ 
+diff --git a/tests/test_complex.py b/tests/test_complex.py
+index 78a76cd6a..7c2b205cc 100644
+--- a/tests/test_complex.py
++++ b/tests/test_complex.py
+@@ -1,9 +1,13 @@
+-from autode.species.complex import Complex
++import shutil
++from autode.exceptions import NoConformers
++from autode.species.complex import Complex, NCIComplex
+ from autode.config import Config
++from autode.methods import XTB
+ from autode.species.molecule import Molecule
+ from autode.geom import are_coords_reasonable
+ from autode.atoms import Atom
+ from autode.values import Distance
++from autode.utils import work_in_tmp_dir
+ import numpy as np
+ from copy import deepcopy
+ import pytest
+@@ -212,3 +216,30 @@ def test_complex_atom_reorder():
+     hf_dimer.reorder_atoms(mapping={0: 1, 1: 0, 2: 2, 3: 3})
+     assert [atom.label for atom in hf_dimer.atoms] == ['F', 'H', 'H', 'F']
+     assert hf_dimer.n_molecules == 2
++
++
++@work_in_tmp_dir(filenames_to_copy=[], kept_file_exts=[])
++def test_allow_connectivity_change():
++
++    # Don't run the calculation without a working XTB install
++    if shutil.which('xtb') is None or not shutil.which('xtb').endswith('xtb'):
++        return
++
++    xtb = XTB()
++    xtb.path = shutil.which('xtb')
++    assert xtb.available
++
++    na_h2o = NCIComplex(Molecule(smiles='[Na+]'), Molecule(smiles='O'))
++
++    # Should prune connectivity change
++    try:
++        na_h2o.find_lowest_energy_conformer(lmethod=xtb)
++        assert na_h2o.n_conformers == 0
++
++    # Will fail to set the lowest energy conformer
++    except (NoConformers, RuntimeError):
++        pass
++
++    # but should generate more conformers allowing the Na-OH2 'bond'
++    na_h2o.find_lowest_energy_conformer(allow_connectivity_changes=True)
++    assert na_h2o.n_conformers > 0
+diff --git a/tests/test_molecule.py b/tests/test_molecule.py
+index 80964b6c0..0e231d23b 100644
+--- a/tests/test_molecule.py
++++ b/tests/test_molecule.py
+@@ -195,7 +195,7 @@ def test_multi_ring_smiles_init():
+     assert are_coords_reasonable(cr_complex.coordinates)
+ 
+ 
+-def test_lowest_energy_conformer_set():
++def test_prune_diff_graphs():
+ 
+     h2 = Molecule(smiles='[H][H]')
+     h2.energy = -1.0
+@@ -208,9 +208,47 @@ def test_lowest_energy_conformer_set():
+ 
+     h2.conformers = [h2_not_bonded]
+ 
+-    # Throw an exception if no conformers are found
+-    with pytest.raises(RuntimeError):
+-        h2._set_lowest_energy_conformer()
++    h2.conformers.prune_diff_graph(graph=h2.graph)
++
++    # Should prune all conformers
++    assert h2.n_conformers == 0
++
++
++def test_lowest_energy_conformer_set_ok():
++
++    h2 = Molecule(smiles='[H][H]')
++    h2.energy = -1.0
++
++    h2_long = Molecule(atoms=[Atom('H'), Atom('H', x=0.5)])
++    h2_long.energy = -1.1
++
++    h2.conformers = [h2_long]
++
++    # Setting the lowest energy conformer should override the atoms
++    # and energy of the molecule
++    h2._set_lowest_energy_conformer()
++
++    assert h2.energy == -1.1
++    assert np.isclose(h2.distance(0, 1).to('ang'), 0.5)
++
++
++def test_lowest_energy_conformer_set_no_energy():
++
++    h2 = Molecule(smiles='[H][H]')
++    h2.energy = -1.0
++
++    # No lowest energy conformer without any conformers..
++    assert h2.conformers.lowest_energy is None
++
++    h2_conf = Molecule(atoms=[Atom('H'), Atom('H', x=1)])
++    assert h2_conf.energy is None
++
++    h2.conformers = [h2_conf]
++    assert h2.conformers.lowest_energy is None
++
++    # Cannot set the lowest energy with no conformers having defined energies
++    with pytest.raises(Exception):
++        h2_conf._set_lowest_energy_conformer()
+ 
+ 
+ def test_defined_metal_spin_state():

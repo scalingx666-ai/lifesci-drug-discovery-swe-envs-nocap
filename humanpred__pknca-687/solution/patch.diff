@@ -1,0 +1,2525 @@
+diff --git a/NEWS.md b/NEWS.md
+index 4c70dbdb..d92740f2 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -564,6 +564,51 @@ the generated intervals:
+   test-replicated, and the NTID and HVNTID frameworks are not feasible for
+   it).  `reps_test` is the smallest of the per-formulation medians.
+ 
++* The intra-subject contrasts used by the FDA RSABE, NTID, and HVNTID
++  frameworks follow the FDA progesterone and warfarin guidances:  only subjects
++  with every test and reference administration their sequence calls for
++  contribute, the ratio is the unweighted mean of the sequence means of the
++  contrasts, and its standard error and `n - m` degrees of freedom (`n`
++  subjects, `m` sequences) come from the one-way model on sequence, so period
++  effects do not enter the ratio or its interval.  A subject without a single
++  known sequence is an error for these frameworks, and without a sequence
++  column the sequence is the subject's treatment-by-period pattern.
++  (@billdenney)
++
++* `be_within_var()` gains `model_type = "isc"`, the FDA progesterone and
++  warfarin guidance estimator (each subject's difference between its two
++  administrations of a formulation, centered within sequence, on `n - m`
++  degrees of freedom), and a `sequence` argument for it.  The FDA RSABE, NTID,
++  and HVNTID frameworks in `be_assess()` use it for `swR`, `swT`, and the
++  `swT`/`swR` bound; it equals the EMA ANOVA estimate for `TRTR`/`RTRT` and
++  differs for `TRR`/`RTR`/`RRT`.  `be_extract_param()` reports it in
++  `isc_`-prefixed columns.  (@billdenney)
++
++* The unscaled 80.00-125.00% criterion of the FDA frameworks (RSABE when
++  `swR < 0.294`, NTID, and HVNTID) uses the model of `model_type`.  The
++  default, `model_type = "isc"`, is for a replicate design the mixed-effects
++  model of the FDA progesterone and warfarin guidances (SAS
++  `RANDOM TRT/TYPE=FA0(2)`, `REPEATED/GRP=TRT`, `DDFM=SATTERTH`): correlated
++  treatment random effects for each subject, a residual variance per
++  treatment, REML, and Satterthwaite degrees of freedom, fit by subject so
++  that large studies stay fast; the fixed-effects ANOVA gives the geometric
++  means, and a design without a replicated formulation keeps the ANOVA ratio.
++  The reference-scaled criterion keeps the intra-subject contrasts, and each
++  row of `be_assess()` shows the ratio and interval that its decision used.
++  When the mixed model cannot be fit (too few subjects, a formulation whose
++  replicates agree exactly, or no convergence), `be_extract_param()` reports
++  the message in `model_error`, and only a decision that needs the unscaled
++  criterion stops, with an error of class `pknca_error_be_fda_model`.  The
++  `be_assess()` caption for HVNTID states its criteria (the conventional
++  interval and the `swT`/`swR` bound).  (@billdenney)
++
++* `be_dataset()`, and so `be_assess()` and `be_compare()`, stops with
++  `pknca_error_be_design_missing` when the subject, sequence, period, or
++  treatment is missing in a row that would be analyzed, and with
++  `pknca_error_be_sequence_inconsistent` when a subject has more than one
++  sequence, so no model drops such rows while the subject count includes them.
++  (@billdenney)
++
+ * Secondary parameters can now be calculated by linking intervals with
+   `interval_id` and `<parameter>_ref` columns in the interval specification.
+   The reference interval supplies the cross-profile input (the plasma AUC for
+diff --git a/R/bioequivalence-fda-mixed.R b/R/bioequivalence-fda-mixed.R
+new file mode 100644
+index 00000000..0aa4e3a7
+--- /dev/null
++++ b/R/bioequivalence-fda-mixed.R
+@@ -0,0 +1,431 @@
++# FDA mixed-effects model for unscaled average bioequivalence in replicate
++# designs ----------------------------------------------------------------------
++#
++# The FDA progesterone (2011) and warfarin (2012) guidances decide the unscaled
++# 80.00-125.00% criterion with
++#
++#   PROC MIXED; CLASSES SEQ SUBJ PER TRT;
++#     MODEL Y = SEQ PER TRT / DDFM=SATTERTH;
++#     RANDOM TRT / TYPE=FA0(2) SUB=SUBJ G;
++#     REPEATED / GRP=TRT SUB=SUBJ;
++#
++# so each subject has correlated random effects for the treatments (an
++# unstructured k x k covariance G, parameterized by its Cholesky factor as
++# TYPE=FA0 is) and the residual variance differs by treatment.  The REML fit,
++# its information matrix, and the Satterthwaite degrees of freedom are computed
++# here subject by subject, so the cost grows linearly with the number of
++# subjects; subjects with the same treatment pattern share one covariance
++# block.
++#
++# The model is for replicate designs, where some formulation is given twice
++# and its within-subject variance keeps every covariance block positive
++# definite.  A treatment that no subject receives twice has a residual variance
++# that cannot be separated from its between-subject variance (the guidance
++# model is over-specified for a partial replicate's test formulation); that
++# residual variance is fixed at zero, which leaves the likelihood, the
++# estimates, and their variance unchanged.
++#
++# Every error raised here has the class `pknca_error_be_fda_model`, so callers
++# can defer it until a decision needs the model.
++#
++# Parameter scales: `theta` holds the natural covariance parameters (the lower
++# triangle of G by column, then the residual variance of each replicated
++# treatment); `u`, the optimization scale, holds the lower triangle of the
++# Cholesky factor L of G, then the log residual variances.  The information and
++# the Satterthwaite degrees of freedom use the SAS scale (the Cholesky factor,
++# then the residual variances), on which a fit with a singular G is still a
++# stationary point.
++
++# Design pieces for the FDA mixed model of one endpoint.  `ds_ep` carries
++# `.subject`, `.sequence`, `.period`, `.trt` (reference first), and `.logval`.
++# A missing `.sequence` is replaced by each subject's treatment pattern, as for
++# the intra-subject contrasts.  Covariates are not used.
++.be_fda_design <- function(ds_ep) {
++  ds_ep <- ds_ep[order(ds_ep$.subject, ds_ep$.period), , drop = FALSE]
++  subj <- droplevels(factor(ds_ep$.subject))
++  seq_id <- .be_isc_sequence(ds_ep, subj, derived = all(is.na(ds_ep$.sequence)))
++  ds_ep$.sequence <- factor(seq_id[as.integer(subj)])
++  ds_ep$.trt <- droplevels(ds_ep$.trt)
++  fixed <- .be_model_formula(ds_ep[, !startsWith(names(ds_ep), ".cov_"), drop = FALSE], random = FALSE)
++  X <- stats::model.matrix(fixed, data = ds_ep)
++  qx <- qr(X)
++  X <- X[, sort(qx$pivot[seq_len(qx$rank)]), drop = FALSE]
++  test_cols <- paste0(".trt", levels(ds_ep$.trt)[-1])
++  if (!all(test_cols %in% colnames(X))) {
++    rlang::abort(
++      "The treatment effect is aliased with the sequence or period effects, so the FDA mixed model cannot estimate it.",
++      class = c("pknca_error_be_fda_model_aliased", "pknca_error_be_fda_model")
++    )
++  }
++  trt_idx <- as.integer(ds_ep$.trt)
++  k <- nlevels(ds_ep$.trt)
++  rows <- split(seq_along(subj), subj)
++  pattern <- vapply(rows, .be_fda_pattern, character(1), trt_idx = trt_idx)
++  list(
++    X = X, y = ds_ep$.logval, rows = rows, pattern = pattern, subj = subj,
++    trt_idx = trt_idx, k = k, levels = levels(ds_ep$.trt),
++    replicated = vapply(seq_len(k), .be_fda_is_replicated, logical(1), trt_idx = trt_idx, subj = subj),
++    gi = which(lower.tri(diag(k), diag = TRUE), arr.ind = TRUE),
++    n_g = k * (k + 1) / 2, test_cols = test_cols
++  )
++}
++
++# Whether any subject receives treatment `t` (an index) more than once.
++.be_fda_is_replicated <- function(t, trt_idx, subj) {
++  any(tabulate(as.integer(subj)[trt_idx == t], nbins = nlevels(subj)) >= 2)
++}
++
++# A subject's treatment pattern: the treatment indices of its rows `i`.
++.be_fda_pattern <- function(i, trt_idx) {
++  paste(trt_idx[i], collapse = ".")
++}
++
++# The Cholesky factor L of G from the optimization scale u.
++.be_fda_chol <- function(u, d) {
++  L <- matrix(0, d$k, d$k)
++  L[lower.tri(L, diag = TRUE)] <- u[seq_len(d$n_g)]
++  L
++}
++
++# Natural covariance parameters theta from the optimization scale u.
++.be_fda_theta <- function(u, d) {
++  L <- .be_fda_chol(u, d)
++  G <- L %*% t(L)
++  c(G[lower.tri(G, diag = TRUE)], exp(u[-seq_len(d$n_g)]))
++}
++
++# d V / d theta_j for every natural parameter j, for a subject whose rows have
++# treatment indices `ti`.
++.be_fda_dv <- function(ti, d) {
++  out <- vector("list", d$n_g + sum(d$replicated))
++  for (j in seq_len(d$n_g)) {
++    a <- d$gi[j, 1]
++    b <- d$gi[j, 2]
++    out[[j]] <- (outer(ti == a, ti == b) | outer(ti == b, ti == a)) * 1
++  }
++  j <- d$n_g
++  for (t in which(d$replicated)) {
++    j <- j + 1
++    out[[j]] <- diag(as.numeric(ti == t), length(ti))
++  }
++  out
++}
++
++# Handler that turns a failed Cholesky decomposition into NULL.
++.be_fda_null <- function(cnd) {
++  NULL
++}
++
++# REML fit quantities at natural parameters theta: the log-likelihood (without
++# its constant), the fixed effects `beta`, their covariance `C`, and one block
++# per treatment pattern with V^-1, the d V / d theta_j, and each member's
++# residual e = y - X beta with V^-1 e.  NULL when a covariance block is not
++# positive definite.
++.be_fda_reml <- function(theta, d) {
++  G <- matrix(0, d$k, d$k)
++  G[lower.tri(G, diag = TRUE)] <- theta[seq_len(d$n_g)]
++  G <- G + t(G) - diag(diag(G), d$k)
++  s2 <- rep(0, d$k)
++  s2[d$replicated] <- theta[-seq_len(d$n_g)]
++  p <- ncol(d$X)
++  A <- matrix(0, p, p)
++  b <- numeric(p)
++  logdet <- 0
++  blocks <- list()
++  for (pat in unique(d$pattern)) {
++    members <- d$rows[d$pattern == pat]
++    ti <- d$trt_idx[members[[1]]]
++    ch <- tryCatch(chol(G[ti, ti, drop = FALSE] + diag(s2[ti], length(ti))), error = .be_fda_null)
++    if (is.null(ch)) {
++      return(NULL)
++    }
++    vi <- chol2inv(ch)
++    logdet <- logdet + length(members) * 2 * sum(log(diag(ch)))
++    for (i in members) {
++      xi <- d$X[i, , drop = FALSE]
++      A <- A + crossprod(xi, vi %*% xi)
++      b <- b + drop(crossprod(xi, vi %*% d$y[i]))
++    }
++    blocks[[pat]] <- list(members = members, vi = vi, dv = .be_fda_dv(ti, d))
++  }
++  ch_a <- tryCatch(chol(A), error = .be_fda_null)
++  if (is.null(ch_a)) {
++    return(NULL)
++  }
++  C <- chol2inv(ch_a)
++  beta <- drop(C %*% b)
++  q <- 0
++  for (pat in names(blocks)) {
++    blocks[[pat]]$res <- lapply(blocks[[pat]]$members, .be_fda_resid, d = d, beta = beta, vi = blocks[[pat]]$vi)
++    for (rs in blocks[[pat]]$res) {
++      q <- q + sum(rs$e * rs$r)
++    }
++  }
++  list(loglik = -0.5 * (logdet + 2 * sum(log(diag(ch_a))) + q), beta = beta, C = C, blocks = blocks)
++}
++
++# A subject's residual e = y - X beta and V^-1 e, for its rows `i`.
++.be_fda_resid <- function(i, d, beta, vi) {
++  e <- d$y[i] - drop(d$X[i, , drop = FALSE] %*% beta)
++  list(i = i, e = e, r = drop(vi %*% e))
++}
++
++# M_j = X' V^-1 V_j V^-1 X for each natural parameter j.
++.be_fda_m <- function(fit, d) {
++  n_par <- length(fit$blocks[[1]]$dv)
++  M <- rep(list(matrix(0, ncol(d$X), ncol(d$X))), n_par)
++  for (blk in fit$blocks) {
++    for (j in seq_len(n_par)) {
++      inner <- blk$vi %*% blk$dv[[j]] %*% blk$vi
++      for (i in blk$members) {
++        xi <- d$X[i, , drop = FALSE]
++        M[[j]] <- M[[j]] + crossprod(xi, inner %*% xi)
++      }
++    }
++  }
++  M
++}
++
++# Gradient of the REML log-likelihood with respect to the natural parameters,
++# -tr(P V_j) / 2 + (Py)' V_j (Py) / 2, where P = V^-1 - V^-1 X C X' V^-1, so
++# tr(P V_j) = tr(V^-1 V_j) - tr(C M_j), and P y = V^-1 (y - X beta).
++.be_fda_gradient <- function(fit, d, M = .be_fda_m(fit, d)) {
++  n_par <- length(M)
++  out <- numeric(n_par)
++  for (j in seq_len(n_par)) {
++    tr_v <- 0
++    quad <- 0
++    for (blk in fit$blocks) {
++      tr_v <- tr_v + length(blk$members) * sum(blk$vi * blk$dv[[j]])
++      for (rs in blk$res) {
++        quad <- quad + sum(rs$r * (blk$dv[[j]] %*% rs$r))
++      }
++    }
++    out[j] <- -0.5 * (tr_v - sum(fit$C * M[[j]])) + 0.5 * quad
++  }
++  out
++}
++
++# Observed information of the natural parameters, minus the Hessian of the REML
++# log-likelihood.  V is linear in theta, so d P / d theta_j = -P V_j P and
++#   I_ab = -tr(P V_a P V_b) / 2 + (Py)' V_a P V_b (Py),
++# with
++#   tr(P V_a P V_b) = tr(V^-1 V_a V^-1 V_b) - 2 tr(C N_ab) + tr(C M_a C M_b),
++#   N_ab = X' V^-1 V_a V^-1 V_b V^-1 X,
++#   (Py)' V_a P V_b (Py) = (Py)' V_a V^-1 V_b (Py) - w_a' C w_b,
++#   w_a = X' V^-1 V_a (Py),
++# each summed by subject.
++.be_fda_information <- function(fit, d, M = .be_fda_m(fit, d)) {
++  n_par <- length(M)
++  p <- ncol(d$X)
++  w <- rep(list(numeric(p)), n_par)
++  for (blk in fit$blocks) {
++    for (rs in blk$res) {
++      xi <- d$X[rs$i, , drop = FALSE]
++      for (a in seq_len(n_par)) {
++        w[[a]] <- w[[a]] + drop(crossprod(xi, blk$vi %*% blk$dv[[a]] %*% rs$r))
++      }
++    }
++  }
++  info <- matrix(0, n_par, n_par)
++  for (a in seq_len(n_par)) {
++    for (b in a:n_par) {
++      tr_vv <- 0
++      n_ab <- matrix(0, p, p)
++      quad <- 0
++      for (blk in fit$blocks) {
++        va_vi_vb <- blk$dv[[a]] %*% blk$vi %*% blk$dv[[b]]
++        tr_vv <- tr_vv + length(blk$members) * sum(diag(blk$vi %*% va_vi_vb))
++        inner <- blk$vi %*% va_vi_vb %*% blk$vi
++        for (rs in blk$res) {
++          xi <- d$X[rs$i, , drop = FALSE]
++          n_ab <- n_ab + crossprod(xi, inner %*% xi)
++          quad <- quad + sum(rs$r * (va_vi_vb %*% rs$r))
++        }
++      }
++      tr_pp <- tr_vv - 2 * sum(fit$C * n_ab) + sum(diag(fit$C %*% M[[a]] %*% fit$C %*% M[[b]]))
++      info[a, b] <- info[b, a] <- -0.5 * tr_pp + quad - drop(crossprod(w[[a]], fit$C %*% w[[b]]))
++    }
++  }
++  info
++}
++
++# Jacobian of the natural G parameters with respect to the Cholesky factor
++# entries (both in lower-triangle column order), and for each G parameter its
++# Hessian with respect to those entries.  theta_ab = sum_c L_ac L_bc, so
++# d theta_ab / d L_rs = [a = r] L_bs + [b = r] L_as and
++# d2 theta_ab / d L_rs d L_tv = [s = v] ([a = r][b = t] + [b = r][a = t]).
++.be_fda_chol_derivs <- function(L, d) {
++  gi <- d$gi
++  jac <- matrix(0, d$n_g, d$n_g)
++  hess <- rep(list(matrix(0, d$n_g, d$n_g)), d$n_g)
++  for (m in seq_len(d$n_g)) {
++    a <- gi[m, 1]
++    b <- gi[m, 2]
++    for (p1 in seq_len(d$n_g)) {
++      r <- gi[p1, 1]
++      s <- gi[p1, 2]
++      jac[m, p1] <- (a == r) * L[b, s] + (b == r) * L[a, s]
++      for (p2 in seq_len(d$n_g)) {
++        t <- gi[p2, 1]
++        v <- gi[p2, 2]
++        hess[[m]][p1, p2] <- (s == v) * ((a == r) * (b == t) + (b == r) * (a == t))
++      }
++    }
++  }
++  list(jac = jac, hess = hess)
++}
++
++# Negative REML log-likelihood on the optimization scale (for stats::optim).
++.be_fda_objective <- function(u, d) {
++  fit <- .be_fda_reml(.be_fda_theta(u, d), d)
++  if (is.null(fit)) .Machine$double.xmax else -fit$loglik
++}
++
++# Gradient of .be_fda_objective(): the natural-parameter gradient through the
++# Cholesky factor for G and through exp() for the residual variances.
++.be_fda_objective_grad <- function(u, d) {
++  theta <- .be_fda_theta(u, d)
++  fit <- .be_fda_reml(theta, d)
++  if (is.null(fit)) {
++    return(rep(0, length(u)))
++  }
++  g <- .be_fda_gradient(fit, d)
++  jac <- .be_fda_chol_derivs(.be_fda_chol(u, d), d)$jac
++  idx_g <- seq_len(d$n_g)
++  -c(drop(crossprod(jac, g[idx_g])), g[-idx_g] * theta[-idx_g])
++}
++
++# Starting values on the optimization scale: the within-subject variance from a
++# fixed-effects fit with subject, the between-subject variance from the subject
++# means of the fixed-effects residuals, and between-subject correlation `rho`.
++# An unreplicated treatment's within-subject variance goes into G.
++.be_fda_start <- function(d, rho) {
++  n <- length(d$y)
++  subj_x <- stats::model.matrix(~ 0 + d$subj)
++  fit_w <- stats::lm.fit(cbind(d$X, subj_x), d$y)
++  df_w <- n - fit_w$rank
++  s2w <- if (df_w > 0) sum(fit_w$residuals^2) / df_w else stats::var(d$y)
++  e0 <- stats::lm.fit(d$X, d$y)$residuals
++  s2b <- max(stats::var(tapply(e0, d$subj, mean)) - s2w / 2, s2w / 10)
++  G <- s2b * (rho + (1 - rho) * diag(d$k))
++  diag(G)[!d$replicated] <- diag(G)[!d$replicated] + s2w
++  L <- t(chol(G))
++  c(L[lower.tri(L, diag = TRUE)], rep(log(s2w), sum(d$replicated)))
++}
++
++# Fit the FDA mixed model to one endpoint and return, for each test
++# formulation, the log test/reference estimate, its standard error, and the
++# Satterthwaite degrees of freedom, plus the REML log-likelihood (without its
++# constant), the natural covariance parameters `theta`, and the optimization
++# scale parameters `u`.
++.be_fda_mixed <- function(ds_ep) {
++  d <- .be_fda_design(ds_ep)
++  n_par <- d$n_g + sum(d$replicated)
++  if (length(d$y) - ncol(d$X) <= n_par) {
++    rlang::abort(
++      sprintf(
++        "The FDA mixed model has %d covariance parameters but only %d residual degrees of freedom.",
++        n_par, length(d$y) - ncol(d$X)
++      ),
++      class = c("pknca_error_be_fda_model_insufficient", "pknca_error_be_fda_model")
++    )
++  }
++  best <- .be_fda_optimize(d)
++  theta <- .be_fda_theta(best$par, d)
++  .be_fda_check_variances(theta, d)
++  if (max(abs(.be_fda_objective_grad(best$par, d))) > 1e-3 * max(1, abs(best$value))) {
++    .be_fda_abort_convergence()
++  }
++  fit <- .be_fda_reml(theta, d)
++  M <- .be_fda_m(fit, d)
++  info_theta <- .be_fda_information(fit, d, M)
++  grad_theta <- .be_fda_gradient(fit, d, M)
++  # Information on the SAS scale: J' I J minus the gradient-weighted Hessian of
++  # the G parameters in the Cholesky entries (zero at an interior optimum).
++  derivs <- .be_fda_chol_derivs(.be_fda_chol(best$par, d), d)
++  n_par <- length(theta)
++  idx_g <- seq_len(d$n_g)
++  jac <- diag(n_par)
++  jac[idx_g, idx_g] <- derivs$jac
++  info <- crossprod(jac, info_theta %*% jac)
++  for (m in idx_g) {
++    info[idx_g, idx_g] <- info[idx_g, idx_g] - grad_theta[m] * derivs$hess[[m]]
++  }
++  cov_par <- tryCatch(solve(info), error = .be_fda_null)
++  if (is.null(cov_par)) {
++    rlang::abort(
++      "The information matrix of the FDA mixed model is singular, so its Satterthwaite degrees of freedom are not available.",
++      class = c("pknca_error_be_fda_model_singular", "pknca_error_be_fda_model")
++    )
++  }
++  contrasts <- list()
++  for (j in seq_along(d$test_cols)) {
++    cvec <- as.numeric(colnames(d$X) == d$test_cols[j])
++    cc <- drop(fit$C %*% cvec)
++    f <- sum(cvec * cc)
++    # d f / d theta_j = c' C M_j C c, carried to the SAS scale.
++    g <- crossprod(jac, vapply(M, .be_fda_quad, numeric(1), x = cc))
++    df <- 2 * f^2 / drop(crossprod(g, cov_par %*% g))
++    if (!is.finite(df) || df <= 0) {
++      rlang::abort(
++        sprintf("The Satterthwaite degrees of freedom of the FDA mixed model are not positive (%g).", df),
++        class = c("pknca_error_be_fda_model_df", "pknca_error_be_fda_model")
++      )
++    }
++    contrasts[[d$levels[j + 1]]] <- list(pe_log = sum(cvec * fit$beta), se = sqrt(f), df = df)
++  }
++  list(contrasts = contrasts, loglik = fit$loglik, theta = theta, u = best$par)
++}
++
++# Maximize the REML log-likelihood from two starting points (high and zero
++# between-subject correlation) and return the better optim() result.  Stops
++# unless a fit converged to a finite likelihood.
++.be_fda_optimize <- function(d) {
++  best <- NULL
++  for (rho in c(0.9, 0)) {
++    opt <- stats::optim(
++      .be_fda_start(d, rho), .be_fda_objective, .be_fda_objective_grad, d = d,
++      method = "BFGS", control = list(maxit = 2000, reltol = 1e-14)
++    )
++    if (opt$convergence == 0 && opt$value < .Machine$double.xmax && (is.null(best) || opt$value < best$value)) {
++      best <- opt
++    }
++  }
++  if (is.null(best)) {
++    .be_fda_abort_convergence()
++  }
++  best
++}
++
++.be_fda_abort_convergence <- function() {
++  rlang::abort(
++    "The REML fit of the FDA mixed model did not converge.",
++    class = c("pknca_error_be_fda_model_convergence", "pknca_error_be_fda_model")
++  )
++}
++
++# Stop when a replicated formulation's within-subject variance is zero (its
++# replicate administrations agree exactly once the fixed effects are removed),
++# where the REML likelihood has no maximum.
++.be_fda_check_variances <- function(theta, d) {
++  idx_g <- seq_len(d$n_g)
++  diag_g <- theta[idx_g][d$gi[, 1] == d$gi[, 2]]
++  s2 <- theta[-idx_g]
++  zero <- s2 < 1e-8 * (diag_g[d$replicated] + s2)
++  if (any(zero)) {
++    rlang::abort(
++      sprintf(
++        "The within-subject variance of formulation(s) %s is zero, so the FDA mixed model is degenerate.",
++        paste(d$levels[d$replicated][zero], collapse = ", ")
++      ),
++      class = c("pknca_error_be_fda_model_degenerate", "pknca_error_be_fda_model")
++    )
++  }
++  invisible(theta)
++}
++
++# The quadratic form x' M x.
++.be_fda_quad <- function(M, x) {
++  sum(x * (M %*% x))
++}
+diff --git a/R/bioequivalence.R b/R/bioequivalence.R
+index 234b28c1..208e1660 100644
+--- a/R/bioequivalence.R
++++ b/R/bioequivalence.R
+@@ -420,19 +420,34 @@ print.be_design <- function(x, ...) {
+   list(s2w = NA_real_, sw = NA_real_, df = NA_real_, cv = NA_real_)
+ }
+ 
+-# ANOVA within-formulation variance: lm(log(value) ~ subject + period) on a
+-# single formulation's replicate rows.  The subject factor absorbs sequence, so
+-# the residual mean square is the within-subject variance; this reproduces
+-# replicateBE's CV.calc exactly.  `arm` carries the `.subject`, `.period`, and
+-# `.logval` columns.
+-.be_arm_var <- function(arm) {
++# ANOVA within-formulation variance on a single formulation's replicate rows.
++# With `by_sequence = FALSE` the model is lm(log(value) ~ subject + period); the
++# subject factor absorbs sequence, so the residual mean square is the
++# within-subject variance, and this reproduces replicateBE's CV.calc exactly.
++# With `by_sequence = TRUE` the period effects differ by sequence
++# (lm(log(value) ~ subject + sequence:period)), which reproduces the FDA
++# progesterone and warfarin guidance estimator sum((D - mean D within
++# sequence)^2) / (2 (n - m)) for D, a subject's first minus second
++# administration.  The two agree for TRTR/RTRT and differ for TRR/RTR/RRT.
++# `arm` carries the `.subject`, `.period`, and `.logval` columns, and
++# `.sequence` for `by_sequence = TRUE`.
++.be_arm_var <- function(arm, by_sequence = FALSE) {
+   if (nrow(arm) == 0 || max(table(arm$.subject)) < 2) {
+     return(.be_arm_var_na())
+   }
+   arm$.subject <- droplevels(arm$.subject)
+   arm$.period <- droplevels(arm$.period)
++  if (by_sequence) {
++    arm$.sequence <- droplevels(factor(arm$.sequence))
++  }
+   fit_formula <-
+-    if (nlevels(arm$.period) > 1) .logval ~ .subject + .period else .logval ~ .subject
++    if (nlevels(arm$.period) <= 1) {
++      .logval ~ .subject
++    } else if (by_sequence) {
++      .logval ~ .subject + .sequence:.period
++    } else {
++      .logval ~ .subject + .period
++    }
+   a <- stats::anova(stats::lm(fit_formula, data = arm))
+   s2w <- a["Residuals", "Mean Sq"]
+   df <- a["Residuals", "Df"]
+@@ -448,13 +463,20 @@ print.be_design <- function(x, ...) {
+ #' log-transformed endpoint separately for the reference (`swR`) and test
+ #' (`swT`) formulations, the quantities that reference-scaling frameworks need.
+ #' The default `model_type = "anova"` is an analysis of variance (ANOVA) of the
+-#' replicate observations within each formulation; this is the estimator used by
+-#' both Method A and Method B of the EMA `replicateBE` reference implementation
+-#' and by the FDA moment-based approach, and it works for full and partial
+-#' replicate designs.  `model_type = "nlme"` instead fits a single mixed model
+-#' with treatment-specific residual variances and requires a fully replicated
+-#' design; it is provided as the alternative described in the FDA progesterone
+-#' guidance and can differ slightly from `"anova"`.
++#' replicate observations within each formulation with subject and period
++#' effects; this is the estimator used by both Method A and Method B of the EMA
++#' `replicateBE` reference implementation, and it works for full and partial
++#' replicate designs.  `model_type = "isc"` is the estimator of the FDA
++#' progesterone and warfarin guidances, used by the FDA frameworks in
++#' [be_assess()]: each subject's difference between its two administrations of
++#' a formulation, centered within sequence, so that
++#' `s2wR = sum((D - mean D within sequence)^2) / (2 * (n - m))` on `n - m`
++#' degrees of freedom for `n` subjects in `m` sequences.  It equals the
++#' `"anova"` estimate for a two-sequence full replicate (`TRTR`/`RTRT`) and
++#' differs for a partial replicate (`TRR`/`RTR`/`RRT`), where the period effects of the
++#' reference administrations differ by sequence.  `model_type = "nlme"` instead
++#' fits a single mixed model with treatment-specific residual variances and
++#' requires a fully replicated design; it can differ slightly from `"anova"`.
+ #'
+ #' @param data A long data.frame with one row per observation for a *single*
+ #'   endpoint (subject, period, treatment, and the endpoint value).
+@@ -463,12 +485,15 @@ print.be_design <- function(x, ...) {
+ #' @param subject,period,treatment Column names identifying the subject, period,
+ #'   and treatment.
+ #' @param reference_value The value of `treatment` that is the reference.
+-#' @param model_type `"anova"` (the default and the regulatory standard) or
+-#'   `"nlme"` (mixed model with treatment-specific residual variances; full
+-#'   replicate only).
++#' @param model_type `"anova"` (the default; the EMA estimator), `"isc"` (the
++#'   FDA estimator), or `"nlme"` (mixed model with treatment-specific residual
++#'   variances; full replicate only).
+ #' @param alpha The significance level for the `swT`/`swR` ratio confidence
+ #'   bound (default `0.10` gives the 90% upper bound used for narrow therapeutic
+ #'   index drugs).
++#' @param sequence The column name of the randomization sequence, used by
++#'   `model_type = "isc"`.  When `NULL`, a subject's sequence is its
++#'   treatment-by-period pattern.
+ #' @returns An object of class `be_within_var`: a list with `swR`, `swT`,
+ #'   `s2wR`, `s2wT`, `cvwr_percent`, `cvwt_percent`, `df_wR`, `df_wT`,
+ #'   `sw_ratio` (= `swT`/`swR`), `sw_ratio_ci_upper` (the upper `1 - alpha`
+@@ -479,14 +504,15 @@ print.be_design <- function(x, ...) {
+ #' @seealso [be_assess()]
+ #' @export
+ be_within_var <- function(data, value, subject, period, treatment, reference_value,
+-                          model_type = c("anova", "nlme"), alpha = 0.10) {
++                          model_type = c("anova", "nlme", "isc"), alpha = 0.10, sequence = NULL) {
+   model_type <- match.arg(model_type)
+   checkmate::assert_data_frame(data, min.rows = 1)
+   checkmate::assert_string(value)
+   checkmate::assert_string(subject)
+   checkmate::assert_string(period)
+   checkmate::assert_string(treatment)
+-  for (col in c(value, subject, period, treatment)) {
++  checkmate::assert_string(sequence, null.ok = TRUE)
++  for (col in c(value, subject, period, treatment, sequence)) {
+     checkmate::assert_choice(col, choices = names(data))
+   }
+   assert_numeric_between(alpha, lower = 0, upper = 1)
+@@ -494,6 +520,7 @@ be_within_var <- function(data, value, subject, period, treatment, reference_val
+ 
+   work <- data.frame(
+     .subject = factor(as.character(data[[subject]])),
++    .sequence = if (is.null(sequence)) NA_character_ else as.character(data[[sequence]]),
+     .period = factor(as.character(data[[period]])),
+     .trt = as.character(data[[treatment]]),
+     .val = data[[value]]
+@@ -508,12 +535,13 @@ be_within_var <- function(data, value, subject, period, treatment, reference_val
+   }
+   test_levels <- setdiff(unique(work$.trt), reference_value)
+ 
+-  # ANOVA within-formulation variance on each formulation's replicate rows
+-  # (see .be_arm_var).
+-  ref_v <- .be_arm_var(work[work$.trt == reference_value, , drop = FALSE])
++  # Within-formulation variance on each formulation's replicate rows (see
++  # .be_arm_var and .be_isc_arm_var).
++  arm_var <- if (model_type == "isc") .be_isc_arm_var else .be_arm_var_level
++  ref_v <- arm_var(work, reference_value)
+   test_v <-
+     if (length(test_levels) == 1) {
+-      .be_arm_var(work[work$.trt == test_levels, , drop = FALSE])
++      arm_var(work, test_levels)
+     } else {
+       # Multiple test formulations: swT (and the ratio) are not defined for a
+       # single test arm; report reference variability only.
+@@ -539,28 +567,54 @@ be_within_var <- function(data, value, subject, period, treatment, reference_val
+     test_v$cv <- sqrt(exp(mixed$s2wT) - 1) * 100
+   }
+ 
+-  sw_ratio <-
+-    if (!is.na(test_v$sw) && !is.na(ref_v$sw) && ref_v$sw > 0) test_v$sw / ref_v$sw else NA_real_
+-  sw_ratio_ci_upper <-
+-    if (!is.na(sw_ratio) && !is.na(test_v$df) && !is.na(ref_v$df)) {
+-      sw_ratio / sqrt(stats::qf(1 - alpha / 2, test_v$df, ref_v$df, lower.tail = FALSE))
+-    } else {
+-      NA_real_
+-    }
+-
++  sw_ratio <- .be_sw_ratio(test_v$sw, ref_v$sw)
+   structure(
+     list(
+       swR = ref_v$sw, swT = test_v$sw,
+       s2wR = ref_v$s2w, s2wT = test_v$s2w,
+       cvwr_percent = ref_v$cv, cvwt_percent = test_v$cv,
+       df_wR = ref_v$df, df_wT = test_v$df,
+-      sw_ratio = sw_ratio, sw_ratio_ci_upper = sw_ratio_ci_upper,
++      sw_ratio = sw_ratio,
++      sw_ratio_ci_upper = .be_sw_ratio_ci_upper(sw_ratio, test_v$df, ref_v$df, alpha),
+       model_type = model_type, alpha = alpha
+     ),
+     class = "be_within_var"
+   )
+ }
+ 
++# The ANOVA within-formulation variance (.be_arm_var()) of the rows of `work`
++# given formulation `level`.
++.be_arm_var_level <- function(work, level) {
++  .be_arm_var(work[work$.trt %in% level, , drop = FALSE])
++}
++
++# The FDA within-formulation variance (.be_arm_var() with sequence-specific
++# period effects) of the rows of `work` given formulation `level`.  The sequence
++# is the `.sequence` column, or each subject's treatment-by-period pattern when
++# `.sequence` is all missing (see .be_isc_sequence()).
++.be_isc_arm_var <- function(work, level) {
++  subj <- droplevels(factor(work$.subject))
++  seq_id <- .be_isc_sequence(work, subj, derived = all(is.na(work$.sequence)))
++  work$.sequence <- seq_id[as.integer(subj)]
++  .be_arm_var(work[work$.trt %in% level, , drop = FALSE], by_sequence = TRUE)
++}
++
++# Ratio of the test to the reference within-subject standard deviation, NA
++# when either is unavailable.  Vectorized.
++.be_sw_ratio <- function(swt, swr) {
++  ifelse(!is.na(swt) & !is.na(swr) & swr > 0, swt / swr, NA_real_)
++}
++
++# Upper limit of the equal-tailed 1 - alpha confidence interval of swT/swR (FDA
++# warfarin guidance): the ratio divided by the square root of the F quantile
++# with probability 1 - alpha/2 to its right.  Vectorized.
++.be_sw_ratio_ci_upper <- function(sw_ratio, df_wt, df_wr, alpha) {
++  ok <- !is.na(sw_ratio) & !is.na(df_wt) & !is.na(df_wr)
++  out <- rep(NA_real_, length(sw_ratio))
++  out[ok] <- sw_ratio[ok] / sqrt(stats::qf(1 - alpha / 2, df_wt[ok], df_wr[ok], lower.tail = FALSE))
++  out
++}
++
+ # Mixed model with treatment-specific residual variances (nlme::lme +
+ # varIdent).  Returns the within-subject variances for the reference and the
+ # single test formulation.  nlme is a hard dependency of PKNCA (in Imports).
+@@ -602,13 +656,14 @@ print.be_within_var <- function(x, ...) {
+ #
+ # Each `.be_*` decider takes the average-BE estimate `est` (a list with
+ # `pe_log`, `se`, `df`, `n`, `gmr_percent`, `ci_lower`, `ci_upper`), a
+-# `be_within_var` object `wv`, a `be_regulator` object `reg`, and `alpha`, and
+-# returns the decision fragment `list(limit_lower, limit_upper, criterion,
+-# pass)` that becomes one row of the [be_assess()] result.
++# `be_within_var` object `wv`, a `be_regulator` object `reg`, `alpha`, and
++# `unscaled`, the model estimate (same fields) whose interval decides the
++# unscaled 80.00-125.00% criterion of the FDA frameworks; for the other
++# frameworks `est` is the model estimate.  It returns the decision fragment
++# `list(limit_lower, limit_upper, criterion, pass, report)` that becomes one
++# row of the [be_assess()] result, where `report` is the estimate whose ratio
++# and interval the row shows.
+ 
+-# Intra-subject contrasts (ISC) point estimate, the FDA reference-scaled
+-# approach: within each subject form the mean log test minus mean log reference,
+-# then average across subjects.  `work` carries `.subject`, `.trt`, `.logval`.
+ # Within-subject contrast for one subject: mean log test minus mean log
+ # reference, or NA if the subject lacks either formulation.  `s` carries the
+ # `.trt` and `.logval` columns.
+@@ -622,9 +677,10 @@ print.be_within_var <- function(x, ...) {
+   }
+ }
+ 
+-# ISC estimate with the same fields as .be_isc(), all missing.  Used when no two
+-# subjects received both formulations (a parallel design), where intra-subject
+-# contrasts do not exist.  The argument is the condition from tryCatch().
++# ISC estimate with the same fields as .be_isc(), all missing.  Used when the
++# contrasts cannot be estimated: no subject received both formulations (a
++# parallel design), too few subjects have complete data, or a subject's sequence
++# is missing.  The argument is the condition from tryCatch().
+ .be_isc_na <- function(cnd = NULL) {
+   list(
+     pe_log = NA_real_, se = NA_real_, df = NA_real_, n = 0L,
+@@ -632,9 +688,9 @@ print.be_within_var <- function(x, ...) {
+   )
+ }
+ 
+-# .be_isc(), or all-missing values when too few subjects have both formulations.
+-# be_table() errors if a regulator that needs the ISC estimate gets the missing
+-# values.
++# .be_isc(), or all-missing values when it cannot be estimated (see
++# .be_isc_na()).  be_table() errors if a regulator that needs the ISC estimate
++# gets the missing values.
+ .be_isc_or_na <- function(work, reference_value, test_level, alpha = 0.10) {
+   tryCatch(
+     .be_isc(work, reference_value, test_level, alpha),
+@@ -642,20 +698,91 @@ print.be_within_var <- function(x, ...) {
+   )
+ }
+ 
++# The sequence of each subject, one value per level of `subj`: the `.sequence`
++# column, or with `derived = TRUE` the subject's treatment-by-period pattern (as
++# in be_design()).
++.be_isc_sequence <- function(work, subj, derived) {
++  if (derived) {
++    return(as.character(tapply(
++      seq_len(nrow(work)), subj, .be_subject_pattern,
++      per = work$.period, trt = as.character(work$.trt)
++    )))
++  }
++  if (anyNA(work$.sequence)) {
++    rlang::abort(
++      "Intra-subject contrasts need the sequence of every subject.",
++      class = c("pknca_error_be_isc_sequence_missing", "pknca_error_be_isc_insufficient")
++    )
++  }
++  labels <- unique(data.frame(subj = subj, sequence = as.character(work$.sequence)))
++  if (anyDuplicated(labels$subj) > 0) {
++    rlang::abort(
++      "Intra-subject contrasts need a single sequence for each subject.",
++      class = c("pknca_error_be_isc_sequence_inconsistent", "pknca_error_be_isc_insufficient")
++    )
++  }
++  as.character(tapply(as.character(work$.sequence), subj, `[`, 1))
++}
++
++# Whether each subject (one value per level of `subj`) has every test and
++# reference administration its sequence calls for: as many as the most seen in
++# that sequence, and no administration of unknown (missing) treatment.  The
++# counts are inferred from the subjects of each sequence, so a sequence in which
++# every subject lacks the same administration counts as complete.  A derived
++# sequence cannot tell a subject who missed a period from a different sequence,
++# so with `derived = TRUE` every period of the design is also required.
++.be_isc_complete <- function(work, subj, seq_id, reference_value, test_level, derived) {
++  n_ref <- as.vector(tapply(work$.trt %in% reference_value, subj, sum))
++  n_test <- as.vector(tapply(work$.trt %in% test_level, subj, sum))
++  known_trt <- !as.vector(tapply(is.na(work$.trt), subj, any))
++  complete <-
++    known_trt &
++    n_ref == stats::ave(n_ref, seq_id, FUN = max) &
++    n_test == stats::ave(n_test, seq_id, FUN = max)
++  if (derived) {
++    n_obs <- as.vector(table(subj))
++    complete <- complete & n_obs == max(n_obs)
++  }
++  complete
++}
++
++# Intra-subject contrasts (ISC), the estimate for the FDA reference-scaled
++# frameworks (FDA draft guidances on progesterone, 2011, and warfarin sodium,
++# 2012).  Each subject's contrast is its mean log test minus its mean log
++# reference, from subjects with every test and reference administration their
++# sequence calls for.  The estimate is the unweighted mean of the sequence means
++# of the contrasts (SAS `model ilat = seq; estimate 'average' intercept 1 seq
++# 1/m ... 1/m`) with n - m degrees of freedom (n subjects, m sequences).  Each
++# sequence mean carries that sequence's period effects; the unweighted mean
++# cancels them for the standard designs (TRTR/RTRT, TRR/RTR/RRT, TR/RT) for any
++# number of subjects per sequence, and the one-way model keeps them out of the
++# standard error.  `work` carries `.subject`, `.sequence`, `.period`, `.trt`,
++# and `.logval`; an all-missing `.sequence` is derived from the treatment
++# pattern.
+ .be_isc <- function(work, reference_value, test_level, alpha = 0.10) {
+-  byid <- split(work, work$.subject)
+-  ilat <- vapply(byid, .be_subject_ilat, numeric(1), reference_value, test_level)
+-  ilat <- ilat[!is.na(ilat)]
++  subj <- droplevels(factor(work$.subject))
++  derived <- all(is.na(work$.sequence))
++  seq_id <- .be_isc_sequence(work, subj, derived)
++  ilat <- vapply(split(work, subj), .be_subject_ilat, numeric(1), reference_value, test_level)
++  use <- !is.na(ilat) & .be_isc_complete(work, subj, seq_id, reference_value, test_level, derived)
++  ilat <- unname(ilat[use])
++  sq <- factor(seq_id[use])
+   n <- length(ilat)
+-  if (n < 2) {
++  m <- nlevels(sq)
++  if (n - m < 1) {
+     rlang::abort(
+-      "The intra-subject contrast estimate needs at least 2 subjects with both formulations.",
++      "The intra-subject contrast estimate needs complete test and reference data from more subjects than there are sequences.",
+       class = "pknca_error_be_isc_insufficient"
+     )
+   }
+-  pe_log <- mean(ilat)
+-  se <- stats::sd(ilat) / sqrt(n)
+-  df <- n - 1
++  # The one-way model on sequence: its residual mean square gives the variance
++  # of each sequence mean, and the estimate weights each sequence mean by 1/m.
++  # With a single sequence this is the mean, sd / sqrt(n), and n - 1.
++  seq_mean <- as.vector(tapply(ilat, sq, mean))
++  df <- n - m
++  mse <- sum((ilat - seq_mean[as.integer(sq)])^2) / df
++  pe_log <- mean(seq_mean)
++  se <- sqrt(mse * sum(1 / as.vector(table(sq)))) / m
+   ci <- exp(pe_log + c(-1, 1) * stats::qt(1 - alpha / 2, df) * se) * 100
+   list(
+     pe_log = pe_log, se = se, df = df, n = n,
+@@ -684,15 +811,16 @@ print.be_within_var <- function(x, ...) {
+ }
+ 
+ # Average bioequivalence: conventional 80-125% on the 90% confidence interval.
+-.be_abe <- function(est, wv, reg, alpha) {
++.be_abe <- function(est, wv, reg, alpha, unscaled = est) {
+   list(
+     limit_lower = 80, limit_upper = 125, criterion = NA_real_,
+-    pass = isTRUE(est$ci_lower >= 80 && est$ci_upper <= 125)
++    pass = isTRUE(est$ci_lower >= 80 && est$ci_upper <= 125),
++    report = est
+   )
+ }
+ 
+ # Average bioequivalence with expanding limits (EMA / HC / GCC).
+-.be_abel <- function(est, wv, reg, alpha) {
++.be_abel <- function(est, wv, reg, alpha, unscaled = est) {
+   if (is.na(wv$swR)) {
+     rlang::abort(
+       "Reference scaling requires a replicated reference; the reference is not replicated.",
+@@ -704,93 +832,116 @@ print.be_within_var <- function(x, ...) {
+   list(
+     limit_lower = unname(lim[["lower"]]), limit_upper = unname(lim[["upper"]]),
+     criterion = NA_real_,
+-    pass = isTRUE(ci_ok && .be_pe_ok(reg, est$gmr_percent))
++    pass = isTRUE(ci_ok && .be_pe_ok(reg, est$gmr_percent)),
++    report = est
+   )
+ }
+ 
+ # FDA reference-scaled average bioequivalence (RSABE).  Below the switching
+-# variability (swR < 0.294) it falls back to unscaled average bioequivalence.
+-.be_rsabe <- function(est, wv, reg, alpha) {
++# variability (swR < 0.294) it falls back to unscaled average bioequivalence on
++# the `unscaled` estimate (the FDA mixed model by default).
++.be_rsabe <- function(est, wv, reg, alpha, unscaled = est) {
+   if (is.na(wv$swR)) {
+     rlang::abort(
+       "Reference scaling requires a replicated reference; the reference is not replicated.",
+       class = "pknca_error_be_rsabe_reference_not_replicated"
+     )
+   }
+-  pe_ok <- .be_pe_ok(reg, est$gmr_percent)
+   if (!is.na(reg$switch_swr) && wv$swR < reg$switch_swr) {
+     # Unscaled average bioequivalence fallback.
++    .be_check_unscaled(unscaled)
+     list(
+       limit_lower = 80, limit_upper = 125, criterion = NA_real_,
+-      pass = isTRUE(est$ci_lower >= 80 && est$ci_upper <= 125 && pe_ok)
++      pass = isTRUE(
++        unscaled$ci_lower >= 80 && unscaled$ci_upper <= 125 && .be_pe_ok(reg, unscaled$gmr_percent)
++      ),
++      report = unscaled
+     )
+   } else {
+     bound <- .be_rsabe_bound(est$pe_log, est$se, est$df, wv$s2wR, wv$df_wR, reg$r_const)
+     list(
+       limit_lower = NA_real_, limit_upper = NA_real_, criterion = bound,
+-      pass = isTRUE(bound <= 0 && pe_ok)
++      pass = isTRUE(bound <= 0 && .be_pe_ok(reg, est$gmr_percent)),
++      report = est
+     )
+   }
+ }
+ 
+-# FDA narrow therapeutic index drugs (NTID): the scaled criterion must pass, the
+-# conventional 90% CI must lie within 80-125%, and the upper 90% confidence
+-# bound of swT/swR must be at most the regulator's ratio cap (2.5).  Matches
+-# PowerTOST's power.NTID (BEscABE & BEABE & BEsratio).
+-.be_ntid <- function(est, wv, reg, alpha) {
++# FDA narrow therapeutic index drugs (NTID): the scaled criterion (on the
++# intra-subject contrasts) must pass, the conventional 90% CI of the `unscaled`
++# estimate must lie within 80-125%, and the upper 90% confidence bound of
++# swT/swR must be at most the regulator's ratio cap (2.5), as in the FDA
++# warfarin guidance.
++.be_ntid <- function(est, wv, reg, alpha, unscaled = est) {
+   if (is.na(wv$swT)) {
+     rlang::abort(
+       "NTID assessment requires a fully replicated design (both formulations replicated).",
+       class = "pknca_error_be_ntid_not_replicated"
+     )
+   }
++  .be_check_unscaled(unscaled)
+   bound <- .be_rsabe_bound(est$pe_log, est$se, est$df, wv$s2wR, wv$df_wR, reg$r_const)
+   list(
+     limit_lower = 80, limit_upper = 125, criterion = bound,
+     pass = isTRUE(
+       bound <= 0 &&
+-        est$ci_lower >= 80 && est$ci_upper <= 125 &&
++        unscaled$ci_lower >= 80 && unscaled$ci_upper <= 125 &&
+         !is.na(wv$sw_ratio_ci_upper) && wv$sw_ratio_ci_upper <= reg$sw_ratio_cap &&
+         .be_pe_ok(reg, est$gmr_percent)
+-    )
++    ),
++    report = unscaled
+   )
+ }
+ 
+ # FDA highly variable narrow therapeutic index drugs (HVNTID): unscaled --
+-# the conventional 90% CI must lie within 80-125% and the upper 90% confidence
+-# bound of swT/swR must be at most the regulator's ratio cap (2.5).  There is no
+-# reference-scaled bound (reference scaling does not apply to highly variable
+-# NTIDs).  Matches PowerTOST's power.HVNTID (BEABE & BEsratio).
+-.be_hvntid <- function(est, wv, reg, alpha) {
++# the conventional 90% CI of the `unscaled` estimate must lie within 80-125%
++# and the upper 90% confidence bound of swT/swR must be at most the regulator's
++# ratio cap (2.5).  There is no reference-scaled bound (reference scaling does
++# not apply to highly variable NTIDs).
++.be_hvntid <- function(est, wv, reg, alpha, unscaled = est) {
+   if (is.na(wv$swT)) {
+     rlang::abort(
+       "HVNTID assessment requires a fully replicated design (both formulations replicated).",
+       class = "pknca_error_be_hvntid_not_replicated"
+     )
+   }
++  .be_check_unscaled(unscaled)
+   list(
+     limit_lower = 80, limit_upper = 125, criterion = NA_real_,
+     pass = isTRUE(
+-      est$ci_lower >= 80 && est$ci_upper <= 125 &&
++      unscaled$ci_lower >= 80 && unscaled$ci_upper <= 125 &&
+         !is.na(wv$sw_ratio_ci_upper) && wv$sw_ratio_ci_upper <= reg$sw_ratio_cap &&
+-        .be_pe_ok(reg, est$gmr_percent)
+-    )
++        .be_pe_ok(reg, unscaled$gmr_percent)
++    ),
++    report = unscaled
+   )
+ }
+ 
++# Stop when the unscaled criterion needs the model estimate but the model
++# (the FDA mixed model) could not be fit; `unscaled$error` is its message.
++.be_check_unscaled <- function(unscaled) {
++  if (!is.null(unscaled$error) && !is.na(unscaled$error)) {
++    rlang::abort(
++      paste("The unscaled criterion needs the FDA mixed model, which failed:", unscaled$error),
++      class = c("pknca_error_be_fda_model_unavailable", "pknca_error_be_fda_model")
++    )
++  }
++  invisible(unscaled)
++}
++
+ # Dispatch to the decider for a regulator's scaling type.  The descriptive
+ # framework makes no decision.
+-.be_decide <- function(est, wv, reg, alpha) {
++.be_decide <- function(est, wv, reg, alpha, unscaled = est) {
+   if (!reg$decision) {
+-    return(list(limit_lower = NA_real_, limit_upper = NA_real_, criterion = NA_real_, pass = NA))
++    return(list(limit_lower = NA_real_, limit_upper = NA_real_, criterion = NA_real_, pass = NA, report = est))
+   }
+   switch(
+     reg$scaling,
+-    none = .be_abe(est, wv, reg, alpha),
+-    abel = .be_abel(est, wv, reg, alpha),
+-    rsabe = .be_rsabe(est, wv, reg, alpha),
+-    ntid = .be_ntid(est, wv, reg, alpha),
+-    hvntid = .be_hvntid(est, wv, reg, alpha)
++    none = .be_abe(est, wv, reg, alpha, unscaled),
++    abel = .be_abel(est, wv, reg, alpha, unscaled),
++    rsabe = .be_rsabe(est, wv, reg, alpha, unscaled),
++    ntid = .be_ntid(est, wv, reg, alpha, unscaled),
++    hvntid = .be_hvntid(est, wv, reg, alpha, unscaled)
+   )
+ }
+ 
+@@ -904,6 +1055,13 @@ print.be_within_var <- function(x, ...) {
+ #' column is present, units are unavailable and the `units` column is omitted
+ #' from the assessment table.
+ #'
++#' The subject, period, treatment, and (when present) sequence may not be
++#' missing in any row of the requested endpoints that is analyzed, and each
++#' subject must have a single sequence; otherwise `be_dataset()` stops with an
++#' error rather than letting a model drop those rows.  In a parallel design
++#' (one row per subject and endpoint) only the subject and treatment are
++#' checked, because the sequence and period enter no model.
++#'
+ #' Each covariate is copied to a standardized column named `.cov_<name>`
+ #' (character columns become factors).  A covariate may not be one of the
+ #' subject, sequence, period, treatment, or value columns, and it may not be
+@@ -972,6 +1130,10 @@ be_dataset.default <- function(object, reference_col, reference_value,
+   }
+ 
+   data <- data[!is.na(data[[value_col]]) & data[[value_col]] > 0, , drop = FALSE]
++  .be_check_design_cols(
++    data[data$PPTESTCD %in% endpoints, , drop = FALSE],
++    subject = subject, sequence = sequence, period = period, treatment = reference_col
++  )
+   missing_cov <- covariates[vapply(data[covariates], anyNA, logical(1))]
+   if (length(missing_cov) > 0) {
+     rlang::abort(
+@@ -1013,6 +1175,44 @@ be_dataset.default <- function(object, reference_col, reference_value,
+   )
+ }
+ 
++# Stop when a design column (subject, sequence, period, or treatment) is
++# missing in a row that would be analyzed, or when a subject has more than one
++# sequence.  The model fits would otherwise drop those rows while the subject
++# counts still include them.  `data` holds the rows of the requested endpoints,
++# and `sequence` is NA when the data have no sequence column.  In a parallel
++# design (one row per subject and endpoint) the sequence and period do not
++# enter any model, so only the subject and treatment are checked.
++.be_check_design_cols <- function(data, subject, sequence, period, treatment) {
++  parallel <- nrow(data) == 0 || max(table(paste(data[[subject]], data$PPTESTCD))) <= 1
++  cols <-
++    if (parallel) {
++      c(subject, treatment)
++    } else {
++      c(subject, if (!is.na(sequence)) sequence, period, treatment)
++    }
++  missing_cols <- cols[vapply(data[cols], anyNA, logical(1))]
++  if (length(missing_cols) > 0) {
++    rlang::abort(
++      sprintf(
++        "Design column(s) %s have missing values in rows that would be analyzed.",
++        paste(missing_cols, collapse = ", ")
++      ),
++      class = "pknca_error_be_design_missing"
++    )
++  }
++  if (!parallel && !is.na(sequence)) {
++    labels <- unique(data[c(subject, sequence)])
++    multi <- unique(labels[[subject]][duplicated(labels[[subject]])])
++    if (length(multi) > 0) {
++      rlang::abort(
++        sprintf("Subject(s) %s have more than one sequence.", paste(multi, collapse = ", ")),
++        class = "pknca_error_be_sequence_inconsistent"
++      )
++    }
++  }
++  invisible(data)
++}
++
+ # The value column (PPSTRES when present, otherwise PPORRES) and the units
+ # column matching it (PKNCAresults provides PPSTRESU / PPORRESU).  The units
+ # may be absent, in which case they are unavailable (NA).
+@@ -1231,20 +1431,25 @@ print.be_dataset <- function(x, ...) {
+ #' `be_fit_model_gls()`, or `be_fit_model_anova()`.  This is the only place
+ #' model fitting happens.  For the `"lmer"`, `"anova"`, and `"isc"` types the
+ #' within-formulation ANOVA variances are also fit here; for `"nlme"` they come
+-#' from the single mixed model.  Covariate columns carried by [be_dataset()]
++#' from the single mixed model.  The `"isc"` type, the FDA path, also fits the
++#' FDA mixed-effects model for the unscaled ratio (treatment-specific
++#' between- and within-subject variances, Satterthwaite degrees of freedom, as
++#' in the FDA progesterone and warfarin guidance SAS code).  Covariate columns carried by [be_dataset()]
+ #' (`.cov_<name>`) enter every model as additive fixed effects.
+ #'
+ #' @param ds_ep The standardized single-endpoint data.frame from [be_dataset()]
+ #'   (`be_dataset(...)$data` filtered to one endpoint).
+-#' @param model_type One of `"lmer"`, `"nlme"`, `"anova"`, `"isc"` (the
+-#'   intra-subject-contrast path, fit like `"anova"`), or `"gls"` (generalized
+-#'   least squares with treatment-specific residual variances, for parallel
++#' @param model_type One of `"lmer"`, `"nlme"`, `"anova"`, `"isc"` (the FDA
++#'   path: `"anova"` for the geometric means plus, for a replicate design, the
++#'   FDA mixed-effects model for the ratio), or `"gls"` (generalized least
++#'   squares with treatment-specific residual variances, for parallel
+ #'   designs).
+ #' @param scaling Logical; whether reference scaling is needed (controls whether
+ #'   the within-formulation variances are estimated).
+ #' @returns An object of class `be_fit`: a list with `model_type`, the fitted
+-#'   `model`, and (for lmer/anova/isc) `ref_var`/`test_var` within-formulation
+-#'   ANOVA variances.  The endpoint's measurement units are attached as a `units`
++#'   `model`, (for lmer/anova/isc) `ref_var`/`test_var` within-formulation
++#'   ANOVA variances, and (for isc with repeated measures) `fda`, the FDA
++#'   mixed-model estimates.  The endpoint's measurement units are attached as a `units`
+ #'   attribute (`NULL` when not provided).
+ #' @family Bioequivalence
+ #' @export
+@@ -1256,8 +1461,8 @@ be_fit_model_single <- function(ds_ep, model_type = c("lmer", "nlme", "anova", "
+       lmer = be_fit_model_lmer(ds_ep, scaling = scaling),
+       nlme = be_fit_model_nlme(ds_ep, scaling = scaling),
+       gls = be_fit_model_gls(ds_ep),
+-      anova = ,
+-      isc = be_fit_model_anova(ds_ep, scaling = scaling)
++      anova = be_fit_model_anova(ds_ep, scaling = scaling),
++      isc = be_fit_model_isc(ds_ep, scaling = scaling)
+     )
+   fit$model_type <- model_type
+   # Units of the endpoint (from be_dataset); NULL when not provided.
+@@ -1301,6 +1506,24 @@ be_fit_model_anova <- function(ds_ep, scaling = TRUE) {
+   c(list(model = model), .be_fit_within(ds_ep, scaling))
+ }
+ 
++# Internal fitter dispatched by be_fit_model_single().  The fixed-effects ANOVA
++# gives the geometric means; for a replicate design the FDA mixed model (see
++# .be_fda_mixed()) gives the unscaled ratio, and a design without a replicated
++# formulation keeps the ANOVA ratio.  An error from the mixed model is kept as
++# `fda$error` and raised only by a decision that needs the unscaled ratio.
++be_fit_model_isc <- function(ds_ep, scaling = TRUE) {
++  fit <- be_fit_model_anova(ds_ep, scaling = scaling)
++  if (any(duplicated(paste(ds_ep$.subject, ds_ep$.trt)))) {
++    fit$fda <- tryCatch(.be_fda_mixed(ds_ep), pknca_error_be_fda_model = .be_fda_failed)
++  }
++  fit
++}
++
++# The `fda` element of a fit whose FDA mixed model failed with condition `cnd`.
++.be_fda_failed <- function(cnd) {
++  list(error = conditionMessage(cnd))
++}
++
+ # Internal fitter dispatched by be_fit_model_single().  Several test
+ # formulations are allowed unless reference scaling is requested, because the
+ # scaling frameworks compare one test formulation's variance to the reference.
+@@ -1347,9 +1570,10 @@ be_fit_model_gls <- function(ds_ep) {
+ #'
+ #' `be_extract_param()` turns a [be_fit_model_single()] fit into the parameters
+ #' the regulatory decision needs.  It always computes the intra-subject-contrast
+-#' (ISC) point estimate, then dispatches on the model type to extract the
+-#' model-based geometric means, the geometric mean ratio and its confidence
+-#' interval, and the within-formulation standard deviations.
++#' (ISC) point estimate and the FDA within-formulation standard deviations, then
++#' dispatches on the model type to extract the model-based geometric means, the
++#' geometric mean ratio and its confidence interval, and the model's
++#' within-formulation standard deviations.
+ #'
+ #' @param fit A `be_fit` object from [be_fit_model_single()].
+ #' @param ds_ep The standardized single-endpoint data.frame from [be_dataset()].
+@@ -1357,7 +1581,9 @@ be_fit_model_gls <- function(ds_ep) {
+ #'   `1 - alpha`.
+ #' @returns A data.frame with one row per test formulation, carrying the model
+ #'   and ISC point estimates/intervals, geometric means, and within-formulation
+-#'   variances.
++#'   variances: `swr`, `swt`, `cvwr_percent`, `cvwt_percent`, `df_wr`, `df_wt`,
++#'   `sw_ratio`, and `sw_ratio_ci_upper` from the model's estimator, and the same
++#'   columns prefixed `isc_` from the FDA estimator (see [be_within_var()]).
+ #' @family Bioequivalence
+ #' @export
+ be_extract_param <- function(fit, ds_ep, alpha = 0.10) {
+@@ -1369,17 +1595,19 @@ be_extract_param <- function(fit, ds_ep, alpha = 0.10) {
+       lmer = be_extract_param_lmer(fit, alpha),
+       nlme = be_extract_param_nlme(fit, alpha),
+       gls = be_extract_param_gls(fit, ds_ep, alpha),
+-      anova = ,
+-      isc = be_extract_param_anova(fit, ds_ep, alpha)
++      anova = be_extract_param_anova(fit, ds_ep, alpha),
++      isc = be_extract_param_isc(fit, ds_ep, alpha)
+     )
+   # Within-formulation variances: from the ANOVA fits (lmer/anova) or the
+   # varIdent model (nlme); none for gls (parallel).
+   wv <- model_part$within
++  isc_ref_var <- .be_isc_arm_var(ds_ep, reference_value)
+   units <- attr(fit, "units")
+   if (is.null(units)) units <- NA_character_
+   rows <- list()
+   for (tl in test_levels) {
+     isc <- .be_isc_or_na(ds_ep, reference_value, tl, alpha)
++    isc_test_var <- .be_isc_arm_var(ds_ep, tl)
+     m <- model_part$contrasts[[tl]]
+     n_tl <- length(unique(ds_ep$.subject[ds_ep$.trt %in% c(reference_value, tl)]))
+     rows[[length(rows) + 1]] <-
+@@ -1391,22 +1619,22 @@ be_extract_param <- function(fit, ds_ep, alpha = 0.10) {
+         gm_test = m$gm_test, gm_test_lower = m$gm_test_lower, gm_test_upper = m$gm_test_upper,
+         model_gmr_percent = m$gmr_percent, model_ci_lower = m$ci_lower,
+         model_ci_upper = m$ci_upper, model_df = m$df,
++        model_error = if (is.null(m$error)) NA_character_ else m$error,
+         isc_pe_log = isc$pe_log, isc_se = isc$se, isc_df = isc$df,
+         isc_gmr_percent = isc$gmr_percent, isc_ci_lower = isc$ci_lower, isc_ci_upper = isc$ci_upper,
+         swr = wv$ref_var$sw, swt = wv$test_var$sw,
+         cvwr_percent = wv$ref_var$cv, cvwt_percent = wv$test_var$cv,
+-        df_wr = wv$ref_var$df, df_wt = wv$test_var$df
++        df_wr = wv$ref_var$df, df_wt = wv$test_var$df,
++        isc_swr = isc_ref_var$sw, isc_swt = isc_test_var$sw,
++        isc_cvwr_percent = isc_ref_var$cv, isc_cvwt_percent = isc_test_var$cv,
++        isc_df_wr = isc_ref_var$df, isc_df_wt = isc_test_var$df
+       )
+   }
+   out <- do.call(rbind, rows)
+-  out$sw_ratio <-
+-    ifelse(!is.na(out$swt) & !is.na(out$swr) & out$swr > 0, out$swt / out$swr, NA_real_)
+-  out$sw_ratio_ci_upper <-
+-    ifelse(
+-      !is.na(out$sw_ratio) & !is.na(out$df_wt) & !is.na(out$df_wr),
+-      out$sw_ratio / sqrt(stats::qf(1 - alpha / 2, out$df_wt, out$df_wr, lower.tail = FALSE)),
+-      NA_real_
+-    )
++  out$sw_ratio <- .be_sw_ratio(out$swt, out$swr)
++  out$sw_ratio_ci_upper <- .be_sw_ratio_ci_upper(out$sw_ratio, out$df_wt, out$df_wr, alpha)
++  out$isc_sw_ratio <- .be_sw_ratio(out$isc_swt, out$isc_swr)
++  out$isc_sw_ratio_ci_upper <- .be_sw_ratio_ci_upper(out$isc_sw_ratio, out$isc_df_wt, out$isc_df_wr, alpha)
+   out
+ }
+ 
+@@ -1566,14 +1794,44 @@ be_extract_param_anova <- function(fit, ds_ep, alpha = 0.10) {
+   )
+ }
+ 
++# Internal extractor dispatched by be_extract_param().  The geometric means
++# come from the fixed-effects ANOVA; the ratio, its confidence interval, and
++# its degrees of freedom come from the FDA mixed model when it was fit, and are
++# missing, with the model's error message, when it failed.
++be_extract_param_isc <- function(fit, ds_ep, alpha = 0.10) {
++  part <- be_extract_param_anova(fit, ds_ep, alpha)
++  if (is.null(fit$fda)) {
++    return(part)
++  }
++  for (tl in names(part$contrasts)) {
++    if (!is.null(fit$fda$error)) {
++      part$contrasts[[tl]]$gmr_percent <- NA_real_
++      part$contrasts[[tl]]$ci_lower <- NA_real_
++      part$contrasts[[tl]]$ci_upper <- NA_real_
++      part$contrasts[[tl]]$df <- NA_real_
++      part$contrasts[[tl]]$error <- fit$fda$error
++      next
++    }
++    fc <- fit$fda$contrasts[[tl]]
++    ci <- exp(fc$pe_log + c(-1, 1) * stats::qt(1 - alpha / 2, fc$df) * fc$se) * 100
++    part$contrasts[[tl]]$gmr_percent <- exp(fc$pe_log) * 100
++    part$contrasts[[tl]]$ci_lower <- ci[1]
++    part$contrasts[[tl]]$ci_upper <- ci[2]
++    part$contrasts[[tl]]$df <- fc$df
++  }
++  part
++}
++
+ #' Build the regulatory bioequivalence table
+ #'
+ #' `be_table()` takes the parameters from [be_extract_param()] and a regulatory
+ #' framework and produces the final per-endpoint pass/fail table.  It selects the
+ #' regulator-appropriate statistic (the model contrast for the expanding-limits
+-#' frameworks, intra-subject contrasts for the FDA family) and calls the
+-#' per-framework decision functions; it is the only place regulator decisions
+-#' are made.
++#' frameworks; for the FDA family, intra-subject contrasts for the
++#' reference-scaled criterion and the model contrast for the unscaled
++#' 80.00-125.00% criterion) and calls the per-framework decision functions; it
++#' is the only place regulator decisions are made.  Each row shows the ratio and
++#' confidence interval that its decision used.
+ #'
+ #' @param params A data.frame of parameters from [be_extract_param()] (with an
+ #'   `endpoint` column added per endpoint).
+@@ -1591,11 +1849,11 @@ be_table <- function(params, regulator, alpha = 0.10, design = NA_character_, mo
+   rows <- list()
+   for (i in seq_len(nrow(params))) {
+     p <- params[i, , drop = FALSE]
+-    wv <- list(
+-      swR = p$swr, swT = p$swt, s2wR = p$swr^2, s2wT = p$swt^2,
+-      cvwr_percent = p$cvwr_percent, cvwt_percent = p$cvwt_percent,
+-      df_wR = p$df_wr, df_wT = p$df_wt,
+-      sw_ratio = p$sw_ratio, sw_ratio_ci_upper = p$sw_ratio_ci_upper
++    wv <- .be_wv_from_params(p, if (identical(reg$est_method, "isc")) "isc_" else "")
++    model_est <- list(
++      pe_log = log(p$model_gmr_percent / 100), se = NA_real_, df = p$model_df, n = p$n,
++      gmr_percent = p$model_gmr_percent, ci_lower = p$model_ci_lower, ci_upper = p$model_ci_upper,
++      error = p$model_error
+     )
+     est <-
+       if (identical(reg$est_method, "isc")) {
+@@ -1604,26 +1862,23 @@ be_table <- function(params, regulator, alpha = 0.10, design = NA_character_, mo
+           gmr_percent = p$isc_gmr_percent, ci_lower = p$isc_ci_lower, ci_upper = p$isc_ci_upper
+         )
+       } else {
+-        list(
+-          pe_log = log(p$model_gmr_percent / 100), se = NA_real_, df = p$model_df, n = p$n,
+-          gmr_percent = p$model_gmr_percent, ci_lower = p$model_ci_lower, ci_upper = p$model_ci_upper
+-        )
++        model_est
+       }
+     if (identical(reg$est_method, "isc") && is.na(est$pe_log)) {
+       rlang::abort(
+-        "The intra-subject contrast estimate needs at least 2 subjects with both formulations.",
++        "The intra-subject contrast estimate needs one known sequence for every subject and complete test and reference data from more subjects than there are sequences.",
+         class = "pknca_error_be_isc_insufficient"
+       )
+     }
+-    dec <- .be_decide(est, wv, reg, alpha)
++    dec <- .be_decide(est, wv, reg, alpha, unscaled = model_est)
+     rows[[length(rows) + 1]] <-
+       data.frame(
+         endpoint = p$endpoint, test = p$test, n = p$n, design = design, units = p$units,
+         gm_reference = p$gm_reference, gm_reference_lower = p$gm_reference_lower,
+         gm_reference_upper = p$gm_reference_upper,
+         gm_test = p$gm_test, gm_test_lower = p$gm_test_lower, gm_test_upper = p$gm_test_upper,
+-        gmr_percent = est$gmr_percent, ci_lower = est$ci_lower, ci_upper = est$ci_upper,
+-        cvwr_percent = p$cvwr_percent, cvwt_percent = p$cvwt_percent, swr = p$swr,
++        gmr_percent = dec$report$gmr_percent, ci_lower = dec$report$ci_lower, ci_upper = dec$report$ci_upper,
++        cvwr_percent = wv$cvwr_percent, cvwt_percent = wv$cvwt_percent, swr = wv$swR,
+         limit_lower = dec$limit_lower, limit_upper = dec$limit_upper, criterion = dec$criterion,
+         regulator = reg$name, model_type = model_type, pass = dec$pass
+       )
+@@ -1636,6 +1891,20 @@ be_table <- function(params, regulator, alpha = 0.10, design = NA_character_, mo
+   out
+ }
+ 
++# Within-subject variability for the decision functions from one row `p` of
++# be_extract_param() output: the model's estimator with `prefix = ""`, or the
++# FDA estimator with `prefix = "isc_"`.
++.be_wv_from_params <- function(p, prefix) {
++  cols <- c("swr", "swt", "cvwr_percent", "cvwt_percent", "df_wr", "df_wt", "sw_ratio", "sw_ratio_ci_upper")
++  v <- stats::setNames(as.list(p[paste0(prefix, cols)]), cols)
++  list(
++    swR = v$swr, swT = v$swt, s2wR = v$swr^2, s2wT = v$swt^2,
++    cvwr_percent = v$cvwr_percent, cvwt_percent = v$cvwt_percent,
++    df_wR = v$df_wr, df_wT = v$df_wt,
++    sw_ratio = v$sw_ratio, sw_ratio_ci_upper = v$sw_ratio_ci_upper
++  )
++}
++
+ # Confirm the design supports the chosen framework.
+ .be_check_feasible <- function(reg, design) {
+   key <- switch(
+@@ -1712,7 +1981,11 @@ be_fit_models <- function(object, reference_col, reference_value,
+   if (length(ds$columns$covariates) > 0 && identical(reg$est_method, "isc")) {
+     rlang::warn(
+       sprintf(
+-        "The %s framework uses intra-subject contrasts for the ratio and its decision; covariates affect only the geometric means.",
++        if (identical(model_type, "isc")) {
++          "The %s framework decides with intra-subject contrasts and the FDA mixed model, which do not use covariates; covariates affect only the geometric means."
++        } else {
++          "The %s framework decides its reference-scaled criterion with intra-subject contrasts, which do not use covariates; covariates enter the geometric means and the unscaled criterion."
++        },
+         reg$name
+       ),
+       class = "pknca_warning_be_covariates_isc"
+@@ -1779,12 +2052,19 @@ be_fit_models <- function(object, reference_col, reference_value,
+         ci, model_desc
+       )
+     } else if (identical(reg$est_method, "isc")) {
++      unscaled_desc <-
++        if (identical(model_type, "isc")) {
++          "the FDA mixed-effects model (treatment-specific between- and within-subject variances, REML, Satterthwaite degrees of freedom)"
++        } else {
++          model_desc
++        }
+       sprintf(
+         paste(
+-          "Geometric means (with %s) are least-squares means from %s;",
+-          "the geometric mean ratio and reference-scaling criterion use intra-subject contrasts."
++          "Geometric means (with %s) are least-squares means from %s.",
++          "The reference-scaled criterion uses intra-subject contrasts, and the unscaled",
++          "80.00-125.00%% criterion uses %s; the ratio and %s shown are the ones the decision used."
+         ),
+-        ci, model_desc
++        ci, model_desc, unscaled_desc, ci
+       )
+     } else {
+       sprintf(
+@@ -1802,7 +2082,7 @@ be_fit_models <- function(object, reference_col, reference_value,
+       abel = "Acceptance limits are widened by the within-reference variability (ABEL) and capped per the regulator.",
+       rsabe = "Reference scaling uses the linearized (Howe/Hyslop) criterion with a one-sided 95% upper bound.",
+       ntid = "Narrow therapeutic index scaling requires the scaled bound, the conventional 90% CI within 80.00-125.00%, and the swT/swR ratio bound.",
+-      hvntid = "Highly variable NTID scaling requires the scaled bound and the swT/swR ratio bound."
++      hvntid = "Highly variable NTID assessment requires the conventional 90% CI within 80.00-125.00% and the swT/swR ratio bound; reference scaling does not apply."
+     )
+   if (!reg$decision) {
+     decision <- "No regulatory decision was applied: there are no acceptance limits and no pass/fail."
+@@ -1810,6 +2090,8 @@ be_fit_models <- function(object, reference_col, reference_value,
+   within <-
+     if (identical(reg$scaling, "none")) {
+       ""
++    } else if (identical(reg$est_method, "isc")) {
++      " Within-formulation variances (swR, swT) are estimated from within-sequence differences between each subject's replicate administrations (FDA)."
+     } else if (identical(model_type, "nlme")) {
+       " Within-formulation variances are the treatment-specific residual variances from the mixed model."
+     } else {
+@@ -1827,7 +2109,13 @@ be_fit_models <- function(object, reference_col, reference_value,
+           ),
+           paste(covariates, collapse = ", ")
+         ),
+-        if (identical(reg$est_method, "isc")) " Covariates do not enter the intra-subject contrasts." else ""
++        if (!identical(reg$est_method, "isc")) {
++          ""
++        } else if (identical(model_type, "isc")) {
++          " Covariates enter neither the intra-subject contrasts nor the FDA mixed model."
++        } else {
++          " Covariates do not enter the intra-subject contrasts."
++        }
+       )
+     }
+   title <-
+@@ -1855,10 +2143,36 @@ be_fit_models <- function(object, reference_col, reference_value,
+ #' subject) uses the mixed model (`"lmer"`) for the geometric mean ratio and its
+ #' confidence interval.  The FDA reference-scaled frameworks (FDA RSABE, NTID,
+ #' HVNTID) always use intra-subject contrasts (`"isc"`), as the guidances
+-#' specify, regardless of design.  Pass `model_type` to override (`"lmer"`,
+-#' `"anova"`, `"isc"`, `"nlme"`, or `"gls"`).  Within-subject variability uses
+-#' the regulatory ANOVA estimator for the `"lmer"`/`"anova"`/`"isc"` paths and
+-#' the treatment-specific mixed-model estimator for `"nlme"`.
++#' specify, regardless of design.  Each subject's contrast is its mean log test
++#' minus its mean log reference, from the subjects with every test and
++#' reference administration their sequence calls for; the ratio is the
++#' unweighted mean of the sequence means of the contrasts, with `n - m` degrees
++#' of freedom for `n` subjects in `m` sequences (FDA draft guidances on
++#' progesterone and warfarin sodium).  Without a sequence column, a subject's
++#' sequence is its treatment-by-period pattern.  The unscaled 80.00-125.00%
++#' criterion of these frameworks (FDA RSABE when `swR < 0.294`, NTID, and
++#' HVNTID) uses the model of `model_type`; the default `"isc"` is the guidance
++#' mixed-effects model for replicate designs: fixed sequence, period, and
++#' treatment effects, correlated treatment random effects for each subject, a
++#' residual variance per treatment, REML, and Satterthwaite degrees of freedom
++#' (SAS `RANDOM TRT/TYPE=FA0(2)`, `REPEATED/GRP=TRT`).  A formulation that no
++#' subject receives twice has its residual variance folded into its
++#' between-subject variance, where the guidance model is over-specified, and a
++#' subject missing a period forms its own sequence when the sequence is derived
++#' from the treatment pattern.  When the mixed model cannot be fit (for
++#' example, a formulation whose replicates agree exactly), only a decision that
++#' needs the unscaled criterion stops with an error.  Each row shows the ratio
++#' and interval its decision used: the intra-subject contrasts for the
++#' reference-scaled criterion and the model for the unscaled one.  Pass
++#' `model_type` to override (`"lmer"`, `"anova"`, `"isc"`, `"nlme"`, or
++#' `"gls"`); with `"isc"` the FDA mixed model also gives the ratio for the
++#' other frameworks, and a design without a replicated formulation keeps the
++#' fixed-effects ANOVA ratio.  Within-subject
++#' variability for the FDA frameworks uses the FDA estimator from within-sequence
++#' differences between replicate administrations (`model_type = "isc"` in
++#' [be_within_var()]); for the other frameworks it uses the EMA ANOVA estimator
++#' for the `"lmer"`/`"anova"`/`"isc"` paths and the treatment-specific
++#' mixed-model estimator for `"nlme"`.
+ #'
+ #' With `heteroscedastic = TRUE` the residual variance is estimated separately
+ #' for each treatment: a crossover or replicate study uses `nlme::lme()` with
+diff --git a/inst/WORDLIST b/inst/WORDLIST
+index d869d7c5..974bdfdb 100644
+--- a/inst/WORDLIST
++++ b/inst/WORDLIST
+@@ -296,3 +296,4 @@ Shen
+ Takakura
+ Takemoto
+ Yamaoka
++warfarin
+diff --git a/man/be_assess.Rd b/man/be_assess.Rd
+index 3c3578f5..1fee687f 100644
+--- a/man/be_assess.Rd
++++ b/man/be_assess.Rd
+@@ -127,10 +127,36 @@ ANOVA (\code{"anova"}), while a crossover or replicate study (repeated measures
+ subject) uses the mixed model (\code{"lmer"}) for the geometric mean ratio and its
+ confidence interval.  The FDA reference-scaled frameworks (FDA RSABE, NTID,
+ HVNTID) always use intra-subject contrasts (\code{"isc"}), as the guidances
+-specify, regardless of design.  Pass \code{model_type} to override (\code{"lmer"},
+-\code{"anova"}, \code{"isc"}, \code{"nlme"}, or \code{"gls"}).  Within-subject variability uses
+-the regulatory ANOVA estimator for the \code{"lmer"}/\code{"anova"}/\code{"isc"} paths and
+-the treatment-specific mixed-model estimator for \code{"nlme"}.
++specify, regardless of design.  Each subject's contrast is its mean log test
++minus its mean log reference, from the subjects with every test and
++reference administration their sequence calls for; the ratio is the
++unweighted mean of the sequence means of the contrasts, with \code{n - m} degrees
++of freedom for \code{n} subjects in \code{m} sequences (FDA draft guidances on
++progesterone and warfarin sodium).  Without a sequence column, a subject's
++sequence is its treatment-by-period pattern.  The unscaled 80.00-125.00\%
++criterion of these frameworks (FDA RSABE when \code{swR < 0.294}, NTID, and
++HVNTID) uses the model of \code{model_type}; the default \code{"isc"} is the guidance
++mixed-effects model for replicate designs: fixed sequence, period, and
++treatment effects, correlated treatment random effects for each subject, a
++residual variance per treatment, REML, and Satterthwaite degrees of freedom
++(SAS \verb{RANDOM TRT/TYPE=FA0(2)}, \code{REPEATED/GRP=TRT}).  A formulation that no
++subject receives twice has its residual variance folded into its
++between-subject variance, where the guidance model is over-specified, and a
++subject missing a period forms its own sequence when the sequence is derived
++from the treatment pattern.  When the mixed model cannot be fit (for
++example, a formulation whose replicates agree exactly), only a decision that
++needs the unscaled criterion stops with an error.  Each row shows the ratio
++and interval its decision used: the intra-subject contrasts for the
++reference-scaled criterion and the model for the unscaled one.  Pass
++\code{model_type} to override (\code{"lmer"}, \code{"anova"}, \code{"isc"}, \code{"nlme"}, or
++\code{"gls"}); with \code{"isc"} the FDA mixed model also gives the ratio for the
++other frameworks, and a design without a replicated formulation keeps the
++fixed-effects ANOVA ratio.  Within-subject
++variability for the FDA frameworks uses the FDA estimator from within-sequence
++differences between replicate administrations (\code{model_type = "isc"} in
++\code{\link[=be_within_var]{be_within_var()}}); for the other frameworks it uses the EMA ANOVA estimator
++for the \code{"lmer"}/\code{"anova"}/\code{"isc"} paths and the treatment-specific
++mixed-model estimator for \code{"nlme"}.
+ 
+ With \code{heteroscedastic = TRUE} the residual variance is estimated separately
+ for each treatment: a crossover or replicate study uses \code{nlme::lme()} with
+diff --git a/man/be_dataset.Rd b/man/be_dataset.Rd
+index df1cb0bc..a5ca9663 100644
+--- a/man/be_dataset.Rd
++++ b/man/be_dataset.Rd
+@@ -89,6 +89,13 @@ by including the corresponding \code{PPSTRESU}/\code{PPORRESU} column.  When no
+ column is present, units are unavailable and the \code{units} column is omitted
+ from the assessment table.
+ 
++The subject, period, treatment, and (when present) sequence may not be
++missing in any row of the requested endpoints that is analyzed, and each
++subject must have a single sequence; otherwise \code{be_dataset()} stops with an
++error rather than letting a model drop those rows.  In a parallel design
++(one row per subject and endpoint) only the subject and treatment are
++checked, because the sequence and period enter no model.
++
+ Each covariate is copied to a standardized column named \verb{.cov_<name>}
+ (character columns become factors).  A covariate may not be one of the
+ subject, sequence, period, treatment, or value columns, and it may not be
+diff --git a/man/be_extract_param.Rd b/man/be_extract_param.Rd
+index 94460786..5644f364 100644
+--- a/man/be_extract_param.Rd
++++ b/man/be_extract_param.Rd
+@@ -17,14 +17,17 @@ be_extract_param(fit, ds_ep, alpha = 0.1)
+ \value{
+ A data.frame with one row per test formulation, carrying the model
+ and ISC point estimates/intervals, geometric means, and within-formulation
+-variances.
++variances: \code{swr}, \code{swt}, \code{cvwr_percent}, \code{cvwt_percent}, \code{df_wr}, \code{df_wt},
++\code{sw_ratio}, and \code{sw_ratio_ci_upper} from the model's estimator, and the same
++columns prefixed \code{isc_} from the FDA estimator (see \code{\link[=be_within_var]{be_within_var()}}).
+ }
+ \description{
+ \code{be_extract_param()} turns a \code{\link[=be_fit_model_single]{be_fit_model_single()}} fit into the parameters
+ the regulatory decision needs.  It always computes the intra-subject-contrast
+-(ISC) point estimate, then dispatches on the model type to extract the
+-model-based geometric means, the geometric mean ratio and its confidence
+-interval, and the within-formulation standard deviations.
++(ISC) point estimate and the FDA within-formulation standard deviations, then
++dispatches on the model type to extract the model-based geometric means, the
++geometric mean ratio and its confidence interval, and the model's
++within-formulation standard deviations.
+ }
+ \seealso{
+ Other Bioequivalence:
+diff --git a/man/be_fit_model_single.Rd b/man/be_fit_model_single.Rd
+index c04dd75d..33e175fb 100644
+--- a/man/be_fit_model_single.Rd
++++ b/man/be_fit_model_single.Rd
+@@ -14,9 +14,10 @@ be_fit_model_single(
+ \item{ds_ep}{The standardized single-endpoint data.frame from \code{\link[=be_dataset]{be_dataset()}}
+ (\code{be_dataset(...)$data} filtered to one endpoint).}
+ 
+-\item{model_type}{One of \code{"lmer"}, \code{"nlme"}, \code{"anova"}, \code{"isc"} (the
+-intra-subject-contrast path, fit like \code{"anova"}), or \code{"gls"} (generalized
+-least squares with treatment-specific residual variances, for parallel
++\item{model_type}{One of \code{"lmer"}, \code{"nlme"}, \code{"anova"}, \code{"isc"} (the FDA
++path: \code{"anova"} for the geometric means plus, for a replicate design, the
++FDA mixed-effects model for the ratio), or \code{"gls"} (generalized least
++squares with treatment-specific residual variances, for parallel
+ designs).}
+ 
+ \item{scaling}{Logical; whether reference scaling is needed (controls whether
+@@ -24,8 +25,9 @@ the within-formulation variances are estimated).}
+ }
+ \value{
+ An object of class \code{be_fit}: a list with \code{model_type}, the fitted
+-\code{model}, and (for lmer/anova/isc) \code{ref_var}/\code{test_var} within-formulation
+-ANOVA variances.  The endpoint's measurement units are attached as a \code{units}
++\code{model}, (for lmer/anova/isc) \code{ref_var}/\code{test_var} within-formulation
++ANOVA variances, and (for isc with repeated measures) \code{fda}, the FDA
++mixed-model estimates.  The endpoint's measurement units are attached as a \code{units}
+ attribute (\code{NULL} when not provided).
+ }
+ \description{
+@@ -34,7 +36,10 @@ dispatches on \code{model_type} to \code{be_fit_model_lmer()}, \code{be_fit_mode
+ \code{be_fit_model_gls()}, or \code{be_fit_model_anova()}.  This is the only place
+ model fitting happens.  For the \code{"lmer"}, \code{"anova"}, and \code{"isc"} types the
+ within-formulation ANOVA variances are also fit here; for \code{"nlme"} they come
+-from the single mixed model.  Covariate columns carried by \code{\link[=be_dataset]{be_dataset()}}
++from the single mixed model.  The \code{"isc"} type, the FDA path, also fits the
++FDA mixed-effects model for the unscaled ratio (treatment-specific
++between- and within-subject variances, Satterthwaite degrees of freedom, as
++in the FDA progesterone and warfarin guidance SAS code).  Covariate columns carried by \code{\link[=be_dataset]{be_dataset()}}
+ (\verb{.cov_<name>}) enter every model as additive fixed effects.
+ }
+ \seealso{
+diff --git a/man/be_table.Rd b/man/be_table.Rd
+index 25eb952d..58475ea0 100644
+--- a/man/be_table.Rd
++++ b/man/be_table.Rd
+@@ -33,9 +33,11 @@ columns (\code{limit_lower}, \code{limit_upper}, \code{criterion}, and \code{pas
+ \code{be_table()} takes the parameters from \code{\link[=be_extract_param]{be_extract_param()}} and a regulatory
+ framework and produces the final per-endpoint pass/fail table.  It selects the
+ regulator-appropriate statistic (the model contrast for the expanding-limits
+-frameworks, intra-subject contrasts for the FDA family) and calls the
+-per-framework decision functions; it is the only place regulator decisions
+-are made.
++frameworks; for the FDA family, intra-subject contrasts for the
++reference-scaled criterion and the model contrast for the unscaled
++80.00-125.00\% criterion) and calls the per-framework decision functions; it
++is the only place regulator decisions are made.  Each row shows the ratio and
++confidence interval that its decision used.
+ }
+ \seealso{
+ Other Bioequivalence:
+diff --git a/man/be_within_var.Rd b/man/be_within_var.Rd
+index b912525c..89f36001 100644
+--- a/man/be_within_var.Rd
++++ b/man/be_within_var.Rd
+@@ -11,8 +11,9 @@ be_within_var(
+   period,
+   treatment,
+   reference_value,
+-  model_type = c("anova", "nlme"),
+-  alpha = 0.1
++  model_type = c("anova", "nlme", "isc"),
++  alpha = 0.1,
++  sequence = NULL
+ )
+ }
+ \arguments{
+@@ -27,13 +28,17 @@ and treatment.}
+ 
+ \item{reference_value}{The value of \code{treatment} that is the reference.}
+ 
+-\item{model_type}{\code{"anova"} (the default and the regulatory standard) or
+-\code{"nlme"} (mixed model with treatment-specific residual variances; full
+-replicate only).}
++\item{model_type}{\code{"anova"} (the default; the EMA estimator), \code{"isc"} (the
++FDA estimator), or \code{"nlme"} (mixed model with treatment-specific residual
++variances; full replicate only).}
+ 
+ \item{alpha}{The significance level for the \code{swT}/\code{swR} ratio confidence
+ bound (default \code{0.10} gives the 90\% upper bound used for narrow therapeutic
+ index drugs).}
++
++\item{sequence}{The column name of the randomization sequence, used by
++\code{model_type = "isc"}.  When \code{NULL}, a subject's sequence is its
++treatment-by-period pattern.}
+ }
+ \value{
+ An object of class \code{be_within_var}: a list with \code{swR}, \code{swT},
+@@ -48,13 +53,20 @@ partial replicate design).
+ log-transformed endpoint separately for the reference (\code{swR}) and test
+ (\code{swT}) formulations, the quantities that reference-scaling frameworks need.
+ The default \code{model_type = "anova"} is an analysis of variance (ANOVA) of the
+-replicate observations within each formulation; this is the estimator used by
+-both Method A and Method B of the EMA \code{replicateBE} reference implementation
+-and by the FDA moment-based approach, and it works for full and partial
+-replicate designs.  \code{model_type = "nlme"} instead fits a single mixed model
+-with treatment-specific residual variances and requires a fully replicated
+-design; it is provided as the alternative described in the FDA progesterone
+-guidance and can differ slightly from \code{"anova"}.
++replicate observations within each formulation with subject and period
++effects; this is the estimator used by both Method A and Method B of the EMA
++\code{replicateBE} reference implementation, and it works for full and partial
++replicate designs.  \code{model_type = "isc"} is the estimator of the FDA
++progesterone and warfarin guidances, used by the FDA frameworks in
++\code{\link[=be_assess]{be_assess()}}: each subject's difference between its two administrations of
++a formulation, centered within sequence, so that
++\verb{s2wR = sum((D - mean D within sequence)^2) / (2 * (n - m))} on \code{n - m}
++degrees of freedom for \code{n} subjects in \code{m} sequences.  It equals the
++\code{"anova"} estimate for a two-sequence full replicate (\code{TRTR}/\code{RTRT}) and
++differs for a partial replicate (\code{TRR}/\code{RTR}/\code{RRT}), where the period effects of the
++reference administrations differ by sequence.  \code{model_type = "nlme"} instead
++fits a single mixed model with treatment-specific residual variances and
++requires a fully replicated design; it can differ slightly from \code{"anova"}.
+ }
+ \seealso{
+ \code{\link[=be_assess]{be_assess()}}
+diff --git a/tests/testthat/helper-bioequivalence.R b/tests/testthat/helper-bioequivalence.R
+index 2937b6b4..17096a13 100644
+--- a/tests/testthat/helper-bioequivalence.R
++++ b/tests/testthat/helper-bioequivalence.R
+@@ -5,7 +5,9 @@
+ # coefficients of variation are controllable.  The expected values pinned in
+ # test-bioequivalence-assess.R were computed from the data this function
+ # produces and were cross-checked against PowerTOST and replicateBE during
+-# development (those packages are not dependencies of PKNCA).
++# development (those packages are not dependencies of PKNCA).  The
++# intra-subject contrast values were checked against a transcription of the SAS
++# code in the FDA progesterone and warfarin guidances.
+ generate_be_replicate <- function(nsub = 24, seed = 20240501,
+                                   design = c("full", "partial", "2x2"),
+                                   cv_wr = 0.45, cv_wt = 0.40, gmr = 1.05,
+@@ -45,6 +47,16 @@ generate_be_replicate <- function(nsub = 24, seed = 20240501,
+   out
+ }
+ 
++# Convert generate_be_replicate() output into the standardized single-endpoint
++# frame that .be_isc() reads (the `.`-prefixed columns built by be_dataset()).
++be_isc_work <- function(d) {
++  data.frame(
++    .subject = factor(d$subject), .sequence = factor(d$sequence),
++    .period = factor(d$period), .trt = as.character(d$treatment),
++    .logval = log(d$PK)
++  )
++}
++
+ # Convert generate_be_replicate() output into the long PPTESTCD/PPORRES format
+ # that be_assess() consumes, with a per-endpoint units column (PPORRESU).
+ be_replicate_long <- function(d, endpoint = "auclast", units = if (endpoint == "cmax") "ng/mL" else "h*ng/mL") {
+diff --git a/tests/testthat/test-bioequivalence-assess.R b/tests/testthat/test-bioequivalence-assess.R
+index ed4068bc..b9010a81 100644
+--- a/tests/testthat/test-bioequivalence-assess.R
++++ b/tests/testthat/test-bioequivalence-assess.R
+@@ -146,6 +146,47 @@ test_that("be_within_var returns NA test variability for a partial replicate", {
+   )
+ })
+ 
++test_that("be_within_var (isc) is the FDA within-sequence estimator (known answer)", {
++  # Reference differences D = R1 - R2 of 0.1, 0.3 (TRR), -0.2, 0 (RTR), and 0.4,
++  # 0.2 (RRT): the sequence means are 0.2, -0.1, and 0.3, each D deviates by
++  # 0.1, so s2wR = 6 * 0.01 / (2 * (6 - 3)) = 0.01 on 3 degrees of freedom.
++  seqs <- rep(c("TRR", "RTR", "RRT"), each = 2)
++  d <- data.frame(
++    subject = rep(1:6, each = 3), sequence = rep(seqs, each = 3),
++    period = rep(1:3, 6), treatment = unlist(strsplit(seqs, ""))
++  )
++  d$logpk <- 0
++  first_r <- !duplicated(paste(d$subject, d$treatment)) & d$treatment == "R"
++  d$logpk[first_r] <- c(0.1, 0.3, -0.2, 0, 0.4, 0.2)
++  d$PK <- exp(d$logpk)
++  wv <- be_within_var(d, "PK", "subject", "period", "treatment", "R", model_type = "isc", sequence = "sequence")
++  expect_equal(wv$s2wR, 0.01, tolerance = 1e-12)
++  expect_equal(wv$df_wR, 3)
++  # Without the sequence column, the sequence is the treatment pattern.
++  expect_equal(be_within_var(d, "PK", "subject", "period", "treatment", "R", model_type = "isc"), wv)
++})
++
++test_that("be_within_var (isc) matches the FDA guidance, and equals the ANOVA for a full replicate", {
++  # Partial replicate: the expected value comes from a literal transcription of
++  # the FDA progesterone guidance SAS code (`model dlat = seq`, s2wr = MSE / 2).
++  dp <- generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40)
++  wp <- be_within_var(dp, "PK", "subject", "period", "treatment", "R", model_type = "isc", sequence = "sequence")
++  expect_equal(wp$swR, 0.565267363, tolerance = 1e-8)
++  expect_equal(wp$df_wR, 21)
++  expect_true(is.na(wp$swT))
++  # The EMA ANOVA has period effects common to the sequences, so it differs.
++  wa <- be_within_var(dp, "PK", "subject", "period", "treatment", "R", model_type = "anova")
++  expect_equal(wa$swR, 0.576194165, tolerance = 1e-8)
++  expect_equal(wa$df_wR, 22)
++  # Full replicate (TRTR/RTRT): the two estimators are identical.
++  d <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  wf <- be_within_var(d, "PK", "subject", "period", "treatment", "R", model_type = "isc", sequence = "sequence")
++  wf_anova <- be_within_var(d, "PK", "subject", "period", "treatment", "R")
++  for (nm in c("swR", "swT", "df_wR", "df_wT", "sw_ratio", "sw_ratio_ci_upper")) {
++    expect_equal(wf[[nm]], wf_anova[[nm]], tolerance = 1e-10)
++  }
++})
++
+ test_that("be_within_var nlme agrees with anova to within a few percent", {
+   d <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
+   a <- be_within_var(d, "PK", "subject", "period", "treatment", "R", model_type = "anova")
+@@ -157,13 +198,175 @@ test_that("be_within_var nlme agrees with anova to within a few percent", {
+ # Internal criterion building blocks ----------------------------------------
+ 
+ test_that(".be_isc reproduces the intra-subject contrast point estimate", {
++  # Expected values come from a literal transcription of the SAS code in the FDA
++  # progesterone and warfarin guidances (ilat per subject, `model ilat = seq`,
++  # `estimate intercept 1 seq 1/m ... 1/m`, 90% CI), computed separately from
++  # .be_isc().
+   d <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
+-  work <- data.frame(.subject = factor(d$subject), .trt = as.character(d$treatment), .logval = log(d$PK))
++  isc <- .be_isc(be_isc_work(d), "R", "T", alpha = 0.10)
++  expect_equal(isc$gmr_percent, 88.3595729, tolerance = 1e-8)
++  expect_equal(isc$se, 0.104889919, tolerance = 1e-8)
++  expect_equal(isc$df, 22)
++  expect_equal(isc$n, 24)
++  expect_equal(c(isc$ci_lower, isc$ci_upper), c(73.7959174, 105.797372), tolerance = 1e-8)
++
++  dp <- generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40)
++  iscp <- .be_isc(be_isc_work(dp), "R", "T", alpha = 0.10)
++  expect_equal(iscp$gmr_percent, 96.2343254, tolerance = 1e-8)
++  expect_equal(iscp$se, 0.101554674, tolerance = 1e-8)
++  expect_equal(iscp$df, 21)
++  expect_equal(c(iscp$ci_lower, iscp$ci_upper), c(80.8048204, 114.610061), tolerance = 1e-8)
++})
++
++test_that(".be_isc averages the sequence means with equal weight (known answer)", {
++  # Contrasts 0.1, 0.2, 0.3 in sequence TR and -0.1, 0.1 in sequence RT: the
++  # sequence means are 0.2 and 0, so the estimate is 0.1 (the pooled mean would
++  # be 0.12).  The residual mean square is 0.04 / 3 on 5 - 2 = 3 degrees of
++  # freedom, so se = sqrt(0.04 / 3 * (1/3 + 1/2)) / 2.
++  seqs <- c("TR", "TR", "TR", "RT", "RT")
++  work <- data.frame(
++    .subject = factor(rep(1:5, each = 2)),
++    .sequence = factor(rep(seqs, each = 2)),
++    .period = factor(rep(1:2, 5)),
++    .trt = unlist(strsplit(seqs, "")),
++    .logval = 0
++  )
++  work$.logval[work$.trt == "T"] <- c(0.1, 0.2, 0.3, -0.1, 0.1)
++  se <- sqrt(0.04 / 3 * (1 / 3 + 1 / 2)) / 2
+   isc <- .be_isc(work, "R", "T", alpha = 0.10)
+-  expect_equal(isc$gmr_percent, 88.3595729, tolerance = 1e-5)
+-  expect_equal(isc$se, 0.104543750, tolerance = 1e-7)
+-  expect_equal(isc$df, 23)
+-  expect_equal(c(isc$ci_lower, isc$ci_upper), c(73.865065, 105.698331), tolerance = 1e-4)
++  expect_equal(isc$pe_log, 0.1, tolerance = 1e-12)
++  expect_equal(isc$se, se, tolerance = 1e-12)
++  expect_equal(isc$df, 3)
++  expect_equal(isc$n, 5)
++  expect_equal(
++    c(isc$ci_lower, isc$ci_upper),
++    100 * exp(0.1 + c(-1, 1) * stats::qt(0.95, 3) * se),
++    tolerance = 1e-12
++  )
++})
++
++test_that(".be_isc is unaffected by period effects, even with unequal sequence sizes", {
++  for (design in c("full", "partial")) {
++    d <- generate_be_replicate(24, 20240501, design, cv_wr = 0.45, cv_wt = 0.40)
++    # Subjects 1 and 3 are in different sequences of the partial design and the
++    # same sequence of the full design, so both designs become unbalanced.
++    d <- d[!(d$subject %in% c("1", "3")), ]
++    shifted <- d
++    shifted$PK <- d$PK * exp(c(0, 0.3, -0.2, 0.15)[as.integer(as.character(d$period))])
++    expect_equal(
++      .be_isc(be_isc_work(shifted), "R", "T", alpha = 0.10),
++      .be_isc(be_isc_work(d), "R", "T", alpha = 0.10),
++      tolerance = 1e-10
++    )
++  }
++})
++
++test_that(".be_isc uses only subjects with every administration their sequence calls for", {
++  d <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  work <- be_isc_work(d)
++  # Subject 5 loses its second reference administration.
++  drop_row <- which(work$.subject == "5" & work$.trt == "R")[2]
++  incomplete <- .be_isc(work[-drop_row, ], "R", "T", alpha = 0.10)
++  expect_equal(incomplete, .be_isc(work[work$.subject != "5", ], "R", "T", alpha = 0.10))
++  expect_equal(incomplete$n, 23)
++  expect_equal(incomplete$df, 21)
++})
++
++test_that(".be_isc derives the sequence from the treatment pattern when it is absent", {
++  d <- generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40)
++  work <- be_isc_work(d)
++  no_seq <- work
++  no_seq$.sequence <- factor(NA_character_)
++  expect_equal(.be_isc(no_seq, "R", "T"), .be_isc(work, "R", "T"))
++  # A subject missing a period would form a pattern of its own; it is excluded
++  # as it is when the sequence is known.
++  drop_row <- which(work$.subject == "2")[3]
++  expect_equal(.be_isc(no_seq[-drop_row, ], "R", "T"), .be_isc(work[-drop_row, ], "R", "T"))
++  expect_equal(.be_isc(no_seq[-drop_row, ], "R", "T")$n, 23)
++})
++
++test_that(".be_isc errors when it cannot be estimated", {
++  d <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  work <- be_isc_work(d)
++  part_seq <- work
++  part_seq$.sequence[part_seq$.subject == "3"] <- NA
++  expect_error(.be_isc(part_seq, "R", "T"), class = "pknca_error_be_isc_sequence_missing")
++  expect_identical(.be_isc_or_na(part_seq, "R", "T"), .be_isc_na())
++  # One subject per sequence leaves no degrees of freedom.
++  expect_error(
++    .be_isc(work[work$.subject %in% c("1", "2"), ], "R", "T"),
++    class = "pknca_error_be_isc_insufficient"
++  )
++  # Subject 3 is in sequence TRTR; one of its rows says RTRT.
++  mixed <- work
++  mixed$.sequence <- as.character(mixed$.sequence)
++  mixed$.sequence[which(mixed$.subject == "3")[1]] <- "RTRT"
++  expect_error(.be_isc(mixed, "R", "T"), class = "pknca_error_be_isc_sequence_inconsistent")
++  expect_identical(.be_isc_or_na(mixed, "R", "T"), .be_isc_na())
++  # be_assess() rejects a missing sequence in be_dataset(), before any model
++  # could drop the row, for every regulator.
++  long <- be_replicate_long(d)
++  long$sequence <- as.character(long$sequence)
++  long$sequence[long$subject == "3"] <- NA
++  for (regulator in c("ABE", "EMA", "FDA")) {
++    expect_error(
++      be_assess(long, "treatment", "R", "auclast", regulator = regulator),
++      class = "pknca_error_be_design_missing"
++    )
++  }
++})
++
++test_that(".be_isc with a single sequence is the mean of the contrasts", {
++  # A fixed-order crossover (every subject gets T then R) has one sequence, so
++  # the estimate is the mean contrast with sd / sqrt(n) and n - 1 degrees of
++  # freedom.
++  d <- generate_be_replicate(24, 20240501, "2x2", cv_wr = 0.3, cv_wt = 0.3)
++  d <- d[d$sequence == "TR", ]
++  ilat <- log(d$PK[d$treatment == "T"]) - log(d$PK[d$treatment == "R"])
++  isc <- .be_isc(be_isc_work(d), "R", "T", alpha = 0.10)
++  expect_equal(isc$pe_log, mean(ilat), tolerance = 1e-12)
++  expect_equal(isc$se, stats::sd(ilat) / sqrt(12), tolerance = 1e-12)
++  expect_equal(isc$df, 11)
++  expect_equal(isc$n, 12)
++  # be_extract_param() computes the ISC through .be_isc_or_na() for every model
++  # and regulator, so it must return the estimate rather than fail.
++  expect_identical(.be_isc_or_na(be_isc_work(d), "R", "T", alpha = 0.10), isc)
++  # End to end, average bioequivalence on this design uses the mixed model
++  # (treatment is aliased with period in the fixed-effects ANOVA), which needs
++  # the suggested packages.
++  skip_if_not_installed("lme4")
++  skip_if_not_installed("lmerTest")
++  skip_if_not_installed("emmeans")
++  abe <- suppressMessages(be_assess(be_replicate_long(d), "treatment", "R", "auclast", regulator = "ABE"))
++  expect_equal(abe$gmr_percent, 100 * exp(mean(ilat)), tolerance = 1e-8)
++})
++
++test_that(".be_isc excludes a subject with an administration of unknown treatment", {
++  for (design in c("full", "partial")) {
++    d <- generate_be_replicate(24, 20240501, design, cv_wr = 0.45, cv_wt = 0.40)
++    work <- be_isc_work(d)
++    unknown <- work
++    unknown$.trt[which(unknown$.subject == "5")[1]] <- NA
++    expected <- .be_isc(work[work$.subject != "5", ], "R", "T")
++    expect_equal(.be_isc(unknown, "R", "T"), expected)
++    unknown$.sequence <- factor(NA_character_)
++    expect_equal(.be_isc(unknown, "R", "T"), expected)
++  }
++})
++
++test_that(".be_isc compares each test formulation with the reference", {
++  d <- generate_be_williams()
++  work <- data.frame(
++    .subject = factor(d$subject), .sequence = factor(d$sequence),
++    .period = factor(d$period), .trt = d$treatment, .logval = log(d$PPORRES)
++  )
++  for (tl in c("T1", "T2")) {
++    expect_equal(.be_isc(work, "R", tl), .be_isc(work[work$.trt %in% c("R", tl), ], "R", tl))
++  }
++  # A subject missing only T2 still contributes to T1 versus R.
++  drop_row <- which(work$.subject == "1" & work$.trt == "T2")
++  expect_equal(.be_isc(work[-drop_row, ], "R", "T1")$n, 18)
++  expect_equal(.be_isc(work[-drop_row, ], "R", "T2")$n, 17)
+ })
+ 
+ test_that(".be_rsabe_bound is monotone in the point estimate and flips once", {
+@@ -240,13 +443,30 @@ test_that("be_assess applies HC, GCC, and ABE limits correctly", {
+ test_that("be_assess (FDA RSABE) computes the linearized criterion", {
+   d <- be_replicate_long(generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40))
+   res <- be_assess(d, "treatment", "R", "auclast", regulator = "FDA")
+-  expect_equal(res$gmr_percent, 88.3595729, tolerance = 1e-5)
+-  # Linearized Howe/Hyslop bound; equals the PowerTOST power.RSABE criterion.
+-  expect_equal(res$criterion, -0.073963079, tolerance = 1e-6)
++  # Linearized Howe/Hyslop bound on the intra-subject contrasts; the expected
++  # values come from a literal transcription of the FDA progesterone guidance
++  # SAS code, computed separately from PKNCA.
++  expect_equal(res$gmr_percent, 88.3595729, tolerance = 1e-8)
++  expect_equal(c(res$ci_lower, res$ci_upper), c(73.7959174, 105.797372), tolerance = 1e-8)
++  expect_equal(res$swr, 0.485616493, tolerance = 1e-8)
++  expect_equal(res$criterion, -0.0735236679, tolerance = 1e-8)
+   expect_true(is.na(res$limit_lower))
+   expect_true(res$pass)
+ })
+ 
++test_that("be_assess (FDA RSABE) uses the FDA within-subject variance for a partial replicate", {
++  dp <- be_replicate_long(generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40))
++  res <- be_assess(dp, "treatment", "R", "auclast", regulator = "FDA")
++  # From the SAS transcription of the FDA progesterone guidance.
++  expect_equal(res$swr, 0.565267363, tolerance = 1e-8)
++  expect_equal(res$cvwr_percent, 100 * sqrt(exp(0.565267363^2) - 1), tolerance = 1e-8)
++  expect_equal(c(res$ci_lower, res$ci_upper), c(80.8048204, 114.610061), tolerance = 1e-8)
++  expect_equal(res$criterion, -0.157507556, tolerance = 1e-8)
++  # The expanding-limits frameworks keep the EMA ANOVA estimator.
++  ema <- be_assess(dp, "treatment", "R", "auclast", regulator = "EMA", model_type = "anova")
++  expect_equal(ema$swr, 0.576194165, tolerance = 1e-8)
++})
++
+ test_that("be_assess (FDA RSABE) falls back to unscaled ABE when swR < 0.294", {
+   d <- be_replicate_long(generate_be_replicate(24, 2024, "full", cv_wr = 0.12, cv_wt = 0.12, gmr = 1.02))
+   res <- be_assess(d, "treatment", "R", "auclast", regulator = "FDA")
+@@ -261,7 +481,9 @@ test_that("be_assess (NTID) enforces all three gates", {
+   # below 80% so NTID fails.
+   d_hi <- be_replicate_long(generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40))
+   ntid_hi <- be_assess(d_hi, "treatment", "R", "auclast", regulator = "NTID")
+-  expect_equal(ntid_hi$criterion, -0.130502036, tolerance = 1e-6)
++  # From the warfarin guidance SAS code with Delta = 1/0.9 (the guidance prints
++  # it rounded as 1.11111), computed separately from PKNCA.
++  expect_equal(ntid_hi$criterion, -0.130132422, tolerance = 1e-8)
+   expect_false(ntid_hi$pass)
+ 
+   # Low variability with a tight CI: all three gates pass.
+@@ -430,8 +652,11 @@ test_that("be_extract_param returns both the model and ISC point estimates", {
+   # lmer model contrast == replicateBE method.A on the balanced design
+   expect_equal(p$model_gmr_percent, 88.359573, tolerance = 1e-5)
+   expect_equal(c(p$model_ci_lower, p$model_ci_upper), c(75.617477, 103.248804), tolerance = 1e-4)
+-  # ISC point estimate (wider, used by the FDA family)
+-  expect_equal(p$isc_gmr_percent, 88.3595729, tolerance = 1e-5)
++  # The ISC estimate used by the FDA family: the same ratio as the model on this
++  # balanced, complete design, with a wider interval on n - m degrees of freedom.
++  expect_equal(p$isc_gmr_percent, 88.3595729, tolerance = 1e-8)
++  expect_equal(c(p$isc_ci_lower, p$isc_ci_upper), c(73.7959174, 105.797372), tolerance = 1e-8)
++  expect_equal(p$isc_df, 22)
+   expect_equal(p$swr, 0.485616493, tolerance = 1e-7)
+ })
+ 
+diff --git a/tests/testthat/test-bioequivalence-fda-mixed.R b/tests/testthat/test-bioequivalence-fda-mixed.R
+new file mode 100644
+index 00000000..f5823643
+--- /dev/null
++++ b/tests/testthat/test-bioequivalence-fda-mixed.R
+@@ -0,0 +1,394 @@
++# The FDA mixed-effects model for unscaled average bioequivalence (SAS
++# RANDOM TRT/TYPE=FA0(2), REPEATED/GRP=TRT, DDFM=SATTERTH).  The anchors are
++# known answers (with complete data the model reproduces the intra-subject
++# contrasts with n - 2 degrees of freedom), nlme as an independent REML fitter,
++# a dense N x N computation with numerical derivatives as an independent check
++# of the Satterthwaite degrees of freedom, and finite-difference checks of the
++# analytic derivatives.
++
++# Standardized single-endpoint frame (as from be_dataset()) with the reference
++# first in the treatment factor.
++fda_work <- function(d) {
++  w <- be_isc_work(d)
++  w$.trt <- stats::relevel(factor(w$.trt), ref = "R")
++  w
++}
++
++# The same model fit by nlme: correlated treatment random effects (unstructured)
++# and treatment-specific residual variances.
++fda_nlme <- function(w) {
++  nlme::lme(
++    .logval ~ .sequence + .period + .trt,
++    random = list(.subject = nlme::pdSymm(~ 0 + .trt)),
++    weights = nlme::varIdent(form = ~ 1 | .trt),
++    data = w, method = "REML",
++    control = nlme::lmeControl(opt = "optim", returnObject = TRUE)
++  )
++}
++
++# REML log-likelihood at natural parameters, for numerical derivatives.
++fda_loglik <- function(theta, d) {
++  .be_fda_reml(theta, d)$loglik
++}
++
++# An nlme fit's covariance parameters on the natural scale of .be_fda_reml(),
++# with an unidentified residual variance folded into G.
++fda_nlme_theta <- function(fit, d) {
++  G <- as.matrix(nlme::getVarCov(fit))
++  mult <- stats::coef(fit$modelStruct$varStruct, unconstrained = FALSE, allCoef = TRUE)[d$levels]
++  s2 <- (fit$sigma * mult)^2
++  diag(G)[!d$replicated] <- diag(G)[!d$replicated] + s2[!d$replicated]
++  c(G[lower.tri(G, diag = TRUE)], s2[d$replicated])
++}
++
++# The FDA model and nlme agree when nlme converges, and otherwise the FDA fit
++# has at least nlme's REML log-likelihood and agrees to within nlme's
++# convergence.  `tol` is the relative tolerance for the estimate and its
++# standard error of each test formulation in `levels`.
++expect_fda_matches_nlme <- function(w, tol, levels = "T") {
++  d <- .be_fda_design(w)
++  m <- .be_fda_mixed(w)
++  nf <- fda_nlme(w)
++  tt <- summary(nf)$tTable
++  expect_gte(m$loglik, fda_loglik(fda_nlme_theta(nf, d), d) - 1e-9)
++  for (tl in levels) {
++    expect_equal(m$contrasts[[tl]]$pe_log, tt[paste0(".trt", tl), "Value"], tolerance = tol)
++    expect_equal(m$contrasts[[tl]]$se, tt[paste0(".trt", tl), "Std.Error"], tolerance = tol)
++  }
++}
++
++# Dense reference computation on the SAS scale `phi` (the Cholesky factor
++# entries of G, then the residual variances of the replicated treatments): the
++# full N x N covariance matrix, the REML log-likelihood, and the variance of the
++# contrast `cvec`.
++fda_dense_cov <- function(phi, d) {
++  L <- .be_fda_chol(phi, d)
++  G <- L %*% t(L)
++  s2 <- rep(0, d$k)
++  s2[d$replicated] <- phi[-seq_len(d$n_g)]
++  V <- matrix(0, length(d$y), length(d$y))
++  for (r in d$rows) {
++    ti <- d$trt_idx[r]
++    V[r, r] <- G[ti, ti, drop = FALSE] + diag(s2[ti], length(ti))
++  }
++  V
++}
++fda_dense_loglik <- function(phi, d) {
++  V <- fda_dense_cov(phi, d)
++  vi <- solve(V)
++  A <- t(d$X) %*% vi %*% d$X
++  e <- d$y - d$X %*% solve(A, t(d$X) %*% vi %*% d$y)
++  -0.5 * (as.numeric(determinant(V)$modulus) + as.numeric(determinant(A)$modulus) + sum(e * (vi %*% e)))
++}
++fda_dense_var <- function(phi, d, cvec) {
++  vi <- solve(fda_dense_cov(phi, d))
++  drop(t(cvec) %*% solve(t(d$X) %*% vi %*% d$X) %*% cvec)
++}
++
++# Central-difference gradient and Hessian of fn(x, ...) with step h.
++fda_num_grad <- function(fn, x, h, ...) {
++  out <- numeric(length(x))
++  for (i in seq_along(x)) {
++    e <- replace(numeric(length(x)), i, h)
++    out[i] <- (fn(x + e, ...) - fn(x - e, ...)) / (2 * h)
++  }
++  out
++}
++fda_num_hessian <- function(fn, x, h, ...) {
++  n <- length(x)
++  out <- matrix(0, n, n)
++  for (i in seq_len(n)) {
++    for (j in i:n) {
++      ei <- replace(numeric(n), i, h)
++      ej <- replace(numeric(n), j, h)
++      out[i, j] <- out[j, i] <-
++        (fn(x + ei + ej, ...) - fn(x + ei - ej, ...) - fn(x - ei + ej, ...) + fn(x - ei - ej, ...)) / (4 * h^2)
++    }
++  }
++  out
++}
++
++# Satterthwaite degrees of freedom of test formulation `level` from the dense
++# computation with numerical derivatives, at the fit `m` from .be_fda_mixed().
++fda_dense_df <- function(w, m, level = "T", h = 1e-5) {
++  d <- .be_fda_design(w)
++  phi <- c(m$u[seq_len(d$n_g)], exp(m$u[-seq_len(d$n_g)]))
++  cvec <- as.numeric(colnames(d$X) == paste0(".trt", level))
++  info <- -fda_num_hessian(fda_dense_loglik, phi, h, d = d)
++  g <- fda_num_grad(fda_dense_var, phi, h / 10, d = d, cvec = cvec)
++  2 * fda_dense_var(phi, d, cvec)^2 / drop(t(g) %*% solve(info, g))
++}
++
++# Component `m` of theta_G(x), the lower triangle of L L' for Cholesky entries
++# `x` (all components when `m` is NULL).
++fda_theta_g <- function(x, d, m = NULL) {
++  L <- .be_fda_chol(x, d)
++  G <- L %*% t(L)
++  out <- G[lower.tri(G, diag = TRUE)]
++  if (is.null(m)) out else out[m]
++}
++
++# Mocks for the failure paths.
++fda_flat_objective <- function(u, d) {
++  .Machine$double.xmax
++}
++fda_zero_information <- function(fit, d, M) {
++  matrix(0, length(M), length(M))
++}
++fda_negative_information <- function(fit, d, M) {
++  -diag(length(M))
++}
++fda_failing_mixed <- function(ds_ep) {
++  rlang::abort("mocked failure", class = c("pknca_error_be_fda_model_convergence", "pknca_error_be_fda_model"))
++}
++
++# An estimate for the decision functions with the given ratio and interval (%).
++fda_est <- function(gmr, lower, upper, se = 0.02, df = 22) {
++  list(pe_log = log(gmr / 100), se = se, df = df, n = 24, gmr_percent = gmr, ci_lower = lower, ci_upper = upper)
++}
++
++test_that("with complete data the FDA mixed model reproduces the intra-subject contrasts on n - 2 df", {
++  full <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  cases <- list(
++    full = full,
++    unbalanced = full[!(full$subject %in% c("1", "3")), ],
++    two_by_two = generate_be_replicate(24, 20240501, "2x2", cv_wr = 0.3, cv_wt = 0.3),
++    large = generate_be_replicate(100, 11, "full", cv_wr = 0.4, cv_wt = 0.35)
++  )
++  for (nm in names(cases)) {
++    w <- fda_work(cases[[nm]])
++    fda <- .be_fda_mixed(w)$contrasts$T
++    isc <- .be_isc(w, "R", "T")
++    expect_equal(fda$pe_log, isc$pe_log, tolerance = 1e-7, label = nm)
++    expect_equal(fda$se, isc$se, tolerance = 1e-5, label = nm)
++    expect_equal(fda$df, isc$df, tolerance = 1e-4, label = nm)
++  }
++})
++
++test_that("the FDA mixed model matches nlme and the dense computation with incomplete data and a partial replicate", {
++  full <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  partial <- generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40)
++  full_incomplete <- fda_work(full[-c(which(full$subject == "5")[4], which(full$subject == "8")[2]), ])
++  partial_incomplete <- fda_work(partial[-which(partial$subject == "4")[2], ])
++  # The full replicate identifies every covariance parameter, so nlme
++  # converges to the same fit.
++  expect_fda_matches_nlme(full_incomplete, tol = 1e-5)
++  # A partial replicate's test residual variance is not identifiable, and nlme
++  # stops short of the REML optimum.
++  expect_fda_matches_nlme(fda_work(partial), tol = 1e-3)
++  expect_fda_matches_nlme(partial_incomplete, tol = 1e-3)
++  # With incomplete data the model differs from the intra-subject contrasts,
++  # which drop the incomplete subjects.
++  m <- .be_fda_mixed(full_incomplete)
++  expect_false(isTRUE(all.equal(m$contrasts$T$pe_log, .be_isc(full_incomplete, "R", "T")$pe_log)))
++  expect_equal(m$contrasts$T$df, fda_dense_df(full_incomplete, m), tolerance = 1e-4)
++  expect_equal(m$contrasts$T$df, 22.4730, tolerance = 1e-4)
++  mp <- .be_fda_mixed(partial_incomplete)
++  expect_equal(mp$contrasts$T$df, fda_dense_df(partial_incomplete, mp), tolerance = 1e-4)
++})
++
++test_that("the analytic gradient, information, and Cholesky derivatives match finite differences", {
++  wp <- fda_work(generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40))
++  dp <- .be_fda_design(wp)
++  u <- .be_fda_start(dp, 0.5)
++  expect_equal(.be_fda_objective_grad(u, dp), fda_num_grad(.be_fda_objective, u, 1e-6, d = dp), tolerance = 1e-5)
++
++  full <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  partial <- generate_be_replicate(24, 20240501, "partial", cv_wr = 0.45, cv_wt = 0.40)
++  cases <- list(
++    full = fda_work(full),
++    partial_unbalanced = fda_work(partial[!(partial$subject %in% c("1", "5")), ])
++  )
++  for (nm in names(cases)) {
++    d <- .be_fda_design(cases[[nm]])
++    m <- .be_fda_mixed(cases[[nm]])
++    theta <- m$theta
++    fit <- .be_fda_reml(theta, d)
++    expect_equal(
++      .be_fda_information(fit, d),
++      -fda_num_hessian(fda_loglik, theta, 1e-5, d = d),
++      tolerance = 1e-4, label = nm
++    )
++    # The fit is stationary on the optimization (Cholesky) scale, also when
++    # the optimum has a singular G and the natural-scale gradient is not zero.
++    expect_lt(max(abs(.be_fda_objective_grad(m$u, d))), 1e-3)
++  }
++
++  # theta_G(L) = lower triangle of L L'; its Jacobian and Hessians in the
++  # Cholesky entries.
++  d3 <- list(k = 3, n_g = 6, gi = which(lower.tri(diag(3), diag = TRUE), arr.ind = TRUE))
++  lam <- c(0.7, -0.2, 0.4, 0.5, 0.1, 0.3)
++  derivs <- .be_fda_chol_derivs(.be_fda_chol(lam, d3), d3)
++  num_jac <- matrix(0, 6, 6)
++  for (p in 1:6) {
++    e <- replace(numeric(6), p, 1e-6)
++    num_jac[, p] <- (fda_theta_g(lam + e, d3) - fda_theta_g(lam - e, d3)) / 2e-6
++  }
++  expect_equal(derivs$jac, num_jac, tolerance = 1e-8)
++  for (m in 1:6) {
++    expect_equal(derivs$hess[[m]], fda_num_hessian(fda_theta_g, lam, 1e-4, d = d3, m = m), tolerance = 1e-6)
++  }
++})
++
++test_that("a fit with a singular between-subject covariance uses the Cholesky-scale information", {
++  # The REML optimum has a singular G (SAS reports that G is not positive
++  # definite).  The degrees of freedom come from the information on the
++  # Cholesky (FA0) scale, where the optimum is stationary; the dense
++  # computation on that scale agrees.
++  w <- fda_work(generate_be_replicate(48, 7, "full", cv_wr = 0.3, cv_wt = 0.5))
++  m <- .be_fda_mixed(w)
++  G <- matrix(c(m$theta[1], m$theta[2], m$theta[2], m$theta[3]), 2)
++  expect_lt(min(eigen(G, symmetric = TRUE)$values), 1e-8)
++  expect_fda_matches_nlme(w, tol = 1e-3)
++  expect_equal(m$contrasts$T$df, fda_dense_df(w, m), tolerance = 1e-3)
++  expect_equal(m$contrasts$T$df, 118.4934, tolerance = 1e-4)
++})
++
++test_that("the FDA mixed model handles several test formulations and rejects an aliased treatment", {
++  d <- generate_be_williams()
++  w <- data.frame(
++    .subject = factor(d$subject), .sequence = factor(d$sequence),
++    .period = factor(d$period), .trt = stats::relevel(factor(d$treatment), ref = "R"),
++    .logval = log(d$PPORRES)
++  )
++  m <- .be_fda_mixed(w)
++  expect_named(m$contrasts, c("T1", "T2"))
++  expect_fda_matches_nlme(w, tol = 1e-3, levels = c("T1", "T2"))
++  for (tl in c("T1", "T2")) {
++    expect_equal(m$contrasts[[tl]]$df, fda_dense_df(w, m, level = tl), tolerance = 1e-3, label = tl)
++  }
++  # Every subject gets T then R, so treatment is aliased with period.
++  fixed_order <- generate_be_replicate(24, 20240501, "2x2")
++  fixed_order <- fixed_order[fixed_order$sequence == "TR", ]
++  expect_error(.be_fda_mixed(fda_work(fixed_order)), class = "pknca_error_be_fda_model_aliased")
++})
++
++test_that("the FDA mixed model stops on degenerate input and failed fits", {
++  # Two subjects leave fewer residual degrees of freedom than covariance
++  # parameters.
++  expect_error(
++    .be_fda_mixed(fda_work(generate_be_replicate(2, 5, "full"))),
++    class = "pknca_error_be_fda_model_insufficient"
++  )
++  # Identical test replicates within each subject: the test within-subject
++  # variance is zero and the likelihood has no maximum.
++  full <- generate_be_replicate(16, 5, "full", cv_wr = 0.1, cv_wt = 0.3)
++  is_t <- full$treatment == "T"
++  full$PK[is_t] <- exp(stats::ave(log(full$PK[is_t]), full$subject[is_t]))
++  expect_error(.be_fda_mixed(fda_work(full)), regexp = "formulation\\(s\\) T is zero", class = "pknca_error_be_fda_model_degenerate")
++
++  w <- fda_work(generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40))
++  local({
++    local_mocked_bindings(.be_fda_objective = fda_flat_objective)
++    expect_error(.be_fda_mixed(w), class = "pknca_error_be_fda_model_convergence")
++  })
++  local({
++    local_mocked_bindings(.be_fda_information = fda_zero_information)
++    expect_error(.be_fda_mixed(w), class = "pknca_error_be_fda_model_singular")
++  })
++  local({
++    local_mocked_bindings(.be_fda_information = fda_negative_information)
++    expect_error(.be_fda_mixed(w), class = "pknca_error_be_fda_model_df")
++  })
++})
++
++test_that("model_type = 'isc' uses the FDA mixed model for a replicate design and the ANOVA otherwise", {
++  full <- generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40)
++  incomplete <- full[-c(which(full$subject == "5")[4], which(full$subject == "8")[2]), ]
++  ds <- be_dataset(be_replicate_long(incomplete), "treatment", "R", "auclast")
++  fit <- be_fit_model_single(ds$data, "isc")
++  p <- be_extract_param(fit, ds$data, alpha = 0.10)
++  fc <- fit$fda$contrasts$T
++  expect_equal(p$model_gmr_percent, 100 * exp(fc$pe_log), tolerance = 1e-10)
++  expect_equal(
++    c(p$model_ci_lower, p$model_ci_upper),
++    100 * exp(fc$pe_log + c(-1, 1) * stats::qt(0.95, fc$df) * fc$se),
++    tolerance = 1e-10
++  )
++  expect_equal(p$model_df, fc$df)
++  expect_true(is.na(p$model_error))
++
++  # Without a replicated formulation (parallel or 2x2) the ANOVA ratio is kept.
++  par_ds <- be_dataset(generate_be_parallel(), "treatment", "R", "auclast")
++  expect_null(be_fit_model_single(par_ds$data, "isc")$fda)
++  ds_2x2 <- be_dataset(be_replicate_long(generate_be_replicate(24, 20240501, "2x2")), "treatment", "R", "auclast")
++  fit_2x2 <- be_fit_model_single(ds_2x2$data, "isc")
++  expect_null(fit_2x2$fda)
++  expect_equal(
++    be_extract_param(fit_2x2, ds_2x2$data)$model_gmr_percent,
++    be_extract_param(be_fit_model_single(ds_2x2$data, "anova"), ds_2x2$data)$model_gmr_percent
++  )
++})
++
++test_that("an FDA mixed model failure stops only the decisions that need the unscaled criterion", {
++  local_mocked_bindings(.be_fda_mixed = fda_failing_mixed)
++  # High variability: FDA RSABE decides on the reference-scaled bound alone.
++  hi <- be_replicate_long(generate_be_replicate(24, 20240501, "full", cv_wr = 0.45, cv_wt = 0.40))
++  ds <- be_dataset(hi, "treatment", "R", "auclast")
++  p <- be_extract_param(be_fit_model_single(ds$data, "isc"), ds$data)
++  expect_true(is.na(p$model_gmr_percent))
++  expect_identical(p$model_error, "mocked failure")
++  fda <- suppressWarnings(be_assess(hi, "treatment", "R", "auclast", regulator = "FDA"))
++  expect_equal(fda$criterion, -0.0735236679, tolerance = 1e-8)
++  expect_true(fda$pass)
++  # The NTID interval and the low-variability fallback need the model.
++  expect_error(
++    suppressWarnings(be_assess(hi, "treatment", "R", "auclast", regulator = "NTID")),
++    regexp = "mocked failure",
++    class = "pknca_error_be_fda_model_unavailable"
++  )
++  lo <- be_replicate_long(generate_be_replicate(24, 2024, "full", cv_wr = 0.12, cv_wt = 0.12, gmr = 1.02))
++  expect_error(
++    suppressWarnings(be_assess(lo, "treatment", "R", "auclast", regulator = "FDA")),
++    class = "pknca_error_be_fda_model"
++  )
++})
++
++test_that("the FDA deciders apply the unscaled criterion to the unscaled estimate", {
++  inside <- fda_est(100, 90, 110)
++  outside <- fda_est(90, 78, 105)
++  fda <- be_regulator("FDA")
++  low <- list(swR = 0.2, s2wR = 0.04, df_wR = 22)
++  # RSABE below the switch: the unscaled estimate decides and is reported.
++  expect_false(.be_rsabe(inside, low, fda, 0.1, unscaled = outside)$pass)
++  expect_true(.be_rsabe(outside, low, fda, 0.1, unscaled = inside)$pass)
++  expect_identical(.be_rsabe(inside, low, fda, 0.1, unscaled = outside)$report, outside)
++  # Above the switch the intra-subject contrasts decide and are reported.
++  high <- list(swR = 0.4, s2wR = 0.16, df_wR = 22)
++  scaled <- .be_rsabe(inside, high, fda, 0.1, unscaled = outside)
++  expect_true(scaled$pass)
++  expect_identical(scaled$report, inside)
++  # NTID and HVNTID: the conventional interval is the unscaled one.
++  ntid_wv <- list(swR = 0.2, s2wR = 0.04, df_wR = 22, swT = 0.2, sw_ratio_ci_upper = 1.5)
++  expect_true(.be_ntid(fda_est(100, 70, 140), ntid_wv, be_regulator("NTID"), 0.1, unscaled = inside)$pass)
++  expect_false(.be_ntid(inside, ntid_wv, be_regulator("NTID"), 0.1, unscaled = outside)$pass)
++  expect_identical(.be_ntid(inside, ntid_wv, be_regulator("NTID"), 0.1, unscaled = outside)$report, outside)
++  expect_true(.be_hvntid(outside, ntid_wv, be_regulator("HVNTID"), 0.1, unscaled = inside)$pass)
++  expect_false(.be_hvntid(inside, ntid_wv, be_regulator("HVNTID"), 0.1, unscaled = outside)$pass)
++})
++
++test_that("the FDA unscaled criteria use the FDA mixed model and report its interval", {
++  full <- generate_be_replicate(24, 2024, "full", cv_wr = 0.12, cv_wt = 0.12, gmr = 1.02)
++  incomplete <- full[-c(which(full$subject == "5")[4], which(full$subject == "8")[2]), ]
++  long <- be_replicate_long(incomplete)
++  ds <- be_dataset(long, "treatment", "R", "auclast")
++  p <- be_extract_param(be_fit_model_single(ds$data, "isc"), ds$data, alpha = 0.10)
++  # swR < 0.294, so FDA RSABE falls back to the unscaled criterion.
++  fda <- suppressWarnings(be_assess(long, "treatment", "R", "auclast", regulator = "FDA"))
++  expect_true(is.na(fda$criterion))
++  expect_equal(c(fda$gmr_percent, fda$ci_lower, fda$ci_upper),
++               c(p$model_gmr_percent, p$model_ci_lower, p$model_ci_upper), tolerance = 1e-10)
++  expect_false(isTRUE(all.equal(fda$ci_lower, p$isc_ci_lower)))
++  # NTID: the scaled bound uses the intra-subject contrasts, and the row shows
++  # the interval of the unscaled criterion.
++  ntid <- suppressWarnings(be_assess(long, "treatment", "R", "auclast", regulator = "NTID"))
++  expect_equal(c(ntid$ci_lower, ntid$ci_upper), c(p$model_ci_lower, p$model_ci_upper), tolerance = 1e-10)
++  expect_false(is.na(ntid$criterion))
++  hv <- suppressWarnings(be_assess(long, "treatment", "R", "auclast", regulator = "HVNTID"))
++  expect_equal(c(hv$ci_lower, hv$ci_upper), c(p$model_ci_lower, p$model_ci_upper), tolerance = 1e-10)
++  expect_match(
++    attr(fda, "caption"),
++    "the unscaled 80.00-125.00% criterion uses the FDA mixed-effects model",
++    fixed = TRUE
++  )
++})
+diff --git a/tests/testthat/test-bioequivalence.R b/tests/testthat/test-bioequivalence.R
+index 4a829c06..14399d9d 100644
+--- a/tests/testthat/test-bioequivalence.R
++++ b/tests/testthat/test-bioequivalence.R
+@@ -110,6 +110,63 @@ test_that("be_dataset prefers PPSTRES over PPORRES", {
+   expect_identical(ds$columns$value, "PPSTRES")
+ })
+ 
++test_that("be_dataset stops when a design column is missing in an analyzed row", {
++  for (col in c("subject", "sequence", "period", "form")) {
++    d <- make_be_df()
++    d[[col]][3] <- NA
++    expect_error(
++      be_dataset(d, reference_col = "form", reference_value = "R", endpoints = "auclast"),
++      regexp = paste0("Design column\\(s\\) ", col, " have missing values"),
++      class = "pknca_error_be_design_missing"
++    )
++  }
++  # A row without a value is not analyzed, so its design columns may be missing.
++  d <- make_be_df()
++  d$PPORRES[3] <- NA
++  d$sequence[3] <- NA
++  ds <- be_dataset(d, reference_col = "form", reference_value = "R", endpoints = "auclast")
++  expect_equal(nrow(ds$data), nrow(d) - 1)
++  # Without a sequence column there is no sequence to check.
++  d <- make_be_df()
++  d$sequence <- NULL
++  ds <- be_dataset(d, reference_col = "form", reference_value = "R", endpoints = "auclast")
++  expect_true(all(is.na(ds$data$.sequence)))
++  # Rows of an endpoint that was not requested are not analyzed.
++  d <- rbind(make_be_df(), make_be_df(endpoint = "cmax"))
++  d$period[d$PPTESTCD == "cmax"][1] <- NA
++  ds <- be_dataset(d, reference_col = "form", reference_value = "R", endpoints = "auclast")
++  expect_identical(ds$endpoints, "auclast")
++  expect_error(
++    be_dataset(d, reference_col = "form", reference_value = "R", endpoints = c("auclast", "cmax")),
++    class = "pknca_error_be_design_missing"
++  )
++})
++
++test_that("be_dataset checks only the subject and treatment for a parallel design", {
++  d <- generate_be_parallel()
++  d$period <- NA
++  d$sequence <- NA
++  ds <- be_dataset(d, reference_col = "treatment", reference_value = "R", endpoints = "auclast", sequence = "sequence")
++  expect_equal(nrow(ds$data), nrow(d))
++  d$treatment[2] <- NA
++  expect_error(
++    be_dataset(d, reference_col = "treatment", reference_value = "R", endpoints = "auclast"),
++    regexp = "Design column\\(s\\) treatment have missing values",
++    class = "pknca_error_be_design_missing"
++  )
++})
++
++test_that("be_dataset stops when a subject has more than one sequence", {
++  d <- make_be_df()
++  # Subject 2 is in sequence TR.
++  d$sequence[d$subject == 2][1] <- "RT"
++  expect_error(
++    be_dataset(d, reference_col = "form", reference_value = "R", endpoints = "auclast"),
++    regexp = "Subject\\(s\\) 2 have more than one sequence",
++    class = "pknca_error_be_sequence_inconsistent"
++  )
++})
++
+ test_that("be_dataset warns about and skips a missing endpoint", {
+   expect_warning(
+     ds <- be_dataset(make_be_df(), reference_col = "form", reference_value = "R",
+@@ -369,7 +426,17 @@ test_that("covariates with an intra-subject-contrast framework warn that they do
+   plain <- be_assess(d, "treatment", "R", "auclast", regulator = "FDA")
+   expect_equal(res$gmr_percent, plain$gmr_percent)
+   expect_equal(res$criterion, plain$criterion)
+-  expect_match(attr(res, "caption"), "Covariates do not enter the intra-subject contrasts.", fixed = TRUE)
++  expect_match(
++    attr(res, "caption"),
++    "Covariates enter neither the intra-subject contrasts nor the FDA mixed model.",
++    fixed = TRUE
++  )
++  # The unscaled criterion, from the FDA mixed model, does not use them either.
++  d_lo <- be_replicate_long(generate_be_replicate(24, 2024, "full", cv_wr = 0.12, cv_wt = 0.12))
++  d_lo$WT <- as.numeric(d_lo$subject) + 60
++  lo <- suppressWarnings(be_assess(d_lo, "treatment", "R", "auclast", regulator = "HVNTID", covariates = "WT"))
++  lo_plain <- be_assess(d_lo, "treatment", "R", "auclast", regulator = "HVNTID")
++  expect_equal(c(lo$ci_lower, lo$ci_upper), c(lo_plain$ci_lower, lo_plain$ci_upper))
+ })
+ 
+ # Heteroscedastic models ------------------------------------------------------
+diff --git a/vignettes/v50-bioequivalence.Rmd b/vignettes/v50-bioequivalence.Rmd
+index 947e9d9c..0f10475c 100644
+--- a/vignettes/v50-bioequivalence.Rmd
++++ b/vignettes/v50-bioequivalence.Rmd
+@@ -65,7 +65,19 @@ pass `model_type` to `be_assess()` to override it.  A parallel study (one
+ measurement per subject) is analyzed by a fixed-effects ANOVA, while a crossover
+ or replicate study (repeated measures per subject) uses the mixed model.  The
+ FDA reference-scaled family always uses intra-subject contrasts (`"isc"`)
+-regardless of design.
++regardless of design: each subject's mean log test minus mean log reference,
++from the subjects with every administration their sequence calls for, averaged
++with equal weight per sequence and with `n - m` degrees of freedom (`n` subjects,
++`m` sequences), as the FDA progesterone and warfarin guidances specify.  Their
++within-subject variability comes from each subject's difference between its two
++administrations of a formulation, centered within sequence
++(`be_within_var(model_type = "isc")`); the expanding-limits frameworks use the
++EMA ANOVA estimator.  The two agree for a `TRTR`/`RTRT` full replicate.  The unscaled
++80.00-125.00% criterion of the FDA frameworks (RSABE below the switching
++variability, NTID, and HVNTID) uses the guidance's mixed-effects model, with
++correlated treatment random effects per subject, a residual variance per
++treatment, and Satterthwaite degrees of freedom; with complete data it gives the
++same ratio and interval as the intra-subject contrasts.
+ 
+ | Regulator | Design required | Auto `model_type` | Notes |
+ |---|---|---|---|
+@@ -345,8 +357,9 @@ bioequivalence decision.
+   replicated design.
+ * **`covariates`** names columns added to every model as additive fixed
+   effects.  The least-squares means are then at the mean of numeric covariates.
+-  The intra-subject contrasts used by the FDA frameworks and the within-subject
+-  variances used for reference scaling do not use covariates.
++  The intra-subject contrasts and the FDA mixed model used by the FDA frameworks
++  and the within-subject variances used for reference scaling do not use
++  covariates.
+ * **`regulator = "descriptive"`** estimates the geometric means, their ratio,
+   and its confidence interval exactly as `"ABE"` does, but applies no
+   acceptance limits and reports no pass/fail.  It is meant for comparisons that

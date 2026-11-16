@@ -1,0 +1,353 @@
+diff --git a/compert/embedding.py b/compert/embedding.py
+index 12f6f03..186142b 100644
+--- a/compert/embedding.py
++++ b/compert/embedding.py
+@@ -28,6 +28,7 @@ def get_chemical_representation(
+         "seq2seq",
+         "rdkit",
+         "jtvae",
++        "zeros",
+         "chemvae",
+     )
+ 
+@@ -37,6 +38,7 @@ def get_chemical_representation(
+         data_dir = Path(data_dir)
+     assert Path(data_dir).exists()
+ 
++    df = None
+     if embedding_model == "grover_base":
+         df = pd.read_parquet(
+             data_dir / "grover" / "data" / "embeddings" / "grover_base.parquet"
+@@ -88,6 +90,10 @@ def get_chemical_representation(
+     elif embedding_model == "chemvae":
+         df = pd.read_parquet(data_dir / "chemvae" / "chemvae.parquet")
+ 
+-    emb = torch.tensor(df.loc[smiles].values, dtype=torch.float32, device=device)
+-    assert emb.shape[0] == len(smiles)
++    if df is not None:
++        emb = torch.tensor(df.loc[smiles].values, dtype=torch.float32, device=device)
++        assert emb.shape[0] == len(smiles)
++    else:
++        assert embedding_model == "zeros"
++        emb = torch.zeros((len(smiles), 256))
+     return torch.nn.Embedding.from_pretrained(emb, freeze=True)
+diff --git a/compert/model.py b/compert/model.py
+index 9e61a56..1ada443 100644
+--- a/compert/model.py
++++ b/compert/model.py
+@@ -2,6 +2,7 @@
+ 
+ import json
+ import logging
++from collections import OrderedDict
+ from typing import Union
+ 
+ import numpy as np
+@@ -100,7 +101,14 @@ class MLP(torch.nn.Module):
+     Careful: if activation is set to ReLU, ReLU is only applied to the first half of NN outputs!
+     """
+ 
+-    def __init__(self, sizes, batch_norm=True, last_layer_act="linear"):
++    def __init__(
++        self,
++        sizes,
++        batch_norm=True,
++        last_layer_act="linear",
++        append_layer_width=None,
++        append_layer_position=None,
++    ):
+         super(MLP, self).__init__()
+         layers = []
+         for s in range(len(sizes) - 1):
+@@ -121,7 +129,35 @@ def __init__(self, sizes, batch_norm=True, last_layer_act="linear"):
+         else:
+             raise ValueError("last_layer_act must be one of 'linear' or 'ReLU'")
+ 
+-        self.network = torch.nn.Sequential(*layers)
++        # We add another layer either at the front / back of the sequential model. It gets a different name
++        # `append_XXX`. The naming of the other layers stays consistent.
++        # This allows us to load the state dict of the "non_appended" MLP without errors.
++        if append_layer_width:
++            assert append_layer_position in ("first", "last")
++            if append_layer_position == "first":
++                layers_dict = OrderedDict()
++                layers_dict["append_linear"] = torch.nn.Linear(
++                    append_layer_width, sizes[0]
++                )
++                layers_dict["append_bn1d"] = torch.nn.BatchNorm1d(sizes[0])
++                layers_dict["append_relu"] = torch.nn.ReLU()
++                for i, module in enumerate(layers):
++                    layers_dict[str(i)] = module
++            else:
++                layers_dict = OrderedDict(
++                    {str(i): module for i, module in enumerate(layers)}
++                )
++                layers_dict["append_bn1d"] = torch.nn.BatchNorm1d(sizes[-1])
++                layers_dict["append_relu"] = torch.nn.ReLU()
++                layers_dict["append_linear"] = torch.nn.Linear(
++                    sizes[-1], append_layer_width
++                )
++        else:
++            layers_dict = OrderedDict(
++                {str(i): module for i, module in enumerate(layers)}
++            )
++
++        self.network = torch.nn.Sequential(layers_dict)
+ 
+     def forward(self, x):
+         if self.activation == "ReLU":
+@@ -208,6 +244,7 @@ def __init__(
+         hparams="",
+         drug_embeddings: Union[None, torch.nn.Embedding] = None,
+         use_drugs_idx=False,
++        append_layer_width=None,
+     ):
+         super(ComPert, self).__init__()
+         # set generic attributes
+@@ -241,11 +278,12 @@ def __init__(
+             "use_drugs_idx": use_drugs_idx,
+         }
+ 
+-        # set models
+         self.encoder = MLP(
+             [num_genes]
+             + [self.hparams["autoencoder_width"]] * self.hparams["autoencoder_depth"]
+-            + [self.hparams["dim"]]
++            + [self.hparams["dim"]],
++            append_layer_width=append_layer_width,
++            append_layer_position="first",
+         )
+ 
+         self.decoder = MLP(
+@@ -253,6 +291,8 @@ def __init__(
+             + [self.hparams["autoencoder_width"]] * self.hparams["autoencoder_depth"]
+             + [num_genes * 2],
+             last_layer_act=decoder_activation,
++            append_layer_width=2 * append_layer_width if append_layer_width else None,
++            append_layer_position="last",
+         )
+         if self.num_drugs > 0:
+             self.adversary_drugs = MLP(
+diff --git a/compert/seml_sweep_icb.py b/compert/seml_sweep_icb.py
+index 6b0ffa4..d391240 100644
+--- a/compert/seml_sweep_icb.py
++++ b/compert/seml_sweep_icb.py
+@@ -113,68 +113,95 @@ def init_model(
+         hparams: dict,
+         additional_params: dict,
+         load_pretrained: bool,
++        append_ae_layer: bool,
+         pretrained_model_path: str,
+         pretrained_model_hashes: dict,
+     ):
+ 
+         device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+-        self.autoencoder = ComPert(
+-            self.datasets["training"].num_genes,
+-            self.datasets["training"].num_drugs,
+-            self.datasets["training"].num_covariates,
+-            device=device,
+-            **additional_params,
+-            hparams=hparams,
+-            drug_embeddings=self.drug_embeddings,
+-            use_drugs_idx=self.dataset.use_drugs_idx,
+-        )
+-
+         if load_pretrained:
+-            filename = pretrained_model_hashes[self.embedding_model_type] + ".pt"
+-            filepath = Path(pretrained_model_path) / filename
++            state_dict, model_config = self.load_state_dict(
++                pretrained_model_hashes, pretrained_model_path, append_ae_layer
++            )
++            append_layer_width = (
++                self.datasets["training"].num_genes if append_ae_layer else None
++            )
++            in_out_size = (
++                model_config["num_genes"]
++                if append_ae_layer
++                else self.datasets["training"].num_genes
++            )
++            # idea: Reconstruct the ComPert model as pretrained (hence the "old" in_out_size)
++            # then add the append_layer (the "new" in_out_size)
++            self.autoencoder = ComPert(
++                in_out_size,
++                self.datasets["training"].num_drugs,
++                self.datasets["training"].num_covariates,
++                device=device,
++                **additional_params,
++                hparams=hparams,
++                drug_embeddings=self.drug_embeddings,
++                use_drugs_idx=self.dataset.use_drugs_idx,
++                append_layer_width=append_layer_width,
++            )
++            incomp_keys = self.autoencoder.load_state_dict(state_dict, strict=False)
+             logging.info(
+-                f"Loading pretrained {self.embedding_model_type} model from: {filepath}"
++                f"INCOMP_KEYS (make sure these contain what you expected):\n{incomp_keys}"
++            )
++        else:
++            self.autoencoder = ComPert(
++                self.datasets["training"].num_genes,
++                self.datasets["training"].num_drugs,
++                self.datasets["training"].num_covariates,
++                device=device,
++                **additional_params,
++                hparams=hparams,
++                drug_embeddings=self.drug_embeddings,
++                use_drugs_idx=self.dataset.use_drugs_idx,
++                append_layer_width=None,
+             )
+-            dumped_model = torch.load(filepath)
+-            if len(dumped_model) == 3:
+-                # old version
+-                state_dict, model_config, history = dumped_model
+-            else:
+-                # new version
+-                assert len(dumped_model) == 4
+-                (
+-                    state_dict,
+-                    adversary_cov_state_dicts,
+-                    model_config,
+-                    history,
+-                ) = dumped_model
+-
+-            # sanity check
+-            assert model_config["num_genes"] == self.datasets["training"].num_genes
+-            assert model_config["use_drugs_idx"]
+ 
++    def load_state_dict(
++        self, pretrained_model_hashes, pretrained_model_path, append_ae_layer
++    ):
++        filename = pretrained_model_hashes[self.embedding_model_type] + ".pt"
++        filepath = Path(pretrained_model_path) / filename
++        logging.info(
++            f"Loading pretrained {self.embedding_model_type} model from: {filepath}"
++        )
++        dumped_model = torch.load(filepath)
++        if len(dumped_model) == 3:
++            # old version
++            state_dict, model_config, history = dumped_model
++        else:
++            # new version
++            assert len(dumped_model) == 4
++            (
++                state_dict,
++                adversary_cov_state_dicts,
++                model_config,
++                history,
++            ) = dumped_model
++        # sanity check
++        if append_ae_layer:
++            assert model_config["num_genes"] < self.datasets["training"].num_genes
++        else:
++            assert model_config["num_genes"] == self.datasets["training"].num_genes
++        assert model_config["use_drugs_idx"]
++        keys = list(state_dict.keys())
++        for key in keys:
++            # remove all components which we will train from scratch
++            # the drug embedding is saved in the state_dict for some reason, but we don't need it
++            if key.startswith("adversary_drugs") or key == "drug_embeddings.weight":
++                state_dict.pop(key)
++        if self.embedding_model_type == "vanilla":
++            # for Vanilla CPA, we also train the amortized doser & drug_embedding_encoder anew
+             keys = list(state_dict.keys())
+             for key in keys:
+-                # remove all components which we will train from scratch
+-                # the drug embedding is saved in the state_dict for some reason, but we don't need it
+-                if key.startswith("adversary_drugs") or key == "drug_embeddings.weight":
++                if key.startswith("dosers") or key.startswith("drug_embedding_encoder"):
+                     state_dict.pop(key)
+-
+-            if self.embedding_model_type == "vanilla":
+-                # for Vanilla CPA, we also train the amortized doser & drug_embedding_encoder anew
+-                keys = list(state_dict.keys())
+-                for key in keys:
+-                    if key.startswith("dosers") or key.startswith(
+-                        "drug_embedding_encoder"
+-                    ):
+-                        state_dict.pop(key)
+-
+-            # load the state dict
+-            incomp_keys = self.autoencoder.load_state_dict(state_dict, strict=False)
+-            logging.info(
+-                f"INCOMP_KEYS (make sure these contain what you expected):\n{incomp_keys}"
+-            )
++        return state_dict, model_config
+ 
+     def update_datasets(self):
+         """
+diff --git a/preprocessing/sciplex_SMILES_v1.ipynb b/preprocessing/sciplex_SMILES_v1.ipynb
+index 8dd2b67..ab187b6 100644
+--- a/preprocessing/sciplex_SMILES_v1.ipynb
++++ b/preprocessing/sciplex_SMILES_v1.ipynb
+@@ -107,7 +107,7 @@
+    "outputs": [],
+    "source": [
+     "adata_out = PROJECT_DIR / 'datasets' / 'trapnell_cpa.h5ad'\n",
+-    "adata_out_subset = PROJECT_DIR / 'datasets' / 'trapnell_cpa_subsets.h5ad'"
++    "adata_out_subset = PROJECT_DIR / 'datasets' / 'trapnell_cpa_subset.h5ad'"
+    ]
+   },
+   {
+@@ -875,4 +875,4 @@
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+-}
++}
+\ No newline at end of file
+diff --git a/preprocessing/sciplex_SMILES_v1.py b/preprocessing/sciplex_SMILES_v1.py
+index 9c0a8a6..46b738e 100644
+--- a/preprocessing/sciplex_SMILES_v1.py
++++ b/preprocessing/sciplex_SMILES_v1.py
+@@ -55,7 +55,7 @@
+ 
+ # %%
+ adata_out = PROJECT_DIR / "datasets" / "trapnell_cpa.h5ad"
+-adata_out_subset = PROJECT_DIR / "datasets" / "trapnell_cpa_subsets.h5ad"
++adata_out_subset = PROJECT_DIR / "datasets" / "trapnell_cpa_subset.h5ad"
+ 
+ # %% [markdown]
+ # Overview over adata files
+diff --git a/simon/config_sciplex3_interactive.yaml b/simon/config_sciplex3_interactive.yaml
+index 6f9e54b..413e57c 100644
+--- a/simon/config_sciplex3_interactive.yaml
++++ b/simon/config_sciplex3_interactive.yaml
+@@ -29,6 +29,7 @@ fixed:
+   training.save_dir: sweeps/checkpoints
+ 
+   model.load_pretrained: True # if False, will initialize all weights randomly
++  model.append_ae_layer: True # if True, will add another layer to encoder & decoder to expand gene set
+   model.pretrained_model_path: /home/simon/Documents/ETH/Masters_thesis/chemical_CPA/sweeps/checkpoints
+ #  model.pretrained_model_path: /storage/groups/ml01/projects/2021_chemicalCPA_leon.hetzel/sweeps/checkpoints
+   model.pretrained_model_hashes: # seml config_hashes for the pretrained models for each embedding
+@@ -45,14 +46,14 @@ fixed:
+   model.additional_params.doser_type: amortized # non-linearity for doser function
+ 
+   dataset.dataset_type: trapnell
+-  dataset.data_params.dataset_path: /storage/groups/ml01/projects/2021_chemicalCPA_leon.hetzel/datasets/trapnell_cpa_subset_lincs_genes.h5ad # full path to the anndata dataset
++  dataset.data_params.dataset_path: datasets/trapnell_cpa_subsets.h5ad # full path to the anndata dataset
+   dataset.data_params.perturbation_key: condition # stores name of the drug
+   dataset.data_params.pert_category: cov_drug_dose_name # stores celltype_drugname_drugdose
+   dataset.data_params.dose_key: dose # stores drug dose as a float
+   dataset.data_params.covariate_keys: cell_type # necessary field for cell types. Fill it with a dummy variable if no celltypes present.
+   dataset.data_params.smiles_key: SMILES
+   dataset.data_params.degs_key: lincs_DEGs
+-  dataset.data_params.split_key: split # necessary field for train, test, ood splits.
++  dataset.data_params.split_key: split_ho_pathway # necessary field for train, test, ood splits.
+   dataset.data_params.use_drugs_idx: True
+ 
+   # fixed, bc we're transfer learning now
+diff --git a/simon/manual_training_seml_sweep.py b/simon/manual_training_seml_sweep.py
+index 4dc2fca..0bd986e 100644
+--- a/simon/manual_training_seml_sweep.py
++++ b/simon/manual_training_seml_sweep.py
+@@ -28,6 +28,7 @@
+         hparams=args["model"]["hparams"],
+         additional_params=args["model"]["additional_params"],
+         load_pretrained=args["model"]["load_pretrained"],
++        append_ae_layer=args["model"]["append_ae_layer"],
+         pretrained_model_path=args["model"]["pretrained_model_path"],
+         pretrained_model_hashes=args["model"]["pretrained_model_hashes"],
+     )

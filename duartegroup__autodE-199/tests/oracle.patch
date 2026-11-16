@@ -1,0 +1,680 @@
+diff --git a/autode/calculations/executors.py b/autode/calculations/executors.py
+index 851ae5b26..9efb42ca3 100644
+--- a/autode/calculations/executors.py
++++ b/autode/calculations/executors.py
+@@ -360,7 +360,7 @@ def run(self) -> None:
+         type_ = PRFOptimiser if self._calc_is_ts_opt else CRFOptimiser
+ 
+         self.optimiser = type_(
+-            init_alpha=0.1,  # Å
++            init_alpha=self._step_size,
+             maxiter=self._max_opt_cycles,
+             etol=self.etol,
+             gtol=self.gtol,
+@@ -433,7 +433,11 @@ def _max_opt_cycles(self) -> int:
+                 if isinstance(kwd, kws.MaxOptCycles)
+             )
+         except StopIteration:
+-            return 30
++            return 50
++
++    @property
++    def _step_size(self) -> float:
++        return 0.05 if self._calc_is_ts_opt else 0.1
+ 
+     @property
+     def _opt_trajectory_name(self) -> str:
+diff --git a/autode/config.py b/autode/config.py
+index 0f91f2d1d..9cf3e17ac 100644
+--- a/autode/config.py
++++ b/autode/config.py
+@@ -305,7 +305,7 @@ class NWChem:
+             grad=[def2svp, pbe0, "task dft gradient"],
+             low_sp=[def2svp, pbe0, "task dft energy"],
+             opt=[def2svp, pbe0, MaxOptCycles(100), "task dft gradient"],
+-            opt_ts=[def2svp, pbe0, "task dft gradient"],
++            opt_ts=[def2svp, pbe0, MaxOptCycles(50), "task dft gradient"],
+             hess=[def2svp, pbe0, "task dft freq"],
+             sp=[def2tzvp, pbe0, "task dft energy"],
+             ecp=def2ecp,
+diff --git a/autode/opt/coordinates/cartesian.py b/autode/opt/coordinates/cartesian.py
+index fc146bdd4..e674f5bad 100644
+--- a/autode/opt/coordinates/cartesian.py
++++ b/autode/opt/coordinates/cartesian.py
+@@ -89,3 +89,9 @@ def to(self, value: str) -> OptCoordinates:
+             raise ValueError(
+                 f"Cannot convert Cartesian coordinates to {value}"
+             )
++
++    @property
++    def expected_number_of_dof(self) -> int:
++        """Expected number of degrees of freedom for the system"""
++        n_atoms = len(self.flatten()) // 3
++        return 3 * n_atoms - 6
+diff --git a/autode/opt/coordinates/dic.py b/autode/opt/coordinates/dic.py
+index fd73fd689..48fbe574c 100644
+--- a/autode/opt/coordinates/dic.py
++++ b/autode/opt/coordinates/dic.py
+@@ -69,6 +69,13 @@ def _calc_U(primitives: PIC, x: "CartesianCoordinates") -> np.ndarray:
+         # of 3N - 6 non-redundant internals for a system of N atoms
+         idxs = np.where(np.abs(lambd) > 1e-10)[0]
+ 
++        if len(idxs) < x.expected_number_of_dof:
++            raise RuntimeError(
++                "Failed to create a complete set of delocalised internal "
++                f"coordinates. {len(idxs)} < 3 N_atoms - 6. Likely due to "
++                f"missing primitives"
++            )
++
+         logger.info(f"Removed {len(lambd) - len(idxs)} redundant vectors")
+         return u[:, idxs]
+ 
+@@ -248,6 +255,16 @@ def iadd(
+     def _allow_unconverged_back_transform(self) -> bool:
+         return True
+ 
++    @property
++    def active_indexes(self) -> List[int]:
++        """A list of indexes for the active modes in this coordinate set"""
++        return list(range(len(self)))
++
++    @property
++    def inactive_indexes(self) -> List[int]:
++        """A list of indexes for the non-active modes in this coordinate set"""
++        return []
++
+ 
+ class DICWithConstraints(DIC):
+     r"""
+@@ -434,7 +451,7 @@ def _schmidt_orthogonalise(arr: np.ndarray, *indexes: int) -> np.ndarray:
+     provide pure primitive coordinates, which can then be constrained simply
+     """
+     logger.info(
+-        f"Schmidt-orthogonalizing. Using {indexes} as " f"orthonormal vectors"
++        f"Schmidt-orthogonalizing. Using {indexes} as orthonormal vectors"
+     )
+ 
+     u = np.zeros_like(arr)
+diff --git a/autode/opt/optimisers/base.py b/autode/opt/optimisers/base.py
+index 5cc06757c..c13f27d14 100644
+--- a/autode/opt/optimisers/base.py
++++ b/autode/opt/optimisers/base.py
+@@ -1,3 +1,4 @@
++import os.path
+ import numpy as np
+ 
+ from abc import ABC, abstractmethod
+@@ -5,9 +6,10 @@
+ from autode.log import logger
+ from autode.utils import NumericStringDict
+ from autode.config import Config
+-from autode.values import GradientRMS, PotentialEnergy
++from autode.values import GradientRMS, PotentialEnergy, method_string
+ from autode.opt.coordinates.base import OptCoordinates
+ from autode.opt.optimisers.hessian_update import NullUpdate
++from autode.exceptions import CalculationException
+ 
+ 
+ class BaseOptimiser(ABC):
+@@ -213,7 +215,7 @@ def _update_gradient_and_energy(self) -> None:
+         grad.clean_up(force=True, everything=True)
+ 
+         if self._species.gradient is None:
+-            raise RuntimeError(
++            raise CalculationException(
+                 "Calculation failed to calculate a gradient. "
+                 "Cannot continue!"
+             )
+@@ -227,16 +229,43 @@ def _update_hessian_gradient_and_energy(self) -> None:
+         Update the energy, gradient and Hessian using the method. Will
+         transform from the current coordinates type to Cartesian coordinates
+         to perform the calculation, then back. Uses a numerical Hessian if
+-        analytic Hessians are not implemented for this method
++        analytic Hessians are not implemented for this method. Does not
++        perform a Hessian evaluation if the molecule's energy is evaluated
++        at the same level of theory that would be used for the Hessian
++        evaluation.
+ 
+         -----------------------------------------------------------------------
+         Raises:
+             (autode.exceptions.CalculationException):
+         """
++        should_calc_hessian = True
++
++        if (
++            _energy_method_string(self._species)
++            == method_string(self._method, self._method.keywords.hess)
++            and self._species.hessian is not None
++        ):
++            logger.info(
++                "Have a calculated the energy at the same level of "
++                "theory as this optimisation and a present Hessian. "
++                "Not calculating a new Hessian"
++            )
++            should_calc_hessian = False
++
+         self._update_gradient_and_energy()
+ 
++        if should_calc_hessian:
++            self._update_hessian()
++        else:
++            self._coords.update_h_from_cart_h(
++                self._species.hessian.to("Ha Å^-2")
++            )
++        return None
++
++    def _update_hessian(self) -> None:
++        """Update the Hessian of a species"""
+         species = self._species.new_species(
+-            name=f"{self._species.name}" f"_opt_{self.iteration}"
++            name=f"{self._species.name}_opt_{self.iteration}"
+         )
+         species.coordinates = self._coords.to("cartesian")
+ 
+@@ -247,8 +276,7 @@ def _update_hessian_gradient_and_energy(self) -> None:
+         )
+ 
+         self._species.hessian = species.hessian.copy()
+-        self._coords.update_h_from_cart_h(self._species.hessian)
+-        return None
++        self._coords.update_h_from_cart_h(self._species.hessian.to("Ha Å^-2"))
+ 
+     @property
+     def _space_has_degrees_of_freedom(self) -> bool:
+@@ -547,6 +575,10 @@ def save(self, filename: str) -> None:
+             f" maxiter = {self._maxiter}"
+         )
+ 
++        if os.path.exists(filename):
++            logger.warning(f"FIle {filename} existed. Overwriting")
++            open(filename, "w").close()
++
+         for i, coordinates in enumerate(self._history):
+ 
+             energy = coordinates.e
+@@ -839,3 +871,7 @@ def __call__(self, coordinates: OptCoordinates) -> Any:
+ 
+         logger.info("Calling callback function")
+         return self._f(coordinates, **self._kwargs)
++
++
++def _energy_method_string(species: "Species") -> str:
++    return "" if species.energy is None else species.energy.method_str
+diff --git a/autode/opt/optimisers/crfo.py b/autode/opt/optimisers/crfo.py
+index ff2ddb786..712e13e60 100644
+--- a/autode/opt/optimisers/crfo.py
++++ b/autode/opt/optimisers/crfo.py
+@@ -117,8 +117,18 @@ def _build_internal_coordinates(self):
+             )
+ 
+         cartesian_coords = CartesianCoordinates(self._species.coordinates)
++        primitives = self._primitives
++
++        if len(primitives) < cartesian_coords.expected_number_of_dof:
++            logger.info(
++                "Had an incomplete set of primitives. Adding "
++                "additional distances"
++            )
++            for i, j in combinations(range(self._species.n_atoms), 2):
++                primitives.append(Distance(i, j))
++
+         self._coords = DICWithConstraints.from_cartesian(
+-            x=cartesian_coords, primitives=self._primitives
++            x=cartesian_coords, primitives=primitives
+         )
+         self._coords.zero_lagrangian_multipliers()
+         return None
+@@ -127,7 +137,15 @@ def _build_internal_coordinates(self):
+     def _primitives(self) -> PIC:
+         """Primitive internal coordinates in this molecule"""
+         logger.info("Generating primitive internal coordinates")
+-        graph = self._species.graph
++        graph = self._species.graph.copy()
++
++        # Any distance constraints should also count as 'bonds' when forming
++        # the set of primitive internal coordinates, so that there is a
++        # single molecule if those distances are approaching dissociation
++        if self._species.constraints.distance is not None:
++            logger.info("Adding distance constraints as primitives")
++            for (i, j) in self._species.constraints.distance:
++                graph.add_edge(i, j)
+ 
+         pic = PIC()
+ 
+diff --git a/autode/opt/optimisers/prfo.py b/autode/opt/optimisers/prfo.py
+index 157b1d06d..bc3dfa9b0 100644
+--- a/autode/opt/optimisers/prfo.py
++++ b/autode/opt/optimisers/prfo.py
+@@ -1,14 +1,19 @@
+ """Partitioned rational function optimisation"""
+ import numpy as np
+ from autode.log import logger
+-from autode.opt.coordinates import CartesianCoordinates
+-from autode.opt.optimisers.rfo import RFOptimiser
++from autode.opt.optimisers.crfo import CRFOptimiser
+ from autode.opt.optimisers.hessian_update import BofillUpdate
++from autode.opt.coordinates.cartesian import CartesianCoordinates
++from autode.exceptions import CalculationException
+ 
+ 
+-class PRFOptimiser(RFOptimiser):
++class PRFOptimiser(CRFOptimiser):
+     def __init__(
+-        self, init_alpha: float = 0.1, imag_mode_idx: int = 0, *args, **kwargs
++        self,
++        init_alpha: float = 0.05,
++        recalc_hessian_every: int = 10,
++        *args,
++        **kwargs,
+     ):
+         """
+         Partitioned rational function optimiser (PRFO) using a maximum step
+@@ -17,7 +22,7 @@ def __init__(
+ 
+         -----------------------------------------------------------------------
+         Arguments:
+-            init_alpha: Maximum step size
++            init_alpha: Maximum step size (Å)
+ 
+             imag_mode_idx: Index of the imaginary mode to follow. Default = 0,
+                            the most imaginary mode (i.e. most negative
+@@ -29,77 +34,41 @@ def __init__(
+         super().__init__(*args, **kwargs)
+ 
+         self.alpha = float(init_alpha)
+-        self.imag_mode_idx = int(imag_mode_idx)
+-
++        self.recalc_hessian_every = int(recalc_hessian_every)
+         self._hessian_update_types = [BofillUpdate]
+ 
+     def _step(self) -> None:
+         """Partitioned rational function step"""
+ 
+-        self._coords.h = self._updated_h()
+-
+-        # Eigenvalues (\tilde{H}_kk in ref [1]) and eigenvectors (V in ref [1])
+-        # of the Hessian matrix
+-        lmda, v = np.linalg.eigh(self._coords.h)
++        if self.should_calculate_hessian:
++            self._update_hessian()
++        else:
++            self._coords.h = self._updated_h()
+ 
+-        if np.min(lmda) > 0:
+-            raise RuntimeError(
+-                "Hessian had no negative eigenvalues, cannot " "follow to a TS"
+-            )
++        idxs = list(range(len(self._coords)))
+ 
++        b, u = np.linalg.eigh(self._coords.h[:, idxs][idxs, :])
++        n_negative_eigenvalues = sum(lmda < 0 for lmda in b)
+         logger.info(
+-            f"Maximising along mode {self.imag_mode_idx} with "
+-            f"λ={lmda[self.imag_mode_idx]:.4f}"
+-        )
+-
+-        # Gradient in the eigenbasis of the Hessian. egn 49 in ref. 50
+-        g_tilde = np.matmul(v.T, self._coords.g)
+-
+-        # Initialised step in the Hessian eigenbasis
+-        s_tilde = np.zeros_like(g_tilde)
+-
+-        # For a step in Cartesian coordinates the Hessian will have zero
+-        # eigenvalues for translation/rotation - keep track of them
+-        non_zero_lmda = np.where(np.abs(lmda) > 1e-8)[0]
+-
+-        # Augmented Hessian 1 along the imaginary mode to maximise, with the
+-        # form (see eqn. 59 in ref [1]):
+-        #  (\tilde{H}_11  \tilde{g}_1) (\tilde{s}_1)  =      (\tilde{s}_1)
+-        #  (                         ) (           )  =  ν_R (           )
+-        #  (\tilde{g}_1        0     ) (    1      )         (     1     )
+-        #
+-        aug1 = np.array(
+-            [
+-                [lmda[self.imag_mode_idx], g_tilde[self.imag_mode_idx]],
+-                [g_tilde[self.imag_mode_idx], 0.0],
+-            ]
++            f"∇^2E has {n_negative_eigenvalues} negative "
++            f"eigenvalue(s). Should have 1"
+         )
+-        _, aug1_v = np.linalg.eigh(aug1)
+ 
+-        # component of the step along the imaginary mode is the first element
+-        # of the eigenvector with the largest eigenvalue (1), scaled by the
+-        # final element
+-        s_tilde[self.imag_mode_idx] = aug1_v[0, 1] / aug1_v[1, 1]
++        if n_negative_eigenvalues < 1:
++            raise CalculationException("Lost imaginary (TS) mode")
+ 
+-        # Augmented Hessian along all other modes with non-zero eigenvalues,
+-        # that are also not the imaginary mode to be followed
+-        non_mode_lmda = np.delete(non_zero_lmda, [self.imag_mode_idx])
++        f = u.T.dot(self._coords.g[idxs])
++        lambda_p = self._lambda_p_from_eigvals_and_gradient(b, f)
++        lambda_n = self._lambda_n_from_eigvals_and_gradient(b, f)
++        logger.info(f"Calculated λ_p=+{lambda_p:.8f}, λ_n={lambda_n:.8f}")
+ 
+-        # see eqn. 60 in ref. [1] for the structure of this matrix!
+-        augn = np.diag(np.concatenate((lmda[non_mode_lmda], np.zeros(1))))
+-        augn[:-1, -1] = g_tilde[non_mode_lmda]
+-        augn[-1, :-1] = g_tilde[non_mode_lmda]
++        delta_s = np.zeros(shape=(len(idxs),))
++        delta_s -= f[0] * u[:, 0] / (b[0] - lambda_p)
+ 
+-        _, augn_v = np.linalg.eigh(augn)
++        for j in range(1, len(idxs)):
++            delta_s -= f[j] * u[:, j] / (b[j] - lambda_n)
+ 
+-        # The step along all other components is then the all but the final
+-        # component of the eigenvector with the smallest eigenvalue (0)
+-        s_tilde[non_mode_lmda] = augn_v[:-1, 0] / augn_v[-1, 0]
+-
+-        # Transform back from the eigenbasis with eqn. 52 in ref [1]
+-        delta_s = np.matmul(v, s_tilde)
+-
+-        self._take_step_within_trust_radius(delta_s)
++        _ = self._take_step_within_trust_radius(delta_s)
+         return None
+ 
+     def _initialise_run(self) -> None:
+@@ -107,8 +76,15 @@ def _initialise_run(self) -> None:
+         Initialise running a partitioned rational function optimisation by
+         setting the coordinates and Hessian
+         """
++        # self._build_internal_coordinates()
+         self._coords = CartesianCoordinates(self._species.coordinates).to(
+             "dic"
+         )
+         self._update_hessian_gradient_and_energy()
+         return None
++
++    @property
++    def should_calculate_hessian(self) -> bool:
++        """Should an explicit Hessian calculation be performed?"""
++        n = self.iteration
++        return n > 1 and n % self.recalc_hessian_every == 0
+diff --git a/autode/species/species.py b/autode/species/species.py
+index 67c2d0093..b4b3ee43e 100644
+--- a/autode/species/species.py
++++ b/autode/species/species.py
+@@ -833,7 +833,6 @@ def _default_hessian_calculation(
+             keywords=HessianKeywords(keywords),
+             n_cores=Config.n_cores if n_cores is None else n_cores,
+         )
+-
+         return calc
+ 
+     def _default_opt_calculation(
+diff --git a/autode/transition_states/transition_state.py b/autode/transition_states/transition_state.py
+index 0d1618639..80a17fc75 100644
+--- a/autode/transition_states/transition_state.py
++++ b/autode/transition_states/transition_state.py
+@@ -43,6 +43,10 @@ def __init__(
+             mult=ts_guess.mult,
+         )
+ 
++        self.energy = ts_guess.energy
++        self.gradient = ts_guess.gradient
++        self.hessian = ts_guess.hessian
++
+         if bond_rearr is not None:
+             self.bond_rearrangement = bond_rearr
+ 
+@@ -85,15 +89,11 @@ def _run_opt_ts_calc(self, method, name_ext):
+             n_cores=Config.n_cores,
+             keywords=method.keywords.opt_ts,
+         )
+-        optts_calc.run()
+-
+-        if not optts_calc.optimisation_converged():
+-            optts_calc = self._reoptimise(optts_calc, name_ext, method)
+-
+         try:
+-            self.atoms = optts_calc.get_final_atoms()
+-            self.energy = optts_calc.get_energy()
+-            self.hessian = optts_calc.get_hessian()
++            optts_calc.run()
++
++            if not optts_calc.optimisation_converged():
++                self._reoptimise(optts_calc, name_ext, method)
+ 
+         except CalculationException:
+             logger.error("Transition state optimisation calculation failed")
+diff --git a/autode/values.py b/autode/values.py
+index 3c6089ad2..e611b2dee 100644
+--- a/autode/values.py
++++ b/autode/values.py
+@@ -300,22 +300,7 @@ def __init__(
+         super().__init__(value, units=units)
+ 
+         self.is_estimated = estimated
+-        self.method_str = ""
+-        self.set_method_str(method, keywords)
+-
+-    def set_method_str(
+-        self,
+-        method: Optional["autode.wrappers.methods.Method"],
+-        keywords: Optional["autode.wrappers.keywords.Keywords"],
+-    ) -> None:
+-        """
+-        Set the method string for a method and the keywords that were used
+-        to calculate it
+-        """
+-        self.method_str = (
+-            f"{method.name} " if method is not None else "unknown"
+-        )
+-        self.method_str += keywords.bstring if keywords is not None else ""
++        self.method_str = method_string(method, keywords)
+ 
+     def __repr__(self):
+         return f"Energy({round(self, 5)} {self.units.name})"
+@@ -339,6 +324,13 @@ def __eq__(self, other):
+ 
+         return abs(other - float(self.to("Ha"))) < tol_ha
+ 
++    def set_method_str(
++        self,
++        method: Optional["autode.wrappers.methods.Method"],
++        keywords: Optional["autode.wrappers.keywords.Keywords"],
++    ) -> None:
++        self.method_str = method_string(method, keywords)
++
+ 
+ class PotentialEnergy(Energy):
+     """Potential electronic energy (0 K, no zero-point energy)"""
+@@ -747,3 +739,15 @@ class EnergyArray(ValueArray):
+     def __repr__(self):
+         """Representation of the energies in a PES"""
+         return f"PES{self.ndim}d"
++
++
++def method_string(
++    method: Optional["autode.wrappers.methods.Method"],
++    keywords: Optional["autode.wrappers.keywords.Keywords"],
++) -> str:
++    """
++    Create a method string for a method and the keywords
++    """
++    method_str = f"{method.name} " if method is not None else "unknown"
++    method_str += keywords.bstring if keywords is not None else ""
++    return method_str
+diff --git a/doc/changelog.rst b/doc/changelog.rst
+index 1f215ddc8..8376c4501 100644
+--- a/doc/changelog.rst
++++ b/doc/changelog.rst
+@@ -8,9 +8,16 @@ Changelog
+ Bugfix release.
+ 
+ 
++Functionality improvements
++**************************
++- Adds skipping Hessian re-evaluation when using autodE optimisers if a molecules has a Hessian calculated at the same level of theory
++- Adds a Hessian recalculation frequency to :code:`autode.optimisers.PRFOptimiser`
++- Improves the default step size for TS optimising to be consistent with the ORCA default
++
+ Bug Fixes
+ *********
+-- Adds checking of SMILES-defined charge and multiplicity against user-specified values
++- Adds checking of SMILES-defined charge against the user-specified value
++- Fixes :code:`autode.optimisers.CRFOptimiser` building incomplete internal coordinates for partially or completely fragmented molecules
+ 
+ 
+ 1.3.2
+diff --git a/tests/test_opt/test_coordiantes.py b/tests/test_opt/test_coordiantes.py
+index d81334fe0..2b823bd1f 100644
+--- a/tests/test_opt/test_coordiantes.py
++++ b/tests/test_opt/test_coordiantes.py
+@@ -233,6 +233,8 @@ def test_cart_to_dic():
+     # as a copy, so changing the initial x should not change prev_x
+     assert id(dics._x) != id(x)
+ 
++    assert dics.inactive_indexes == []
++
+     x += 0.1
+     assert np.allclose(x, np.array([0.1, 0.1, 0.1, 2.1, 0.1, 0.1]))
+     assert not np.allclose(x, dics._x)
+@@ -743,3 +745,12 @@ def test_constrained_angle_equality():
+ 
+     b._theta0 = 0.0
+     assert a != b
++
++
++def test_dics_cannot_be_built_with_incomplete_primitives():
++
++    x = CartesianCoordinates(methane_mol().coordinates)
++    primitives = PIC(Distance(0, 1))
++
++    with pytest.raises(RuntimeError):
++        _ = DIC.from_cartesian(x=x, primitives=primitives)
+diff --git a/tests/test_opt/test_opt.py b/tests/test_opt/test_opt.py
+index 60c38f238..7db7c922d 100644
+--- a/tests/test_opt/test_opt.py
++++ b/tests/test_opt/test_opt.py
+@@ -4,6 +4,7 @@
+ 
+ from autode.methods import XTB
+ from autode.values import GradientRMS, PotentialEnergy
++from autode.hessians import Hessian
+ from autode.utils import work_in_tmp_dir
+ from ..testutils import requires_with_working_xtb_install
+ from .molecules import h2, methane_mol, h_atom
+@@ -295,3 +296,50 @@ def test_last_energy_change_less_than_two_steps():
+     optimiser.__class__ = UnconvergedHarmonicPotentialOptimiser
+     assert not optimiser.converged
+     assert not np.isfinite(optimiser.last_energy_change)
++
++
++class HessianInTesting(Hessian):
++    """Hessian with a different class, used for testing"""
++
++
++@work_in_tmp_dir()
++@requires_with_working_xtb_install
++def test_hessian_is_not_recalculated_if_present():
++
++    mol = h2()
++    xtb = XTB()
++
++    optimiser = CartesianSDOptimiser(
++        maxiter=1,
++        gtol=GradientRMS(0.01),
++        etol=PotentialEnergy(1e-3),
++    )
++    optimiser.run(species=mol, method=xtb, n_cores=1)
++
++    mol.calc_hessian(method=xtb)
++    mol.hessian.__class__ = HessianInTesting
++
++    # If the Hessian calculation is skipped then the class will be retained
++    optimiser._update_hessian_gradient_and_energy()
++    assert mol.hessian.__class__ == HessianInTesting
++
++
++@work_in_tmp_dir()
++@requires_with_working_xtb_install
++def test_multiple_optimiser_saves_overrides_not_append():
++
++    optimiser = CartesianSDOptimiser(
++        maxiter=2,
++        gtol=GradientRMS(0.01),
++        etol=PotentialEnergy(1e-3),
++    )
++    optimiser.run(method=XTB(), species=h2())
++    optimiser.save("tmp.traj")
++
++    def n_lines_in_traj_file():
++        return len(open("tmp.traj", "r").readlines())
++
++    n_init_lines = n_lines_in_traj_file()
++    optimiser.save("tmp.traj")
++
++    assert n_lines_in_traj_file() == n_init_lines
+diff --git a/tests/test_opt/test_prfo.py b/tests/test_opt/test_prfo.py
+index ae59a163d..ad12fe369 100644
+--- a/tests/test_opt/test_prfo.py
++++ b/tests/test_opt/test_prfo.py
+@@ -6,13 +6,19 @@
+ from autode.utils import work_in_tmp_dir
+ from ..testutils import requires_with_working_xtb_install
+ 
++xtb = XTB()
++
++
++def has_single_imag_freq_at_xtb_level(mol: Molecule) -> bool:
++    mol.calc_hessian(method=xtb)
++
++    return len(mol.imaginary_frequencies) == 1
++
+ 
+ @requires_with_working_xtb_install
+ @work_in_tmp_dir()
+ def test_sn2_opt():
+ 
+-    xtb = XTB()
+-
+     mol = Molecule(
+         name="sn2_ts",
+         charge=-1,
+@@ -30,9 +36,39 @@ def test_sn2_opt():
+     assert mol.is_implicitly_solvated
+ 
+     PRFOptimiser.optimise(mol, method=xtb, maxiter=10, init_alpha=0.02)
+-    mol.calc_hessian(method=xtb)
+ 
+-    assert len(mol.imaginary_frequencies) == 1
++    assert has_single_imag_freq_at_xtb_level(mol)
+     freq = mol.imaginary_frequencies[0]
+-
+     assert np.isclose(freq.to("cm-1"), -555, atol=20)
++
++
++@requires_with_working_xtb_install
++@work_in_tmp_dir()
++def test_diels_alder_ts_opt():
++
++    xyz_file_string = (
++        "16\n\n"
++        "C   -0.00246842   1.65107949   0.05871997\n"
++        "C    1.19010335   1.11169078   0.27709357\n"
++        "C    1.58518503  -0.30014150   0.31048716\n"
++        "C    0.05830748  -1.54292177  -0.45110322\n"
++        "C   -1.18801295  -1.07571606   0.14240225\n"
++        "C   -1.28206230   0.99883443  -0.23631125\n"
++        "H   -0.07432316   2.73634443   0.08639466\n"
++        "H    2.01755127   1.78921170   0.47735384\n"
++        "H    1.70502646  -0.70915918   1.30549866\n"
++        "H    2.40397525  -0.55376353  -0.34855409\n"
++        "H    0.44229481  -2.48695410  -0.08638411\n"
++        "H    0.15288739  -1.41865071  -1.51944246\n"
++        "H   -1.25409868  -1.13318437   1.21833314\n"
++        "H   -2.09996454  -1.35917816  -0.36714627\n"
++        "H   -2.09461648   1.29054940   0.41494506\n"
++        "H   -1.56001451   1.00182912  -1.28216692\n"
++    )
++    with open("init.xyz", "w") as file:
++        print(xyz_file_string, file=file)
++
++    mol = Molecule("init.xyz")
++    PRFOptimiser.optimise(mol, method=xtb, maxiter=50, init_alpha=0.05)
++    assert has_single_imag_freq_at_xtb_level(mol)
++    # print(mol.imaginary_frequencies)  # should be ~600 cm-1

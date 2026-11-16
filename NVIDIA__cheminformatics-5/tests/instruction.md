@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Change to tanimoto to match rdkit...
+
+## Description
+
+Added a new function to compute tanimoto distance similar to rdkit.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `2952bf1eaff9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

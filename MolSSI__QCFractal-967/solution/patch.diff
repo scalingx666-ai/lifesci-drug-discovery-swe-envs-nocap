@@ -1,0 +1,784 @@
+diff --git a/qcfractal/qcfractal/components/optimization/test_record_client.py b/qcfractal/qcfractal/components/optimization/test_record_client.py
+index f30728224..78e39037d 100644
+--- a/qcfractal/qcfractal/components/optimization/test_record_client.py
++++ b/qcfractal/qcfractal/components/optimization/test_record_client.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ import itertools
+-from typing import TYPE_CHECKING, Optional
++from typing import TYPE_CHECKING
+ 
+ import pytest
+ 
+@@ -287,10 +287,10 @@ def test_optimization_client_traj(snowflake: QCATestingSnowflake, opt_file: str,
+     if fetch_traj:
+         rec._fetch_trajectory()
+         assert rec.trajectory_ids_ is not None
+-        assert rec._trajectory_records is not None
++        assert rec.trajectory_records_ is not None
+     else:
+         assert rec.trajectory_ids_ is None
+-        assert rec._trajectory_records is None
++        assert rec.trajectory_records_ is None
+ 
+     assert rec.trajectory_element(0).id == rec_traj.trajectory[0].id
+     assert rec.trajectory_element(-1).id == rec_traj.trajectory[-1].id
+diff --git a/qcportal/qcportal/cache.py b/qcportal/qcportal/cache.py
+index 8965b05e8..d1b37e841 100644
+--- a/qcportal/qcportal/cache.py
++++ b/qcportal/qcportal/cache.py
+@@ -10,18 +10,21 @@
+ from urllib.parse import urlparse
+ 
+ import apsw
++import msgpack
+ 
+ from .utils import chunk_iterable
+ 
+ try:
+     import pydantic.v1 as pydantic
+     from pydantic.v1 import BaseModel, Extra, validator, PrivateAttr, Field
++    from pydantic.v1.json import pydantic_encoder
+ except ImportError:
+     import pydantic
+     from pydantic import BaseModel, Extra, validator, PrivateAttr, Field
++    from pydantic.json import pydantic_encoder
+ import zstandard
+ 
+-from .serialization import serialize, deserialize
++from .serialization import serialize, deserialize, _msgpack_encode
+ 
+ if TYPE_CHECKING:
+     from qcportal.record_models import RecordStatusEnum
+@@ -33,8 +36,19 @@
+ _query_chunk_size = 125
+ 
+ 
++def _msgpack_encode_cache(obj: Any) -> Any:
++    # Similar to msgpack_encode in serialization, however
++    # does NOT include child records
++
++    # Importing BaseRecord is a circular dependency :(
++    if hasattr(obj, "get_cache_dict"):
++        return obj.get_cache_dict(exclude_unset=True, by_alias=True)
++    else:
++        return _msgpack_encode(obj)
++
++
+ def compress_for_cache(data: Any) -> bytes:
+-    serialized_data = serialize(data, "msgpack")
++    serialized_data = msgpack.dumps(data, default=_msgpack_encode_cache, use_bin_type=True)
+     compressed_data = zstandard.compress(serialized_data, level=1)
+     return compressed_data
+ 
+diff --git a/qcportal/qcportal/gridoptimization/record_models.py b/qcportal/qcportal/gridoptimization/record_models.py
+index 010e6570b..19b149529 100644
+--- a/qcportal/qcportal/gridoptimization/record_models.py
++++ b/qcportal/qcportal/gridoptimization/record_models.py
+@@ -210,16 +210,20 @@ class GridoptimizationRecord(BaseRecord):
+     starting_molecule_: Optional[Molecule] = Field(None, alias="starting_molecule")
+     optimizations_: Optional[List[GridoptimizationOptimization]] = Field(None, alias="optimizations")
+ 
+-    ########################################
+-    # Caches
+-    ########################################
+-    _optimizations_cache: Optional[Dict[Any, OptimizationRecord]] = PrivateAttr(None)
++    ##############################################
++    # Fields with child records
++    # (generally not received from the server)
++    ##############################################
++    optimization_records_: Optional[Dict[Any, OptimizationRecord]] = Field(None, alias="optimizations_records")
++
++    # Actual mapping, with tuples as keys. These will point to the same lists & records as above
++    _optimization_map: Optional[Dict[Any, OptimizationRecord]] = PrivateAttr(None)
+ 
+     def propagate_client(self, client, base_url_prefix: Optional[str]):
+         BaseRecord.propagate_client(self, client, base_url_prefix)
+ 
+-        if self._optimizations_cache is not None:
+-            for opt in self._optimizations_cache.values():
++        if self.optimization_records_ is not None:
++            for opt in self.optimization_records_.values():
+                 opt.propagate_client(client, base_url_prefix)
+ 
+     @classmethod
+@@ -259,12 +263,12 @@ def _fetch_children_multi(
+ 
+             for r in records:
+                 if r.optimizations_ is None:
+-                    r._optimizations_cache = None
++                    r._optimization_map = None
+                 else:
+-                    r._optimizations_cache = {}
+-                    for go_opt in r.optimizations_:
+-                        key = deserialize_key(go_opt.key)
+-                        r._optimizations_cache[key] = opt_map[go_opt.optimization_id]
++                    r.optimization_records_ = {
++                        go_opt.key: opt_map[go_opt.optimization_id] for go_opt in r.optimizations_
++                    }
++                    r._optimization_map = {deserialize_key(k): v for k, v in r.optimization_records_.items()}
+ 
+                 r.propagate_client(r._client, base_url_prefix)
+ 
+@@ -287,6 +291,9 @@ def _fetch_optimizations(self):
+ 
+         self.fetch_children(["optimizations"])
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        return self.dict(exclude={"optimization_records_"}, **kwargs)
++
+     @property
+     def initial_molecule(self) -> Molecule:
+         if self.initial_molecule_ is None:
+@@ -301,15 +308,19 @@ def starting_molecule(self) -> Optional[Molecule]:
+ 
+     @property
+     def optimizations(self) -> Dict[Any, OptimizationRecord]:
+-        if self._optimizations_cache is None:
++        if self.optimization_records_ is None:
+             self._fetch_optimizations()
+-        return self._optimizations_cache
++
++        if self._optimization_map is None:
++            self._optimization_map = {deserialize_key(k): v for k, v in self.optimization_records_.items()}
++
++        return self._optimization_map
+ 
+     @property
+     def preoptimization(self) -> Optional[OptimizationRecord]:
+-        if self._optimizations_cache is None:
++        if self.optimization_records_ is None:
+             self._fetch_optimizations()
+-        return self._optimizations_cache.get("preoptimization", None)
++        return self.optimization_records_.get("preoptimization", None)
+ 
+     @property
+     def final_energies(self) -> Dict[Tuple[int, ...], float]:
+diff --git a/qcportal/qcportal/gridoptimization/test_record_models.py b/qcportal/qcportal/gridoptimization/test_record_models.py
+index fe04c8b5d..aa8cff4d5 100644
+--- a/qcportal/qcportal/gridoptimization/test_record_models.py
++++ b/qcportal/qcportal/gridoptimization/test_record_models.py
+@@ -33,12 +33,12 @@ def test_gridoptimization_record_model(snowflake: QCATestingSnowflake, includes:
+         assert record.offline
+ 
+         # children have all data fetched
+-        assert all(x.initial_molecule_ is not None for x in record._optimizations_cache.values())
+-        assert all(x.final_molecule_ is not None for x in record._optimizations_cache.values())
++        assert all(x.initial_molecule_ is not None for x in record.optimization_records_.values())
++        assert all(x.final_molecule_ is not None for x in record.optimization_records_.values())
+     else:
+         assert record.initial_molecule_ is None
+         assert record.optimizations_ is None
+-        assert record._optimizations_cache is None
++        assert record.optimization_records_ is None
+ 
+     assert record.id == rec_id
+     assert record.status == RecordStatusEnum.complete
+diff --git a/qcportal/qcportal/manybody/record_models.py b/qcportal/qcportal/manybody/record_models.py
+index c373572fe..2b69a7c79 100644
+--- a/qcportal/qcportal/manybody/record_models.py
++++ b/qcportal/qcportal/manybody/record_models.py
+@@ -4,9 +4,9 @@
+ from typing import List, Union, Optional, Dict, Any, Iterable
+ 
+ try:
+-    from pydantic.v1 import BaseModel, Extra, validator, constr, PrivateAttr, Field
++    from pydantic.v1 import BaseModel, Extra, validator, constr, Field
+ except ImportError:
+-    from pydantic import BaseModel, Extra, validator, constr, PrivateAttr, Field
++    from pydantic import BaseModel, Extra, validator, constr, Field
+ from typing_extensions import Literal
+ 
+ from qcportal.base_models import RestModelBase
+@@ -94,16 +94,17 @@ class ManybodyRecord(BaseRecord):
+     initial_molecule_: Optional[Molecule] = Field(None, alias="initial_molecule")
+     clusters_meta_: Optional[List[ManybodyClusterMeta]] = Field(None, alias="clusters")
+ 
+-    ########################################
+-    # Caches
+-    ########################################
+-    _clusters: Optional[List[ManybodyCluster]] = PrivateAttr(None)
++    ##############################################
++    # Fields with child records
++    # (generally not received from the server)
++    ##############################################
++    cluster_records_: Optional[List[ManybodyCluster]] = Field(None, alias="cluster_records")
+ 
+     def propagate_client(self, client, base_url_prefix: Optional[str]):
+         BaseRecord.propagate_client(self, client, base_url_prefix)
+ 
+-        if self._clusters is not None:
+-            for cluster in self._clusters:
++        if self.cluster_records_ is not None:
++            for cluster in self.cluster_records_:
+                 if cluster.singlepoint_record:
+                     cluster.singlepoint_record.propagate_client(client, base_url_prefix)
+ 
+@@ -140,16 +141,16 @@ def _fetch_children_multi(
+ 
+             for r in records:
+                 if r.clusters_meta_ is None:
+-                    r._clusters = None
++                    r.cluster_records_ = None
+                 else:
+-                    r._clusters = []
++                    r.cluster_records_ = []
+                     for cm in r.clusters_meta_:
+                         cluster = ManybodyCluster(**cm.dict())
+ 
+                         if cluster.singlepoint_id is not None:
+                             cluster.singlepoint_record = sp_map[cluster.singlepoint_id]
+ 
+-                        r._clusters.append(cluster)
++                        r.cluster_records_.append(cluster)
+ 
+                 r.propagate_client(client, base_url_prefix)
+ 
+@@ -168,6 +169,9 @@ def _fetch_clusters(self):
+ 
+         self.fetch_children(["clusters"])
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        return self.dict(exclude={"cluster_records_"}, **kwargs)
++
+     @property
+     def initial_molecule(self) -> Molecule:
+         if self.initial_molecule_ is None:
+@@ -176,6 +180,6 @@ def initial_molecule(self) -> Molecule:
+ 
+     @property
+     def clusters(self) -> List[ManybodyCluster]:
+-        if self._clusters is None:
++        if self.cluster_records_ is None:
+             self._fetch_clusters()
+-        return self._clusters
++        return self.cluster_records_
+diff --git a/qcportal/qcportal/manybody/test_record_models.py b/qcportal/qcportal/manybody/test_record_models.py
+index dd564fcd0..4a331338c 100644
+--- a/qcportal/qcportal/manybody/test_record_models.py
++++ b/qcportal/qcportal/manybody/test_record_models.py
+@@ -28,7 +28,7 @@ def test_manybody_record_model(snowflake: QCATestingSnowflake, includes: Optiona
+     if includes is not None:
+         assert record.initial_molecule_ is not None
+         assert record.clusters_meta_ is not None
+-        assert record._clusters is not None
++        assert record.cluster_records_ is not None
+         record.propagate_client(None, None)
+         assert record.offline
+ 
+@@ -41,7 +41,7 @@ def test_manybody_record_model(snowflake: QCATestingSnowflake, includes: Optiona
+     else:
+         assert record.initial_molecule_ is None
+         assert record.clusters_meta_ is None
+-        assert record._clusters is None
++        assert record.cluster_records_ is None
+ 
+     assert record.id == rec_id
+     assert record.status == RecordStatusEnum.complete
+diff --git a/qcportal/qcportal/neb/record_models.py b/qcportal/qcportal/neb/record_models.py
+index 7d16f1610..589776bbd 100644
+--- a/qcportal/qcportal/neb/record_models.py
++++ b/qcportal/qcportal/neb/record_models.py
+@@ -1,11 +1,11 @@
+ from __future__ import annotations
+ 
+-from typing import List, Optional, Union, Dict, Iterable
++from typing import List, Optional, Union, Dict, Iterable, Any
+ 
+ try:
+-    from pydantic.v1 import BaseModel, Field, Extra, root_validator, constr, validator, PrivateAttr
++    from pydantic.v1 import BaseModel, Field, Extra, root_validator, constr, validator
+ except ImportError:
+-    from pydantic import BaseModel, Field, Extra, root_validator, constr, validator, PrivateAttr
++    from pydantic import BaseModel, Field, Extra, root_validator, constr, validator
+ from typing_extensions import Literal
+ 
+ from qcportal.base_models import RestModelBase
+@@ -147,22 +147,23 @@ class NEBRecord(BaseRecord):
+     neb_result_: Optional[Molecule] = Field(None, alias="neb_result")
+     initial_chain_: Optional[List[Molecule]] = Field(None, alias="initial_chain")
+ 
+-    ########################################
+-    # Caches
+-    ########################################
+-    _optimizations_cache: Optional[Dict[str, OptimizationRecord]] = PrivateAttr(None)
+-    _singlepoints_cache: Optional[Dict[int, List[SinglepointRecord]]] = PrivateAttr(None)
+-    _ts_hessian: Optional[SinglepointRecord] = PrivateAttr(None)
++    ##############################################
++    # Fields with child records
++    # (generally not received from the server)
++    ##############################################
++    optimization_records_: Optional[Dict[str, OptimizationRecord]] = Field(None, field="optimization_records")
++    singlepoint_records_: Optional[Dict[int, List[SinglepointRecord]]] = Field(None, field="singlepoint_records")
++    ts_hessian_: Optional[SinglepointRecord] = Field(None, field="ts_hessian")
+ 
+     def propagate_client(self, client, base_url_prefix: Optional[str]):
+         BaseRecord.propagate_client(self, client, base_url_prefix)
+ 
+-        if self._optimizations_cache is not None:
+-            for opt in self._optimizations_cache.values():
++        if self.optimization_records_ is not None:
++            for opt in self.optimization_records_.values():
+                 opt.propagate_client(client, base_url_prefix)
+ 
+-        if self._singlepoints_cache is not None:
+-            for splist in self._singlepoints_cache.values():
++        if self.singlepoint_records_ is not None:
++            for splist in self.singlepoint_records_.values():
+                 for sp2 in splist:
+                     sp2.propagate_client(client, base_url_prefix)
+ 
+@@ -221,25 +222,25 @@ def _fetch_children_multi(
+ 
+         for r in records:
+             if r.optimizations_ is None:
+-                r._optimizations_cache = None
++                r.optimization_records_ = None
+             elif do_opt:
+-                r._optimizations_cache = dict()
++                r.optimization_records_ = dict()
+                 for opt_key, opt_info in r.optimizations_.items():
+-                    r._optimizations_cache[opt_key] = opt_map[opt_info.optimization_id]
++                    r.optimization_records_[opt_key] = opt_map[opt_info.optimization_id]
+ 
+             if r.singlepoints_ is None:
+-                r._singlepoints_cache = None
++                r.singlepoint_records_ = None
+             elif do_sp:
+-                r._singlepoints_cache = dict()
++                r.singlepoint_records_ = dict()
+                 for sp_info in r.singlepoints_:
+-                    r._singlepoints_cache.setdefault(sp_info.chain_iteration, list())
+-                    r._singlepoints_cache[sp_info.chain_iteration].append(sp_map[sp_info.singlepoint_id])
++                    r.singlepoint_records_.setdefault(sp_info.chain_iteration, list())
++                    r.singlepoint_records_[sp_info.chain_iteration].append(sp_map[sp_info.singlepoint_id])
+ 
+-                if len(r._singlepoints_cache) > 0:
+-                    if len(r._singlepoints_cache[max(r._singlepoints_cache)]) == 1:
+-                        _, temp_list = r._singlepoints_cache.popitem()
+-                        r._ts_hessian = temp_list[0]
+-                        assert r._ts_hessian.specification.driver == "hessian"
++                if len(r.singlepoint_records_) > 0:
++                    if len(r.singlepoint_records_[max(r.singlepoint_records_)]) == 1:
++                        _, temp_list = r.singlepoint_records_.popitem()
++                        r.ts_hessian_ = temp_list[0]
++                        assert r.ts_hessian_.specification.driver == "hessian"
+ 
+             r.propagate_client(r._client, base_url_prefix)
+ 
+@@ -286,6 +287,9 @@ def _fetch_neb_result(self):
+                 Optional[Molecule],
+             )
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        return self.dict(exclude={"optimization_records_", "singlepoint_records_", "ts_hessian_"}, **kwargs)
++
+     @property
+     def initial_chain(self) -> List[Molecule]:
+         if self.initial_chain_ is None:
+@@ -298,9 +302,9 @@ def final_chain(self) -> List[SinglepointRecord]:
+ 
+     @property
+     def singlepoints(self) -> Dict[int, List[SinglepointRecord]]:
+-        if self._singlepoints_cache is None:
++        if self.singlepoint_records_ is None:
+             self._fetch_singlepoints()
+-        return self._singlepoints_cache
++        return self.singlepoint_records_
+ 
+     @property
+     def result(self):
+@@ -310,9 +314,9 @@ def result(self):
+ 
+     @property
+     def optimizations(self) -> Optional[Dict[str, OptimizationRecord]]:
+-        if self._optimizations_cache is None:
++        if self.optimization_records_ is None:
+             self._fetch_optimizations()
+-        return self._optimizations_cache
++        return self.optimization_records_
+ 
+     @property
+     def ts_optimization(self) -> Optional[OptimizationRecord]:
+@@ -320,6 +324,6 @@ def ts_optimization(self) -> Optional[OptimizationRecord]:
+ 
+     @property
+     def ts_hessian(self) -> Optional[SinglepointRecord]:
+-        if self._singlepoints_cache is None:
++        if self.singlepoint_records_ is None:
+             self._fetch_singlepoints()
+-        return self._ts_hessian
++        return self.ts_hessian_
+diff --git a/qcportal/qcportal/optimization/record_models.py b/qcportal/qcportal/optimization/record_models.py
+index 025ee4657..4cd1c2736 100644
+--- a/qcportal/qcportal/optimization/record_models.py
++++ b/qcportal/qcportal/optimization/record_models.py
+@@ -4,9 +4,9 @@
+ from typing import Optional, Union, Any, List, Dict
+ 
+ try:
+-    from pydantic.v1 import BaseModel, Field, constr, validator, Extra, PrivateAttr
++    from pydantic.v1 import BaseModel, Field, constr, validator, Extra
+ except ImportError:
+-    from pydantic import BaseModel, Field, constr, validator, Extra, PrivateAttr
++    from pydantic import BaseModel, Field, constr, validator, Extra
+ from qcelemental.models import Molecule
+ from qcelemental.models.procedures import (
+     OptimizationResult,
+@@ -63,10 +63,11 @@ class OptimizationRecord(BaseRecord):
+     final_molecule_: Optional[Molecule] = Field(None, alias="final_molecule")
+     trajectory_ids_: Optional[List[int]] = Field(None, alias="trajectory_ids")
+ 
+-    ########################################
+-    # Caches
+-    ########################################
+-    _trajectory_records: Optional[List[SinglepointRecord]] = PrivateAttr(None)
++    ##############################################
++    # Fields with child records
++    # (generally not received from the server)
++    ##############################################
++    trajectory_records_: Optional[List[SinglepointRecord]] = Field(None, alias="trajectory_records")
+ 
+     @classmethod
+     def _fetch_children_multi(
+@@ -105,16 +106,16 @@ def _fetch_children_multi(
+ 
+             for r in records:
+                 if r.trajectory_ids_ is None:
+-                    r._trajectory_records = None
++                    r.trajectory_records_ = None
+                 else:
+-                    r._trajectory_records = [sp_map[x] for x in r.trajectory_ids_]
++                    r.trajectory_records_ = [sp_map[x] for x in r.trajectory_ids_]
+                 r.propagate_client(r._client, base_url_prefix)
+ 
+     def propagate_client(self, client, base_url_prefix: Optional[str]):
+         BaseRecord.propagate_client(self, client, base_url_prefix)
+ 
+-        if self._trajectory_records is not None:
+-            for sp in self._trajectory_records:
++        if self.trajectory_records_ is not None:
++            for sp in self.trajectory_records_:
+                 sp.propagate_client(client, base_url_prefix)
+ 
+     def _fetch_initial_molecule(self):
+@@ -137,6 +138,9 @@ def _fetch_trajectory(self):
+ 
+         self.fetch_children(["trajectory"])
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        return self.dict(exclude={"trajectory_records_"}, **kwargs)
++
+     @property
+     def initial_molecule(self) -> Molecule:
+         if self.initial_molecule_ is None:
+@@ -151,13 +155,13 @@ def final_molecule(self) -> Optional[Molecule]:
+ 
+     @property
+     def trajectory(self) -> Optional[List[SinglepointRecord]]:
+-        if self._trajectory_records is None:
++        if self.trajectory_records_ is None:
+             self._fetch_trajectory()
+-        return self._trajectory_records
++        return self.trajectory_records_
+ 
+     def trajectory_element(self, trajectory_index: int) -> SinglepointRecord:
+-        if self._trajectory_records is not None:
+-            return self._trajectory_records[trajectory_index]
++        if self.trajectory_records_ is not None:
++            return self.trajectory_records_[trajectory_index]
+         else:
+             self._assert_online()
+ 
+diff --git a/qcportal/qcportal/reaction/record_models.py b/qcportal/qcportal/reaction/record_models.py
+index 236c4118d..a295f5ff8 100644
+--- a/qcportal/qcportal/reaction/record_models.py
++++ b/qcportal/qcportal/reaction/record_models.py
+@@ -1,11 +1,11 @@
+ from __future__ import annotations
+ 
+-from typing import List, Union, Optional, Tuple, Iterable
++from typing import List, Union, Optional, Tuple, Iterable, Dict, Any
+ 
+ try:
+-    from pydantic.v1 import BaseModel, Extra, root_validator, constr, PrivateAttr, Field
++    from pydantic.v1 import BaseModel, Extra, root_validator, constr, Field
+ except ImportError:
+-    from pydantic import BaseModel, Extra, root_validator, constr, PrivateAttr, Field
++    from pydantic import BaseModel, Extra, root_validator, constr, Field
+ from typing_extensions import Literal
+ 
+ from qcportal.base_models import RestModelBase
+@@ -101,16 +101,17 @@ class ReactionRecord(BaseRecord):
+     ######################################################
+     components_meta_: Optional[List[ReactionComponentMeta]] = Field(None, alias="components")
+ 
+-    ########################################
+-    # Caches
+-    ########################################
+-    _components: Optional[List[ReactionComponent]] = PrivateAttr(None)
++    ##############################################
++    # Fields with child records
++    # (generally not received from the server)
++    ##############################################
++    component_records_: Optional[List[ReactionComponent]] = Field(None, alias="component_records")
+ 
+     def propagate_client(self, client, base_url_prefix: Optional[str]):
+         BaseRecord.propagate_client(self, client, base_url_prefix)
+ 
+-        if self._components is not None:
+-            for comp in self._components:
++        if self.component_records_ is not None:
++            for comp in self.component_records_:
+                 if comp.singlepoint_record:
+                     comp.singlepoint_record.propagate_client(self._client, base_url_prefix)
+                 if comp.optimization_record:
+@@ -167,9 +168,9 @@ def _fetch_children_multi(
+ 
+             for r in records:
+                 if r.components_meta_ is None:
+-                    r._components = None
++                    r.component_records_ = None
+                 else:
+-                    r._components = []
++                    r.component_records_ = []
+                     for cm in r.components_meta_:
+                         rc = ReactionComponent(**cm.dict())
+ 
+@@ -178,7 +179,7 @@ def _fetch_children_multi(
+                         if rc.optimization_id is not None:
+                             rc.optimization_record = opt_map[rc.optimization_id]
+ 
+-                        r._components.append(rc)
++                        r.component_records_.append(rc)
+ 
+                 r.propagate_client(r._client, base_url_prefix)
+ 
+@@ -195,8 +196,11 @@ def _fetch_components(self):
+ 
+         self.fetch_children(["components"])
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        return self.dict(exclude={"component_records_"}, **kwargs)
++
+     @property
+     def components(self) -> List[ReactionComponent]:
+-        if self._components is None:
++        if self.component_records_ is None:
+             self._fetch_components()
+-        return self._components
++        return self.component_records_
+diff --git a/qcportal/qcportal/reaction/test_record_models.py b/qcportal/qcportal/reaction/test_record_models.py
+index eeb4a58e6..f27e2697d 100644
+--- a/qcportal/qcportal/reaction/test_record_models.py
++++ b/qcportal/qcportal/reaction/test_record_models.py
+@@ -28,7 +28,7 @@ def test_reaction_record_model(snowflake: QCATestingSnowflake, includes: Optiona
+ 
+     if includes is not None:
+         assert record.components_meta_ is not None
+-        assert record._components is not None
++        assert record.component_records_ is not None
+         record.propagate_client(None, None)
+         assert record.offline
+ 
+@@ -45,7 +45,7 @@ def test_reaction_record_model(snowflake: QCATestingSnowflake, includes: Optiona
+                 assert c.optimization_record.comments_ is not None
+     else:
+         assert record.components_meta_ is None
+-        assert record._components is None
++        assert record.component_records_ is None
+ 
+     assert record.id == rec_id
+     assert record.status == RecordStatusEnum.complete
+diff --git a/qcportal/qcportal/record_models.py b/qcportal/qcportal/record_models.py
+index 8a438f50f..039491121 100644
+--- a/qcportal/qcportal/record_models.py
++++ b/qcportal/qcportal/record_models.py
+@@ -568,6 +568,19 @@ def sync_to_cache(self, detach: bool = False):
+         if detach:
+             self._record_cache = None
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        """
++        Returns a dictionary of the record meant for caching
++
++        When a record is stored in the cache, it is stored without child records (which
++        are in the cache under their own keys). This function returns a dictionary that
++        excludes those children.
++
++        kwargs are passed directly to the pydantic `dict()` function.
++        """
++
++        return self.dict(**kwargs)
++
+     def __str__(self) -> str:
+         return f"<{self.__class__.__name__} id={self.id} status={self.status}>"
+ 
+diff --git a/qcportal/qcportal/torsiondrive/record_models.py b/qcportal/qcportal/torsiondrive/record_models.py
+index d9221357f..051a0e832 100644
+--- a/qcportal/qcportal/torsiondrive/record_models.py
++++ b/qcportal/qcportal/torsiondrive/record_models.py
+@@ -153,11 +153,15 @@ class TorsiondriveRecord(BaseRecord):
+     optimizations_: Optional[List[TorsiondriveOptimization]] = Field(None, alias="optimizations")
+     minimum_optimizations_: Optional[Dict[str, int]] = Field(None, alias="minimum_optimizations")
+ 
+-    ########################################
+-    # Caches
+-    ########################################
+-    _optimizations_cache: Optional[Dict[Any, List[OptimizationRecord]]] = PrivateAttr(None)
+-    _minimum_optimizations_cache: Optional[Dict[Any, OptimizationRecord]] = PrivateAttr(None)
++    ##############################################
++    # Fields with child records
++    # (generally not received from the server)
++    ##############################################
++    optimization_records_: Optional[Dict[str, List[OptimizationRecord]]] = Field(None, alias="optimization_records")
++
++    # Actual mapping, with tuples as keys. These will point to the same lists & records as above
++    _optimization_map: Optional[Dict[Any, List[OptimizationRecord]]] = PrivateAttr(None)
++    _minimum_optimization_map: Optional[Dict[Any, OptimizationRecord]] = PrivateAttr(None)
+ 
+     @classmethod
+     def _fetch_children_multi(
+@@ -197,34 +201,42 @@ def _fetch_children_multi(
+ 
+         for r in records:
+             if do_opt:
+-                r._optimizations_cache = None
++                r.optimization_records_ = None
++                r._optimization_map = None
+             if do_minopt or do_opt:
+-                r._minimum_optimizations_cache = None
++                r._minimum_optimization_map = None
+ 
+             if r.optimizations_ is None and r.minimum_optimizations_ is None:
++                # Bail out early, leaving those fields as None
+                 continue
+ 
+             if do_opt and r.optimizations_ is not None:
+-                r._optimizations_cache = {}
++                r.optimization_records_ = {}
++                r._optimization_map = {}
+                 for td_opt in r.optimizations_:
++                    # optimization_records_ uses the string key
++                    r.optimization_records_.setdefault(td_opt.key, list())
++                    r.optimization_records_[td_opt.key].append(opt_map[td_opt.optimization_id])
++
++                    # maps use tuples or strings
+                     key = deserialize_key(td_opt.key)
+-                    r._optimizations_cache.setdefault(key, list())
+-                    r._optimizations_cache[key].append(opt_map[td_opt.optimization_id])
++                    r._optimization_map.setdefault(key, list())
++                    r._optimization_map[key].append(opt_map[td_opt.optimization_id])
+ 
+             if r.minimum_optimizations_ is None and r.optimizations_ is not None and do_opt:
+                 # find the minimum optimizations for each key from what we have in the optimizations
+                 # chooses the lowest id if there are records with the same energy
+                 r.minimum_optimizations_ = {}
+-                for k, v in r._optimizations_cache.items():
++                for str_key, rec_list in r.optimization_records_.items():
+                     # Remove any optimizations without energies
+-                    v2 = [x for x in v if x.energies]
++                    v2 = [x for x in rec_list if x.energies]
+                     if v2:
+                         lowest_opt = min(v2, key=lambda x: (x.energies[-1], x.id))
+-                        r.minimum_optimizations_[serialize_key(k)] = lowest_opt.id
++                        r.minimum_optimizations_[str_key] = lowest_opt.id
+ 
+-            if do_minopt or do_opt and r.minimum_optimizations_ is not None:  # either from the server or from above
+-                r._minimum_optimizations_cache = {
+-                    deserialize_key(k): opt_map[v] for k, v in r.minimum_optimizations_.items()
++            if (do_minopt or do_opt) and r.minimum_optimizations_ is not None:  # either from the server or from above
++                r._minimum_optimization_map = {
++                    deserialize_key(str_key): opt_map[opt_id] for str_key, opt_id in r.minimum_optimizations_.items()
+                 }
+ 
+             r.propagate_client(r._client, base_url_prefix)
+@@ -232,14 +244,14 @@ def _fetch_children_multi(
+     def propagate_client(self, client, base_url_prefix: Optional[str]):
+         BaseRecord.propagate_client(self, client, base_url_prefix)
+ 
+-        if self._optimizations_cache is not None:
+-            for opts in self._optimizations_cache.values():
++        if self.optimization_records_ is not None:
++            for opts in self.optimization_records_.values():
+                 for opt in opts:
+                     opt.propagate_client(client, base_url_prefix)
+ 
+-        # But may need to do minimum_optimizations_cache_, since they may have been obtained separately
+-        if self._minimum_optimizations_cache is not None:
+-            for opt in self._minimum_optimizations_cache.values():
++        # But may need to do minimum optimizations map, since they may have been obtained separately
++        if self._minimum_optimization_map is not None:
++            for opt in self._minimum_optimization_map.values():
+                 opt.propagate_client(client, base_url_prefix)
+ 
+     def _fetch_initial_molecules(self):
+@@ -275,6 +287,9 @@ def _fetch_minimum_optimizations(self):
+ 
+         self.fetch_children(["minimum_optimizations"])
+ 
++    def get_cache_dict(self, **kwargs) -> Dict[str, Any]:
++        return self.dict(exclude={"optimization_records_"}, **kwargs)
++
+     @property
+     def initial_molecules(self) -> List[Molecule]:
+         if self.initial_molecules_ is None:
+@@ -283,17 +298,33 @@ def initial_molecules(self) -> List[Molecule]:
+ 
+     @property
+     def optimizations(self) -> Dict[str, List[OptimizationRecord]]:
+-        if self._optimizations_cache is None:
++        if self.optimization_records_ is None:
+             self._fetch_optimizations()
+ 
+-        return self._optimizations_cache
++        if self._optimization_map is None:
++            self._optimization_map = {deserialize_key(k): v for k, v in self.optimization_records_.items()}
++
++        return self._optimization_map
+ 
+     @property
+     def minimum_optimizations(self) -> Dict[Tuple[float, ...], OptimizationRecord]:
+-        if self._minimum_optimizations_cache is None:
++        if (
++            self._minimum_optimization_map is None
++            and self.minimum_optimizations_ is not None
++            and self.optimization_records_ is not None
++        ):
++            opt_map = {}
++            for opt_records in self.optimization_records_.values():
++                opt_map.update({x.id: x for x in opt_records})
++
++            self._minimum_optimization_map = {
++                deserialize_key(k): opt_map[v] for k, v in self.minimum_optimizations_.items()
++            }
++
++        elif self._minimum_optimization_map is None:
+             self._fetch_minimum_optimizations()
+ 
+-        return self._minimum_optimizations_cache
++        return self._minimum_optimization_map
+ 
+     @property
+     def final_energies(self) -> Dict[Tuple[float, ...], float]:
+diff --git a/qcportal/qcportal/torsiondrive/test_record_models.py b/qcportal/qcportal/torsiondrive/test_record_models.py
+index 23b4431a0..b3a00187d 100644
+--- a/qcportal/qcportal/torsiondrive/test_record_models.py
++++ b/qcportal/qcportal/torsiondrive/test_record_models.py
+@@ -33,13 +33,13 @@ def test_torsiondrive_record_model(snowflake: QCATestingSnowflake, includes: Opt
+         assert record.offline
+ 
+         # children have all data fetched
+-        for opts in record._optimizations_cache.values():
++        for opts in record.optimization_records_.values():
+             assert all(x.initial_molecule_ is not None for x in opts)
+             assert all(x.final_molecule_ is not None for x in opts)
+     else:
+         assert record.initial_molecules_ is None
+         assert record.optimizations_ is None
+-        assert record._optimizations_cache is None
++        assert record.optimization_records_ is None
+ 
+     assert record.id == rec_id
+     assert record.status == RecordStatusEnum.complete

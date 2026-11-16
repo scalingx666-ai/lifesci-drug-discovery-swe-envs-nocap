@@ -1,0 +1,1471 @@
+diff --git a/ersilia/cli/commands/close.py b/ersilia/cli/commands/close.py
+index df586ed89..bd7bccd77 100644
+--- a/ersilia/cli/commands/close.py
++++ b/ersilia/cli/commands/close.py
+@@ -29,6 +29,14 @@ def close():
+         from ...utils.session import deregister_model_session
+ 
+         session = Session(config_json=None)
++        served_model, status = session.served_model()
++        if status == "stale":
++            session.clear_stale(served_model)
++            echo(
++                f"Model {served_model} closed (it was no longer running).",
++                fg="green",
++            )
++            return
+         model_id = session.current_model_id()
+         service_class = session.current_service_class()
+         if model_id is None:
+diff --git a/ersilia/cli/commands/info.py b/ersilia/cli/commands/info.py
+index adb797e21..a0874b000 100644
+--- a/ersilia/cli/commands/info.py
++++ b/ersilia/cli/commands/info.py
+@@ -36,6 +36,15 @@ def info(output):
+         from ...hub.content.information import InformationDisplayer
+ 
+         session = Session(config_json=None)
++        served_model, status = session.served_model()
++        if status == "stale":
++            session.clear_stale(served_model)
++            echo(
++                f"Model {served_model} is no longer running in this terminal (its server stopped).",
++                fg="yellow",
++            )
++            echo(f"Serve it again with 'ersilia serve {served_model}'.")
++            return
+         model_id = session.current_model_id()
+         service_class = session.current_service_class()
+         if model_id is None:
+@@ -72,3 +81,5 @@ def info(output):
+             echo(f"Model information saved to {output}", fg="green")
+         else:
+             InformationDisplayer(info).echo()
++
++    return info
+diff --git a/ersilia/cli/commands/run.py b/ersilia/cli/commands/run.py
+index 4af349bb6..56e5d3f34 100644
+--- a/ersilia/cli/commands/run.py
++++ b/ersilia/cli/commands/run.py
+@@ -99,6 +99,15 @@ def run(input, output, batch_size):
+ 
+         validate_input_output_types(input, output)
+         session = Session(config_json=None)
++        served_model, status = session.served_model()
++        if status == "stale":
++            session.clear_stale(served_model)
++            echo(
++                f"Model {served_model} is no longer running in this terminal (its server stopped).",
++                fg="yellow",
++            )
++            echo(f"Serve it again with 'ersilia serve {served_model}'.")
++            return
+         model_id = session.current_model_id()
+         service_class = session.current_service_class()
+         output_source = session.current_output_source()
+diff --git a/ersilia/cli/commands/serve.py b/ersilia/cli/commands/serve.py
+index be4b1b3da..851e22ba7 100644
+--- a/ersilia/cli/commands/serve.py
++++ b/ersilia/cli/commands/serve.py
+@@ -179,6 +179,29 @@ def serve(
+         from ..messages import ModelNotFound
+ 
+         sess = Session(config_json=None)
++        stale_model, status = sess.served_model()
++        if status == "stale":
++            # Recorded as served, but no longer running: nothing to close.
++            sess.clear_stale(stale_model)
++            echo(f"Model {stale_model} was no longer running; replacing it.")
++        elif status == "running":
++            from ... import ModelBase
++
++            if ModelBase(model).model_id == stale_model:
++                # The same model is already running here: nothing to do.
++                from ...utils import tmp_pid_file
++                from ...utils.ports import normalize_connect_url
++
++                with open(tmp_pid_file(stale_model)) as f:
++                    lines = [line.split() for line in f if line.strip()]
++                url = normalize_connect_url(lines[-1][1]) if lines else None
++                echo(
++                    f"Model {stale_model} is already being served in this terminal.",
++                    fg="green",
++                )
++                if url:
++                    echo(f"It is available at {url}.")
++                return
+         existing_session = sess.get() or {}
+         already_served = existing_session.get("model_id")
+         if already_served:
+diff --git a/ersilia/core/model.py b/ersilia/core/model.py
+index 51459e81f..84ede4294 100644
+--- a/ersilia/core/model.py
++++ b/ersilia/core/model.py
+@@ -698,7 +698,17 @@ def serve(self, track_runs=None):
+         self.setup()
+         spinner("Closing existing sessions of a model", self.close)
+         self.session.open(model_id=self.model_id, track_runs=self.track)
+-        self.autoservice.serve()
++        try:
++            self.autoservice.serve()
++        except BaseException:
++            # Serving failed or was interrupted (e.g. Ctrl+C): undo the session
++            # record, so the terminal does not claim a model that is not running.
++            self.logger.info("Serving did not complete; closing the session")
++            try:
++                self.autoservice.close()
++            finally:
++                self.session.close()
++            raise
+         self.session.register_service_class(self.autoservice._service_class)
+         self.session.register_output_source(self.output_source)
+         self.session.register_store_status(
+diff --git a/ersilia/core/session.py b/ersilia/core/session.py
+index 3d8d43612..e19953955 100644
+--- a/ersilia/core/session.py
++++ b/ersilia/core/session.py
+@@ -3,8 +3,16 @@
+ import time
+ import uuid
+ 
++import psutil
++
+ from ..default import SESSION_JSON
+-from ..utils.session import get_session_dir, prune_empty_session_dirs
++from ..utils.session import (
++    _pid_was_recycled,
++    container_is_running,
++    get_session_dir,
++    prune_empty_session_dirs,
++    read_pid_file,
++)
+ from .base import ErsiliaBase
+ 
+ 
+@@ -351,6 +359,67 @@ def update_peak_memory(self, peak_memory):
+         with open(self.session_file, "w") as f:
+             json.dump(data, f, indent=4)
+ 
++    def served_model(self):
++        """
++        Tell which model this session serves, and whether it is really running.
++
++        ``session.json`` records which model is served, and ``<model>.pid``
++        where it runs. The two can disagree, e.g. when serving was interrupted
++        or the model's container was removed outside Ersilia.
++
++        Returns
++        -------
++        tuple of (str or None, str or None)
++            The model ID and its status: "running", or "stale" when the model
++            is recorded but its .pid file, container or process is gone.
++            (None, None) when no model is recorded.
++        """
++        data = self.get() or {}
++        model_id = data.get("model_id")
++        if not model_id:
++            return None, None
++        pid_file = os.path.join(self._session_dir, "{0}.pid".format(model_id))
++        if not os.path.isfile(pid_file):
++            return model_id, "stale"
++        try:
++            pids, containers = read_pid_file(pid_file)
++            written_at = os.path.getmtime(pid_file)
++        except OSError:
++            return model_id, "stale"
++        if containers:
++            running = [container_is_running(name) for name in containers]
++            # If Docker cannot be reached, the record is trusted.
++            if any(r is None for r in running) or any(running):
++                return model_id, "running"
++            return model_id, "stale"
++        servers = [p for p in pids if p is not None and p >= 0]
++        if servers:
++            alive = [
++                psutil.pid_exists(p) and not _pid_was_recycled(p, written_at)
++                for p in servers
++            ]
++            return model_id, "running" if any(alive) else "stale"
++        # Nothing to check (e.g. a hosted model): trust the record.
++        return model_id, "running"
++
++    def clear_stale(self, model_id):
++        """
++        Forget a model that is recorded as served but is no longer running.
++
++        Parameters
++        ----------
++        model_id : str
++            The model recorded in this session.
++        """
++        from ..utils.session import deregister_model_session
++
++        self.logger.info("Clearing stale session record of model {0}".format(model_id))
++        pid_file = os.path.join(self._session_dir, "{0}.pid".format(model_id))
++        if os.path.isfile(pid_file):
++            os.remove(pid_file)
++        self.close()
++        deregister_model_session(model_id, self._session_dir)
++
+     def close(self):
+         """
+         Close the current session.
+diff --git a/ersilia/db/environments/managers.py b/ersilia/db/environments/managers.py
+index 3eb62498f..c16cdb1aa 100644
+--- a/ersilia/db/environments/managers.py
++++ b/ersilia/db/environments/managers.py
+@@ -1,6 +1,5 @@
+ import os
+ import re
+-import shutil
+ import subprocess
+ import sys
+ from collections import OrderedDict
+@@ -466,101 +465,6 @@ def delete_image(self, model_id):
+         """
+         self.remove(model_id)
+ 
+-    def remove_stopped_containers(self):
+-        """
+-        Removes all stopped Docker containers.
+-        """
+-        if self.is_inside_docker():
+-            return
+-        if not self.is_installed():
+-            return
+-        cmd = "docker container prune -f"
+-        self.logger.debug("Removing stopped containers")
+-        run_command(cmd)
+-
+-    def _stop_containers_with_model_id(self, model_id):
+-        if self.is_inside_docker():
+-            return
+-        if not self.is_installed():
+-            return
+-        tmp_folder = make_temp_dir(prefix="ersilia-")
+-        tmp_file = os.path.join(tmp_folder, "docker-ps.txt")
+-        cmd = "docker ps > {0}".format(tmp_file)
+-        self.logger.debug("Running {0}".format(cmd))
+-        run_command(cmd)
+-        cids = []
+-        with open(tmp_file, "r") as f:
+-            h = next(f)
+-            col_idx = len(h.split("IMAGE")[0])
+-            for l in f:
+-                img_str = l[col_idx:].split(" ")[0]
+-                if model_id in img_str:
+-                    cid = l.split(" ")[0]
+-                    cids += [cid]
+-        for cid in cids:
+-            cmd = "docker container kill {0}".format(cid)
+-            run_command(cmd)
+-        shutil.rmtree(tmp_folder)
+-
+-    def _stop_containers_with_entrypoint_sh(self):
+-        if self.is_inside_docker:
+-            return
+-        if not self.is_installed():
+-            return
+-        tmp_folder = make_temp_dir(prefix="ersilia-")
+-        tmp_file = os.path.join(tmp_folder, "docker-ps.txt")
+-        cmd = "docker ps > {0}".format(tmp_file)
+-        self.logger.debug("Running {0}".format(cmd))
+-        run_command(cmd)
+-        cids = []
+-        with open(tmp_file, "r") as f:
+-            h = next(f)
+-            col_idx = len(h.split("COMMAND")[0])
+-            for l in f:
+-                cmd_str = l[col_idx:].split(" ")[0]
+-                if "entrypoint.sh bash" in cmd_str:
+-                    cid = l.split(" ")[0]
+-                    cids += [cid]
+-        for cid in cids:
+-            cmd = "docker container kill {0}".format(cid)
+-            run_command(cmd)
+-        shutil.rmtree(tmp_folder)
+-
+-    def stop_containers(self, model_id):
+-        """
+-        Stops all running Docker containers associated with a model.
+-
+-        Parameters
+-        ----------
+-        model_id : str
+-            Identifier of the model.
+-        """
+-        if self.is_inside_docker:
+-            return
+-        if not self.is_installed():
+-            return
+-        self._stop_containers_with_model_id(model_id)
+-        self._stop_containers_with_entrypoint_sh()
+-        self.remove_stopped_containers()
+-        tmp_folder = make_temp_dir(prefix="ersilia-")
+-        tmp_file = os.path.join(tmp_folder, "docker-ps.txt")
+-        cmd = "docker ps > {0}".format(tmp_file)
+-        self.logger.debug("Running {0}".format(cmd))
+-        run_command(cmd)
+-        cids = []
+-        with open(tmp_file, "r") as f:
+-            next(f)
+-            for l in f:
+-                mid = l.rstrip().split(" ")[-1].split("_")[0]
+-                if mid == model_id:
+-                    cid = l.split(" ")[0]
+-                    cids += [cid]
+-        for cid in cids:
+-            cmd = "docker container kill {0}".format(cid)
+-            run_command(cmd)
+-        shutil.rmtree(tmp_folder)
+-        self.remove_stopped_containers()
+-
+     def prune(self):
+         """
+         Prunes unused Docker objects to free up space.
+@@ -595,7 +499,6 @@ def delete_images(self, model_id, purge_unnamed=True):
+         if self.is_inside_docker() or not self.is_installed():
+             return
+ 
+-        self.stop_containers(model_id)
+         self.prune()
+ 
+         cmd = (
+diff --git a/ersilia/hub/delete/delete.py b/ersilia/hub/delete/delete.py
+index f5f683c18..5004af072 100644
+--- a/ersilia/hub/delete/delete.py
++++ b/ersilia/hub/delete/delete.py
+@@ -15,8 +15,8 @@
+ from ...utils.environment import Environment
+ from ...utils.session import (
+     deregister_model_session,
+-    get_model_session,
+-    remove_session_dir,
++    get_live_model_sessions,
++    get_model_sessions,
+ )
+ from ...utils.system import is_inside_docker
+ from ...utils.terminal import run_command
+@@ -493,11 +493,23 @@ def can_be_deleted(self, model_id: str) -> Tuple[bool, str]:
+         bool
+             True if the model can be deleted, False otherwise.
+         """
+-        mdl_session = get_model_session(model_id)
+-        if mdl_session:
+-            self.logger.debug("Removing session {0}".format(mdl_session))
+-            remove_session_dir(mdl_session)
+-            deregister_model_session(model_id)
++        live_sessions = get_live_model_sessions(model_id)
++        if live_sessions:
++            # Deleting the image would stop the containers of every terminal
++            # serving this model, so ask the user to close them first.
++            n = len(live_sessions)
++            return (
++                False,
++                "Model {0} is being served in {1} session{2} ({3}). Run 'ersilia close' there before deleting it.".format(
++                    model_id,
++                    n,
++                    "" if n == 1 else "s",
++                    ", ".join(os.path.basename(d) for d in live_sessions),
++                ),
++            )
++        for session_dir in get_model_sessions(model_id):
++            self.logger.debug("Deregistering stale session {0}".format(session_dir))
++            deregister_model_session(model_id, session_dir)
+         needs_delete = self._needs_delete(model_id)
+         mc = ModelCard(config_json=self.config_json).get(model_id)
+         model_source = ModelCatalog(config_json=self.config_json)._get_model_source(mc)
+diff --git a/ersilia/serve/autoservice.py b/ersilia/serve/autoservice.py
+index 80bca4cc8..ca7ab70e2 100644
+--- a/ersilia/serve/autoservice.py
++++ b/ersilia/serve/autoservice.py
+@@ -2,10 +2,8 @@
+ import json
+ import os
+ import shutil
+-import tempfile
+ 
+ from .. import ErsiliaBase
+-from ..db.environments.managers import DockerManager
+ from ..default import (
+     APIS_LIST_FILE,
+     DEFAULT_BATCH_SIZE,
+@@ -15,7 +13,12 @@
+ )
+ from ..utils import tmp_pid_file
+ from ..utils.echo import echo, spinner
+-from ..utils.session import kill_process_tree, stop_containers_by_name
++from ..utils.session import (
++    get_session_dir,
++    kill_process_tree,
++    read_pid_file,
++    stop_containers_by_name,
++)
+ from .api import Api
+ from .services import (
+     CondaEnvironmentService,
+@@ -319,12 +322,8 @@ def is_served(self):
+         else:
+             return False
+ 
+-    def _pids_from_file(self, fn):
+-        pids = []
+-        with open(fn, "r") as f:
+-            for l in f:
+-                pids += [int(l.split(" ")[0])]
+-        return pids
++    def _read_pid_file(self, fn):
++        return read_pid_file(fn)
+ 
+     def _kill_pids(self, pids):
+         for pid in pids:
+@@ -343,45 +342,52 @@ def clean_before_serving(self):
+         tmp_file = tmp_pid_file(self.model_id)
+         dir_name = os.path.dirname(tmp_file)
+         pids = []
++        container_names = []
+         for proc_file in os.listdir(dir_name):
+             if proc_file[-3:] != "pid":
+                 continue
+             proc_file = os.path.join(dir_name, proc_file)
+             self.logger.debug(proc_file)
+-            pids += self._pids_from_file(proc_file)
++            file_pids, file_containers = self._read_pid_file(proc_file)
++            pids += file_pids
++            container_names += file_containers
+             os.remove(proc_file)
+         self.logger.debug("Cleaning {0} processes".format(pids))
+         self._kill_pids(pids)
++        # The pid files are removed here, so their containers must be stopped
++        # now; otherwise they would keep running with no session tracking them.
++        self._stop_session_containers(container_names)
+ 
+     def clean_temp_dir(self):
+         """
+-        Clean the temporary directory.
++        Clean the temporary directories created by this session.
++
++        Each session tracks its temporary directories as symlinks in
++        ``<session>/logs/tmp`` (see ``make_temp_dir``). Only those are removed,
++        so runs, fetches and servers of other sessions (terminals) keep theirs.
+         """
+-        self.logger.debug("Cleaning temp dir")
+-        tmp_folder = tempfile.gettempdir()
+-        for d in os.listdir(tmp_folder):
+-            if "ersilia-" in d:
+-                d = os.path.join(tmp_folder, d)
+-                self.logger.debug("Flushing temporary directory {0}".format(d))
++        self.logger.debug("Cleaning temp dirs of this session")
++        logs_tmp_dir = os.path.join(get_session_dir(), "logs", "tmp")
++        if not os.path.isdir(logs_tmp_dir):
++            return
++        for name in os.listdir(logs_tmp_dir):
++            link = os.path.join(logs_tmp_dir, name)
++            target = os.path.realpath(link)
++            if os.path.basename(target).startswith("ersilia-") and os.path.isdir(
++                target
++            ):
++                self.logger.debug("Flushing temporary directory {0}".format(target))
+                 try:
+-                    shutil.rmtree(d)
+-                except:
++                    shutil.rmtree(target)
++                except Exception:
+                     self.logger.warning(
+-                        "Could not remove temporary directory {0}".format(d)
++                        "Could not remove temporary directory {0}".format(target)
+                     )
+-
+-    def clean_docker_containers(self):
+-        """
+-        Clean Docker containers if necessary.
+-        """
+-        self.logger.debug("Silencing docker containers if necessary")
+-        dm = DockerManager(config_json=self.config_json)
+-        if dm.is_inside_docker():
+-            self.logger.debug("It is inside docker")
+-            return
+-        if dm.is_installed():
+-            self.logger.debug("It is not inside docker")
+-            dm.stop_containers(self.model_id)
++                    continue
++            try:
++                os.unlink(link)
++            except OSError:
++                pass
+ 
+     def serve(self):
+         """
+@@ -411,18 +417,7 @@ def close(self):
+         tmp_file = tmp_pid_file(self.model_id)
+         container_names = []
+         if os.path.isfile(tmp_file):
+-            pids = []
+-            with open(tmp_file, "r") as f:
+-                for line in f:
+-                    parts = line.strip().split()
+-                    if not parts:
+-                        continue
+-                    try:
+-                        pids.append(int(parts[0]))
+-                    except ValueError:
+-                        pass
+-                    if len(parts) >= 3 and parts[2] != "-":
+-                        container_names.append(parts[2])
++            pids, container_names = self._read_pid_file(tmp_file)
+             self._kill_pids(pids)
+             os.remove(tmp_file)
+         self.clean_temp_dir()
+diff --git a/ersilia/serve/services.py b/ersilia/serve/services.py
+index 7055a40c7..af4b6f89e 100644
+--- a/ersilia/serve/services.py
++++ b/ersilia/serve/services.py
+@@ -32,7 +32,7 @@
+ )
+ from ..utils.logging import make_temp_dir
+ from ..utils.ports import find_free_port
+-from ..utils.session import kill_process_tree
++from ..utils.session import kill_process_tree, stop_containers_by_name
+ from ..utils.terminal import run_command
+ from ..utils.venv import SimpleVenv
+ 
+@@ -720,9 +720,11 @@ def serve(self):
+ 
+     def close(self):
+         """
+-        Close the Docker image service.
++        Close the Docker image service, stopping only this service's container.
+         """
+-        self.df.stop_containers(self.model_id)
++        name = getattr(self, "container_name", None)
++        if name:
++            stop_containers_by_name([name])
+ 
+     def api(self, api_name, input):
+         """
+@@ -963,6 +965,7 @@ def __init__(self, model_id, config_json=None, preferred_port=None, url=None):
+         )
+         set_docker_host()
+         self.client = docker.from_env(timeout=600)
++        self._port_given = preferred_port is not None
+         if preferred_port is None:
+             self.port = find_free_port()
+         else:
+@@ -1056,22 +1059,6 @@ def is_available(self) -> bool:
+             )
+             return False
+ 
+-    def _stop_all_containers_of_image(self):
+-        self.logger.debug(
+-            "Stopping all containers related to model {0}".format(self.model_id)
+-        )
+-        containers = self.client.containers.list(all=True)
+-        for container in containers:
+-            if container.name.startswith(self.model_id):
+-                self.logger.debug(
+-                    "Stopping and removing container {0}".format(container.name)
+-                )
+-                self._delete_temp_files(container.name)
+-                container.stop()
+-                self.logger.info(f"Container {container.name} stopped")
+-                container.remove()
+-                self.logger.info(f"Container {container.name} removed")
+-
+     @throw_ersilia_exception()
+     def _get_apis(self):
+         file_name = os.path.join(
+@@ -1186,7 +1173,6 @@ def serve(self):
+         Serve the model using the Docker image service.
+         """
+         self._create_docker_network()
+-        self.container_name = f"{self.model_id}_{str(uuid.uuid4())[:4]}"
+ 
+         env = {
+             "REDIS_HOST": os.getenv("REDIS_HOST", "redis"),
+@@ -1194,21 +1180,38 @@ def serve(self):
+             "REDIS_URI": os.getenv("REDIS_URI", "redis://redis:6379"),
+             "REDIS_EXPIRATION": os.getenv("REDIS_EXPIRATION", str(3600 * 24 * 7)),
+         }
+-
+-        run_kwargs = dict(
+-            image=self.image_name,
+-            name=self.container_name,
+-            detach=True,
+-            ports={"80/tcp": self.port},
+-            environment=env,
+-            network=DEFAULT_DOCKER_NETWORK_NAME,
+-        )
+-
+-        if self._mem_gb is not None:
+-            run_kwargs["mem_limit"] = f"{self._mem_gb}g"
+-
+         self.logger.debug(f"Running container with env: {env!r}")
+-        self.container = self.client.containers.run(**run_kwargs)
++
++        for attempt in range(2):
++            self.container_name = f"{self.model_id}_{uuid.uuid4().hex[:8]}"
++            run_kwargs = dict(
++                image=self.image_name,
++                name=self.container_name,
++                detach=True,
++                ports={"80/tcp": self.port},
++                environment=env,
++                network=DEFAULT_DOCKER_NETWORK_NAME,
++            )
++            if self._mem_gb is not None:
++                run_kwargs["mem_limit"] = f"{self._mem_gb}g"
++            try:
++                self.container = self.client.containers.run(**run_kwargs)
++                break
++            except docker.errors.APIError as e:
++                # Another session may have taken the free port between picking
++                # it and starting the container: retry once on a new port.
++                port_taken = "port is already allocated" in str(e) or (
++                    "address already in use" in str(e)
++                )
++                if attempt or self._port_given or not port_taken:
++                    raise
++                stop_containers_by_name([self.container_name])
++                self.port = find_free_port()
++                self.logger.warning(
++                    "Port was taken by another process, retrying on port {0}".format(
++                        self.port
++                    )
++                )
+ 
+         self.container_id = self.container.id
+         self.url = f"http://0.0.0.0:{self.port}"
+diff --git a/ersilia/utils/cache.py b/ersilia/utils/cache.py
+index 774fabfc8..8271d887f 100644
+--- a/ersilia/utils/cache.py
++++ b/ersilia/utils/cache.py
+@@ -114,8 +114,9 @@ def _is_amenable(self):
+             return (False, "Docker is not active!")
+ 
+         if not self.cache:
++            # Other sessions may be using the shared Redis container, so it is
++            # left running; this session simply does not use it.
+             logger.warning("Caching is disabled. Model result will not be cached!")
+-            self._remove_container_if_exists()
+             return (False, "Caching is disabled using flag!")
+ 
+         if self.cache:
+@@ -216,35 +217,6 @@ def remove_redis_image_if_exists(self):
+         except Exception as e:
+             logger.error(f"An unexpected error occurred while removing the image: {e}")
+ 
+-    def _remove_container_if_exists(self):
+-        set_docker_host()
+-        client = docker.from_env()
+-
+-        try:
+-            containers = client.containers.list(
+-                all=True, filters={"name": REDIS_CONTAINER_NAME}
+-            )
+-        except docker.errors.DockerException as e:
+-            logger.error(f"Error accessing Docker: {e}")
+-            return 0
+-
+-        if not containers:
+-            logger.info(
+-                f"No containers found with name containing '{REDIS_CONTAINER_NAME}'."
+-            )
+-            return 0
+-
+-        removed = 0
+-        for c in containers:
+-            try:
+-                logger.info(f"Removing container {c.name} ({c.id[:12]})")
+-                c.remove(force=True)
+-                removed += 1
+-            except docker.errors.APIError as e:
+-                logger.error(f"Failed to remove {c.name}: {e}")
+-
+-        return removed
+-
+     def _start_new_container(self):
+         self._create_docker_network()
+         self._create_data_volume()
+diff --git a/ersilia/utils/session.py b/ersilia/utils/session.py
+index 64d335a51..e76f53532 100644
+--- a/ersilia/utils/session.py
++++ b/ersilia/utils/session.py
+@@ -1,8 +1,14 @@
++import contextlib
+ import json
+ import os
+ import shutil
+ import stat
+ 
++try:
++    import fcntl
++except ImportError:  # not available on Windows
++    fcntl = None
++
+ import psutil
+ 
+ from ..default import (
+@@ -124,10 +130,15 @@ def remove_session_dir(session_name):
+                     os.unlink(item_path)
+                 elif os.path.isdir(item_path):
+                     shutil.rmtree(item_path)
++            except FileNotFoundError:
++                # Another terminal may be cleaning the same session.
++                continue
+             except Exception as e:
+                 raise ValueError(f"Error deleting {item_path}: {e}")
+         try:
+             shutil.rmtree(session_dir)
++        except FileNotFoundError:
++            pass
+         except Exception as e:
+             raise ValueError(f"Error deleting {session_dir}: {e}")
+ 
+@@ -138,8 +149,12 @@ def prune_empty_session_dirs():
+     """
+     for session_name in os.listdir(SESSIONS_DIR):
+         session_dir = os.path.join(SESSIONS_DIR, session_name)
++        try:
++            files = os.listdir(session_dir)
++        except (FileNotFoundError, NotADirectoryError):
++            continue
+         do_prune = True
+-        for fn in os.listdir(session_dir):
++        for fn in files:
+             if fn.endswith(".pid"):
+                 do_prune = False
+                 break
+@@ -150,6 +165,45 @@ def prune_empty_session_dirs():
+             remove_session_dir(session_name)
+ 
+ 
++def session_pid_from_name(session_name):
++    """
++    Get the parent process ID encoded in a session name.
++
++    Parameters
++    ----------
++    session_name : str
++        A session name such as ``session_12345``, or a path ending in one.
++
++    Returns
++    -------
++    int or None
++        The process ID, or None if the name is not a session name.
++    """
++    name = os.path.basename(os.path.normpath(session_name))
++    prefix, _, pid = name.partition("_")
++    if prefix != "session" or not pid.isdigit():
++        return None
++    return int(pid)
++
++
++def is_session_alive(session_name):
++    """
++    Check whether the process that owns a session is still running.
++
++    Parameters
++    ----------
++    session_name : str
++        A session name such as ``session_12345``, or a path ending in one.
++
++    Returns
++    -------
++    bool
++        True if the session's process exists.
++    """
++    pid = session_pid_from_name(session_name)
++    return pid is not None and psutil.pid_exists(pid)
++
++
+ def determine_orphaned_session():
+     """
+     Determine orphaned sessions.
+@@ -166,12 +220,75 @@ def determine_orphaned_session():
+     )
+     if sessions:
+         for session in sessions:
+-            session_pid = int(session.split("_")[1])
++            session_pid = session_pid_from_name(session)
++            if session_pid is None:
++                continue
+             if not psutil.pid_exists(session_pid):
+                 _sessions.append(session)
+     return _sessions
+ 
+ 
++def read_pid_file(path):
++    """
++    Read a model's .pid file.
++
++    Each line is "<pid> <url> <container_name|->", written when the model is
++    served (``AutoService.serve``).
++
++    Parameters
++    ----------
++    path : str
++        The .pid file.
++
++    Returns
++    -------
++    tuple of (list of int, list of str)
++        The process IDs and the container names it lists.
++    """
++    pids, container_names = [], []
++    with open(path, "r") as f:
++        for line in f:
++            parts = line.strip().split()
++            if not parts:
++                continue
++            try:
++                pids.append(int(parts[0]))
++            except ValueError:
++                pass
++            if len(parts) >= 3 and parts[2] != "-":
++                container_names.append(parts[2])
++    return pids, container_names
++
++
++def container_is_running(name):
++    """
++    Tell whether a Docker container is running.
++
++    Parameters
++    ----------
++    name : str
++        The container name.
++
++    Returns
++    -------
++    bool or None
++        True if it is running, False if it is stopped or does not exist, and
++        None if Docker cannot be reached (so the answer is unknown).
++    """
++    try:
++        import docker
++
++        client = docker.from_env()
++    except Exception:
++        return None
++    try:
++        return client.containers.get(name).status == "running"
++    except docker.errors.NotFound:
++        return False
++    except Exception:
++        return None
++
++
+ def stop_containers_by_name(names):
+     """
+     Stop and remove the named Docker containers, if any.
+@@ -253,25 +370,32 @@ def purge_session_processes(session_name):
+         return
+     pids = []
+     container_names = []
+-    for fn in os.listdir(session_dir):
++    try:
++        files = os.listdir(session_dir)
++    except FileNotFoundError:
++        return
++    for fn in files:
+         if not fn.endswith(".pid"):
+             continue
+         path = os.path.join(session_dir, fn)
+         try:
++            written_at = os.path.getmtime(path)
+             with open(path, "r") as f:
+                 for line in f:
+                     parts = line.strip().split()
+                     if not parts:
+                         continue
+                     try:
+-                        pids.append(int(parts[0]))
++                        pids.append((int(parts[0]), written_at))
+                     except ValueError:
+                         pass
+                     if len(parts) >= 3 and parts[2] != "-":
+                         container_names.append(parts[2])
+         except Exception:
+             continue
+-    for pid in pids:
++    for pid, written_at in pids:
++        if _pid_was_recycled(pid, written_at):
++            continue
+         try:
+             kill_process_tree(pid)
+         except Exception:
+@@ -279,11 +403,26 @@ def purge_session_processes(session_name):
+     stop_containers_by_name(container_names)
+ 
+ 
++def _pid_was_recycled(pid, written_at):
++    # The recorded server started before its pid file was written. A process
++    # with the same pid that started later is an unrelated process (possibly
++    # another terminal's model server) and must not be killed.
++    if pid is None or pid < 0:
++        return False
++    try:
++        return psutil.Process(pid).create_time() > written_at + 1
++    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
++        return False
++
++
+ def remove_orphaned_sessions():
+     """
+     Remove orphaned sessions.
+     """
+-    orphaned_sessions = determine_orphaned_session()
++    try:
++        orphaned_sessions = determine_orphaned_session()
++    except FileNotFoundError:
++        return
+     for session in orphaned_sessions:
+         try:
+             purge_session_processes(session)
+@@ -291,7 +430,13 @@ def remove_orphaned_sessions():
+             pass
+         try:
+             remove_session_dir(session)
+-        except PermissionError:
++        except Exception:
++            # Cleanup must never stop the CLI, e.g. when another terminal
++            # removes the same orphaned session at the same time.
++            pass
++        try:
++            deregister_session(os.path.join(SESSIONS_DIR, session))
++        except Exception:
+             pass
+ 
+ 
+@@ -307,9 +452,48 @@ def get_session_id():
+     return f"session_{get_parent_pid()}"
+ 
+ 
++@contextlib.contextmanager
++def _models_json():
++    # Yields the {model_id: [session_dir, ...]} mapping and writes it back.
++    # A lock serializes the read-modify-write across terminals.
++    file_path = os.path.join(EOS, MODELS_JSON)
++    lock_path = file_path + ".lock"
++    with open(lock_path, "a") as lock:
++        if fcntl is not None:
++            fcntl.flock(lock, fcntl.LOCK_EX)
++        try:
++            models = _read_models_json(file_path)
++            before = json.dumps(models, sort_keys=True)
++            yield models
++            models = {k: v for k, v in models.items() if v}
++            if json.dumps(models, sort_keys=True) != before:
++                tmp_path = file_path + ".tmp"
++                with open(tmp_path, "w") as f:
++                    json.dump(models, f, indent=4)
++                os.replace(tmp_path, file_path)
++        finally:
++            if fcntl is not None:
++                fcntl.flock(lock, fcntl.LOCK_UN)
++
++
++def _read_models_json(file_path):
++    if not os.path.exists(file_path):
++        return {}
++    try:
++        with open(file_path, "r") as f:
++            data = json.load(f)
++    except (json.JSONDecodeError, OSError):
++        return {}
++    # Older versions stored a single session directory per model.
++    return {k: ([v] if isinstance(v, str) else list(v)) for k, v in data.items() if v}
++
++
+ def register_model_session(model_id, session_dir):
+     """
+-    Register a model with a session.
++    Register that a session is serving a model.
++
++    Several sessions (terminals) can serve the same model at the same time,
++    so each model maps to a list of session directories.
+ 
+     Parameters
+     ----------
+@@ -318,25 +502,36 @@ def register_model_session(model_id, session_dir):
+     session_dir : str
+         The session directory.
+     """
+-    file_path = os.path.join(EOS, MODELS_JSON)
+-    if not os.path.exists(file_path):
+-        with open(file_path, "w") as f:
+-            json.dump({}, f, indent=4)
++    with _models_json() as models:
++        sessions = models.setdefault(model_id, [])
++        if session_dir not in sessions:
++            sessions.append(session_dir)
+ 
+-    with open(file_path, "r") as f:
+-        models = json.load(f)
+ 
+-    if (
+-        model_id not in models
+-    ):  # TODO This would have implications when we try to run the same model across multiple sessions
+-        models[model_id] = session_dir
+-        with open(file_path, "w") as f:
+-            json.dump(models, f, indent=4)
++def get_model_sessions(model_id):
++    """
++    Get the sessions registered as serving a model.
++
++    Parameters
++    ----------
++    model_id : str
++        The model ID.
++
++    Returns
++    -------
++    list
++        The session directories, possibly including stale ones.
++    """
++    file_path = os.path.join(EOS, MODELS_JSON)
++    return _read_models_json(file_path).get(model_id, [])
+ 
+ 
+-def get_model_session(model_id):
++def get_live_model_sessions(model_id):
+     """
+-    Get the model session.
++    Get the sessions that are currently serving a model.
++
++    A session counts as live when its process is running and it still
++    holds the model's pid file.
+ 
+     Parameters
+     ----------
+@@ -345,32 +540,48 @@ def get_model_session(model_id):
+ 
+     Returns
+     -------
+-    str
+-        The session ID.
++    list
++        The live session directories.
+     """
+-    file_path = os.path.join(EOS, MODELS_JSON)
+-    if not os.path.exists(file_path):
+-        return None
+-    with open(file_path, "r") as f:
+-        models = json.load(f)
+-    return models.get(model_id, None)
++    return [
++        session_dir
++        for session_dir in get_model_sessions(model_id)
++        if is_session_alive(session_dir)
++        and os.path.exists(os.path.join(session_dir, f"{model_id}.pid"))
++    ]
+ 
+ 
+-def deregister_model_session(model_id):
++def deregister_model_session(model_id, session_dir=None):
+     """
+-    Remove a model from a session.
++    Deregister a session from a model, leaving other sessions untouched.
+ 
+     Parameters
+     ----------
+     model_id : str
+         The model ID.
++    session_dir : str, optional
++        The session directory to deregister. Defaults to the current session.
+     """
+-    file_path = os.path.join(EOS, MODELS_JSON)
+-    if not os.path.exists(file_path):
++    if session_dir is None:
++        session_dir = get_session_dir()
++    with _models_json() as models:
++        sessions = models.get(model_id, [])
++        if session_dir in sessions:
++            sessions.remove(session_dir)
++
++
++def deregister_session(session_dir):
++    """
++    Deregister a session from every model it was registered for.
++
++    Parameters
++    ----------
++    session_dir : str
++        The session directory.
++    """
++    if not os.path.exists(os.path.join(EOS, MODELS_JSON)):
+         return
+-    with open(file_path, "r") as f:
+-        models = json.load(f)
+-    if model_id in models:
+-        del models[model_id]
+-        with open(file_path, "w") as f:
+-            json.dump(models, f, indent=4)
++    with _models_json() as models:
++        for sessions in models.values():
++            if session_dir in sessions:
++                sessions.remove(session_dir)
+diff --git a/ersilia/utils/system.py b/ersilia/utils/system.py
+index 1fe61a74b..41911fdb1 100644
+--- a/ersilia/utils/system.py
++++ b/ersilia/utils/system.py
+@@ -1,5 +1,6 @@
+ import os
+ import platform
++import shutil
+ import stat
+ import tempfile
+ 
+@@ -129,15 +130,18 @@ def get_country(self):
+             stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+         )
+ 
+-        run_command(f"bash {tmp_dir}/geoip.sh > {tmp_dir}/geoip.txt")
+-
+-        with open(os.path.join(tmp_dir, "geoip.txt"), "r") as f:
+-            text = f.read()
+-            if "Country" in text:
+-                country = text.split("Country: ")[1].rstrip().split("\n")[0]
+-                code = text.split("Code:    ")[1].rstrip().split("\n")[0]
+-            else:
+-                country = "None"
+-                code = "None"
++        try:
++            run_command(f"bash {tmp_dir}/geoip.sh > {tmp_dir}/geoip.txt")
++
++            with open(os.path.join(tmp_dir, "geoip.txt"), "r") as f:
++                text = f.read()
++                if "Country" in text:
++                    country = text.split("Country: ")[1].rstrip().split("\n")[0]
++                    code = text.split("Code:    ")[1].rstrip().split("\n")[0]
++                else:
++                    country = "None"
++                    code = "None"
++        finally:
++            shutil.rmtree(tmp_dir, ignore_errors=True)
+ 
+         return (country, code)
+diff --git a/test/test_concurrent_sessions.py b/test/test_concurrent_sessions.py
+new file mode 100644
+index 000000000..66d782fb2
+--- /dev/null
++++ b/test/test_concurrent_sessions.py
+@@ -0,0 +1,318 @@
++import json
++import logging
++import os
++import subprocess
++import sys
++import time
++
++import pytest
++
++import ersilia.serve.autoservice as autoservice
++import ersilia.utils.session as session_utils
++from ersilia.hub.delete.delete import ModelFullDeleter
++from ersilia.serve.autoservice import AutoService
++
++
++@pytest.fixture
++def eos(tmp_path, monkeypatch):
++    sessions = tmp_path / "sessions"
++    sessions.mkdir()
++    monkeypatch.setattr(session_utils, "EOS", str(tmp_path))
++    monkeypatch.setattr(session_utils, "SESSIONS_DIR", str(sessions))
++    return tmp_path
++
++
++def _dead_pid():
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _session(eos, pid, model_id=None):
++    path = eos / "sessions" / f"session_{pid}"
++    (path / "logs" / "tmp").mkdir(parents=True)
++    if model_id:
++        (path / f"{model_id}.pid").write_text("-1 http://0.0.0.0:1 -\n")
++    return str(path)
++
++
++def test_clean_temp_dir_only_removes_this_sessions_dirs(eos, tmp_path, monkeypatch):
++    mine = _session(eos, 1)
++    tmp_root = tmp_path / "tmp"
++    own_dir = tmp_root / "ersilia-own"
++    other_dir = tmp_root / "ersilia-other"
++    own_dir.mkdir(parents=True)
++    other_dir.mkdir()
++    link = os.path.join(mine, "logs", "tmp", "ersilia-own")
++    os.symlink(own_dir, link)
++    monkeypatch.setattr(autoservice, "get_session_dir", lambda: mine)
++
++    svc = AutoService.__new__(AutoService)
++    svc.logger = logging.getLogger("test")
++    svc.clean_temp_dir()
++
++    assert not own_dir.exists()
++    assert not os.path.lexists(link)
++    assert other_dir.exists()
++
++
++def test_models_json_keeps_every_session_of_a_model(eos):
++    session_utils.register_model_session("eos0aaa", "/s/session_1")
++    session_utils.register_model_session("eos0aaa", "/s/session_2")
++    session_utils.register_model_session("eos0aaa", "/s/session_2")
++    assert session_utils.get_model_sessions("eos0aaa") == [
++        "/s/session_1",
++        "/s/session_2",
++    ]
++
++    session_utils.deregister_model_session("eos0aaa", "/s/session_1")
++    assert session_utils.get_model_sessions("eos0aaa") == ["/s/session_2"]
++
++    session_utils.deregister_model_session("eos0aaa", "/s/session_2")
++    data = json.loads((eos / "models.json").read_text())
++    assert "eos0aaa" not in data
++
++
++def test_models_json_reads_old_single_session_format(eos):
++    (eos / "models.json").write_text(json.dumps({"eos0aaa": "/s/session_1"}))
++    assert session_utils.get_model_sessions("eos0aaa") == ["/s/session_1"]
++    session_utils.register_model_session("eos0aaa", "/s/session_2")
++    assert session_utils.get_model_sessions("eos0aaa") == [
++        "/s/session_1",
++        "/s/session_2",
++    ]
++
++
++def test_deregister_session_removes_it_from_every_model(eos):
++    session_utils.register_model_session("eos0aaa", "/s/session_1")
++    session_utils.register_model_session("eos0bbb", "/s/session_1")
++    session_utils.register_model_session("eos0bbb", "/s/session_2")
++    session_utils.deregister_session("/s/session_1")
++    assert session_utils.get_model_sessions("eos0aaa") == []
++    assert session_utils.get_model_sessions("eos0bbb") == ["/s/session_2"]
++
++
++def test_live_model_sessions(eos):
++    live = _session(eos, os.getpid(), "eos0aaa")
++    dead = _session(eos, _dead_pid(), "eos0aaa")
++    closed = _session(eos, os.getppid())
++    for s in (live, dead, closed):
++        session_utils.register_model_session("eos0aaa", s)
++    assert session_utils.get_live_model_sessions("eos0aaa") == [live]
++
++
++def test_purge_does_not_kill_a_recycled_pid(eos):
++    orphan = _session(eos, _dead_pid())
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        pid_file = os.path.join(orphan, "eos0aaa.pid")
++        with open(pid_file, "w") as f:
++            f.write(f"{proc.pid} http://0.0.0.0:1 -\n")
++        # The pid file predates the process, so the pid now belongs to
++        # an unrelated process.
++        past = time.time() - 600
++        os.utime(pid_file, (past, past))
++
++        session_utils.purge_session_processes(os.path.basename(orphan))
++
++        assert proc.poll() is None
++    finally:
++        proc.kill()
++        proc.wait()
++
++
++def test_purge_kills_the_recorded_server(eos):
++    orphan = _session(eos, _dead_pid())
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        # Written after the process started, as serve does.
++        time.sleep(1.1)
++        with open(os.path.join(orphan, "eos0aaa.pid"), "w") as f:
++            f.write(f"{proc.pid} http://0.0.0.0:1 -\n")
++
++        session_utils.purge_session_processes(os.path.basename(orphan))
++
++        assert proc.wait(timeout=10) is not None
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++
++
++def test_orphan_cleanup_tolerates_odd_and_vanished_entries(eos):
++    sessions = eos / "sessions"
++    (sessions / "session_abc").mkdir()
++    (sessions / "session_").mkdir()
++    (sessions / "session_123x").write_text("")
++    orphan = _session(eos, _dead_pid(), "eos0aaa")
++    session_utils.register_model_session("eos0aaa", orphan)
++
++    session_utils.remove_orphaned_sessions()
++    session_utils.remove_session_dir("session_999999999")
++    session_utils.prune_empty_session_dirs()
++
++    assert not os.path.exists(orphan)
++    assert session_utils.get_model_sessions("eos0aaa") == []
++
++
++def test_delete_refuses_while_another_session_serves_the_model(eos):
++    live = _session(eos, os.getpid(), "eos0aaa")
++    session_utils.register_model_session("eos0aaa", live)
++    md = ModelFullDeleter.__new__(ModelFullDeleter)
++    md.logger = logging.getLogger("test")
++
++    can_delete, reason = md.can_be_deleted("eos0aaa")
++
++    assert can_delete is False
++    assert "being served" in reason and os.path.basename(live) in reason
++    assert os.path.exists(live)
++
++
++def test_clean_before_serving_stops_containers_of_removed_pid_files(eos, monkeypatch):
++    mine = _session(eos, os.getpid())
++    with open(os.path.join(mine, "eos0bbb.pid"), "w") as f:
++        f.write("-1 http://0.0.0.0:1 eos0bbb_1234abcd\n")
++    stopped = []
++    monkeypatch.setattr(
++        autoservice, "tmp_pid_file", lambda m: os.path.join(mine, f"{m}.pid")
++    )
++    monkeypatch.setattr(autoservice, "stop_containers_by_name", stopped.extend)
++
++    svc = AutoService.__new__(AutoService)
++    svc.logger = logging.getLogger("test")
++    svc.model_id = "eos0aaa"
++    svc.clean_before_serving()
++
++    assert stopped == ["eos0bbb_1234abcd"]
++    assert not os.path.exists(os.path.join(mine, "eos0bbb.pid"))
++
++
++# Stale sessions: session.json names a model that is no longer running.
++
++
++@pytest.fixture
++def session_here(eos, monkeypatch):
++    import ersilia.core.session as core_session
++
++    path = _session(eos, os.getpid())
++    # A real session always has a log; without one, Session() prunes the dir.
++    open(os.path.join(path, "current.log"), "w").close()
++    monkeypatch.setattr(core_session, "get_session_dir", lambda: path)
++    return path
++
++
++def _record(path, model_id, pid_line=None):
++    with open(os.path.join(path, "session.json"), "w") as f:
++        json.dump({"model_id": model_id, "service_class": "pulled_docker"}, f)
++    if pid_line is not None:
++        with open(os.path.join(path, f"{model_id}.pid"), "w") as f:
++            f.write(pid_line + "\n")
++
++
++def _served(monkeypatch, container_state=True):
++    import ersilia.core.session as core_session
++    from ersilia.core.session import Session
++
++    monkeypatch.setattr(core_session, "container_is_running", lambda n: container_state)
++    return Session(config_json=None).served_model()
++
++
++def test_served_model_states(session_here, monkeypatch):
++    assert _served(monkeypatch) == (None, None)
++    _record(session_here, "eos3b5e")
++    assert _served(monkeypatch) == ("eos3b5e", "stale")  # no .pid file
++    _record(session_here, "eos3b5e", "-1 http://0.0.0.0:1 eos3b5e_1234abcd")
++    assert _served(monkeypatch, True) == ("eos3b5e", "running")
++    assert _served(monkeypatch, False) == ("eos3b5e", "stale")  # container gone
++    assert _served(monkeypatch, None) == ("eos3b5e", "running")  # Docker unknown
++
++
++def test_served_model_checks_server_processes(session_here, monkeypatch):
++    _record(session_here, "eos3b5e", f"{_dead_pid()} http://0.0.0.0:1 -")
++    assert _served(monkeypatch) == ("eos3b5e", "stale")
++    _record(session_here, "eos3b5e", f"{os.getpid()} http://0.0.0.0:1 -")
++    assert _served(monkeypatch) == ("eos3b5e", "running")
++
++
++def test_clear_stale_forgets_the_model(session_here, monkeypatch):
++    from ersilia.core.session import Session
++
++    _record(session_here, "eos3b5e")
++    session_utils.register_model_session("eos3b5e", session_here)
++    Session(config_json=None).clear_stale("eos3b5e")
++    assert not os.path.exists(os.path.join(session_here, "session.json"))
++    assert session_utils.get_model_sessions("eos3b5e") == []
++
++
++@pytest.mark.parametrize(
++    "cmd_name, args, expected",
++    [
++        (
++            "run",
++            ["-i", "in.csv", "-o", "out.csv"],
++            "no longer running in this terminal",
++        ),
++        ("info", [], "no longer running in this terminal"),
++        ("close", [], "closed (it was no longer running)"),
++    ],
++)
++def test_commands_recover_from_a_stale_session(
++    session_here, monkeypatch, cmd_name, args, expected
++):
++    import importlib
++
++    from click.testing import CliRunner
++
++    _record(session_here, "eos3b5e")
++    module = importlib.import_module(f"ersilia.cli.commands.{cmd_name}")
++    result = CliRunner().invoke(getattr(module, f"{cmd_name}_cmd")(), args)
++    assert expected in result.output, result.output
++    assert not os.path.exists(os.path.join(session_here, "session.json"))
++
++
++def test_failed_serve_does_not_leave_a_session_record(monkeypatch):
++    from unittest.mock import MagicMock
++
++    import ersilia.core.model as core_model
++    from ersilia.core.model import ErsiliaModel
++
++    session = MagicMock()
++    monkeypatch.setattr(core_model, "Session", lambda config_json=None: session)
++    mdl = ErsiliaModel.__new__(ErsiliaModel)
++    mdl.config_json = None
++    mdl.model_id = "eos3b5e"
++    mdl.logger = logging.getLogger("test")
++    mdl.setup = MagicMock()
++    mdl.close = MagicMock()
++    mdl.autoservice = MagicMock()
++    mdl.autoservice.serve.side_effect = KeyboardInterrupt
++    with pytest.raises(KeyboardInterrupt):
++        ErsiliaModel.serve(mdl)
++    session.open.assert_called_once()
++    session.close.assert_called_once()
++    mdl.autoservice.close.assert_called_once()
++
++
++def test_serving_the_running_model_again_just_says_so(session_here, monkeypatch):
++    from unittest.mock import MagicMock, patch
++
++    from click.testing import CliRunner
++
++    from ersilia.cli.commands.serve import serve_cmd
++
++    _record(session_here, "eos3b5e", "-1 http://0.0.0.0:5000 eos3b5e_1234abcd")
++    import ersilia.core.session as core_session
++
++    monkeypatch.setattr(core_session, "container_is_running", lambda name: True)
++    monkeypatch.setattr(
++        "ersilia.utils.tmp_pid_file",
++        lambda model_id: os.path.join(session_here, f"{model_id}.pid"),
++    )
++    with (
++        patch("ersilia.ModelBase", return_value=MagicMock(model_id="eos3b5e")),
++        patch("ersilia.core.model.ErsiliaModel") as model,
++    ):
++        result = CliRunner().invoke(serve_cmd(), ["molecular-weight"])
++    assert "Model eos3b5e is already being served in this terminal." in result.output
++    assert "It is available at http://127.0.0.1:5000." in result.output
++    model.assert_not_called()

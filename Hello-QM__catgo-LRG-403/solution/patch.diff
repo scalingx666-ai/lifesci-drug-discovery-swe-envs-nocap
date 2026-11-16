@@ -1,0 +1,1319 @@
+diff --git a/desktop/App.svelte b/desktop/App.svelte
+index b2e51e648..7276c7559 100644
+--- a/desktop/App.svelte
++++ b/desktop/App.svelte
+@@ -1217,7 +1217,9 @@
+         const cube_filename = filename.replace(/\.(gz|bz2|xz|zst)$/i, ``) + `.cube`
+         let structure: AnyStructure | undefined
+         try {
+-          const molecule = cube_atoms_to_molecule(parse_cube_header(cube_text))
++          // CHGCAR-family is always periodic — derive the cell from the cube
++          // grid so the slab renders with its unit-cell box + PBC bonds.
++          const molecule = cube_atoms_to_molecule(parse_cube_header(cube_text), { periodic: true })
+           if (molecule.sites.length > 0) structure = { ...molecule, _aligned: true } as AnyStructure
+         } catch (err) {
+           console.error(`Failed to parse converted cube atoms:`, err)
+@@ -1232,8 +1234,11 @@
+ 
+     if (/\.(cube|cub)$/i.test(filename)) {
+       let structure: AnyStructure | undefined
++      // Molecular Gaussian cubes are non-periodic; VASP-origin cubes
++      // (CHGCAR_diff.cube / *.vasp.cube) carry a real cell — keep it.
++      const cube_is_vasp = /chgcar|chgdiff|diffchg|aeccar|locpot|elfcar|parchg|\.vasp/i.test(filename)
+       try {
+-        const molecule = cube_atoms_to_molecule(parse_cube_header(text))
++        const molecule = cube_atoms_to_molecule(parse_cube_header(text), { periodic: cube_is_vasp })
+         if (molecule.sites.length > 0) structure = { ...molecule, _aligned: true } as AnyStructure
+       } catch (err) {
+         console.error(`Failed to parse cube file atoms:`, err)
+diff --git a/extensions/vscode/src/webview/main.ts b/extensions/vscode/src/webview/main.ts
+index 4986b6aee..a5de30783 100644
+--- a/extensions/vscode/src/webview/main.ts
++++ b/extensions/vscode/src/webview/main.ts
+@@ -522,7 +522,14 @@ const parse_file_content = async (
+     try {
+       const cube_text = is_cube ? content : await chgcar_to_cube(content)
+       const header = parse_cube_header(cube_text)
+-      const molecule = cube_atoms_to_molecule(header)
++      // VASP charge densities are always periodic — derive the cell from the
++      // cube grid so the slab renders with its unit-cell box + PBC bonds.
++      // A genuine molecular Gaussian cube stays non-periodic (its grid is a
++      // padded bounding box). A .cube re-emitted from VASP data carries a
++      // VASP-origin name (CHGCAR_diff.cube / *.vasp.cube) → still periodic.
++      const cube_is_periodic = is_chgcar_family ||
++        /chgcar|chgdiff|diffchg|aeccar|locpot|elfcar|parchg|\.vasp/i.test(stripped_basename)
++      const molecule = cube_atoms_to_molecule(header, { periodic: cube_is_periodic })
+       if (!molecule.sites.length) {
+         throw new Error(`cube header had no atoms`)
+       }
+diff --git a/server/catgo/routers/cohp.py b/server/catgo/routers/cohp.py
+index 241832b14..c34eca9bd 100644
+--- a/server/catgo/routers/cohp.py
++++ b/server/catgo/routers/cohp.py
+@@ -319,6 +319,66 @@ async def upload_icohplist(file: UploadFile) -> ICOHPUploadResponse:
+     )
+ 
+ 
++@router.post("/icohp-from-remote", response_model=ICOHPUploadResponse)
++async def icohp_from_remote(session_id: str, remote_path: str) -> ICOHPUploadResponse:
++    """Download ICOHPLIST.lobster from HPC and parse it into an ICOHP session.
++
++    Downloads the file via SSH, parses it, and stores a session
++    just like the upload endpoint.
++    """
++    import tempfile
++    from catgo_cohp.io import parse_icohplist
++
++    try:
++        from catgo.utils.hpc_client import pool
++        hpc = pool.get_connection(session_id)
++        if not hpc:
++            raise HTTPException(status_code=503, detail=f"HPC session {session_id} not connected")
++
++        # Download file to temp location
++        with tempfile.NamedTemporaryFile(suffix=".lobster", delete=False, mode="wb") as tmp:
++            tmp_path = tmp.name
++
++        await hpc.download_to_local(remote_path, tmp_path)
++
++        try:
++            entries = parse_icohplist(tmp_path)
++        except Exception as e:
++            Path(tmp_path).unlink(missing_ok=True)
++            raise HTTPException(status_code=400, detail=f"Failed to parse ICOHPLIST file: {e}")
++        finally:
++            Path(tmp_path).unlink(missing_ok=True)
++
++        sid = str(uuid.uuid4())
++
++        entry_models = []
++        for e in entries:
++            entry_models.append(ICOHPEntryModel(
++                cohp_num=e.cohp_num,
++                atom1=e.atom1,
++                atom2=e.atom2,
++                distance=e.distance,
++                spin_up=e.spin_up,
++                spin_down=e.spin_down,
++                total=e.total,
++                orbital1=e.orbital1,
++                orbital2=e.orbital2,
++                is_total=e.is_total,
++                label=e.label,
++            ))
++
++        _icohp_sessions[sid] = (entries, time.time())
++
++        return ICOHPUploadResponse(
++            session_id=sid,
++            entries=entry_models,
++        )
++    except HTTPException:
++        raise
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=f"Failed to download from HPC: {e}")
++
++
+ @router.delete("/{session_id}")
+ def cleanup_session(session_id: str) -> dict:
+     """Clean up cached sessions."""
+diff --git a/src/lib/api/cohp.ts b/src/lib/api/cohp.ts
+index 4a520ffd0..b7baeae28 100644
+--- a/src/lib/api/cohp.ts
++++ b/src/lib/api/cohp.ts
+@@ -102,3 +102,20 @@ export async function load_from_remote(
+ 
+   return response.json()
+ }
++
++export async function load_icohp_from_remote(
++  hpc_session_id: string,
++  remote_path: string,
++  server_url = SERVER_URL,
++): Promise<ICOHPResult> {
++  const response = await fetch(`${server_url}/api/cohp/icohp-from-remote?session_id=${encodeURIComponent(hpc_session_id)}&remote_path=${encodeURIComponent(remote_path)}`, {
++    method: 'POST',
++  })
++
++  if (!response.ok) {
++    const detail = await response.text()
++    throw new Error(`Remote load failed: ${detail}`)
++  }
++
++  return response.json()
++}
+diff --git a/src/lib/cube/SlicePanel.svelte b/src/lib/cube/SlicePanel.svelte
+index f13ba3023..e3757c72a 100644
+--- a/src/lib/cube/SlicePanel.svelte
++++ b/src/lib/cube/SlicePanel.svelte
+@@ -1,5 +1,6 @@
+ <script lang="ts">
+   import {
++    crop_slice,
+     render_slice_to_canvas,
+     render_atoms_to_canvas,
+     colormap_css_gradient,
+@@ -29,21 +30,78 @@
+   let heatmap_canvas: HTMLCanvasElement | undefined = $state()
+   let atoms_canvas: HTMLCanvasElement | undefined = $state()
+   let slice_range = $state<[number, number] | null>(null)
++  let fit_to_atoms = $state(true)
++  const SLICE_FIT_MARGIN = 2.5 // Å padding around the atoms when fitting
++
++  // The slice actually drawn: cropped to the atom-bearing region when "fit" is
++  // on (so a slab cross-section fills the figure instead of a thin band lost in
++  // vacuum), otherwise the full plane.
++  let displayed_slice = $derived.by(() => {
++    const s = slice_result
++    if (!s) return s
++    const atoms = atoms_info ?? []
++    if (!fit_to_atoms || atoms.length === 0) return s
++    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity
++    for (const a of atoms) {
++      if (a.u < u0) u0 = a.u
++      if (a.u > u1) u1 = a.u
++      if (a.v < v0) v0 = a.v
++      if (a.v > v1) v1 = a.v
++    }
++    if (!Number.isFinite(u0)) return s
++    return crop_slice(
++      s, u0 - SLICE_FIT_MARGIN, u1 + SLICE_FIT_MARGIN, v0 - SLICE_FIT_MARGIN, v1 + SLICE_FIT_MARGIN,
++    )
++  })
++
++  // ── Orientation read-out ───────────────────────────────────────────
++  // sample_plane_slice returns the plane geometry in Cartesian (Å):
++  //   u_vec = horizontal-axis direction, v_vec = vertical-axis direction,
++  //   normal = plane normal, center = plane center, u/v_min/max = extents.
++  // Surface it (vectors + a plain-language nearest-axis hint) so the slice can
++  // actually be read in space.
++  const fmt_vec = (v: readonly [number, number, number]) =>
++    `[${v.map((c) => c.toFixed(2)).join(`, `)}]`
++  // Nearest cartesian axis, e.g. [0,0,-1] → "−z"; "≈" prefix when not within ~15°.
++  const axis_hint = (v: readonly [number, number, number]) => {
++    const a = [Math.abs(v[0]), Math.abs(v[1]), Math.abs(v[2])]
++    const i = a[0] >= a[1] && a[0] >= a[2] ? 0 : a[1] >= a[2] ? 1 : 2
++    const mag = Math.hypot(v[0], v[1], v[2]) || 1
++    return `${a[i] / mag > 0.966 ? `` : `≈`}${v[i] >= 0 ? `+` : `−`}${[`x`, `y`, `z`][i]}`
++  }
++  let orientation = $derived.by(() => {
++    const s = displayed_slice
++    const full = slice_result
++    if (!s || !full) return null
++    const uh = axis_hint(full.u_vec)
++    const vh = axis_hint(full.v_vec)
++    return {
++      u: fmt_vec(full.u_vec),
++      v: fmt_vec(full.v_vec),
++      n: fmt_vec(full.normal),
++      center: fmt_vec(full.center),
++      u_extent: (s.u_max - s.u_min).toFixed(2),
++      v_extent: (s.v_max - s.v_min).toFixed(2),
++      readable: `horizontal ${uh} · vertical ${vh}${
++        /z/.test(uh) || /z/.test(vh) ? ` · z = depth` : ``
++      }`,
++    }
++  })
+ 
+   // Re-render whenever slice_result, colormap, or atoms change
+   $effect(() => {
+-    if (!heatmap_canvas || !slice_result) return
+-    slice_range = render_slice_to_canvas(heatmap_canvas, slice_result, colormap)
++    if (!heatmap_canvas || !displayed_slice) return
++    slice_range = render_slice_to_canvas(heatmap_canvas, displayed_slice, colormap)
+   })
+ 
+   $effect(() => {
+-    if (!atoms_canvas || !slice_result) return
++    if (!atoms_canvas || !displayed_slice) return
+     const atom_list = atoms_info ?? []
+     if (atom_list.length > 0) {
+-      render_atoms_to_canvas(atoms_canvas, slice_result, atom_list, colors.element, colormap)
++      render_atoms_to_canvas(atoms_canvas, displayed_slice, atom_list, colors.element, colormap)
+     } else {
+       // If no atoms, just render heatmap
+-      render_slice_to_canvas(atoms_canvas, slice_result, colormap)
++      render_slice_to_canvas(atoms_canvas, displayed_slice, colormap)
+     }
+   })
+ 
+@@ -70,6 +128,12 @@
+         title={t('structure.cube_toggle_slice_layout')}
+         onclick={on_layout_toggle}
+       >&#x2194;</button>
++      <button
++        class="slice-export-btn"
++        class:slice-fit-active={fit_to_atoms}
++        title={t('structure.cube_slice_fit')}
++        onclick={() => (fit_to_atoms = !fit_to_atoms)}
++      >Fit</button>
+       <button
+         class="slice-export-btn"
+         onclick={() => export_canvas(heatmap_canvas, `slice_heatmap.png`)}
+@@ -82,12 +146,34 @@
+     </div>
+   </div>
+ 
++  {#if orientation}
++    <div class="slice-orient" title={t('structure.cube_slice_orientation')}>
++      <span class="orient-item"><b>u</b> = {orientation.u}</span>
++      <span class="orient-item"><b>v</b> = {orientation.v}</span>
++      <span class="orient-item"><b>n</b> = {orientation.n}</span>
++      <span class="orient-item">
++        {t('structure.cube_slice_center')} = {orientation.center}
++      </span>
++      <span class="orient-item">
++        {t('structure.cube_slice_extent')}: u {orientation.u_extent} &times; v
++        {orientation.v_extent} &Aring;
++      </span>
++      <span class="orient-item orient-readable">{orientation.readable}</span>
++    </div>
++  {/if}
++
+   <div class="slice-plot-area">
+     <div class="slice-canvases">
+       <div class="slice-view-single">
+         <span class="slice-view-label">{t('structure.cube_heatmap')}</span>
+         <div class="canvas-with-colorbar">
+-          <canvas bind:this={heatmap_canvas} class="slice-canvas"></canvas>
++          <div class="slice-canvas-frame">
++            {#if orientation}
++              <span class="axis-label axis-v">v {orientation.v}</span>
++              <span class="axis-label axis-u">u {orientation.u}</span>
++            {/if}
++            <canvas bind:this={heatmap_canvas} class="slice-canvas"></canvas>
++          </div>
+           {#if slice_range}
+             <div class="colorbar">
+               <span class="cb-label">{slice_range[1].toExponential(2)}</span>
+@@ -103,7 +189,13 @@
+       <div class="slice-view-single">
+         <span class="slice-view-label">{t('structure.atoms')}</span>
+         <div class="canvas-with-colorbar">
+-          <canvas bind:this={atoms_canvas} class="slice-canvas"></canvas>
++          <div class="slice-canvas-frame">
++            {#if orientation}
++              <span class="axis-label axis-v">v {orientation.v}</span>
++              <span class="axis-label axis-u">u {orientation.u}</span>
++            {/if}
++            <canvas bind:this={atoms_canvas} class="slice-canvas"></canvas>
++          </div>
+         </div>
+       </div>
+     </div>
+@@ -155,6 +247,16 @@
+   .slice-layout-btn:hover, .slice-export-btn:hover { background: rgba(255, 255, 255, 0.15); }
+   .slice-close-btn { color: #f55; }
+   .slice-close-btn:hover { background: rgba(255, 60, 60, 0.2); }
++  .slice-export-btn.slice-fit-active {
++    background: rgba(96, 165, 250, 0.35);
++    border-color: rgba(96, 165, 250, 0.6);
++    color: #fff;
++  }
++  .orient-readable {
++    color: #9fe6a0;
++    opacity: 0.95;
++    white-space: nowrap;
++  }
+ 
+   .slice-plot-area {
+     flex: 1;
+@@ -188,6 +290,15 @@
+     flex: 1;
+     min-height: 0;
+   }
++  .slice-canvas-frame {
++    position: relative;
++    flex: 1;
++    min-width: 0;
++    min-height: 0;
++    display: flex;
++    /* leave room for the axis labels along the left/bottom edges */
++    padding: 0 0 12px 14px;
++  }
+   .slice-canvas {
+     flex: 1;
+     max-width: 100%;
+@@ -197,6 +308,49 @@
+     border-radius: 4px;
+     image-rendering: pixelated;
+   }
++  /* Orientation read-out bar */
++  .slice-orient {
++    display: flex;
++    flex-wrap: wrap;
++    gap: 2px 10px;
++    padding: 3px 8px 4px;
++    font-family: monospace;
++    font-size: 0.6rem;
++    line-height: 1.3;
++    color: var(--struct-text-color, #ccc);
++    opacity: 0.85;
++    background: rgba(255, 255, 255, 0.03);
++    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
++    flex-shrink: 0;
++  }
++  .orient-item {
++    white-space: nowrap;
++  }
++  .orient-item b {
++    color: #8ab4ff;
++    font-weight: 700;
++  }
++  /* Per-canvas axis direction hints */
++  .axis-label {
++    position: absolute;
++    font-family: monospace;
++    font-size: 0.52rem;
++    color: var(--struct-text-color, #ccc);
++    opacity: 0.6;
++    pointer-events: none;
++    white-space: nowrap;
++  }
++  .axis-u {
++    left: 50%;
++    bottom: 0;
++    transform: translateX(-30%);
++  }
++  .axis-v {
++    left: 0;
++    top: 50%;
++    transform: translateX(-50%) translateY(-50%) rotate(-90deg);
++    transform-origin: left center;
++  }
+   .colorbar {
+     display: flex;
+     flex-direction: column;
+diff --git a/src/lib/cube/parse-cube.ts b/src/lib/cube/parse-cube.ts
+index d2ab05b8e..39be3ac55 100644
+--- a/src/lib/cube/parse-cube.ts
++++ b/src/lib/cube/parse-cube.ts
+@@ -5,7 +5,17 @@
+  */
+ 
+ import { elem_symbols } from '$lib/labels'
+-import type { ElementSymbol } from '$lib'
++import type {
++  ElementSymbol,
++  Matrix3x3,
++  Pbc,
++  PymatgenLattice,
++  PymatgenMolecule,
++  Site,
++  Vec3,
++} from '$lib'
++import { calc_lattice_params } from '$lib/math'
++import { cartesian_to_fractional } from '$lib/structure/lattice-ops'
+ import type { CubeHeader } from './api'
+ 
+ const BOHR_TO_ANGSTROM = 0.529177210903
+@@ -21,6 +31,17 @@ export interface ParsedCubeHeader {
+   n_atoms: number
+   origin: [number, number, number]
+   dims: [number, number, number]
++  /**
++   * Per-voxel axis vectors (Angstrom). Row i is the displacement of one grid
++   * step along grid axis i. The cell/lattice vector for axis i is
++   * `voxel_axes[i] * dims[i]`. Populated by `parse_cube_header` so the lattice
++   * can be derived for periodic (VASP) charge files.
++   */
++  voxel_axes: [
++    [number, number, number],
++    [number, number, number],
++    [number, number, number],
++  ]
+   is_angstrom: boolean
+ }
+ 
+@@ -67,9 +88,23 @@ export function parse_cube_header(text: string): ParsedCubeHeader {
+ 
+   // Lines 3-5: voxel axes (N, dx, dy, dz)
+   const dims: [number, number, number] = [0, 0, 0]
++  const voxel_axes: [
++    [number, number, number],
++    [number, number, number],
++    [number, number, number],
++  ] = [
++    [0, 0, 0],
++    [0, 0, 0],
++    [0, 0, 0],
++  ]
+   for (let i = 0; i < 3; i++) {
+     const parts = lines[3 + i].trim().split(/\s+/)
+     dims[i] = parseInt(parts[0])
++    voxel_axes[i] = [
++      parseFloat(parts[1]) * scale,
++      parseFloat(parts[2]) * scale,
++      parseFloat(parts[3]) * scale,
++    ]
+   }
+ 
+   // Lines 6 to 6+n_atoms-1: atoms
+@@ -90,7 +125,7 @@ export function parse_cube_header(text: string): ParsedCubeHeader {
+     })
+   }
+ 
+-  return { atoms, n_atoms, origin, dims, is_angstrom }
++  return { atoms, n_atoms, origin, dims, voxel_axes, is_angstrom }
+ }
+ 
+ /**
+@@ -222,24 +257,112 @@ export function parse_cube_full(text: string): ParsedCubeData {
+ }
+ 
+ /**
+- * Convert parsed cube atoms to a PymatgenMolecule-compatible structure.
++ * Derive the real-space cell (lattice) from a cube grid.
++ *
++ * The cube grid spans one full period of the cell: lattice vector i is the
++ * per-voxel axis vector i times the grid count along axis i. `voxel_axes` is
++ * already in Angstrom (the parser applies the bohr→Å scale via `is_angstrom`),
++ * so the returned matrix is in Angstrom. Rows are the a, b, c lattice vectors.
++ *
++ * NOTE: this is only physically meaningful for files whose grid encodes a real
++ * periodic cell (VASP CHGCAR/LOCPOT/ELFCAR/… family). For molecular Gaussian
++ * cubes the grid is a padded bounding box, not a cell — callers must NOT treat
++ * those as periodic. Periodicity is decided by source format at the load entry
++ * point, not here.
+  */
+-export function cube_atoms_to_molecule(header: ParsedCubeHeader) {
+-  const sites = header.atoms.map((atom) => {
++export function derive_cube_lattice(
++  dims: [number, number, number],
++  voxel_axes: [
++    [number, number, number],
++    [number, number, number],
++    [number, number, number],
++  ],
++): Matrix3x3 {
++  return [
++    [
++      voxel_axes[0][0] * dims[0],
++      voxel_axes[0][1] * dims[0],
++      voxel_axes[0][2] * dims[0],
++    ],
++    [
++      voxel_axes[1][0] * dims[1],
++      voxel_axes[1][1] * dims[1],
++      voxel_axes[1][2] * dims[1],
++    ],
++    [
++      voxel_axes[2][0] * dims[2],
++      voxel_axes[2][1] * dims[2],
++      voxel_axes[2][2] * dims[2],
++    ],
++  ]
++}
++
++/** Build a full pymatgen-style lattice (matrix + pbc + params + volume). */
++function build_lattice(matrix: Matrix3x3): PymatgenLattice {
++  const params = calc_lattice_params(matrix)
++  const pbc: Pbc = [true, true, true]
++  return { matrix, pbc, ...params }
++}
++
++/**
++ * Convert parsed cube atoms to a structure for the 3D viewer.
++ *
++ * - `periodic: false` (default, molecular Gaussian cubes): returns a bare
++ *   `PymatgenMolecule` with NO lattice — renders as a finite cluster, exactly
++ *   as before. `abc` is left at [0,0,0].
++ * - `periodic: true` (VASP charge densities — CHGCAR/CHGDIFF/LOCPOT/ELFCAR/
++ *   PARCHG/AECCAR/*.vasp): derives the cell from the cube grid and returns a
++ *   `PymatgenStructure` with a real lattice (matrix + pbc=[true,true,true]) and
++ *   fractional `abc` per site, so the viewer draws the unit-cell box and
++ *   PBC cross-cell bonds via the normal periodic-structure machinery.
++ */
++export function cube_atoms_to_molecule(
++  header: ParsedCubeHeader,
++  opts: { periodic?: boolean } = {},
++): PymatgenMolecule & { lattice?: PymatgenLattice } {
++  const periodic = opts.periodic === true
++  const lattice = periodic
++    ? build_lattice(derive_cube_lattice(header.dims, header.voxel_axes))
++    : undefined
++
++  // The unit-cell box is drawn from the world origin (Lattice.svelte renders
++  // it at vector_origin = [0,0,0], spanning the matrix). The cube grid, though,
++  // is anchored at `header.origin` — for a real periodic cube the cell occupies
++  // [origin, origin + Σ lattice vectors], NOT [0, cell]. Express atom positions
++  // RELATIVE to that origin so the atoms sit inside the rendered box (and their
++  // fractional `abc` lands in [0,1]). For the CHGCAR→cube path the converter
++  // writes origin = (0,0,0), so this subtraction is a no-op there; it only
++  // matters for cubes that carry a non-zero grid origin.
++  const [ox, oy, oz] = periodic ? header.origin : [0, 0, 0]
++  const sites: Site[] = header.atoms.map((atom) => {
+     const symbol = (
+       atom.atomic_number > 0 && atom.atomic_number <= elem_symbols.length
+         ? elem_symbols[atom.atomic_number - 1]
+         : `X`
+     ) as ElementSymbol
+ 
++    const xyz: Vec3 = lattice
++      ? [atom.position[0] - ox, atom.position[1] - oy, atom.position[2] - oz]
++      : (atom.position as Vec3)
++    const abc: Vec3 = lattice
++      ? cartesian_to_fractional(xyz, lattice.matrix)
++      : [0, 0, 0]
++
+     return {
+       species: [{ element: symbol, occu: 1, oxidation_state: 0 }],
+-      xyz: atom.position as [number, number, number],
+-      abc: [0, 0, 0] as [number, number, number],
++      xyz,
++      abc,
+       label: symbol,
+       properties: {} as Record<string, unknown>,
+     }
+   })
+ 
+-  return { sites }
++  // Single (non-union) return type so callers' `{ ...mol, _aligned } as
++  // AnyStructure` cast keeps working. The `lattice` KEY is only attached when
++  // periodic — a molecular cube returns a bare `{ sites }` exactly as before,
++  // so the many bare `'lattice' in structure` guards across the app keep
++  // treating it as a non-periodic molecule.
++  const result: PymatgenMolecule & { lattice?: PymatgenLattice } = { sites }
++  if (lattice) result.lattice = lattice
++  return result
+ }
+diff --git a/src/lib/cube/slice.ts b/src/lib/cube/slice.ts
+index 6ebedd129..6837822c3 100644
+--- a/src/lib/cube/slice.ts
++++ b/src/lib/cube/slice.ts
+@@ -307,6 +307,53 @@ export function sample_plane_slice(
+ 
+ // ── Canvas rendering ─────────────────────────────────────────────────
+ 
++/**
++ * Crop a slice to a sub-window in plane (u,v) coordinates, returning a new
++ * SliceResult with the sub-grid + adjusted extents. Used to "fit to atoms" so a
++ * slab cross-section fills the figure instead of being a thin band in vacuum.
++ * The colormap range (`min`/`max`) and plane vectors are kept from the full
++ * slice so the colorbar and orientation stay consistent.
++ */
++export function crop_slice(
++  slice: SliceResult,
++  u_lo: number,
++  u_hi: number,
++  v_lo: number,
++  v_hi: number,
++): SliceResult {
++  const { data, width, height, u_min, u_max, v_min, v_max } = slice
++  const du = u_max - u_min || 1
++  const dv = v_max - v_min || 1
++  const to_col = (u: number) => Math.round(((u - u_min) / du) * (width - 1))
++  const to_row = (v: number) => Math.round(((v - v_min) / dv) * (height - 1))
++  let c0 = Math.max(0, Math.min(width - 1, to_col(u_lo)))
++  let c1 = Math.max(0, Math.min(width - 1, to_col(u_hi)))
++  let r0 = Math.max(0, Math.min(height - 1, to_row(v_lo)))
++  let r1 = Math.max(0, Math.min(height - 1, to_row(v_hi)))
++  if (c1 < c0) [c0, c1] = [c1, c0]
++  if (r1 < r0) [r0, r1] = [r1, r0]
++  // Degenerate window → return the full slice untouched.
++  if (c1 - c0 < 1 || r1 - r0 < 1) return slice
++  const new_w = c1 - c0 + 1
++  const new_h = r1 - r0 + 1
++  const new_data = new Float64Array(new_w * new_h)
++  for (let r = r0; r <= r1; r++) {
++    for (let c = c0; c <= c1; c++) {
++      new_data[(r - r0) * new_w + (c - c0)] = data[r * width + c]
++    }
++  }
++  return {
++    ...slice,
++    data: new_data,
++    width: new_w,
++    height: new_h,
++    u_min: u_min + (c0 / (width - 1)) * du,
++    u_max: u_min + (c1 / (width - 1)) * du,
++    v_min: v_min + (r0 / (height - 1)) * dv,
++    v_max: v_min + (r1 / (height - 1)) * dv,
++  }
++}
++
+ /**
+  * Render a SliceResult to an HTMLCanvasElement with a selectable colormap.
+  * Returns the [min, max] range used for the colorbar.
+diff --git a/src/lib/electronic/ChargeAnalysisPane.svelte b/src/lib/electronic/ChargeAnalysisPane.svelte
+index d4b94ead3..919f66095 100644
+--- a/src/lib/electronic/ChargeAnalysisPane.svelte
++++ b/src/lib/electronic/ChargeAnalysisPane.svelte
+@@ -1,6 +1,7 @@
+ <script lang="ts">
+   import FileSourceDialog from './FileSourceDialog.svelte'
+   import { API_BASE } from '$lib/api/config'
++  import { getDownloadUrl } from '$lib/api/hpc'
+   import { t, load_i18n_module } from '$lib/i18n/index.svelte'
+ 
+   load_i18n_module('structure')
+@@ -70,11 +71,10 @@
+     loading = true
+     error = null
+     try {
+-      const resp = await fetch(`${API_BASE}/chgcar/download`, {
+-        method: 'POST',
+-        headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ session_id, file_path: path }),
+-      })
++      // Stream the remote file via the existing HPC download endpoint
++      // (GET /api/hpc/download). The old POST /chgcar/download never existed —
++      // it fell through to the SPA GET catch-all → 405 Method Not Allowed.
++      const resp = await fetch(getDownloadUrl(session_id, path))
+       if (!resp.ok) throw new Error(await resp.text())
+       const blob = await resp.blob()
+       const filename = path.split('/').pop() || 'CHGCAR'
+@@ -91,11 +91,10 @@
+     loading = true
+     error = null
+     try {
+-      const resp = await fetch(`${API_BASE}/chgcar/download`, {
+-        method: 'POST',
+-        headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ session_id, file_path: path }),
+-      })
++      // Stream the remote file via the existing HPC download endpoint
++      // (GET /api/hpc/download). The old POST /chgcar/download never existed —
++      // it fell through to the SPA GET catch-all → 405 Method Not Allowed.
++      const resp = await fetch(getDownloadUrl(session_id, path))
+       if (!resp.ok) throw new Error(await resp.text())
+       const content = await resp.text()
+       const filename = path.split('/').pop() || 'ACF.dat'
+@@ -247,22 +246,23 @@
+   {/if}
+ </div>
+ 
+-{#if show_chgcar_dialog}
+-  <FileSourceDialog
+-    title={t('structure.load_chgcar_locpot')}
+-    file_types={['CHGCAR', 'LOCPOT', 'ELFCAR', 'PARCHG', 'AECCAR0', 'AECCAR2']}
+-    onremote_path={handle_remote_chgcar}
+-    onclose={() => show_chgcar_dialog = false}
+-  />
+-{/if}
+-{#if show_bader_dialog}
+-  <FileSourceDialog
+-    title={t('structure.load_acf_bader')}
+-    file_types={['ACF.dat', '.dat']}
+-    onremote_path={handle_remote_bader}
+-    onclose={() => show_bader_dialog = false}
+-  />
+-{/if}
++<!-- Always mounted, visibility driven by bind:show (matches the working
++     DosAnalysisPane pattern). A `{#if cond}<Dialog bind:show={cond}/>{/if}`
++     wrapper is an anti-pattern here and left the dialog never showing. -->
++<FileSourceDialog
++  bind:show={show_chgcar_dialog}
++  title={t('structure.load_chgcar_locpot')}
++  file_types={['CHGCAR', 'LOCPOT', 'ELFCAR', 'PARCHG', 'AECCAR0', 'AECCAR2']}
++  onremote_path={handle_remote_chgcar}
++  onclose={() => show_chgcar_dialog = false}
++/>
++<FileSourceDialog
++  bind:show={show_bader_dialog}
++  title={t('structure.load_acf_bader')}
++  file_types={['ACF.dat', '.dat']}
++  onremote_path={handle_remote_bader}
++  onclose={() => show_bader_dialog = false}
++/>
+ 
+ <style>
+   .charge-pane {
+diff --git a/src/lib/electronic/CohpAnalysisPane.svelte b/src/lib/electronic/CohpAnalysisPane.svelte
+index a9c96d477..a3c849dcb 100644
+--- a/src/lib/electronic/CohpAnalysisPane.svelte
++++ b/src/lib/electronic/CohpAnalysisPane.svelte
+@@ -8,6 +8,7 @@
+     upload_icohplist,
+     cleanup_cohp_session,
+     load_from_remote as cohp_load_remote,
++    load_icohp_from_remote,
+   } from '$lib/api/cohp'
+   import { register_analysis_session, unregister_analysis_session } from '$lib/chat/analysis-session-store.svelte'
+   import FileSourceDialog from './FileSourceDialog.svelte'
+@@ -50,6 +51,7 @@
+   let loading_data = $state(false)
+   let error_msg = $state(``)
+   let show_file_dialog = $state(false)
++  let show_icohp_dialog = $state(false)
+ 
+   // Bond selection
+   let selected_bond_indices: number[] = $state([])
+@@ -529,10 +531,15 @@
+       <summary>{t('structure.cohp_icohp_values')}</summary>
+       <div class="icohp-section">
+         {#if !cohp_state.icohp_entries}
+-          <label class="upload-btn-small">
+-            {t('structure.cohp_upload_icohplist')}
+-            <input type="file" accept=".lobster,.txt" onchange={handle_icohp_upload} hidden />
+-          </label>
++          <div class="source-buttons">
++            <label class="upload-btn-small">
++              {t('structure.cohp_upload_icohplist')}
++              <input type="file" accept=".lobster,.txt" onchange={handle_icohp_upload} hidden />
++            </label>
++            <button class="upload-btn-small remote-btn" onclick={() => show_icohp_dialog = true}>
++              {t('structure.dos_browse_remote_workflow')}
++            </button>
++          </div>
+         {:else}
+           <table class="icohp-table">
+             <thead>
+@@ -598,6 +605,32 @@
+   onclose={() => show_file_dialog = false}
+ />
+ 
++<FileSourceDialog
++  bind:show={show_icohp_dialog}
++  file_types={['.lobster', '.txt']}
++  title={t('structure.cohp_upload_icohplist')}
++  description={t('structure.cohp_load_cohpcar_desc')}
++  onfile={async (file) => {
++    error_msg = ''
++    try {
++      const result = await upload_icohplist(file)
++      cohp_state.icohp_entries = result.entries
++    } catch (e: any) {
++      error_msg = e.message || t('structure.cohp_icohplist_upload_failed')
++    }
++  }}
++  onremote_path={async (session_id, path) => {
++    error_msg = ''
++    try {
++      const result = await load_icohp_from_remote(session_id, path)
++      cohp_state.icohp_entries = result.entries
++    } catch (e: any) {
++      error_msg = e.message || t('structure.dos_remote_load_failed')
++    }
++  }}
++  onclose={() => show_icohp_dialog = false}
++/>
++
+ <style>
+   .cohp-analysis {
+     display: flex;
+diff --git a/src/lib/i18n/en/structure.ts b/src/lib/i18n/en/structure.ts
+index bba94e2b5..350f70d63 100644
+--- a/src/lib/i18n/en/structure.ts
++++ b/src/lib/i18n/en/structure.ts
+@@ -871,6 +871,10 @@ const structure: Record<string, string> = {
+   cube_slice_result: `Slice Result`,
+   cube_save_png: `Save PNG`,
+   cube_plane_slice_alt: `Cube plane slice`,
++  cube_slice_orientation: `Plane orientation`,
++  cube_slice_center: `center`,
++  cube_slice_extent: `extent`,
++  cube_slice_fit: `Fit the 2D view to the atoms (crop away vacuum); click to toggle full cell`,
+   nanotube_use_loaded_structure: `Use loaded structure`,
+   nanotube_manual_input: `Manual input`,
+   nanotube_2d_material: `2D Material`,
+diff --git a/src/lib/i18n/zh/structure.ts b/src/lib/i18n/zh/structure.ts
+index f7f406a30..60b7b728c 100644
+--- a/src/lib/i18n/zh/structure.ts
++++ b/src/lib/i18n/zh/structure.ts
+@@ -871,6 +871,10 @@ const structure: Record<string, string> = {
+   cube_slice_result: `切片结果`,
+   cube_save_png: `保存 PNG`,
+   cube_plane_slice_alt: `Cube 平面切片`,
++  cube_slice_orientation: `平面取向`,
++  cube_slice_center: `中心`,
++  cube_slice_extent: `范围`,
++  cube_slice_fit: `2D 视图裁到原子区(裁掉真空);点击切换整胞`,
+   nanotube_use_loaded_structure: `使用已加载结构`,
+   nanotube_manual_input: `手动输入`,
+   nanotube_2d_material: `二维材料`,
+diff --git a/src/lib/structure/CubePanel.svelte b/src/lib/structure/CubePanel.svelte
+index c1821135b..41a1db920 100644
+--- a/src/lib/structure/CubePanel.svelte
++++ b/src/lib/structure/CubePanel.svelte
+@@ -37,6 +37,8 @@
+     negative_mesh = $bindable(null),
+     cube_atoms = $bindable([]),
+     selected_sites = [],
++    display_positions = [],
++    display_elements = [],
+     cube_state = $bindable({
+       filepath: ``,
+       header: null,
+@@ -75,6 +77,13 @@
+     negative_mesh?: CubeMesh | null
+     cube_atoms?: CubeAtom[]
+     selected_sites?: number[]
++    /** Cartesian positions of ALL displayed atoms (base + PBC images), indexed
++     *  to match selected_sites, so a 3-atom plane works when an image is picked. */
++    display_positions?: number[][]
++    /** Element symbols of ALL displayed atoms (base + PBC images), indexed to
++     *  match selected_sites, for the selected-atom tags (image idx is out of
++     *  range of the base-only header.atoms). */
++    display_elements?: string[]
+     cube_state?: CubeState
+     onslice_data?: (result: SliceResult, atoms: AtomSliceInfo[]) => void
+     toggle_props?: ComponentProps<typeof DraggablePane>[`toggle_props`]
+@@ -268,6 +277,25 @@
+     slice_debounce_timer = setTimeout(handle_extract_slice, 50)
+   }
+ 
++  // Custom ▲▼ steppers — native number-input spinners are unreliable
++  // (hover-only in Chrome, absent in WebKitGTK), and the user wants always-on
++  // up/down arrows. These mutate the bound value, clamp, and re-extract.
++  function step_offset(delta: number) {
++    const v = Math.round((cube_state.slice_plane.offset + delta) * 10) / 10
++    cube_state.slice_plane.offset = Math.min(10, Math.max(-10, v))
++    debounced_slice()
++  }
++  function step_tilt(i: number, delta: number) {
++    const v = Math.round((cube_state.slice_plane.rotation[i] ?? 0) + delta)
++    cube_state.slice_plane.rotation[i] = Math.min(90, Math.max(-90, v))
++    debounced_slice()
++  }
++  function step_position(delta: number) {
++    const v = Math.round((cube_state.slice_plane.position + delta) * 100) / 100
++    cube_state.slice_plane.position = Math.min(1, Math.max(0, v))
++    debounced_slice()
++  }
++
+   // Update normal/center for axis-aligned modes based on position slider and grid info
+   $effect(() => {
+     const h = cube_state.header
+@@ -302,19 +330,43 @@
+     }
+   })
+ 
+-  // Auto-compute custom slice plane when 3+ atoms are selected
++  // Auto-compute custom slice plane when 3+ atoms are selected.
++  // selected_sites are BASE-site indices into the viewer structure; that
++  // structure is built 1:1 from header.atoms (cube_atoms_to_molecule maps in
++  // order), so the same index addresses the matching cube atom. We read the
++  // RAW cube positions (header.atoms[i].position) on purpose: the slice math
++  // (sample_plane_slice) lives in the cube's origin+voxel frame, so the plane
++  // must be defined there too.
+   $effect(() => {
+     const atoms = cube_state.header?.atoms
+     const sp = cube_state.slice_plane
+-    if (!atoms || sp.mode !== `custom` || selected_sites.length < 3) return
+-    const indices = selected_sites.slice(0, 3)
+-    if (indices.some(i => i >= atoms.length)) return
+-    const p1 = atoms[indices[0]].position
+-    const p2 = atoms[indices[1]].position
+-    const p3 = atoms[indices[2]].position
++    // Track selection length explicitly so the effect re-runs as atoms are
++    // clicked one-by-one (and fires the moment the 3rd atom lands).
++    const sel = selected_sites
++    if (!atoms || sp.mode !== `custom` || sel.length < 3) return
++    const indices = sel.slice(0, 3)
++    // selected_sites can include PBC image-atom indices (>= base atom count) for
++    // periodic structures (the user clicked a periodic image). A base-only
++    // lookup rejected those (and silently did nothing). Resolve each clicked
++    // atom's position from the DISPLAYED positions (base + image, same cube
++    // frame), falling back to the base cube atoms when not supplied.
++    const pos_of = (i: number): Vec3 | null => {
++      if (display_positions.length > i) return display_positions[i] as Vec3
++      return i < atoms.length ? (atoms[i].position as Vec3) : null
++    }
++    const p1 = pos_of(indices[0])
++    const p2 = pos_of(indices[1])
++    const p3 = pos_of(indices[2])
++    if (!p1 || !p2 || !p3) return
+     const v1: Vec3 = [p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]]
+     const v2: Vec3 = [p3[0] - p1[0], p3[1] - p1[1], p3[2] - p1[2]]
+-    sp.normal = normalize(cross(v1, v2))
++    const raw_normal = cross(v1, v2)
++    // Guard against three collinear atoms (degenerate plane → cross == ~0).
++    if (Math.hypot(...raw_normal) < 1e-8) {
++      cube_state.error = `Selected atoms are collinear — pick 3 non-collinear atoms`
++      return
++    }
++    sp.normal = normalize(raw_normal)
+     sp.center = [
+       (p1[0] + p2[0] + p3[0]) / 3,
+       (p1[1] + p2[1] + p3[1]) / 3,
+@@ -323,6 +375,12 @@
+     sp.selected_atoms = indices
+     sp.rotation = [0, 0, 0]
+     sp.show_plane = true
++    // X/Y/Z modes only sample the 2D slice when the Position slider fires
++    // `oninput`; the custom mode has no such trigger, so selecting 3 atoms used
++    // to update only the 3D preview plane (driven reactively from sp.normal/
++    // sp.center) and never produced the 2D slice figure. Kick the extract here
++    // so the figure appears as soon as the plane is defined.
++    debounced_slice()
+   })
+ 
+   async function handle_export(format: `glb` | `obj`) {
+@@ -494,15 +552,21 @@
+         {#if cube_state.slice_plane.mode !== `custom`}
+           <label>
+             Position
+-            <input
+-              type="range"
+-              min="0"
+-              max="1"
+-              step="0.01"
+-              bind:value={cube_state.slice_plane.position}
+-              oninput={debounced_slice}
+-            />
+-            <span class="angle">{cube_state.slice_plane.position.toFixed(2)}</span>
++            <span class="spin-wrap">
++              <input
++                type="number"
++                class="spin-input"
++                min="0"
++                max="1"
++                step="0.01"
++                bind:value={cube_state.slice_plane.position}
++                oninput={debounced_slice}
++              />
++              <span class="spin-arrows">
++                <button type="button" class="spin-btn" tabindex="-1" onclick={() => step_position(0.01)}>▲</button>
++                <button type="button" class="spin-btn" tabindex="-1" onclick={() => step_position(-0.01)}>▼</button>
++              </span>
++            </span>
+           </label>
+         {:else}
+           <div class="slice-info">
+@@ -510,7 +574,10 @@
+               <span class="selected-atoms">
+                 {#each cube_state.slice_plane.selected_atoms as idx}
+                   <span class="atom-tag">
+-                    {atom_symbol(cube_state.header.atoms[idx].atomic_number)}{idx + 1}
++                    {display_elements[idx]
++                      ?? (cube_state.header.atoms[idx]
++                        ? atom_symbol(cube_state.header.atoms[idx].atomic_number)
++                        : `?`)}{idx + 1}
+                   </span>
+                 {/each}
+               </span>
+@@ -521,29 +588,43 @@
+ 
+           <label>
+             Offset
+-            <input
+-              type="range"
+-              min="-10"
+-              max="10"
+-              step="0.1"
+-              bind:value={cube_state.slice_plane.offset}
+-              oninput={debounced_slice}
+-            />
+-            <span class="angle">{cube_state.slice_plane.offset.toFixed(1)}&Aring;</span>
++            <span class="spin-wrap">
++              <input
++                type="number"
++                class="spin-input"
++                min="-10"
++                max="10"
++                step="0.1"
++                bind:value={cube_state.slice_plane.offset}
++                oninput={debounced_slice}
++              />
++              <span class="spin-arrows">
++                <button type="button" class="spin-btn" tabindex="-1" onclick={() => step_offset(0.1)}>▲</button>
++                <button type="button" class="spin-btn" tabindex="-1" onclick={() => step_offset(-0.1)}>▼</button>
++              </span>
++            </span>
++            <span class="unit">&Aring;</span>
+           </label>
+ 
+           {#each [`U`, `V`, `N`] as axis, i}
+             <label>
+               Tilt {axis}
+-              <input
+-                type="range"
+-                min="-90"
+-                max="90"
+-                step="1"
+-                bind:value={cube_state.slice_plane.rotation[i]}
+-                oninput={debounced_slice}
+-              />
+-              <span class="angle">{cube_state.slice_plane.rotation[i]}&deg;</span>
++              <span class="spin-wrap">
++                <input
++                  type="number"
++                  class="spin-input"
++                  min="-90"
++                  max="90"
++                  step="1"
++                  bind:value={cube_state.slice_plane.rotation[i]}
++                  oninput={debounced_slice}
++                />
++                <span class="spin-arrows">
++                  <button type="button" class="spin-btn" tabindex="-1" onclick={() => step_tilt(i, 1)}>▲</button>
++                  <button type="button" class="spin-btn" tabindex="-1" onclick={() => step_tilt(i, -1)}>▼</button>
++                </span>
++              </span>
++              <span class="unit">&deg;</span>
+             </label>
+           {/each}
+         {/if}
+@@ -629,6 +710,58 @@
+     padding: 1px 3px;
+     font-size: 0.75rem;
+   }
++  .spin-wrap {
++    flex: 1;
++    display: flex;
++    align-items: stretch;
++    min-width: 60px;
++  }
++  .spin-input {
++    flex: 1;
++    min-width: 40px;
++    padding: 2px 4px;
++    font-size: 0.75rem;
++    border: 1px solid rgba(128, 128, 128, 0.3);
++    border-radius: 3px 0 0 3px;
++    background: rgba(128, 128, 128, 0.1);
++    color: inherit;
++    /* Hide the unreliable native spinner — we provide custom ▲▼ buttons. */
++    appearance: textfield;
++    -moz-appearance: textfield;
++  }
++  .spin-input::-webkit-outer-spin-button,
++  .spin-input::-webkit-inner-spin-button {
++    -webkit-appearance: none;
++    margin: 0;
++  }
++  .spin-arrows {
++    display: flex;
++    flex-direction: column;
++  }
++  .spin-btn {
++    flex: 1;
++    width: 16px;
++    padding: 0;
++    font-size: 0.5rem;
++    line-height: 1;
++    border: 1px solid rgba(128, 128, 128, 0.3);
++    border-left: none;
++    background: rgba(128, 128, 128, 0.15);
++    color: inherit;
++    cursor: pointer;
++    display: flex;
++    align-items: center;
++    justify-content: center;
++  }
++  .spin-btn:first-child { border-radius: 0 3px 0 0; border-bottom: none; }
++  .spin-btn:last-child { border-radius: 0 0 3px 0; }
++  .spin-btn:hover { background: rgba(128, 128, 128, 0.3); }
++  .unit {
++    min-width: 14px;
++    text-align: left;
++    font-size: 0.65rem;
++    opacity: 0.7;
++  }
+   .color-row {
+     display: flex;
+     gap: 0.75rem;
+diff --git a/src/lib/structure/Structure.svelte b/src/lib/structure/Structure.svelte
+index 29e3b6ddf..70bc11066 100644
+--- a/src/lib/structure/Structure.svelte
++++ b/src/lib/structure/Structure.svelte
+@@ -3769,7 +3769,12 @@
+                         const cube_filename = file.name + `.cube`
+                         const { parse_cube_header, cube_atoms_to_molecule } = await import(`$lib/cube/parse-cube`)
+                         const header = parse_cube_header(cube_text)
+-                        const molecule = cube_atoms_to_molecule(header)
++                        // VASP charge-density family is always periodic: derive the
++                        // cell from the cube grid so the viewer draws the unit-cell
++                        // box + PBC cross-cell bonds (the CHGCAR→cube conversion
++                        // drops the VASP origin, so we carry periodicity in from
++                        // the original filename, which `is_chgcar` already matched).
++                        const molecule = cube_atoms_to_molecule(header, { periodic: true })
+                         if (molecule.sites.length > 0) {
+                           structure = { ...molecule, _aligned: true } as any
+                           center_camera_trigger++
+@@ -3781,12 +3786,19 @@
+                         console.error(`CHGCAR conversion failed:`, err)
+                       }
+                     } else {
+-                      // .cube file — parse header to update structure
++                      // .cube file — parse header to update structure.
++                      // A genuine Gaussian/molecular cube is NON-periodic (its
++                      // grid is a padded bounding box, not a cell). But cubes
++                      // we re-emit from VASP charge data (e.g. the difference-
++                      // density "CHGCAR_diff.cube", or a "CHGDIFF.vasp.cube")
++                      // ARE periodic — keep their cell so the slab renders with
++                      // the unit-cell box + PBC bonds.
++                      const cube_is_vasp = /CHGCAR|CHGDIFF|DIFFCHG|AECCAR|LOCPOT|ELFCAR|PARCHG|\.vasp/i.test(file.name)
+                       try {
+                         const text = await file.text()
+                         const { parse_cube_header, cube_atoms_to_molecule } = await import(`$lib/cube/parse-cube`)
+                         const header = parse_cube_header(text)
+-                        const molecule = cube_atoms_to_molecule(header)
++                        const molecule = cube_atoms_to_molecule(header, { periodic: cube_is_vasp })
+                         if (molecule.sites.length > 0) {
+                           structure = { ...molecule, _aligned: true } as any
+                           center_camera_trigger++
+@@ -4178,6 +4190,9 @@
+             bind:negative_mesh={cube_negative_mesh}
+             bind:cube_atoms={cube_atoms_data}
+             {selected_sites}
++            display_positions={(displayed_structure?.sites ?? []).map((s) => s.xyz)}
++            display_elements={(displayed_structure?.sites ?? []).map((s) =>
++              (s as any).species?.[0]?.element ?? (s as any).label ?? `?`)}
+             bind:cube_state={cube_state_data}
+             onslice_data={(result, atoms) => { slice_result = result; slice_atoms_info = atoms }}
+           />
+diff --git a/src/lib/structure/controllers/file-handlers.ts b/src/lib/structure/controllers/file-handlers.ts
+index cfc2b0c34..3cb5bba2e 100644
+--- a/src/lib/structure/controllers/file-handlers.ts
++++ b/src/lib/structure/controllers/file-handlers.ts
+@@ -200,9 +200,11 @@ export function create_file_handlers(deps: FileHandlerDeps) {
+       const cube_text = await resp.text()
+       const cube_filename = filename.replace(/\.(gz|bz2|xz|zst)$/i, ``) + `.cube`
+ 
+-      // Parse cube header to extract structure for the 3D viewer
++      // Parse cube header to extract structure for the 3D viewer.
++      // CHGCAR-family files are always periodic — derive the cell from the
++      // cube grid so the slab renders with its unit-cell box + PBC bonds.
+       const header = parse_cube_header(cube_text)
+-      const molecule = cube_atoms_to_molecule(header)
++      const molecule = cube_atoms_to_molecule(header, { periodic: true })
+       if (molecule.sites.length > 0) {
+         deps.set_structure({ ...molecule, _aligned: true } as AnyStructure)
+         deps.inc_center_camera()
+@@ -229,7 +231,11 @@ export function create_file_handlers(deps: FileHandlerDeps) {
+     if (!/\.(cube|cub)$/i.test(filename)) return false
+     try {
+       const header = parse_cube_header(text)
+-      const molecule = cube_atoms_to_molecule(header)
++      // Molecular Gaussian cubes are non-periodic, but VASP-origin cubes
++      // (e.g. CHGCAR_diff.cube / *.vasp.cube) carry a real cell — keep it so
++      // the slab renders with its unit-cell box + PBC bonds.
++      const cube_is_vasp = /CHGCAR|CHGDIFF|DIFFCHG|AECCAR|LOCPOT|ELFCAR|PARCHG|\.vasp/i.test(filename)
++      const molecule = cube_atoms_to_molecule(header, { periodic: cube_is_vasp })
+       if (molecule.sites.length > 0) {
+         deps.set_structure({ ...molecule, _aligned: true } as AnyStructure)
+         deps.inc_center_camera()
+diff --git a/tests/vitest/cube/periodic-cube-lattice.test.ts b/tests/vitest/cube/periodic-cube-lattice.test.ts
+new file mode 100644
+index 000000000..1207ac621
+--- /dev/null
++++ b/tests/vitest/cube/periodic-cube-lattice.test.ts
+@@ -0,0 +1,126 @@
++import { describe, expect, test } from 'vitest'
++import {
++  cube_atoms_to_molecule,
++  derive_cube_lattice,
++  parse_cube_header,
++} from '$lib/cube/parse-cube'
++import { find_pbc_images_fast } from '$lib/structure'
++
++// Build a minimal periodic cube (CHGCAR→cube shape): negative n_atoms ⇒ the
++// header is already in Ångström (no bohr scaling). `origin` is the grid anchor;
++// the grid spans `voxel_axes[i] * dims[i]` along each axis.
++function make_cube(opts: {
++  cell: number
++  grid: number
++  origin: [number, number, number]
++  atoms: [number, [number, number, number]][]
++}): string {
++  const { cell, grid, origin, atoms } = opts
++  const dv = cell / grid
++  const lines: string[] = [`periodic cube`, `regression fixture`]
++  // negative count ⇒ Ångström units
++  lines.push(`${-atoms.length}  ${origin[0]}  ${origin[1]}  ${origin[2]}`)
++  lines.push(`${grid}  ${dv}  0  0`)
++  lines.push(`${grid}  0  ${dv}  0`)
++  lines.push(`${grid}  0  0  ${dv}`)
++  for (const [z, p] of atoms) {
++    lines.push(`${z}  ${z}.0  ${p[0]}  ${p[1]}  ${p[2]}`)
++  }
++  // voxel payload (values are irrelevant to header parsing)
++  const total = grid * grid * grid
++  for (let i = 0; i < total; i += 6) {
++    lines.push(`  ` + new Array(Math.min(6, total - i)).fill(`0.001`).join(`  `))
++  }
++  return lines.join(`\n`)
++}
++
++describe('periodic cube → lattice + displayed-structure pipeline', () => {
++  test('derive_cube_lattice spans the full grid (voxel × dims)', () => {
++    const header = parse_cube_header(
++      make_cube({ cell: 4, grid: 10, origin: [0, 0, 0], atoms: [[78, [0, 0, 0]]] }),
++    )
++    expect(derive_cube_lattice(header.dims, header.voxel_axes)).toEqual([
++      [4, 0, 0],
++      [0, 4, 0],
++      [0, 0, 4],
++    ])
++  })
++
++  test('periodic cube carries a real lattice and in-cell fractional coords', () => {
++    const header = parse_cube_header(
++      make_cube({
++        cell: 4,
++        grid: 10,
++        origin: [0, 0, 0],
++        atoms: [
++          [78, [0, 0, 0]],
++          [78, [2, 2, 2]],
++        ],
++      }),
++    )
++    const mol = cube_atoms_to_molecule(header, { periodic: true })
++
++    expect(mol.lattice).toBeTruthy()
++    expect(mol.lattice?.matrix).toEqual([
++      [4, 0, 0],
++      [0, 4, 0],
++      [0, 0, 4],
++    ])
++    // pbc must be all-true so the periodic machinery (cell box + PBC bonds) runs
++    expect(mol.lattice?.pbc).toEqual([true, true, true])
++    expect(mol.sites[0].abc).toEqual([0, 0, 0])
++    expect(mol.sites[1].abc).toEqual([0.5, 0.5, 0.5])
++  })
++
++  test('non-zero grid origin is folded into atom coords so they sit in the box', () => {
++    // Real periodic cube whose grid is anchored at (-4,-4,-4); the atom is
++    // written in absolute Cartesian. After load it must land at the cell centre
++    // (frac 0.5,0.5,0.5) RELATIVE to the box drawn from the world origin — not
++    // at frac -1 outside the box (which would make the slab look detached).
++    const header = parse_cube_header(
++      make_cube({
++        cell: 4,
++        grid: 10,
++        origin: [-4, -4, -4],
++        atoms: [[78, [-2, -2, -2]]],
++      }),
++    )
++    const mol = cube_atoms_to_molecule(header, { periodic: true })
++    expect(mol.lattice).toBeTruthy()
++    expect(mol.sites[0].xyz).toEqual([2, 2, 2])
++    expect(mol.sites[0].abc).toEqual([0.5, 0.5, 0.5])
++  })
++
++  test('find_pbc_images_fast preserves the lattice (cell box stays drawable)', async () => {
++    const header = parse_cube_header(
++      make_cube({
++        cell: 4,
++        grid: 10,
++        origin: [0, 0, 0],
++        atoms: [
++          [78, [0, 0, 0]],
++          [78, [2, 2, 2]],
++        ],
++      }),
++    )
++    const mol = cube_atoms_to_molecule(header, { periodic: true })
++    const imaged = await find_pbc_images_fast(mol as never)
++
++    // The cell-box render gate reads get_lattice(displayed_structure); it must
++    // remain truthy after the PBC-image expansion that produces displayed_structure.
++    expect(`lattice` in imaged && (imaged as { lattice?: unknown }).lattice).toBeTruthy()
++    // A boundary atom at frac 0 spawns image copies ⇒ more sites than the input.
++    expect(imaged.sites.length).toBeGreaterThan(mol.sites.length)
++  })
++
++  test('molecular cube (default, non-periodic) has NO lattice', () => {
++    const header = parse_cube_header(
++      make_cube({ cell: 4, grid: 10, origin: [-2, -2, -2], atoms: [[8, [0, 0, 0]]] }),
++    )
++    const mol = cube_atoms_to_molecule(header)
++    expect((mol as { lattice?: unknown }).lattice).toBeFalsy()
++    // molecular cubes keep absolute Cartesian coords and zeroed fractional coords
++    expect(mol.sites[0].xyz).toEqual([0, 0, 0])
++    expect(mol.sites[0].abc).toEqual([0, 0, 0])
++  })
++})

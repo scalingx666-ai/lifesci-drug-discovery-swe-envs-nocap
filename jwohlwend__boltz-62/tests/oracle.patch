@@ -1,0 +1,549 @@
+diff --git a/src/boltz/data/write/mmcif.py b/src/boltz/data/write/mmcif.py
+index f259eb8d0..36128c0f9 100644
+--- a/src/boltz/data/write/mmcif.py
++++ b/src/boltz/data/write/mmcif.py
+@@ -1,17 +1,20 @@
+ import io
+ from collections.abc import Iterator
++from typing import Optional
+ 
+ import ihm
++import modelcif
+ from modelcif import Assembly, AsymUnit, Entity, System, dumper
+ from modelcif.model import AbInitioModel, Atom, ModelGroup
+ from rdkit import Chem
++from torch import Tensor
+ 
+ from boltz.data import const
+ from boltz.data.types import Structure
+ from boltz.data.write.utils import generate_tags
+ 
+ 
+-def to_mmcif(structure: Structure) -> str:  # noqa: C901, PLR0915, PLR0912
++def to_mmcif(structure: Structure, plddts: Optional[Tensor] = None) -> str:  # noqa: C901, PLR0915, PLR0912
+     """Write a structure into an MMCIF file.
+ 
+     Parameters
+@@ -108,15 +111,10 @@ def to_mmcif(structure: Structure) -> str:  # noqa: C901, PLR0915, PLR0912
+         asym_unit_map[chain_idx] = asym
+     modeled_assembly = Assembly(asym_unit_map.values(), name="Modeled assembly")
+ 
+-    # class _LocalPLDDT(modelcif.qa_metric.Local, modelcif.qa_metric.PLDDT):
+-    #     name = "pLDDT"
+-    #     software = None
+-    #     description = "Predicted lddt"
+-
+-    # class _GlobalPLDDT(modelcif.qa_metric.Global, modelcif.qa_metric.PLDDT):
+-    #     name = "pLDDT"
+-    #     software = None
+-    #     description = "Global pLDDT, mean of per-residue pLDDTs"
++    class _LocalPLDDT(modelcif.qa_metric.Local, modelcif.qa_metric.PLDDT):
++        name = "pLDDT"
++        software = None
++        description = "Predicted lddt"
+ 
+     class _MyModel(AbInitioModel):
+         def get_atoms(self) -> Iterator[Atom]:
+@@ -161,36 +159,28 @@ def get_atoms(self) -> Iterator[Atom]:
+                             occupancy=1,
+                         )
+ 
+-        def add_scores(self):
+-            return
+-            # local scores
+-            # plddt_per_residue = {}
+-            # for i in range(n):
+-            #     for mask, b_factor in zip(atom_mask[i], b_factors[i]):
+-            #         if mask < 0.5:
+-            #             continue
+-            #         # add 1 per residue, not 1 per atom
+-            #         if chain_index[i] not in plddt_per_residue:
+-            #             # first time a chain index is seen: add the key and start the residue dict
+-            #             plddt_per_residue[chain_index[i]] = {residue_index[i]: b_factor}
+-            #         if residue_index[i] not in plddt_per_residue[chain_index[i]]:
+-            #             plddt_per_residue[chain_index[i]][residue_index[i]] = b_factor
+-            # plddts = []
+-            # for chain_idx in plddt_per_residue:
+-            #     for residue_idx in plddt_per_residue[chain_idx]:
+-            #         plddt = plddt_per_residue[chain_idx][residue_idx]
+-            #         plddts.append(plddt)
+-            #         self.qa_metrics.append(
+-            #             _LocalPLDDT(
+-            #                 asym_unit_map[chain_idx].residue(residue_idx), plddt
+-            #             )
+-            #         )
+-            # # global score
+-            # self.qa_metrics.append((_GlobalPLDDT(np.mean(plddts))))
++        def add_plddt(self, plddts):
++            res_num = 0
++            for chain in structure.chains:
++                chain_idx = chain["asym_id"]
++                res_start = chain["res_idx"]
++                res_end = chain["res_idx"] + chain["res_num"]
++                residues = structure.residues[res_start:res_end]
++                # We rename the chains in alphabetical order
++                for residue in residues:
++                    residue_idx = residue["res_idx"] + 1
++                    self.qa_metrics.append(
++                        _LocalPLDDT(
++                            asym_unit_map[chain_idx].residue(residue_idx),
++                            plddts[res_num].item(),
++                        )
++                    )
++                    res_num += 1
+ 
+     # Add the model and modeling protocol to the file and write them out:
+     model = _MyModel(assembly=modeled_assembly, name="Model")
+-    # model.add_scores()
++    if plddts is not None:
++        model.add_plddt(plddts)
+ 
+     model_group = ModelGroup([model], name="All models")
+     system.model_groups.append(model_group)
+diff --git a/src/boltz/data/write/writer.py b/src/boltz/data/write/writer.py
+index 6f4aa5994..6a93eb693 100644
+--- a/src/boltz/data/write/writer.py
++++ b/src/boltz/data/write/writer.py
+@@ -1,10 +1,12 @@
+ from dataclasses import asdict, replace
++import json
+ from pathlib import Path
+ from typing import Literal
+ 
+ import numpy as np
+ from pytorch_lightning import LightningModule, Trainer
+ from pytorch_lightning.callbacks import BasePredictionWriter
++import torch
+ from torch import Tensor
+ 
+ from boltz.data.types import (
+@@ -69,16 +71,13 @@ def write_on_batch_end(
+         coords = coords.unsqueeze(0)
+ 
+         pad_masks = prediction["masks"]
+-        if prediction.get("confidence") is not None:
+-            confidences = prediction["confidence"]
+-            confidences = confidences.reshape(len(records), -1).tolist()
+-        else:
+-            confidences = [0.0 for _ in range(len(records))]
++
++        # Get ranking
++        argsort = torch.argsort(prediction["confidence_score"], descending=True)
++        idx_to_rank = {idx.item(): rank for rank, idx in enumerate(argsort)}
+ 
+         # Iterate over the records
+-        for record, coord, pad_mask, _confidence in zip(
+-            records, coords, pad_masks, confidences
+-        ):
++        for record, coord, pad_mask in zip(records, coords, pad_masks):
+             # Load the structure
+             path = self.data_dir / f"{record.id}.npz"
+             structure: Structure = Structure.load(path)
+@@ -134,20 +133,97 @@ def write_on_batch_end(
+                 struct_dir.mkdir(exist_ok=True)
+ 
+                 if self.output_format == "pdb":
+-                    path = struct_dir / f"{record.id}_model_{model_idx}.pdb"
++                    path = (
++                        struct_dir / f"{record.id}_model_{idx_to_rank[model_idx]}.pdb"
++                    )
+                     with path.open("w") as f:
+                         f.write(to_pdb(new_structure))
+                 elif self.output_format == "mmcif":
+-                    path = struct_dir / f"{record.id}_model_{model_idx}.cif"
++                    path = (
++                        struct_dir / f"{record.id}_model_{idx_to_rank[model_idx]}.cif"
++                    )
+                     with path.open("w") as f:
+-                        f.write(to_mmcif(new_structure))
++                        if "plddt" in prediction:
++                            f.write(
++                                to_mmcif(new_structure, prediction["plddt"][model_idx])
++                            )
++                        else:
++                            f.write(to_mmcif(new_structure))
+                 else:
+-                    path = struct_dir / f"{record.id}_model_{model_idx}.npz"
++                    path = (
++                        struct_dir / f"{record.id}_model_{idx_to_rank[model_idx]}.npz"
++                    )
+                     np.savez_compressed(path, **asdict(new_structure))
+ 
++                # Save confidence summary
++                if "plddt" in prediction:
++                    path = (
++                        struct_dir
++                        / f"confidence_{record.id}_model_{idx_to_rank[model_idx]}.json"
++                    )
++                    confidence_summary_dict = {}
++                    for key in [
++                        "confidence_score",
++                        "ptm",
++                        "iptm",
++                        "ligand_iptm",
++                        "protein_iptm",
++                        "complex_plddt",
++                        "complex_iplddt",
++                        "complex_pde",
++                        "complex_ipde",
++                    ]:
++                        confidence_summary_dict[key] = prediction[key][model_idx].item()
++                    confidence_summary_dict["chains_ptm"] = {
++                        idx: prediction["pair_chains_iptm"][idx][idx][model_idx].item()
++                        for idx in prediction["pair_chains_iptm"]
++                    }
++                    confidence_summary_dict["pair_chains_iptm"] = {
++                        idx1: {
++                            idx2: prediction["pair_chains_iptm"][idx1][idx2][
++                                model_idx
++                            ].item()
++                            for idx2 in prediction["pair_chains_iptm"][idx1]
++                        }
++                        for idx1 in prediction["pair_chains_iptm"]
++                    }
++                    with path.open("w") as f:
++                        f.write(
++                            json.dumps(
++                                confidence_summary_dict,
++                                indent=4,
++                            )
++                        )
++
++                    # Save plddt
++                    plddt = prediction["plddt"][model_idx]
++                    path = (
++                        struct_dir
++                        / f"plddt_{record.id}_model_{idx_to_rank[model_idx]}.npz"
++                    )
++                    np.savez_compressed(path, plddt=plddt.cpu().numpy())
++
++                # Save pae
++                if "pae" in prediction:
++                    pae = prediction["pae"][model_idx]
++                    path = (
++                        struct_dir
++                        / f"pae_{record.id}_model_{idx_to_rank[model_idx]}.npz"
++                    )
++                    np.savez_compressed(path, pae=pae.cpu().numpy())
++
++                # Save pde
++                if "pde" in prediction:
++                    pde = prediction["pde"][model_idx]
++                    path = (
++                        struct_dir
++                        / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
++                    )
++                    np.savez_compressed(path, pde=pde.cpu().numpy())
++
+     def on_predict_epoch_end(
+         self,
+-        trainer: Trainer,  # noqa: ARG00s2
++        trainer: Trainer,  # noqa: ARG002
+         pl_module: LightningModule,  # noqa: ARG002
+     ) -> None:
+         """Print the number of failed examples."""
+diff --git a/src/boltz/main.py b/src/boltz/main.py
+index 0ccf4bb2f..07c832efb 100644
+--- a/src/boltz/main.py
++++ b/src/boltz/main.py
+@@ -428,6 +428,24 @@ def cli() -> None:
+     help="The number of diffusion samples to use for prediction. Default is 1.",
+     default=1,
+ )
++@click.option(
++    "--write_confidence_summary",
++    type=bool,
++    help="Whether to dump the confidence metrics summary and plddt into a json file. Default is True.",
++    default=True,
++)
++@click.option(
++    "--write_full_pae",
++    type=bool,
++    help="Whether to dump the pae into a npz file. Default is True.",
++    default=True,
++)
++@click.option(
++    "--write_full_pde",
++    type=bool,
++    help="Whether to dump the pde into a npz file. Default is False.",
++    default=False,
++)
+ @click.option(
+     "--output_format",
+     type=click.Choice(["pdb", "mmcif"]),
+@@ -472,6 +490,9 @@ def predict(
+     recycling_steps: int = 3,
+     sampling_steps: int = 200,
+     diffusion_samples: int = 1,
++    write_confidence_summary: bool = True,
++    write_full_pae: bool = True,
++    write_full_pde: bool = False,
+     output_format: Literal["pdb", "mmcif"] = "mmcif",
+     num_workers: int = 2,
+     override: bool = False,
+@@ -562,6 +583,9 @@ def predict(
+         "recycling_steps": recycling_steps,
+         "sampling_steps": sampling_steps,
+         "diffusion_samples": diffusion_samples,
++        "write_confidence_summary": write_confidence_summary,
++        "write_full_pae": write_full_pae,
++        "write_full_pde": write_full_pde,
+     }
+     model_module: Boltz1 = Boltz1.load_from_checkpoint(
+         checkpoint,
+@@ -569,6 +593,7 @@ def predict(
+         predict_args=predict_args,
+         map_location="cpu",
+         diffusion_process_args=asdict(BoltzDiffusionParams()),
++        ema=False,
+     )
+     model_module.eval()
+ 
+diff --git a/src/boltz/model/model.py b/src/boltz/model/model.py
+index b140100e8..1e5fd7180 100644
+--- a/src/boltz/model/model.py
++++ b/src/boltz/model/model.py
+@@ -1,6 +1,6 @@
+ import gc
+ import random
+-from typing import Any, Optional, Dict
++from typing import Any, Dict, Optional
+ 
+ import torch
+ import torch._dynamo
+@@ -228,7 +228,6 @@ def __init__(  # noqa: PLR0915, C901, PLR0912
+                 self.confidence_module = ConfidenceModule(
+                     token_s,
+                     token_z,
+-                    confidence_prediction=confidence_prediction,
+                     compute_pae=alpha_pae > 0,
+                     imitate_trunk=True,
+                     pairformer_args=pairformer_args,
+@@ -240,7 +239,6 @@ def __init__(  # noqa: PLR0915, C901, PLR0912
+                 self.confidence_module = ConfidenceModule(
+                     token_s,
+                     token_z,
+-                    confidence_prediction=confidence_prediction,
+                     compute_pae=alpha_pae > 0,
+                     **confidence_model_args,
+                 )
+@@ -262,6 +260,7 @@ def forward(
+         num_sampling_steps: Optional[int] = None,
+         multiplicity_diffusion_train: int = 1,
+         diffusion_samples: int = 1,
++        run_confidence_sequentially: bool = False,
+     ) -> dict[str, Tensor]:
+         dict_out = {}
+ 
+@@ -361,6 +360,7 @@ def forward(
+                     feats=feats,
+                     pred_distogram_logits=dict_out["pdistogram"].detach(),
+                     multiplicity=diffusion_samples,
++                    run_sequentially=run_confidence_sequentially,
+                 )
+             )
+         if self.confidence_prediction and self.confidence_module.use_s_diffusion:
+@@ -587,6 +587,7 @@ def validation_step(self, batch: dict[str, Tensor], batch_idx: int):
+                 recycling_steps=self.validation_args.recycling_steps,
+                 num_sampling_steps=self.validation_args.sampling_steps,
+                 diffusion_samples=n_samples,
++                run_confidence_sequentially=self.validation_args.run_confidence_sequentially,
+             )
+ 
+         except RuntimeError as e:  # catch out of memory exceptions
+@@ -1119,13 +1120,32 @@ def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> A
+                 recycling_steps=self.predict_args["recycling_steps"],
+                 num_sampling_steps=self.predict_args["sampling_steps"],
+                 diffusion_samples=self.predict_args["diffusion_samples"],
++                run_confidence_sequentially=True,
+             )
+             pred_dict = {"exception": False}
+             pred_dict["masks"] = batch["atom_pad_mask"]
+             pred_dict["coords"] = out["sample_atom_coords"]
+-            if self.confidence_prediction:
+-                pred_dict["confidence"] = out["iptm"]
+-
++            if self.predict_args.get("write_confidence_summary", True):
++                pred_dict["confidence_score"] = (
++                    4 * out["complex_plddt"] + out["iptm"]
++                ) / 5
++                for key in [
++                    "ptm",
++                    "iptm",
++                    "ligand_iptm",
++                    "protein_iptm",
++                    "pair_chains_iptm",
++                    "complex_plddt",
++                    "complex_iplddt",
++                    "complex_pde",
++                    "complex_ipde",
++                    "plddt",
++                ]:
++                    pred_dict[key] = out[key]
++            if self.predict_args.get("write_full_pae", True):
++                pred_dict["pae"] = out["pae"]
++            if self.predict_args.get("write_full_pde", False):
++                pred_dict["pde"] = out["pde"]
+             return pred_dict
+ 
+         except RuntimeError as e:  # catch out of memory exceptions
+@@ -1176,13 +1196,6 @@ def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+             self.ema = ExponentialMovingAverage(
+                 parameters=self.parameters(), decay=self.ema_decay
+             )
+-        if self.use_ema:
+-            if self.ema.compatible(checkpoint["ema"]["shadow_params"]):
+-                self.ema.load_state_dict(checkpoint["ema"], device=torch.device("cpu"))
+-            else:
+-                print("EMA not compatible with checkpoint, skipping...")
+-        elif "ema" in checkpoint:
+-            self.load_state_dict(checkpoint["ema"]["shadow_params"], strict=False)
+ 
+     def on_train_start(self):
+         if self.use_ema and self.ema is None:
+diff --git a/src/boltz/model/modules/confidence.py b/src/boltz/model/modules/confidence.py
+index e2f7172cd..79f38ab3f 100755
+--- a/src/boltz/model/modules/confidence.py
++++ b/src/boltz/model/modules/confidence.py
+@@ -74,7 +74,6 @@ def __init__(
+             Whether to compile pairformer, by default False.
+ 
+         """
+-
+         super().__init__()
+         self.max_num_atoms_per_token = 23
+         self.no_update_s = pairformer_args.get("no_update_s", False)
+@@ -191,7 +190,44 @@ def forward(
+         pred_distogram_logits,
+         multiplicity=1,
+         s_diffusion=None,
++        run_sequentially=False,
+     ):
++        if run_sequentially and multiplicity > 1:
++            assert z.shape[0] == 1, "Not supported with batch size > 1"
++            out_dicts = []
++            for sample_idx in range(multiplicity):
++                out_dicts.append(  # noqa: PERF401
++                    self.forward(
++                        s_inputs,
++                        s,
++                        z,
++                        x_pred[sample_idx : sample_idx + 1],
++                        feats,
++                        pred_distogram_logits,
++                        multiplicity=1,
++                        s_diffusion=s_diffusion[sample_idx : sample_idx + 1]
++                        if s_diffusion is not None
++                        else None,
++                        run_sequentially=False,
++                    )
++                )
++
++            out_dict = {}
++            for key in out_dicts[0]:
++                if key != "pair_chains_iptm":
++                    out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=0)
++                else:
++                    pair_chains_iptm = {}
++                    for chain_idx1 in out_dicts[0][key].keys():
++                        chains_iptm = {}
++                        for chain_idx2 in out_dicts[0][key][chain_idx1].keys():
++                            chains_iptm[chain_idx2] = torch.cat(
++                                [out[key][chain_idx1][chain_idx2] for out in out_dicts],
++                                dim=0,
++                            )
++                        pair_chains_iptm[chain_idx1] = chains_iptm
++                    out_dict[key] = pair_chains_iptm
++            return out_dict
+         if self.imitate_trunk:
+             s_inputs = self.input_embedder(feats)
+ 
+@@ -302,7 +338,7 @@ def __init__(
+         num_plddt_bins=50,
+         num_pde_bins=64,
+         num_pae_bins=64,
+-        compute_pae: bool = False,
++        compute_pae: bool = True,
+     ):
+         """Initialize the confidence head.
+ 
+@@ -348,10 +384,9 @@ def forward(
+         if self.compute_pae:
+             pae_logits = self.to_pae_logits(z)
+ 
+-        # Weights used to compute the interface pLDDT and PDE
+-        ligand_weight = 20
+-        non_interface_weight = 1
+-        interface_weight = 10
++        # Weights used to compute the interface pLDDT
++        ligand_weight = 2
++        interface_weight = 1
+ 
+         # Retrieve relevant features
+         token_type = feats["mol_type"]
+@@ -374,15 +409,12 @@ def forward(
+             is_contact * is_different_chain * (1 - is_ligand_token).unsqueeze(-1),
+             dim=-1,
+         ).values
+-        token_non_interface_mask = (1 - token_interface_mask) * (1 - is_ligand_token)
+         iplddt_weight = (
+-            is_ligand_token * ligand_weight
+-            + token_interface_mask * interface_weight
+-            + token_non_interface_mask * non_interface_weight
++            is_ligand_token * ligand_weight + token_interface_mask * interface_weight
++        )
++        complex_iplddt = (plddt * token_pad_mask * iplddt_weight).sum(dim=-1) / (
++            torch.sum(token_pad_mask * iplddt_weight, dim=-1) + 1e-5
+         )
+-        complex_iplddt = (plddt * token_pad_mask * iplddt_weight).sum(
+-            dim=-1
+-        ) / torch.sum(token_pad_mask * iplddt_weight, dim=-1)
+ 
+         # Compute the aggregated PDE and iPDE
+         pde = compute_aggregated_metric(pde_logits, end=32)
+@@ -431,12 +463,13 @@ def forward(
+         if self.compute_pae:
+             out_dict["pae_logits"] = pae_logits
+             out_dict["pae"] = compute_aggregated_metric(pae_logits, end=32)
+-            ptm, iptm, ligand_iptm, protein_iptm = compute_ptms(
++            ptm, iptm, ligand_iptm, protein_iptm, pair_chains_iptm = compute_ptms(
+                 pae_logits, x_pred, feats, multiplicity
+             )
+             out_dict["ptm"] = ptm
+             out_dict["iptm"] = iptm
+             out_dict["ligand_iptm"] = ligand_iptm
+             out_dict["protein_iptm"] = protein_iptm
++            out_dict["pair_chains_iptm"] = pair_chains_iptm
+ 
+         return out_dict
+diff --git a/src/boltz/model/modules/confidence_utils.py b/src/boltz/model/modules/confidence_utils.py
+index 7b77be21a..5ffacf116 100644
+--- a/src/boltz/model/modules/confidence_utils.py
++++ b/src/boltz/model/modules/confidence_utils.py
+@@ -157,4 +157,25 @@ def compute_ptms(logits, x_preds, feats, multiplicity):
+         dim=1,
+     ).values
+ 
+-    return ptm, iptm, ligand_iptm, protein_iptm
++    # Compute pair chain ipTM
++    chain_pair_iptm = {}
++    asym_ids_list = torch.unique(asym_id).tolist()
++    for idx1 in asym_ids_list:
++        chain_iptm = {}
++        for idx2 in asym_ids_list:
++            mask_pair_chain = (
++                maski[:, :, None]
++                * (asym_id[:, None, :] == idx1)
++                * (asym_id[:, :, None] == idx2)
++                * mask_pad[:, None, :]
++                * mask_pad[:, :, None]
++            )
++
++            chain_iptm[idx2] = torch.max(
++                torch.sum(tm_expected_value * mask_pair_chain, dim=-1)
++                / (torch.sum(mask_pair_chain, dim=-1) + 1e-5),
++                dim=1,
++            ).values
++        chain_pair_iptm[idx1] = chain_iptm
++
++    return ptm, iptm, ligand_iptm, protein_iptm, chain_pair_iptm

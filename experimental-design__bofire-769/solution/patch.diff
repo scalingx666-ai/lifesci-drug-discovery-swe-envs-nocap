@@ -1,0 +1,140 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 03a35c28e..cd2151ae2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,6 +18,7 @@ and this project adheres to [Pragmatic Versioning](https://github.com/experiment
+ - Configurable `noise_constraint` support for GP-based surrogates (`SingleTaskGP`, `MixedSingleTaskGP`, `TanimotoGP`, `MultiTaskGP`, and `RobustSingleTaskGP`) and corresponding linear/polynomial wrappers.
+ - Optional `initial_value` field on the `GreaterThan`, `LessThan`, and `Positive` prior constraint data models (already present on `Interval`), letting users opt-in to a warm-start of the constrained gpytorch parameter at construction time.
+ - Generalized NChooseK constraint support in DoE: `min_count > 0` is now supported, non-zero lower bounds (`lb > 0`) are allowed for NChooseK features, overlapping NChooseK constraints (shared features) are handled via incremental pairwise merge with consistency filtering, and `nchoosek_constraints_as_bounds` generates deactivation patterns for all activity levels `k ∈ [min_count, max_count]`.
++- Aggregation of duplicated experiments in the `cross_validate` method of trainable surrogates to avoid data leakage, controlled via the `aggregate` boolean flag, default `False`.
+ 
+ ### Changed
+ 
+diff --git a/bofire/surrogates/trainable.py b/bofire/surrogates/trainable.py
+index a66e7984b..494b3281e 100644
+--- a/bofire/surrogates/trainable.py
++++ b/bofire/surrogates/trainable.py
+@@ -6,6 +6,7 @@
+ import pandas as pd
+ from sklearn.model_selection import GroupShuffleSplit, KFold, StratifiedKFold
+ 
++from bofire.data_models.domain.api import Domain
+ from bofire.data_models.domain.features import Inputs, Outputs
+ from bofire.data_models.enum import OutputFilteringEnum
+ from bofire.data_models.features.api import (
+@@ -92,6 +93,8 @@ def cross_validate(
+         folds: int = -1,
+         include_X: bool = False,
+         include_labcodes: bool = False,
++        aggregate: bool = False,
++        aggregate_prec: int = 3,
+         random_state: Optional[int] = None,
+         stratified_feature: Optional[str] = None,
+         group_split_column: Optional[str] = None,
+@@ -119,6 +122,8 @@ def cross_validate(
+             folds (int, optional): Number of folds. -1 is equal to LOO CV. Defaults to -1.
+             include_X (bool, optional): If true the X values of the fold are written to respective CvResult objects for
+                 later analysis. Defaults to False.
++            aggregate (bool, optional): If true, duplicate experiments are aggregated before the CV split. Defaults to False. When group_split_column is provided, aggregation is disabled.
++            aggregate_prec (int, optional): The precision for rounding up when aggregating. Defaults to 3.
+             random_state (int, optional): Controls the randomness of the indices in the train and test sets of each fold.
+                 Defaults to None.
+             stratified_feature (str, optional): The feature name to preserve the percentage of samples for each class in
+@@ -179,6 +184,20 @@ def cross_validate(
+                     f"Number of unique groups {ngroups} is less than the number of folds {folds}."
+                 )
+ 
++            if aggregate:
++                warnings.warn(
++                    "Aggregation is not compatible with group split, fallback to no aggregation.",
++                )
++                aggregate = False
++
++        if aggregate:
++            # aggregate duplicates
++            domain = Domain(inputs=self.inputs, outputs=self.outputs)
++            experiments, _ = domain.aggregate_by_duplicates(
++                experiments=experiments,
++                prec=aggregate_prec,
++            )
++
+         # first filter the experiments based on the model setting
+         experiments = self._preprocess_experiments(experiments)
+         n = len(experiments)
+diff --git a/tests/bofire/surrogates/test_cross_validate.py b/tests/bofire/surrogates/test_cross_validate.py
+index 53ee00746..48f4b5e37 100644
+--- a/tests/bofire/surrogates/test_cross_validate.py
++++ b/tests/bofire/surrogates/test_cross_validate.py
+@@ -584,6 +584,19 @@ def test_model_cross_validate_groupfold(random_state):
+             train_set = set(train_index)
+             assert test_set.issuperset(indices) or train_set.issuperset(indices)
+ 
++    # Test if aggregate is disabled when group split is supplied
++    with pytest.warns(
++        UserWarning,
++        match="Aggregation is not compatible with group split, fallback to no aggregation.",
++    ):
++        train_cv, test_cv, hook_results = model.cross_validate(
++            experiments,
++            folds=4,
++            aggregate=True,
++            random_state=random_state,
++            group_split_column="group",
++        )
++
+ 
+ def test_model_cross_validate_invalid_group_split_column():
+     inputs = Inputs(
+@@ -627,6 +640,52 @@ def test_model_cross_validate_invalid_group_split_column():
+         model.cross_validate(experiments, folds=5, group_split_column="group")
+ 
+ 
++def test_model_cross_validate_aggregate():
++    """Test that aggregation is on by default and removes duplicates."""
++    inputs = Inputs(
++        features=[
++            ContinuousInput(
++                key=f"x_{i + 1}",
++                bounds=(-4, 4),
++            )
++            for i in range(2)
++        ],
++    )
++    outputs = Outputs(features=[ContinuousOutput(key="y")])
++
++    # Create experiments with duplicates
++    experiments = pd.DataFrame(
++        {
++            "x_1": [1.0, 1.0, 2.0, 2.0, 3.0],
++            "x_2": [1.0, 1.0, 2.0, 2.0, 3.0],
++            "y": [1.0, 2.0, 3.0, 4.0, 5.0],
++        }
++    )
++    experiments["valid_y"] = 1
++
++    model = SingleTaskGPSurrogate(
++        inputs=inputs,
++        outputs=outputs,
++    )
++    model = surrogates.map(model)
++
++    # With aggregate, duplicates should be merged
++    train_cv_agg, test_cv_agg, _ = model.cross_validate(
++        experiments, folds=2, aggregate=True
++    )
++
++    # Without aggregation for comparison, default is False
++    train_cv_no_agg, test_cv_no_agg, _ = model.cross_validate(experiments, folds=2)
++
++    # With aggregation, total unique observations across all test folds should be 3
++    agg_test_obs = sum(len(r.observed) for r in test_cv_agg.results)
++    assert agg_test_obs == 3
++
++    # Without aggregation, total unique test observations should be 5
++    noagg_test_obs = sum(len(r.observed) for r in test_cv_no_agg.results)
++    assert noagg_test_obs == 5
++
++
+ def test_make_cv_split():
+     inputs = Inputs(
+         features=[

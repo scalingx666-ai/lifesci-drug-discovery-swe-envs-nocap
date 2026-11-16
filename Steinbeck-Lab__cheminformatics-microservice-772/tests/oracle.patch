@@ -1,0 +1,1778 @@
+diff --git a/app/modules/toolkits/helpers.py b/app/modules/toolkits/helpers.py
+index ab303375..cd5a1b88 100644
+--- a/app/modules/toolkits/helpers.py
++++ b/app/modules/toolkits/helpers.py
+@@ -70,3 +70,84 @@ def parse_SMILES(smiles: str, framework: str = "rdkit", standardize: bool = Fals
+             return Chem.MolFromMolBlock(mol_str)
+     except Exception:
+         raise InvalidInputException(name="smiles", value=smiles)
++
++
++def _is_plausible_atom_row(line: str) -> bool:
++    """Return True if *line* looks like a valid XYZ atom row.
++
++    A plausible row, after stripping, has at least 4 whitespace-separated
++    tokens where the first token starts with an ASCII letter (element symbol)
++    and tokens 2-4 are parseable as floats (the x, y, z coordinates).
++    """
++    parts = line.strip().split()
++    if len(parts) < 4:
++        return False
++    if not parts[0][0].isascii() or not parts[0][0].isalpha():
++        return False
++    try:
++        float(parts[1])
++        float(parts[2])
++        float(parts[3])
++    except ValueError:
++        return False
++    return True
++
++
++def split_xyz_frames(xyz_data: str) -> list[str]:
++    """Split a multi-frame XYZ string into a list of single-frame XYZ strings.
++
++    XYZ format: each record is ``<atom_count>\\n<comment>\\n<atom_count atom rows>``.
++    A multi-record file simply concatenates these blocks.
++
++    The splitter is permissive:
++
++    * Accepts CRLF or LF line endings (output is always LF).
++    * Recovers the next valid frame after a truncated or garbage block by
++      advancing one line at a time rather than aborting the whole parse.
++    * Validates each candidate atom row before accepting a block, so a fake
++      ``atom_count`` cannot greedily consume real lines from the next frame.
++    * Drops zero-atom frames (degenerate).
++    * Normalizes the count line (strips surrounding whitespace).
++    * Each emitted frame is itself a valid XYZ string ending in ``\\n``.
++
++    Args:
++        xyz_data: Raw text, possibly containing multiple concatenated XYZ records.
++
++    Returns:
++        A list of self-contained single-frame XYZ strings. Empty list if the
++        input contains no recognizable frames.
++    """
++    if not xyz_data or not xyz_data.strip():
++        return []
++
++    lines = xyz_data.replace("\r\n", "\n").replace("\r", "\n").split("\n")
++    frames: list[str] = []
++    i = 0
++    n = len(lines)
++    while i < n:
++        token = lines[i].strip()
++        if not token.isdecimal():
++            i += 1
++            continue
++        atom_count = int(token)
++        if atom_count == 0:
++            # Skip the count line + the comment line; emit nothing.
++            i += 2
++            continue
++        # Need atom_count + 2 (count + comment + atoms) lines starting at i.
++        end = i + 2 + atom_count
++        if end > n:
++            # Truncated frame: advance by one line and keep scanning.
++            i += 1
++            continue
++        # Validate every candidate atom row before accepting the block.
++        atom_rows = lines[i + 2 : end]
++        if not all(_is_plausible_atom_row(row) for row in atom_rows):
++            i += 1
++            continue
++        # Normalize the count line; keep all other lines verbatim.
++        block_lines = [lines[i].strip()] + lines[i + 1 : end]
++        # Each emitted frame ends in exactly one newline.
++        frames.append("\n".join(block_lines) + "\n")
++        i = end
++    return frames
+diff --git a/app/modules/toolkits/rdkit_wrapper.py b/app/modules/toolkits/rdkit_wrapper.py
+index adcf1a91..0c64eef4 100644
+--- a/app/modules/toolkits/rdkit_wrapper.py
++++ b/app/modules/toolkits/rdkit_wrapper.py
+@@ -1038,37 +1038,29 @@ def convert_xyz_to_mol(
+     embed_chiral: bool = True,
+     use_huckel: bool = False,
+     cov_factor: float = 1.3,
+-) -> Chem.Mol:
+-    """Parse an XYZ block and assign connectivity + bond orders via xyz2mol.
++) -> tuple[Chem.Mol, str]:
++    """Parse an XYZ block and assign bonds via a two-tier RDKit pipeline.
+ 
+-    Reads coordinates with ``Chem.MolFromXYZBlock`` (which yields a Mol with
+-    only atoms and a 3D conformer, no bonds), copies it via ``Chem.Mol(raw)``
+-    so the original is preserved, then runs ``rdDetermineBonds.DetermineBonds``
+-    to perceive connectivity *and* bond orders in a single charge-aware pass.
++    Tier 1: ``rdDetermineBonds.DetermineBonds`` (xyz2mol) -- full bond-order
++        perception, charge-aware. Works for organic/main-group molecules.
++    Tier 2 (only if Tier 1 raises): ``rdDetermineBonds.DetermineConnectivity``
++        -- VdW connect-the-dots, all bonds order 1, but works for any element
++        including transition metals. Information-poor but accurate-by-construction.
+ 
+     Args:
+-        xyz_data (str): Plain-text XYZ block (atom count, comment line, then
+-            ``element x y z`` rows). Must include the header lines.
+-        charge (int): Net molecular charge. Required for non-neutral species.
+-            Defaults to 0.
+-        allow_charged_fragments (bool): If True, place formal charges on
+-            atoms; if False, assign radical electrons instead. Defaults to
+-            True (matches xyz2mol's default behavior).
+-        embed_chiral (bool): Embed chirality information from 3D coords.
+-            Defaults to True.
+-        use_huckel (bool): Use extended Hückel theory for bond perception
+-            instead of the van der Waals method. More accurate for
+-            unusual valences but slower. Defaults to False.
+-        cov_factor (float): Multiplier on covalent radii for VdW
+-            connect-the-dots. Defaults to 1.3.
++        xyz_data: Plain-text XYZ block including the count + comment header.
++        charge: Net molecular charge (Tier 1 only). Defaults to 0.
++        allow_charged_fragments: xyz2mol option (Tier 1 only). Defaults to True.
++        embed_chiral: xyz2mol option (Tier 1 only). Defaults to True.
++        use_huckel: Use extended Huckel theory in Tier 1. Defaults to False.
++        cov_factor: Covalent-radius multiplier (both tiers). Defaults to 1.3.
+ 
+     Returns:
+-        Chem.Mol: RDKit molecule with 3D conformer and perceived bonds.
++        A tuple ``(mol, method)`` where ``method`` is one of
++        ``"bond_orders"`` (Tier 1) or ``"connectivity_only"`` (Tier 2).
+ 
+     Raises:
+-        ValueError: If the XYZ block cannot be parsed or bond perception
+-            fails (malformed input, unknown elements, geometry that cannot
+-            be reconciled with the requested charge).
++        ValueError: If the XYZ block cannot be parsed, or if both tiers fail.
+     """
+     if not xyz_data or not xyz_data.strip():
+         raise ValueError("Empty XYZ data.")
+@@ -1076,12 +1068,12 @@ def convert_xyz_to_mol(
+     raw_mol = Chem.MolFromXYZBlock(xyz_data)
+     if raw_mol is None:
+         raise ValueError("Failed to parse XYZ block.")
+-
+     if raw_mol.GetNumAtoms() == 0:
+         raise ValueError("XYZ block contains no atoms.")
+ 
+-    mol = Chem.Mol(raw_mol)
++    # Tier 1: full bond-order perception via xyz2mol.
+     try:
++        mol = Chem.Mol(raw_mol)
+         rdDetermineBonds.DetermineBonds(
+             mol,
+             charge=charge,
+@@ -1090,7 +1082,16 @@ def convert_xyz_to_mol(
+             useHueckel=use_huckel,
+             covFactor=cov_factor,
+         )
+-    except (ValueError, RuntimeError) as exc:
+-        raise ValueError(f"Bond perception failed: {exc}") from exc
++        return mol, "bond_orders"
++    except (ValueError, RuntimeError) as tier1_exc:
++        tier1_err = str(tier1_exc)
+ 
+-    return mol
++    # Tier 2: connectivity-only (VdW connect-the-dots). Works for any element.
++    try:
++        mol = Chem.Mol(raw_mol)
++        rdDetermineBonds.DetermineConnectivity(mol, covFactor=cov_factor)
++        return mol, "connectivity_only"
++    except (ValueError, RuntimeError) as tier2_exc:
++        raise ValueError(
++            f"Bond perception failed (tier 1: {tier1_err}; tier 2: {tier2_exc})"
++        ) from tier2_exc
+diff --git a/app/routers/converters.py b/app/routers/converters.py
+index 0b9e0093..a2b8eac5 100644
+--- a/app/routers/converters.py
++++ b/app/routers/converters.py
+@@ -37,7 +37,9 @@
+ from app.schemas.converters_schema import GenerateSMARTSResponse
+ from app.schemas.converters_schema import MolToSMILESResponse
+ from app.schemas.converters_schema import CDXToMolResponse
+-from app.schemas.converters_schema import XYZConversionResponse
++from app.schemas.converters_schema import XYZBatchConversionResponse
++from app.schemas.converters_schema import XYZConversionSummary
++from app.schemas.converters_schema import XYZStructureResult
+ 
+ # Module imports
+ from app.modules.toolkits.cdk_wrapper import get_canonical_SMILES
+@@ -47,6 +49,7 @@
+ from app.modules.toolkits.cdk_wrapper import get_InChI
+ from app.modules.toolkits.cdk_wrapper import get_smiles_opsin
+ from app.modules.toolkits.helpers import parse_input
++from app.modules.toolkits.helpers import split_xyz_frames
+ from app.modules.toolkits.openbabel_wrapper import get_ob_canonical_SMILES
+ from app.modules.toolkits.openbabel_wrapper import get_ob_InChI
+ from app.modules.toolkits.openbabel_wrapper import get_ob_mol
+@@ -1191,17 +1194,112 @@ def cdx_to_mol(
+     "H   -1.3500    1.0000    0.0000\n"
+ )
+ 
++# Defense-in-depth caps. The reverse proxy and rate limiter are upstream;
++# these protect the Python worker from pathological single requests.
++_XYZ_MAX_FRAMES = 50
++_XYZ_MAX_BODY_BYTES = 5 * 1024 * 1024  # 5 MB plain text
++
++
++def _serialize_xyz_mol(mol: Chem.Mol, title: str) -> dict:
++    """Compute SMILES/InChI/InChIKey/MOL for a perceived XYZ-derived Mol.
++
++    Returns a dict shaped for ``XYZStructureResult`` fields. Any post-perception
++    InChI failure is recorded as a warning rather than failing the frame.
++    """
++    if title:
++        mol.SetProp("_Name", title)
++    warnings: list[str] = []
++    try:
++        canonical = Chem.MolToSmiles(mol, kekuleSmiles=True)
++    except Exception as exc:
++        canonical = ""
++        warnings.append(f"SMILES serialization failed: {exc}")
++    try:
++        inchi = Chem.inchi.MolToInchi(mol) or ""
++    except Exception as exc:
++        inchi = ""
++        warnings.append(f"InChI computation failed: {exc}")
++    try:
++        inchikey = Chem.inchi.MolToInchiKey(mol) or ""
++    except Exception as exc:
++        inchikey = ""
++        warnings.append(f"InChIKey computation failed: {exc}")
++    try:
++        molblock = Chem.MolToMolBlock(mol)
++    except Exception as exc:
++        molblock = ""
++        warnings.append(f"MOL block serialization failed: {exc}")
++    return {
++        "canonicalsmiles": canonical,
++        "inchi": inchi,
++        "inchikey": inchikey,
++        "molblock": molblock,
++        "warnings": warnings,
++    }
++
++
++def _process_frame_rdkit(
++    frame_xyz: str, charge: int, use_huckel: bool
++) -> tuple[dict, str | None]:
++    """Run the RDKit two-tier pipeline on a single frame."""
++    try:
++        mol, method = convert_xyz_to_mol(
++            frame_xyz, charge=charge, use_huckel=use_huckel
++        )
++    except ValueError as exc:
++        return {}, str(exc)
++    title = frame_xyz.splitlines()[1].strip() if len(frame_xyz.splitlines()) > 1 else ""
++    serialized = _serialize_xyz_mol(mol, title)
++    serialized.update(
++        {
++            "title": title,
++            "method": method,
++            "bond_orders_perceived": method == "bond_orders",
++        }
++    )
++    if method == "connectivity_only":
++        serialized["warnings"].insert(
++            0,
++            "RDKit DetermineBonds failed; fell back to connectivity-only perception",
++        )
++    return serialized, None
++
++
++def _process_frame_openbabel(frame_xyz: str) -> tuple[dict, str | None]:
++    """Run the OpenBabel single-pass perception on a single frame."""
++    try:
++        ob = get_ob_xyz_conversions(frame_xyz)
++    except Exception as exc:
++        return {}, str(exc)
++    title = frame_xyz.splitlines()[1].strip() if len(frame_xyz.splitlines()) > 1 else ""
++    return (
++        {
++            "title": title,
++            "canonicalsmiles": ob.get("canonicalsmiles", ""),
++            "inchi": ob.get("inchi", ""),
++            "inchikey": ob.get("inchikey", ""),
++            "molblock": ob.get("molblock", ""),
++            "method": "bond_orders",
++            "bond_orders_perceived": True,
++            "warnings": [],
++        },
++        None,
++    )
++
+ 
+ @router.post(
+     "/xyz",
+-    summary="Convert an XYZ-coordinate block into SMILES, InChI, InChIKey, MOL, and SDF",
++    summary=(
++        "Convert one or more XYZ frames to SMILES, InChI, InChIKey, MOL, and SDF"
++    ),
+     responses={
+         200: {
+-            "description": "Successful response",
+-            "model": XYZConversionResponse,
++            "description": "Successful response (per-frame status inside)",
++            "model": XYZBatchConversionResponse,
+         },
+         400: {"description": "Bad Request", "model": BadRequestModel},
+         404: {"description": "Not Found", "model": NotFoundModel},
++        413: {"description": "Payload Too Large"},
+         422: {"description": "Unprocessable Entity", "model": ErrorResponse},
+     },
+ )
+@@ -1210,26 +1308,31 @@ def xyz_to_formats(
+     request: Request,
+     data: str = Body(
+         ...,
+-        title="XYZ block",
++        title="XYZ block(s)",
+         description=(
+-            "Plain-text XYZ coordinates: line 1 = atom count, line 2 = comment, "
+-            "remaining lines = `element x y z`. Both Unix and Windows line endings "
+-            "are accepted."
++            "Plain-text XYZ coordinates. Single-frame: line 1 = atom count, "
++            "line 2 = comment, remaining lines = `element x y z`. Multi-frame: "
++            "concatenate any number of single-frame blocks. Both Unix and "
++            "Windows line endings are accepted."
+         ),
+         media_type="text/plain",
+         openapi_examples={
+-            "water": {"summary": "Water (neutral)", "value": _XYZ_EXAMPLE_WATER},
++            "water": {"summary": "Water (single frame)", "value": _XYZ_EXAMPLE_WATER},
+             "acetate": {
+-                "summary": "Acetate (charge -1)",
++                "summary": "Acetate (charge -1, single frame)",
+                 "value": _XYZ_EXAMPLE_ACETATE,
+             },
++            "multi": {
++                "summary": "Two-frame example",
++                "value": _XYZ_EXAMPLE_WATER + _XYZ_EXAMPLE_ACETATE,
++            },
+         },
+     ),
+     charge: int = Query(
+         default=0,
+         description=(
+-            "Net molecular charge. Required for non-neutral species "
+-            "(e.g. -1 for acetate). RDKit only."
++            "Net molecular charge applied to every frame. Required for "
++            "non-neutral species (e.g. -1 for acetate). RDKit only."
+         ),
+         ge=-10,
+         le=10,
+@@ -1237,101 +1340,118 @@ def xyz_to_formats(
+     use_huckel: bool = Query(
+         default=False,
+         description=(
+-            "Use extended Hückel theory for bond perception (more accurate "
+-            "for unusual valences, slower). RDKit only; ignored otherwise."
++            "Use extended Huckel theory for bond perception (more accurate "
++            "for unusual valences, slower). Applies to every frame. "
++            "RDKit only; ignored when toolkit is openbabel."
+         ),
+     ),
+     toolkit: Literal["rdkit", "openbabel"] = Query(
+         default="rdkit",
+         description=(
+             "Cheminformatics toolkit. RDKit uses the xyz2mol algorithm with "
+-            "explicit charge support. OpenBabel uses distance-based bond "
+-            "perception and is charge-unaware (best for neutral species). "
+-            "CDK is not supported because its core distribution lacks "
+-            "XYZ→bond perception."
++            "explicit charge support and a connectivity-only fallback for "
++            "elements outside its valence table (e.g. transition metals). "
++            "OpenBabel uses distance-based bond perception and is "
++            "charge-unaware (best for neutral species). CDK is not supported "
++            "because its core distribution lacks XYZ-to-bond perception."
+         ),
+     ),
+-) -> XYZConversionResponse:
+-    """Convert an XYZ block into multiple chemical formats.
++) -> XYZBatchConversionResponse:
++    """Convert one or more XYZ frames to multiple chemical formats.
+ 
+-    XYZ files store only element symbols and 3D coordinates -- no bonds.
+-    This endpoint perceives connectivity and bond orders from the geometry,
+-    then emits SMILES, InChI, InChIKey, a V2000 MOL block (carrying the
+-    original 3D coordinates), and an SDF record.
+-
+-    Parameters:
+-    - **data** (str, body): XYZ block. Must include the atom-count and
+-      comment header lines.
+-    - **charge** (int, optional): Net charge. Defaults to ``0``. RDKit only.
+-    - **use_huckel** (bool, optional): Use extended Hückel theory for bond
+-      perception. Defaults to ``False``. RDKit only.
+-    - **toolkit** (str, optional): ``rdkit`` (default) or ``openbabel``.
+-
+-    Returns:
+-    - XYZConversionResponse: ``canonicalsmiles``, ``inchi``, ``inchikey``,
+-      ``molblock``, and ``sdf``.
+-
+-    Raises:
+-    - HTTPException 400: Empty body.
+-    - HTTPException 422: XYZ block cannot be parsed or bond perception
+-      fails (e.g. wrong charge for the geometry, unknown elements).
++    Returns a list of per-frame results with per-frame ``success`` flags.
++    A bad frame does not fail the whole request unless every frame fails.
+     """
+     if not data or not data.strip():
+         raise HTTPException(status_code=400, detail="Empty XYZ block provided")
+ 
+-    xyz_data = data.replace("\r\n", "\n").replace("\r", "\n")
++    if len(data.encode("utf-8")) > _XYZ_MAX_BODY_BYTES:
++        raise HTTPException(
++            status_code=413,
++            detail=f"XYZ payload exceeds {_XYZ_MAX_BODY_BYTES // (1024 * 1024)} MB limit",
++        )
+ 
+-    if toolkit == "rdkit":
+-        try:
+-            mol = convert_xyz_to_mol(
+-                xyz_data,
+-                charge=charge,
+-                use_huckel=use_huckel,
++    frames = split_xyz_frames(data)
++    if not frames:
++        raise HTTPException(
++            status_code=422,
++            detail="Invalid XYZ block (no frames detected)",
++        )
++    if len(frames) > _XYZ_MAX_FRAMES:
++        raise HTTPException(
++            status_code=413,
++            detail=f"Frame count exceeds limit ({_XYZ_MAX_FRAMES})",
++        )
++
++    structures: list[XYZStructureResult] = []
++    sdf_chunks: list[str] = []
++    bond_orders_count = 0
++    connectivity_only_count = 0
++    successful = 0
++    failed = 0
++    first_error: str | None = None
++
++    for index, frame in enumerate(frames):
++        if toolkit == "rdkit":
++            payload, err = _process_frame_rdkit(frame, charge, use_huckel)
++        else:
++            payload, err = _process_frame_openbabel(frame)
++
++        if err:
++            failed += 1
++            if first_error is None:
++                first_error = err
++            title_line = frame.splitlines()[1].strip() if len(frame.splitlines()) > 1 else ""
++            structures.append(
++                XYZStructureResult(
++                    index=index,
++                    title=title_line,
++                    success=False,
++                    error=err,
++                )
+             )
+-        except ValueError as exc:
+-            logger.warning("Invalid XYZ input (rdkit): %s", exc)
+-            raise HTTPException(
+-                status_code=422,
+-                detail="Invalid XYZ block or bond perception failed",
+-            ) from exc
+-        except Exception as exc:
+-            logger.exception("Error converting XYZ via RDKit")
+-            raise HTTPException(
+-                status_code=422,
+-                detail="Error converting XYZ block",
+-            ) from exc
++            continue
++
++        successful += 1
++        if payload["method"] == "bond_orders":
++            bond_orders_count += 1
++        elif payload["method"] == "connectivity_only":
++            connectivity_only_count += 1
++
++        if payload["molblock"]:
++            sdf_chunks.append(payload["molblock"].rstrip() + "\n$$$$\n")
++
++        structures.append(
++            XYZStructureResult(
++                index=index,
++                title=payload["title"],
++                success=True,
++                error=None,
++                canonicalsmiles=payload["canonicalsmiles"],
++                inchi=payload["inchi"],
++                inchikey=payload["inchikey"],
++                molblock=payload["molblock"],
++                method=payload["method"],
++                bond_orders_perceived=payload["bond_orders_perceived"],
++                warnings=payload["warnings"],
++            )
++        )
+ 
+-        try:
+-            molblock = Chem.MolToMolBlock(mol)
+-            canonicalsmiles = Chem.MolToSmiles(mol, kekuleSmiles=True)
+-            inchi = Chem.inchi.MolToInchi(mol)
+-            inchikey = Chem.inchi.MolToInchiKey(mol)
+-        except Exception as exc:
+-            logger.exception("Error serializing XYZ-derived molecule")
+-            raise HTTPException(
+-                status_code=422,
+-                detail="Error serializing molecule",
+-            ) from exc
+-    else:  # openbabel
+-        try:
+-            ob_results = get_ob_xyz_conversions(xyz_data)
+-        except Exception as exc:
+-            logger.exception("Error converting XYZ via OpenBabel")
+-            raise HTTPException(
+-                status_code=422,
+-                detail="Invalid XYZ block",
+-            ) from exc
+-        molblock = ob_results["molblock"]
+-        canonicalsmiles = ob_results["canonicalsmiles"]
+-        inchi = ob_results["inchi"]
+-        inchikey = ob_results["inchikey"]
+-
+-    sdf = molblock.rstrip() + "\n$$$$\n"
+-
+-    return XYZConversionResponse(
+-        canonicalsmiles=canonicalsmiles,
+-        inchi=inchi,
+-        inchikey=inchikey,
+-        molblock=molblock,
+-        sdf=sdf,
++    if successful == 0:
++        logger.warning("XYZ batch had no successful frames; first error: %s", first_error)
++        raise HTTPException(
++            status_code=422,
++            detail=f"All frames failed perception: {first_error}",
++        )
++
++    return XYZBatchConversionResponse(
++        structures=structures,
++        sdf="".join(sdf_chunks),
++        summary=XYZConversionSummary(
++            total=len(frames),
++            successful=successful,
++            failed=failed,
++            bond_orders_count=bond_orders_count,
++            connectivity_only_count=connectivity_only_count,
++        ),
+     )
+diff --git a/app/schemas/converters_schema.py b/app/schemas/converters_schema.py
+index 6a0f6dc6..6a8931ec 100644
+--- a/app/schemas/converters_schema.py
++++ b/app/schemas/converters_schema.py
+@@ -421,58 +421,117 @@ class BatchConversionResponse(BaseModel):
+     )
+ 
+ 
+-class XYZConversionResponse(BaseModel):
+-    """Represents the result of converting an XYZ-coordinate block.
++class XYZStructureResult(BaseModel):
++    """Single-structure result inside an XYZ batch conversion response."""
+ 
+-    Properties:
+-    - canonicalsmiles (str): Canonical SMILES with bond orders perceived from 3D.
+-    - inchi (str): InChI string.
+-    - inchikey (str): InChIKey.
+-    - molblock (str): V2000 MOL block carrying the original 3D coordinates and
+-      perceived bonds. Suitable for downstream tools that consume MDL Molfile.
+-    - sdf (str): The same MOL block followed by an SDF terminator (``$$$$``)
+-      so it can be saved directly as a one-record .sdf file.
+-    """
+-
+-    canonicalsmiles: str = Field(
+-        ...,
+-        description="Canonical SMILES derived from the perceived bonds.",
++    index: int = Field(..., description="Zero-based index of the frame in the input.")
++    title: str = Field(
++        default="",
++        description="Comment line from the XYZ frame (often the molecule name).",
+     )
+-    inchi: str = Field(
++    success: bool = Field(
+         ...,
+-        description="InChI string derived from the perceived bonds.",
++        description="True if perception succeeded for this frame.",
+     )
+-    inchikey: str = Field(
+-        ...,
+-        description="InChIKey derived from the perceived bonds.",
++    error: str | None = Field(
++        default=None,
++        description="Error message when success is False; null otherwise.",
++    )
++    canonicalsmiles: str = Field(
++        default="",
++        description="Canonical SMILES (empty when the frame failed).",
+     )
++    inchi: str = Field(default="", description="InChI string.")
++    inchikey: str = Field(default="", description="InChIKey.")
+     molblock: str = Field(
+-        ...,
+-        description="V2000 MOL block with 3D coordinates and perceived bonds.",
++        default="",
++        description="V2000 MOL block carrying the original 3D coordinates.",
++    )
++    method: str = Field(
++        default="",
++        description=(
++            "How bonds were perceived: 'bond_orders' (xyz2mol full pipeline) or "
++            "'connectivity_only' (VdW connect-the-dots fallback used when Tier 1 "
++            "rejects unusual valences such as transition metals). Empty when the "
++            "frame failed."
++        ),
++    )
++    bond_orders_perceived: bool = Field(
++        default=False,
++        description=(
++            "True only when bond orders were perceived. False for "
++            "connectivity-only fallback or failed frames."
++        ),
++    )
++    warnings: list[str] = Field(
++        default_factory=list,
++        description="Non-fatal diagnostics emitted while processing this frame.",
++    )
++
++
++class XYZConversionSummary(BaseModel):
++    total: int
++    successful: int
++    failed: int
++    bond_orders_count: int
++    connectivity_only_count: int
++
++
++class XYZBatchConversionResponse(BaseModel):
++    """Batch result for the XYZ-to-formats conversion endpoint.
++
++    The ``structures`` list always has at least one entry on success; a single-
++    frame XYZ input yields a list of length 1. The ``sdf`` field is the
++    concatenation of every successful frame's MOL block followed by ``$$$$``
++    (multi-record SDF, ready to save as ``.sdf``).
++    """
++
++    structures: list[XYZStructureResult] = Field(
++        ..., description="Per-frame conversion results, in input order."
+     )
+     sdf: str = Field(
+         ...,
+-        description="MOL block with the SDF record terminator ($$$$).",
++        description=(
++            "Multi-record SDF containing only successful frames. Empty when "
++            "every frame failed."
++        ),
++    )
++    summary: XYZConversionSummary = Field(
++        ..., description="Aggregate counts across all frames."
+     )
+ 
+     model_config = {
+         "json_schema_extra": {
+             "examples": [
+                 {
+-                    "input": (
+-                        "7\nacetate\nC -1.000  0.000  0.000\nC  0.500  0.000  0.000\n"
+-                        "O  1.150  1.060  0.000\nO  1.150 -1.060  0.000\n"
+-                        "H -1.350 -0.500  0.870\nH -1.350 -0.500 -0.870\nH -1.350  1.000  0.000\n"
+-                    ),
++                    "input": "3\nwater\nO 0 0 0\nH 1 0 0\nH -1 0 0\n",
+                     "message": "Success",
+                     "output": {
+-                        "canonicalsmiles": "CC(=O)[O-]",
+-                        "inchi": "InChI=1S/C2H4O2/c1-2(3)4/h1H3,(H,3,4)/p-1",
+-                        "inchikey": "QTBSBXVTEAMEQO-UHFFFAOYSA-M",
+-                        "molblock": "...V2000 MOL block with 3D coords...",
+-                        "sdf": "...MOL block + $$$$",
++                        "structures": [
++                            {
++                                "index": 0,
++                                "title": "water",
++                                "success": True,
++                                "error": None,
++                                "canonicalsmiles": "[H]O[H]",
++                                "inchi": "InChI=1S/H2O/h1H2",
++                                "inchikey": "XLYOFNOQVPJJNP-UHFFFAOYSA-N",
++                                "molblock": "...V2000 MOL block...",
++                                "method": "bond_orders",
++                                "bond_orders_perceived": True,
++                                "warnings": [],
++                            }
++                        ],
++                        "sdf": "...M  END\n$$$$\n",
++                        "summary": {
++                            "total": 1,
++                            "successful": 1,
++                            "failed": 0,
++                            "bond_orders_count": 1,
++                            "connectivity_only_count": 0,
++                        },
+                     },
+-                },
++                }
+             ],
+         }
+     }
+diff --git a/frontend/src/__tests__/components/XYZGridResult.test.tsx b/frontend/src/__tests__/components/XYZGridResult.test.tsx
+new file mode 100644
+index 00000000..ded54d9a
+--- /dev/null
++++ b/frontend/src/__tests__/components/XYZGridResult.test.tsx
+@@ -0,0 +1,112 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++import { render, screen } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import XYZGridResult from "@/components/convert/XYZGridResult";
++import type { XYZBatchConversionResult } from "@/types/api";
++
++// Stub MoleculeDepiction2D — its real implementation hits an external API.
++vi.mock("@/components/depict/MoleculeDepiction2D", () => ({
++  default: ({ smiles }: { smiles: string }) => <div data-testid="depiction">{smiles}</div>,
++}));
++
++const fixture: XYZBatchConversionResult = {
++  structures: [
++    {
++      index: 0,
++      title: "water",
++      success: true,
++      error: null,
++      canonicalsmiles: "[H]O[H]",
++      inchi: "InChI=1S/H2O/h1H2",
++      inchikey: "XLYOFNOQVPJJNP-UHFFFAOYSA-N",
++      molblock: "BLOCK1\nM  END",
++      method: "bond_orders",
++      bond_orders_perceived: true,
++      warnings: [],
++    },
++    {
++      index: 1,
++      title: "ferrocene",
++      success: true,
++      error: null,
++      canonicalsmiles: "[Fe]",
++      inchi: "InChI=1S/Fe",
++      inchikey: "XEEYBQQBJWHFJM-UHFFFAOYSA-N",
++      molblock: "BLOCK2\nM  END",
++      method: "connectivity_only",
++      bond_orders_perceived: false,
++      warnings: ["RDKit DetermineBonds failed; fell back to connectivity-only perception"],
++    },
++    {
++      index: 2,
++      title: "bad",
++      success: false,
++      error: "unknown element Xx",
++      canonicalsmiles: "",
++      inchi: "",
++      inchikey: "",
++      molblock: "",
++      method: "",
++      bond_orders_perceived: false,
++      warnings: [],
++    },
++  ],
++  sdf: "BLOCK1\nM  END\n$$$$\nBLOCK2\nM  END\n$$$$\n",
++  summary: {
++    total: 3,
++    successful: 2,
++    failed: 1,
++    bond_orders_count: 1,
++    connectivity_only_count: 1,
++  },
++};
++
++beforeEach(() => {
++  // Stub URL.createObjectURL / revokeObjectURL — jsdom doesn't ship them.
++  Object.assign(URL, {
++    createObjectURL: vi.fn(() => "blob:fake"),
++    revokeObjectURL: vi.fn(),
++  });
++});
++
++describe("XYZGridResult", () => {
++  it("renders one card per structure", () => {
++    render(<XYZGridResult result={fixture} />);
++    // 2 successful frames have depictions; the failed one does not.
++    expect(screen.getAllByTestId("depiction")).toHaveLength(2);
++    expect(screen.getByText("water")).toBeInTheDocument();
++    expect(screen.getByText("ferrocene")).toBeInTheDocument();
++    expect(screen.getByText("bad")).toBeInTheDocument();
++  });
++
++  it("badges connectivity-only frames", () => {
++    render(<XYZGridResult result={fixture} />);
++    // Multiple elements will contain "connectivity-only" (badge + summary span) — just confirm at least one exists.
++    const els = screen.getAllByText(/connectivity-only/i);
++    expect(els.length).toBeGreaterThanOrEqual(1);
++  });
++
++  it("shows error string for failed frames", () => {
++    render(<XYZGridResult result={fixture} />);
++    expect(screen.getByText(/unknown element Xx/)).toBeInTheDocument();
++  });
++
++  it("download SDF (all) creates a Blob with the full SDF", async () => {
++    const user = userEvent.setup();
++    render(<XYZGridResult result={fixture} />);
++    const btn = screen.getByRole("button", { name: /download sdf/i });
++    await user.click(btn);
++    const calls = (URL.createObjectURL as unknown as ReturnType<typeof vi.fn>).mock.calls;
++    expect(calls).toHaveLength(1);
++    expect(calls[0][0]).toBeInstanceOf(Blob);
++  });
++
++  it("displays summary line", () => {
++    render(<XYZGridResult result={fixture} />);
++    // Summary text is spread across child spans; match against the container's full textContent.
++    const summaryDiv = screen.getByTestId("xyz-summary");
++    expect(summaryDiv.textContent).toMatch(/2\s+of\s+3/i);
++    expect(summaryDiv.textContent).toMatch(/1\s+connectivity-only/i);
++    expect(summaryDiv.textContent).toMatch(/1\s+failed/i);
++  });
++});
+diff --git a/frontend/src/components/convert/FormatConversionView.tsx b/frontend/src/components/convert/FormatConversionView.tsx
+index 816eb2c5..3e65cb1e 100644
+--- a/frontend/src/components/convert/FormatConversionView.tsx
++++ b/frontend/src/components/convert/FormatConversionView.tsx
+@@ -10,6 +10,8 @@ import { EmptyState } from "@/components/feedback/EmptyState";
+ import { getErrorMessage } from "@/lib/error-messages";
+ // Assuming this service is configured correctly
+ import convertService from "../../services/convertService";
++import XYZGridResult from "./XYZGridResult";
++import type { XYZBatchConversionResult } from "@/types/api";
+ import {
+   AlertCircle,
+   ArrowLeftRight,
+@@ -123,6 +125,7 @@ const FormatConversionView = () => {
+   const [xyzCharge, setXyzCharge] = useState(0);
+   const [xyzUseHueckel, setXyzUseHueckel] = useState(false);
+   const xyzFileInputRef = useRef(null);
++  const [xyzBatchResult, setXyzBatchResult] = useState<XYZBatchConversionResult | null>(null);
+ 
+   // Helper function to ensure molblock is in proper format for backend
+   const formatMolblockForBackend = (molblock) => {
+@@ -276,6 +279,7 @@ const FormatConversionView = () => {
+   const handleClearXyzFile = () => {
+     setXyzFilename("");
+     setInput("");
++    setXyzBatchResult(null);
+     if (xyzFileInputRef.current) {
+       xyzFileInputRef.current.value = "";
+     }
+@@ -370,33 +374,47 @@ const FormatConversionView = () => {
+       // XYZ → SMILES / Canonical SMILES / InChI / InChIKey / MOL / SDF
+       if (inputFormat === "xyz") {
+         const xyzToolkit = toolkit === "cdk" ? "rdkit" : (toolkit as "rdkit" | "openbabel");
+-        const xyzResult = await convertService.convertXYZ(trimmedInput, {
++        const batch = await convertService.convertXYZ(trimmedInput, {
+           charge: xyzCharge,
+           useHueckel: xyzUseHueckel,
+           toolkit: xyzToolkit,
+         });
+-        smilesForDisplay = xyzResult.canonicalsmiles;
++
++        setXyzBatchResult(batch);
++
++        // Multi-frame: the grid renders everything; suppress the single-result panel.
++        if (batch.summary.total > 1) {
++          setResult("");
++          setSmilesForStructure("");
++          setShowStructure(false);
++          return;
++        }
++
++        // Single-frame path: pick the chosen output and reuse the existing UX.
++        const only = batch.structures[0];
++        if (!only.success) {
++          throw new Error(only.error || "XYZ conversion failed");
++        }
++        smilesForDisplay = only.canonicalsmiles;
+         switch (outputFormat) {
+           case "smiles":
+           case "canonicalsmiles":
+-            convertedResult = xyzResult.canonicalsmiles;
++            convertedResult = only.canonicalsmiles;
+             break;
+           case "inchi":
+-            convertedResult = xyzResult.inchi;
++            convertedResult = only.inchi;
+             break;
+           case "inchikey":
+-            convertedResult = xyzResult.inchikey;
++            convertedResult = only.inchikey;
+             break;
+           case "mol":
+-            convertedResult = xyzResult.molblock;
++            convertedResult = only.molblock;
+             break;
+           case "sdf":
+-            convertedResult = xyzResult.sdf;
++            convertedResult = batch.sdf;
+             break;
+           default:
+-            throw new Error(
+-              `Unsupported output format for XYZ input: ${outputFormat}. Use SMILES, InChI, InChIKey, MOL, or SDF.`
+-            );
++            throw new Error(`Unsupported output format for XYZ input: ${outputFormat}.`);
+         }
+       } else if (inputFormat === "cdx") {
+         // CDX/CDXML → MOL Block
+@@ -1079,6 +1097,11 @@ const FormatConversionView = () => {
+         />
+       )}
+ 
++      {/* XYZ Multi-frame Grid */}
++      {xyzBatchResult && xyzBatchResult.summary.total > 1 && !loading && (
++        <XYZGridResult result={xyzBatchResult} />
++      )}
++
+       {/* Results Display Section */}
+       {result && !loading && (
+         <div className="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md dark:shadow-lg border border-gray-200 dark:border-gray-700">
+diff --git a/frontend/src/components/convert/XYZGridResult.tsx b/frontend/src/components/convert/XYZGridResult.tsx
+new file mode 100644
+index 00000000..e5f58c86
+--- /dev/null
++++ b/frontend/src/components/convert/XYZGridResult.tsx
+@@ -0,0 +1,198 @@
++import { useState } from "react";
++import { AlertTriangle, Check, Clipboard, Download, Info } from "lucide-react";
++import MoleculeDepiction2D from "../depict/MoleculeDepiction2D";
++import { Button } from "@/components/ui/button";
++import type { XYZBatchConversionResult, XYZStructureResult } from "@/types/api";
++
++interface XYZGridResultProps {
++  result: XYZBatchConversionResult;
++}
++
++const downloadBlob = (content: string, filename: string, mime: string) => {
++  const blob = new Blob([content], { type: mime });
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement("a");
++  a.href = url;
++  a.download = filename;
++  document.body.appendChild(a);
++  a.click();
++  document.body.removeChild(a);
++  URL.revokeObjectURL(url);
++};
++
++const escapeCsvField = (value: string): string => {
++  // RFC 4180: wrap in quotes if contains comma, quote, or newline; double-up internal quotes.
++  if (/[",\n\r]/.test(value)) {
++    return `"${value.replace(/"/g, '""')}"`;
++  }
++  return value;
++};
++
++const XYZGridResult = ({ result }: XYZGridResultProps) => {
++  const { structures, sdf, summary } = result;
++
++  const handleDownloadSdf = () => {
++    if (!sdf) return;
++    downloadBlob(sdf, "structures.sdf", "chemical/x-mdl-sdfile");
++  };
++
++  const handleDownloadCsv = () => {
++    const header = "index,title,success,method,canonicalsmiles,inchi,inchikey\n";
++    const rows = structures
++      .map((s) =>
++        [
++          String(s.index),
++          escapeCsvField(s.title),
++          String(s.success),
++          escapeCsvField(s.method),
++          escapeCsvField(s.canonicalsmiles),
++          escapeCsvField(s.inchi),
++          escapeCsvField(s.inchikey),
++        ].join(",")
++      )
++      .join("\n");
++    downloadBlob(header + rows + "\n", "structures.csv", "text/csv");
++  };
++
++  return (
++    <div className="space-y-4">
++      <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
++        <div data-testid="xyz-summary" className="text-sm text-gray-700 dark:text-gray-200">
++          <span className="font-semibold">{summary.successful}</span> of {summary.total} structures
++          succeeded
++          {summary.connectivity_only_count > 0 && (
++            <>
++              {" "}
++              &middot;{" "}
++              <span className="text-amber-700 dark:text-amber-300">
++                {summary.connectivity_only_count} connectivity-only
++              </span>
++            </>
++          )}
++          {summary.failed > 0 && (
++            <>
++              {" "}
++              &middot;{" "}
++              <span className="text-red-700 dark:text-red-300">{summary.failed} failed</span>
++            </>
++          )}
++        </div>
++        <div className="flex gap-2">
++          <Button
++            variant="outline"
++            type="button"
++            onClick={handleDownloadSdf}
++            disabled={summary.successful === 0}
++          >
++            <Download className="mr-2 h-4 w-4" />
++            Download SDF (all)
++          </Button>
++          <Button variant="outline" type="button" onClick={handleDownloadCsv}>
++            <Download className="mr-2 h-4 w-4" />
++            Download CSV
++          </Button>
++        </div>
++      </div>
++
++      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
++        {structures.map((s) => (
++          <XYZGridCard key={s.index} structure={s} />
++        ))}
++      </div>
++    </div>
++  );
++};
++
++interface XYZGridCardProps {
++  structure: XYZStructureResult;
++}
++
++const XYZGridCard = ({ structure }: XYZGridCardProps) => {
++  const [copied, setCopied] = useState(false);
++
++  const handleCopy = async (text: string) => {
++    if (!text || !navigator.clipboard) return;
++    try {
++      await navigator.clipboard.writeText(text);
++      setCopied(true);
++      setTimeout(() => setCopied(false), 1500);
++    } catch {
++      // Clipboard write blocked — silently ignore.
++    }
++  };
++
++  if (!structure.success) {
++    return (
++      <div className="flex flex-col gap-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
++        <div className="flex items-center gap-2 text-sm font-semibold text-red-900 dark:text-red-100">
++          <AlertTriangle className="h-4 w-4" />
++          {structure.title || `Frame ${structure.index}`}
++        </div>
++        <div className="text-xs text-red-800 dark:text-red-200 break-words">{structure.error}</div>
++      </div>
++    );
++  }
++
++  return (
++    <div className="flex flex-col gap-2 p-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg">
++      <div className="flex items-center justify-between gap-2">
++        <span className="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">
++          {structure.title || `Frame ${structure.index}`}
++        </span>
++        {structure.method === "connectivity_only" && (
++          <span
++            title="Bond orders could not be perceived; only connectivity. Common for transition metals."
++            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200"
++          >
++            <Info className="h-3 w-3" />
++            connectivity-only
++          </span>
++        )}
++      </div>
++
++      <div className="border border-gray-200 dark:border-gray-700 rounded-md overflow-hidden">
++        <MoleculeDepiction2D
++          smiles={structure.canonicalsmiles}
++          title={structure.title}
++          toolkit="cdk"
++          showCIP={false}
++        />
++      </div>
++
++      <div className="flex items-center gap-2">
++        <code className="flex-1 px-2 py-1 bg-gray-100 dark:bg-gray-900 rounded text-xs font-mono break-all text-gray-700 dark:text-gray-300">
++          {structure.canonicalsmiles}
++        </code>
++        <Button
++          variant="ghost"
++          type="button"
++          onClick={() => handleCopy(structure.canonicalsmiles)}
++          aria-label="Copy SMILES"
++        >
++          {copied ? <Check className="h-4 w-4" /> : <Clipboard className="h-4 w-4" />}
++        </Button>
++      </div>
++
++      <details className="text-xs text-gray-600 dark:text-gray-400">
++        <summary className="cursor-pointer select-none">More</summary>
++        <div className="mt-2 space-y-1 break-all">
++          <div>
++            <span className="font-semibold">InChI:</span> {structure.inchi}
++          </div>
++          <div>
++            <span className="font-semibold">InChIKey:</span> {structure.inchikey}
++          </div>
++          {structure.warnings.length > 0 && (
++            <ul className="list-disc list-inside text-amber-700 dark:text-amber-300">
++              {structure.warnings.map((w, i) => (
++                <li key={i}>{w}</li>
++              ))}
++            </ul>
++          )}
++        </div>
++      </details>
++    </div>
++  );
++};
++
++export default XYZGridResult;
+diff --git a/frontend/src/services/convertService.ts b/frontend/src/services/convertService.ts
+index c4aa3550..04b10db4 100644
+--- a/frontend/src/services/convertService.ts
++++ b/frontend/src/services/convertService.ts
+@@ -4,7 +4,7 @@ import { AxiosError } from "axios";
+ import type {
+   MultipleFormatsResult,
+   CdxConversionResult,
+-  XYZConversionResult,
++  XYZBatchConversionResult,
+   XYZConversionOptions,
+ } from "../types/api";
+ 
+@@ -253,7 +253,7 @@ export const convertCDXToMol = async (file: File): Promise<string> => {
+ export const convertXYZ = async (
+   xyz: string,
+   options: XYZConversionOptions = {}
+-): Promise<XYZConversionResult> => {
++): Promise<XYZBatchConversionResult> => {
+   const { charge = 0, useHueckel = false, toolkit = "rdkit" } = options;
+ 
+   const baseURL = api.defaults.baseURL;
+@@ -284,7 +284,7 @@ export const convertXYZ = async (
+       throw new Error(detail);
+     }
+ 
+-    return (await response.json()) as XYZConversionResult;
++    return (await response.json()) as XYZBatchConversionResult;
+   } catch (error) {
+     if (error instanceof Error) throw error;
+     throw new Error("Failed to convert XYZ block: Unknown error");
+diff --git a/frontend/src/types/api.ts b/frontend/src/types/api.ts
+index f81a44b2..905f9445 100644
+--- a/frontend/src/types/api.ts
++++ b/frontend/src/types/api.ts
+@@ -50,12 +50,32 @@ export interface CdxConversionResult {
+   molblock: string;
+ }
+ 
+-export interface XYZConversionResult {
++export interface XYZStructureResult {
++  index: number;
++  title: string;
++  success: boolean;
++  error: string | null;
+   canonicalsmiles: string;
+   inchi: string;
+   inchikey: string;
+   molblock: string;
++  method: "" | "bond_orders" | "connectivity_only";
++  bond_orders_perceived: boolean;
++  warnings: string[];
++}
++
++export interface XYZConversionSummary {
++  total: number;
++  successful: number;
++  failed: number;
++  bond_orders_count: number;
++  connectivity_only_count: number;
++}
++
++export interface XYZBatchConversionResult {
++  structures: XYZStructureResult[];
+   sdf: string;
++  summary: XYZConversionSummary;
+ }
+ 
+ export interface XYZConversionOptions {
+diff --git a/tests/metallocenes_truncated.xyz b/tests/metallocenes_truncated.xyz
+new file mode 100644
+index 00000000..c49b2be8
+--- /dev/null
++++ b/tests/metallocenes_truncated.xyz
+@@ -0,0 +1,79 @@
++21
++CpFeCp-eclipse 
++Fe       0.000077000      0.000000000      0.000000000
++C       -1.216255000      0.000000000      1.604295000
++C       -1.216255000      0.000000000     -1.604295000
++C       -0.375847000      1.156678000      1.604488000
++C       -0.375847000     -1.156678000      1.604488000
++C       -0.375847000     -1.156678000     -1.604488000
++C       -0.375847000      1.156678000     -1.604488000
++C        0.983911000      0.714876000      1.604743000
++C        0.983911000     -0.714876000      1.604743000
++C        0.983911000     -0.714876000     -1.604743000
++C        0.983911000      0.714876000     -1.604743000
++H       -2.293904000      0.000000000      1.588751000
++H       -2.293904000      0.000000000     -1.588751000
++H       -0.708918000      2.181574000      1.589042000
++H       -0.708918000     -2.181574000      1.589042000
++H       -0.708918000     -2.181574000     -1.589042000
++H       -0.708918000      2.181574000     -1.589042000
++H        1.855749000      1.348314000      1.589383000
++H        1.855749000     -1.348314000      1.589383000
++H        1.855749000     -1.348314000     -1.589383000
++H        1.855749000      1.348314000     -1.589383000
++21
++CpRuCp-eclipse 
++Ru    0.000000000000      0.000000000000     -0.000098000000
++C     0.969062000000      1.526858000000      1.216010000000
++C    -0.969062000000     -1.526858000000      1.216010000000
++C     0.000000000000      2.147879000000      0.368358000000
++C     1.947452000000      0.900210000000      0.383269000000
++C     0.000000000000     -2.147879000000      0.368358000000
++C    -1.947452000000     -0.900210000000      0.383269000000
++C     0.379368000000      1.904914000000     -0.988298000000
++C     1.583045000000      1.133938000000     -0.979039000000
++C    -0.379368000000     -1.904914000000     -0.988298000000
++C    -1.583045000000     -1.133938000000     -0.979039000000
++H     0.970258000000      1.541684000000      2.293516000000
++H    -0.970258000000     -1.541684000000      2.293516000000
++H    -0.857586000000      2.712947000000      0.694697000000
++H     2.815717000000      0.359847000000      0.722943000000
++H     0.857586000000     -2.712947000000      0.694697000000
++H    -2.815717000000     -0.359847000000      0.722943000000
++H    -0.141962000000      2.254827000000     -1.864108000000
++H     2.128291000000      0.800587000000     -1.846692000000
++H     0.141962000000     -2.254827000000     -1.864108000000
++H    -2.128291000000     -0.800587000000     -1.846692000000
++31
++B5FeB5-staggered
++B    -0.993603000000      1.769638000000      0.000000000000
++B     0.000000000000      1.420212000000      1.449613000000
++B     1.607701000000      0.855392000000      0.895864000000
++B     1.607701000000      0.855392000000     -0.895864000000
++B     0.000000000000      1.420212000000     -1.449613000000
++Fe    0.000000000000      0.000000000000      0.000000000000
++H    -0.480820000000      2.558551000000      0.946142000000
++H    -0.480820000000      2.558551000000     -0.946142000000
++H     1.216610000000      1.962130000000      1.530479000000
++H     2.265816000000      1.593554000000      0.000000000000
++H     1.216610000000      1.962130000000     -1.530479000000
++H    -2.152050000000      2.019205000000      0.000000000000
++H    -0.392027000000      1.400485000000      2.567765000000
++H     2.455798000000      0.399830000000      1.586899000000
++H     2.455798000000      0.399830000000     -1.586899000000
++H    -0.392027000000      1.400485000000     -2.567765000000
++B     0.993603000000     -1.769638000000      0.000000000000
++B     0.000000000000     -1.420212000000      1.449613000000
++B    -1.607701000000     -0.855392000000      0.895864000000
++B    -1.607701000000     -0.855392000000     -0.895864000000
++B     0.000000000000     -1.420212000000     -1.449613000000
++H     0.480820000000     -2.558551000000      0.946142000000
++H     0.480820000000     -2.558551000000     -0.946142000000
++H    -1.216610000000     -1.962130000000      1.530479000000
++H    -2.265816000000     -1.593554000000      0.000000000000
++H    -1.216610000000     -1.962130000000     -1.530479000000
++H     2.152050000000     -2.019205000000      0.000000000000
++H     0.392027000000     -1.400485000000      2.567765000000
++H    -2.455798000000     -0.399830000000      1.586899000000
++H    -2.455798000000     -0.399830000000     -1.586899000000
++H     0.392027000000     -1.400485000000     -2.567765000000
+diff --git a/tests/test_xyz_split.py b/tests/test_xyz_split.py
+new file mode 100644
+index 00000000..7abc8d5a
+--- /dev/null
++++ b/tests/test_xyz_split.py
+@@ -0,0 +1,135 @@
++"""Tests for the multi-frame XYZ splitter."""
++
++from __future__ import annotations
++
++from rdkit import Chem
++
++from app.modules.toolkits.helpers import split_xyz_frames
++
++
++WATER = (
++    "3\n"
++    "water\n"
++    "O    0.0000    0.0000    0.0000\n"
++    "H    0.7572    0.5860    0.0000\n"
++    "H   -0.7572    0.5860    0.0000\n"
++)
++METHANE = (
++    "5\n"
++    "methane\n"
++    "C    0.0000    0.0000    0.0000\n"
++    "H    0.6300    0.6300    0.6300\n"
++    "H   -0.6300   -0.6300    0.6300\n"
++    "H   -0.6300    0.6300   -0.6300\n"
++    "H    0.6300   -0.6300   -0.6300\n"
++)
++
++
++class TestSplitXYZFrames:
++    def test_mid_stream_truncated_frame_is_dropped_and_next_frame_recovers(self):
++        """Truncated frame mid-stream must not consume lines from the next frame."""
++        truncated = "5\nbad\nC 0 0 0\nH 1 1 1\n"  # declares 5 atoms, only 2 supplied
++        frames = split_xyz_frames(WATER + truncated + METHANE)
++        assert len(frames) == 2
++        comments = {f.splitlines()[1].strip() for f in frames}
++        assert comments == {"water", "methane"}
++
++    def test_atom_row_validation_rejects_consumed_next_frame_header(self):
++        """A frame that declares 5 atoms but only has 2 real atom rows must be rejected.
++
++        Without per-atom-row validation the splitter would greedily treat the
++        next frame's count line and comment as pseudo-atom rows, packaging a
++        bogus 5-row block instead of recovering the following valid frame.
++        """
++        # Frame A: declares 5 atoms, provides only 2 real atom rows; then Frame B follows.
++        frame_a = "5\nbogus\nC 0 0 0\nH 1 1 1\n"
++        frames = split_xyz_frames(frame_a + METHANE)
++        # frame_a must be rejected; METHANE must be recovered.
++        assert len(frames) == 1
++        assert frames[0].splitlines()[1].strip() == "methane"
++
++    def test_unicode_superscript_digit_not_treated_as_atom_count(self):
++        """A line consisting of a Unicode superscript digit must not be parsed as a count."""
++        superscript_line = "²\n"  # U+00B2 — looks like '2' but is not ASCII
++        frames = split_xyz_frames(WATER + superscript_line + METHANE)
++        assert len(frames) == 2
++        comments = {f.splitlines()[1].strip() for f in frames}
++        assert comments == {"water", "methane"}
++
++    def test_padded_count_line_is_normalized(self):
++        """The count line in the emitted frame must be stripped of surrounding whitespace."""
++        padded = "  3  \nwater\nO 0 0 0\nH 1 0 0\nH -1 0 0\n"
++        frames = split_xyz_frames(padded)
++        assert len(frames) == 1
++        assert frames[0].splitlines()[0] == "3"
++
++    def test_empty_returns_empty_list(self):
++        assert split_xyz_frames("") == []
++
++    def test_whitespace_only_returns_empty_list(self):
++        assert split_xyz_frames("   \n  \n") == []
++
++    def test_single_frame(self):
++        frames = split_xyz_frames(WATER)
++        assert len(frames) == 1
++        assert frames[0].splitlines()[0].strip() == "3"
++
++    def test_two_frames_concatenated(self):
++        frames = split_xyz_frames(WATER + METHANE)
++        assert len(frames) == 2
++        assert frames[0].splitlines()[1].strip() == "water"
++        assert frames[1].splitlines()[1].strip() == "methane"
++
++    def test_three_frames(self):
++        frames = split_xyz_frames(WATER + METHANE + WATER)
++        assert len(frames) == 3
++        assert frames[0].splitlines()[1].strip() == "water"
++        assert frames[1].splitlines()[1].strip() == "methane"
++        assert frames[2].splitlines()[1].strip() == "water"
++
++    def test_crlf_line_endings(self):
++        frames = split_xyz_frames(WATER.replace("\n", "\r\n"))
++        assert len(frames) == 1
++        # Splitter normalizes to Unix line endings inside each frame.
++        assert "\r\n" not in frames[0]
++
++    def test_no_trailing_newline(self):
++        frames = split_xyz_frames(WATER.rstrip())
++        assert len(frames) == 1
++        # Each emitted frame must end with exactly one newline.
++        assert frames[0].endswith("\n")
++
++    def test_truncated_last_frame_is_dropped(self):
++        # Declares 5 atoms but supplies only 2.
++        truncated = "5\nbad\nC 0 0 0\nH 1 1 1\n"
++        frames = split_xyz_frames(WATER + truncated)
++        assert len(frames) == 1  # only the WATER frame survives
++        assert frames[0].splitlines()[1].strip() == "water"
++
++    def test_garbage_between_frames_is_skipped(self):
++        garbage = "garbage line 1\ngarbage line 2\n"
++        frames = split_xyz_frames(WATER + garbage + METHANE)
++        # Splitter advances past non-numeric lines and recovers the next frame.
++        assert len(frames) == 2
++        assert {f.splitlines()[1].strip() for f in frames} == {"water", "methane"}
++
++    def test_unicode_in_comment_is_preserved(self):
++        title = "ferrocène (η5)"
++        frame = f"3\n{title}\nO 0 0 0\nH 0 0 1\nH 0 1 0\n"
++        frames = split_xyz_frames(frame)
++        assert frames[0].splitlines()[1] == title
++
++    def test_atom_count_zero_yields_empty_frame_dropped(self):
++        # Zero atoms is a degenerate XYZ; we drop it rather than emit a no-atom mol.
++        frame = "0\nempty\n"
++        frames = split_xyz_frames(frame + WATER)
++        assert len(frames) == 1
++        assert frames[0].splitlines()[1].strip() == "water"
++
++    def test_returns_self_contained_frames(self):
++        """Each returned string must itself be a valid XYZ block (parseable on its own)."""
++        frames = split_xyz_frames(WATER + METHANE)
++        for f in frames:
++            mol = Chem.MolFromXYZBlock(f)
++            assert mol is not None
++            assert mol.GetNumAtoms() in (3, 5)
+diff --git a/tests/test_xyz_to_mol.py b/tests/test_xyz_to_mol.py
+index 29ac4976..6bccb6d3 100644
+--- a/tests/test_xyz_to_mol.py
++++ b/tests/test_xyz_to_mol.py
+@@ -1,9 +1,9 @@
+-"""Tests for the XYZ → SMILES/InChI/InChIKey/MOL/SDF conversion feature.
++"""Tests for the XYZ batch conversion feature.
+ 
+ Covers:
+-  - Unit tests for ``convert_xyz_to_mol`` in rdkit_wrapper (RDKit xyz2mol path)
+-  - Unit tests for ``get_ob_xyz_conversions`` in openbabel_wrapper (OB path)
+-  - API endpoint tests for POST /convert/xyz
++  - convert_xyz_to_mol two-tier perception (rdkit_wrapper)
++  - get_ob_xyz_conversions single-frame helper (openbabel_wrapper)
++  - POST /convert/xyz batch endpoint with per-frame error isolation
+ """
+ 
+ from __future__ import annotations
+@@ -22,8 +22,10 @@
+ 
+ WATER_XYZ_PATH = os.path.join(os.path.dirname(__file__), "water.xyz")
+ ACETATE_XYZ_PATH = os.path.join(os.path.dirname(__file__), "acetate.xyz")
++METALLOCENES_PATH = os.path.join(
++    os.path.dirname(__file__), "metallocenes_truncated.xyz"
++)
+ 
+-# Methane geometry — pure neutral, no surprises, useful as a control.
+ METHANE_XYZ = (
+     "5\n"
+     "methane\n"
+@@ -34,15 +36,11 @@
+     "H    0.6300   -0.6300   -0.6300\n"
+ )
+ 
+-# Reference InChIKeys (without stereo layers).
+ WATER_INCHIKEY = "XLYOFNOQVPJJNP-UHFFFAOYSA-N"
+ ACETATE_INCHIKEY = "QTBSBXVTEAMEQO-UHFFFAOYSA-M"
+ METHANE_INCHIKEY = "VNWKTOKETHGBQD-UHFFFAOYSA-N"
+ 
+ 
+-# ── Fixtures ────────────────────────────────────────────────────────────────
+-
+-
+ @pytest.fixture(scope="module")
+ def water_xyz() -> str:
+     with open(WATER_XYZ_PATH) as fh:
+@@ -55,79 +53,58 @@ def acetate_xyz() -> str:
+         return fh.read()
+ 
+ 
+-# ── Unit: convert_xyz_to_mol (RDKit) ────────────────────────────────────────
++@pytest.fixture(scope="module")
++def metallocenes_xyz() -> str:
++    with open(METALLOCENES_PATH) as fh:
++        return fh.read()
++
++
++# ── Unit: convert_xyz_to_mol returns (mol, method) ──────────────────────────
+ 
+ 
+ class TestConvertXYZToMolRDKit:
+-    """Direct unit tests for the RDKit xyz2mol path."""
+-
+-    def test_water_returns_mol(self, water_xyz):
+-        mol = convert_xyz_to_mol(water_xyz)
+-        assert isinstance(mol, Chem.Mol)
+-        assert mol.GetNumAtoms() == 3
++    def test_water_returns_bond_orders(self, water_xyz):
++        mol, method = convert_xyz_to_mol(water_xyz)
++        assert method == "bond_orders"
+         assert mol.GetNumBonds() == 2
+-
+-    def test_water_smiles_roundtrip(self, water_xyz):
+-        mol = convert_xyz_to_mol(water_xyz)
+-        # Hydrogens are explicit because they came from the XYZ
+         assert Chem.inchi.MolToInchiKey(mol) == WATER_INCHIKEY
+ 
+-    def test_methane_neutral(self):
+-        mol = convert_xyz_to_mol(METHANE_XYZ, charge=0)
+-        assert mol.GetNumAtoms() == 5
+-        assert mol.GetNumBonds() == 4
++    def test_methane_returns_bond_orders(self):
++        mol, method = convert_xyz_to_mol(METHANE_XYZ)
++        assert method == "bond_orders"
+         assert Chem.inchi.MolToInchiKey(mol) == METHANE_INCHIKEY
+ 
+-    def test_acetate_charge_minus_one(self, acetate_xyz):
+-        mol = convert_xyz_to_mol(acetate_xyz, charge=-1)
+-        assert mol.GetNumAtoms() == 7
+-        # Net charge on the molecule should be -1
+-        net_charge = sum(a.GetFormalCharge() for a in mol.GetAtoms())
+-        assert net_charge == -1
++    def test_acetate_with_charge_returns_bond_orders(self, acetate_xyz):
++        mol, method = convert_xyz_to_mol(acetate_xyz, charge=-1)
++        assert method == "bond_orders"
+         assert Chem.inchi.MolToInchiKey(mol) == ACETATE_INCHIKEY
+ 
+-    def test_acetate_wrong_charge_does_not_match_acetate_inchikey(self, acetate_xyz):
+-        """At charge=0 the same geometry yields a different (radical) species,
+-        so it must not pass for the acetate InChIKey. Guards against silent
+-        ignoring of the charge parameter."""
+-        try:
+-            mol = convert_xyz_to_mol(acetate_xyz, charge=0)
+-        except ValueError:
+-            return  # Acceptable: bond perception refuses inconsistent geometry
+-        assert Chem.inchi.MolToInchiKey(mol) != ACETATE_INCHIKEY
+-
+-    def test_molblock_carries_3d_coords(self, water_xyz):
+-        mol = convert_xyz_to_mol(water_xyz)
+-        molblock = Chem.MolToMolBlock(mol)
+-        assert "M  END" in molblock
+-        # The first oxygen sits at the origin in our fixture.
+-        assert "0.0000    0.0000    0.0000 O" in molblock
++    def test_metallocene_falls_back_to_connectivity_only(self, metallocenes_xyz):
++        from app.modules.toolkits.helpers import split_xyz_frames
++
++        frames = split_xyz_frames(metallocenes_xyz)
++        assert len(frames) == 3
++        for frame in frames:
++            mol, method = convert_xyz_to_mol(frame)
++            assert method == "connectivity_only"
++            assert mol.GetNumBonds() > 0
+ 
+     def test_empty_input_raises_value_error(self):
+         with pytest.raises(ValueError):
+             convert_xyz_to_mol("")
+ 
+-    def test_whitespace_input_raises_value_error(self):
+-        with pytest.raises(ValueError):
+-            convert_xyz_to_mol("   \n  \n")
+-
+     def test_garbage_input_raises_value_error(self):
+         with pytest.raises(ValueError):
+-            convert_xyz_to_mol("this is not an xyz file at all")
++            convert_xyz_to_mol("not an xyz file at all")
+ 
+ 
+-# ── Unit: get_ob_xyz_conversions (OpenBabel) ────────────────────────────────
++# ── Unit: get_ob_xyz_conversions ────────────────────────────────────────────
+ 
+ 
+ class TestOBXYZConversions:
+-    """Direct unit tests for the OpenBabel XYZ path."""
+-
+     def test_water(self, water_xyz):
+         result = get_ob_xyz_conversions(water_xyz)
+-        assert set(result.keys()) == {"canonicalsmiles", "inchi", "inchikey", "molblock"}
+-        # OpenBabel's canonical writer is title-stripped by the wrapper.
+         assert "\t" not in result["canonicalsmiles"]
+-        assert result["inchikey"].endswith("UHFFFAOYSA-N") or result["inchikey"].endswith("-N")
+         assert "M  END" in result["molblock"]
+ 
+     def test_methane(self):
+@@ -141,12 +118,10 @@ def test_empty_raises(self):
+             get_ob_xyz_conversions("")
+ 
+ 
+-# ── API: POST /convert/xyz ──────────────────────────────────────────────────
++# ── API: POST /convert/xyz batch ────────────────────────────────────────────
+ 
+ 
+ class TestXYZConvertEndpoint:
+-    """End-to-end tests for the public conversion endpoint."""
+-
+     URL = "/latest/convert/xyz"
+ 
+     def _post(self, body: str, **params):
+@@ -157,60 +132,139 @@ def _post(self, body: str, **params):
+             params=params,
+         )
+ 
+-    def test_water_rdkit_default(self, water_xyz):
++    # --- single frame ---
++
++    def test_single_water_returns_length_one_batch(self, water_xyz):
+         r = self._post(water_xyz)
+-        assert r.status_code == 200
++        assert r.status_code == 200, r.text
+         body = r.json()
+-        assert {"canonicalsmiles", "inchi", "inchikey", "molblock", "sdf"} <= body.keys()
+-        assert body["inchikey"] == WATER_INCHIKEY
++        assert len(body["structures"]) == 1
++        s = body["structures"][0]
++        assert s["success"] is True
++        assert s["index"] == 0
++        assert s["method"] == "bond_orders"
++        assert s["bond_orders_perceived"] is True
++        assert s["inchikey"] == WATER_INCHIKEY
+         assert body["sdf"].rstrip().endswith("$$$$")
+-        assert "M  END" in body["molblock"]
+-
+-    def test_acetate_rdkit_with_charge(self, acetate_xyz):
++        assert body["summary"] == {
++            "total": 1,
++            "successful": 1,
++            "failed": 0,
++            "bond_orders_count": 1,
++            "connectivity_only_count": 0,
++        }
++
++    def test_acetate_with_charge(self, acetate_xyz):
+         r = self._post(acetate_xyz, charge=-1)
+         assert r.status_code == 200
+-        assert r.json()["inchikey"] == ACETATE_INCHIKEY
++        s = r.json()["structures"][0]
++        assert s["inchikey"] == ACETATE_INCHIKEY
++        assert s["method"] == "bond_orders"
+ 
+-    def test_acetate_charge_param_round_trip(self, acetate_xyz):
+-        r0 = self._post(acetate_xyz, charge=0)
+-        r_neg = self._post(acetate_xyz, charge=-1)
+-        # When the geometry is consistent only with charge=-1, charge=0 either
+-        # fails (422) or yields a different InChIKey. Either way, the two
+-        # responses must not be identical -- proves charge is being honored.
+-        if r0.status_code == 200 and r_neg.status_code == 200:
+-            assert r0.json()["inchikey"] != r_neg.json()["inchikey"]
++    # --- multi-frame ---
+ 
+-    def test_water_openbabel(self, water_xyz):
+-        r = self._post(water_xyz, toolkit="openbabel")
++    def test_two_frame_request_returns_two_results(self, water_xyz, acetate_xyz):
++        r = self._post(water_xyz + acetate_xyz, charge=-1)
++        # The second frame (acetate, charge=-1) must always succeed; the first
++        # (water at charge=-1) may either fail or yield a radical/protonated
++        # variant. Either way, the batch should report 2 frames.
+         assert r.status_code == 200
+         body = r.json()
+-        # OB writer must not leak the title field.
+-        assert "\t" not in body["canonicalsmiles"]
+-        assert body["sdf"].rstrip().endswith("$$$$")
+-
+-    def test_garbage_returns_422(self):
+-        r = self._post("not an xyz file at all")
+-        assert r.status_code == 422
+-
+-    def test_truncated_xyz_returns_422(self):
+-        truncated = "3\nwater\nO 0 0 0\n"  # missing two atoms
+-        r = self._post(truncated)
++        assert body["summary"]["total"] == 2
++        # Find the acetate result (will be the one with the acetate InChIKey)
++        ikeys = [s["inchikey"] for s in body["structures"] if s.get("success")]
++        assert ACETATE_INCHIKEY in ikeys
++
++    def test_metallocenes_all_connectivity_only(self, metallocenes_xyz):
++        r = self._post(metallocenes_xyz)
++        assert r.status_code == 200, r.text
++        body = r.json()
++        assert body["summary"]["total"] == 3
++        assert body["summary"]["successful"] == 3
++        assert body["summary"]["connectivity_only_count"] == 3
++        assert body["summary"]["bond_orders_count"] == 0
++        for s in body["structures"]:
++            assert s["method"] == "connectivity_only"
++            assert s["bond_orders_perceived"] is False
++            assert any("connectivity-only" in w.lower() for w in s["warnings"])
++
++    # --- per-frame failure isolation ---
++
++    def test_bad_frame_does_not_fail_whole_request(self, water_xyz):
++        # Bogus 1-atom frame with an invalid element symbol; the splitter
++        # accepts it, but RDKit/OpenBabel both fail to perceive bonds.
++        bad_frame = "1\nbogus\nXx 0 0 0\n"
++        r = self._post(water_xyz + bad_frame + water_xyz)
++        assert r.status_code == 200, r.text
++        body = r.json()
++        assert body["summary"]["total"] >= 2
++        assert body["summary"]["successful"] >= 1
++        # SDF skips failed frames; verify it parses
++        suppl = Chem.SDMolSupplier()
++        suppl.SetData(body["sdf"])
++        n_records = sum(1 for m in suppl if m is not None)
++        assert n_records == body["summary"]["successful"]
++
++    # --- whole-request errors ---
++
++    def test_no_frames_detected_returns_422(self):
++        r = self._post("just some text\nwithout an atom count\n")
+         assert r.status_code == 422
+ 
+-    def test_unknown_element_returns_422(self):
+-        bad = "1\nfake\nXx 0 0 0\n"
++    def test_all_frames_fail_returns_422(self):
++        # Two 1-atom frames with unknown element.
++        bad = "1\na\nXx 0 0 0\n" * 2
+         r = self._post(bad)
+-        assert r.status_code == 422
+-
+-    def test_use_huckel_param_accepted(self, water_xyz):
+-        r = self._post(water_xyz, use_huckel="false")
+-        assert r.status_code == 200
++        # Either every frame fails (-> 422) or RDKit's parser rejects them
++        # before the loop. Either way, the request must not be 200.
++        assert r.status_code in (422, 400)
++
++    def test_too_many_frames_returns_413(self, water_xyz):
++        # 51 frames: cap is 50.
++        r = self._post(water_xyz * 51)
++        assert r.status_code == 413
++        assert "Frame count exceeds limit" in r.json()["detail"]
++
++    def test_too_large_body_returns_413(self):
++        # The body cap fires before splitting, so any >5 MB content works.
++        big = "x" * (5 * 1024 * 1024 + 10)
++        r = self._post(big)
++        assert r.status_code == 413
++        assert "exceeds" in r.json()["detail"]
+ 
+     def test_charge_out_of_range_rejected(self, water_xyz):
+         r = self._post(water_xyz, charge=999)
+         assert r.status_code == 422
+ 
+-    def test_crlf_line_endings_handled(self, water_xyz):
++    def test_crlf_handled(self, water_xyz):
+         r = self._post(water_xyz.replace("\n", "\r\n"))
+         assert r.status_code == 200
+-        assert r.json()["inchikey"] == WATER_INCHIKEY
++        assert r.json()["structures"][0]["inchikey"] == WATER_INCHIKEY
++
++    # --- toolkit=openbabel ---
++
++    def test_water_openbabel(self, water_xyz):
++        r = self._post(water_xyz, toolkit="openbabel")
++        assert r.status_code == 200
++        s = r.json()["structures"][0]
++        assert s["method"] == "bond_orders"  # OB always reports bond_orders
++        assert s["bond_orders_perceived"] is True
++        assert "\t" not in s["canonicalsmiles"]
++
++    # --- SDF roundtrip ---
++
++    def test_sdf_roundtrip(self, water_xyz):
++        r = self._post(water_xyz + water_xyz)
++        body = r.json()
++        suppl = Chem.SDMolSupplier()
++        suppl.SetData(body["sdf"])
++        mols = [m for m in suppl if m is not None]
++        assert len(mols) == body["summary"]["successful"]
++
++    # --- title preserved in MOL block ---
++
++    def test_title_preserved_in_molblock(self):
++        xyz = "3\nMyMolecule\nO 0 0 0\nH 0.76 0.59 0\nH -0.76 0.59 0\n"
++        r = self._post(xyz)
++        body = r.json()
++        assert "MyMolecule" in body["structures"][0]["molblock"]

@@ -1,0 +1,956 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 54b9c6078d..59d9a7d7ca 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+   components, enabling full low-level customization
+ - Configurable fitting criterion for Gaussian process hyperparameter optimization
+ - Factories for all Gaussian process components
+-- `CHEN`, `EDBO` and `EDBO_SMOOTHED` presets for `GaussianProcessSurrogate`
++- `BOTORCH`, `CHEN`, `EDBO` and `EDBO_SMOOTHED` presets for `GaussianProcessSurrogate`
+ - `TypeSelector` and `NameSelector` classes for parameter selection in kernel factories
+ - `parameter_names` attribute to basic kernels for controlling the considered parameters
+ - `ParameterKind` flag enum for classifying parameters by their role and automatic
+diff --git a/baybe/surrogates/gaussian_process/components/_gpytorch.py b/baybe/surrogates/gaussian_process/components/_gpytorch.py
+new file mode 100644
+index 0000000000..b7efc7bcbe
+--- /dev/null
++++ b/baybe/surrogates/gaussian_process/components/_gpytorch.py
+@@ -0,0 +1,71 @@
++"""Custom GPyTorch components."""
++
++import torch
++from botorch.models.multitask import _compute_multitask_mean
++from botorch.models.utils.gpytorch_modules import MIN_INFERRED_NOISE_LEVEL
++from gpytorch.constraints import GreaterThan
++from gpytorch.likelihoods.hadamard_gaussian_likelihood import HadamardGaussianLikelihood
++from gpytorch.means import MultitaskMean
++from gpytorch.means.multitask_mean import Mean
++from gpytorch.priors import LogNormalPrior
++from torch import Tensor
++from torch.nn import Module
++
++
++class HadamardConstantMean(Mean):
++    """A GPyTorch mean function implementing BoTorch's multitask mean logic.
++
++    While GPyTorch already provides a :class:`~gpytorch.means.MultitaskMean` class, it
++    computes mean values for all (input, task)-pairs (where input means all parameters
++    except the task parameter), i.e. it intrinsically applies a Cartesian expansion.
++    However, for the regular transfer learning setting, we only need the means for the
++    pairs that are actually observed/requested. BoTorch subselects the relevant means
++    from the GPyTorch output in `MultiTaskGP.forward`, i.e. it uses a class-based
++    approach to define its special logic for the multitask case. In contrast, BayBE uses
++    a composition approach, which is more flexible but requires that the logic is
++    injected via a self-contained `Mean` object, which is what this class provides.
++
++    Note:
++        Analogous to GPyTorch's
++        https://github.com/cornellius-gp/gpytorch/blob/main/gpytorch/likelihoods/hadamard_gaussian_likelihood.py
++        but where the logic is applied to the mean function, i.e. we learn a different
++        (constant) mean for each task.
++    """
++
++    def __init__(self, mean_module: Module, num_tasks: int, task_feature: int):
++        super().__init__()
++        self.multitask_mean = MultitaskMean(mean_module, num_tasks=num_tasks)
++        self.task_feature = task_feature
++
++    def forward(self, x: Tensor) -> Tensor:
++        # Adapted from https://github.com/meta-pytorch/botorch/blob/e0f4f5b941b5949a4a1171bf8d4ee9f74f146f3a/botorch/models/multitask.py#L397
++
++        # Convert task feature to positive index
++        task_feature = self.task_feature % x.shape[-1]
++
++        # Split input into task and non-task components
++        x_before = x[..., :task_feature]
++        task_idcs = x[..., task_feature : task_feature + 1]
++        x_after = x[..., task_feature + 1 :]
++
++        return _compute_multitask_mean(
++            self.multitask_mean, x_before, task_idcs, x_after
++        )
++
++
++def make_botorch_multitask_likelihood(
++    num_tasks: int, task_feature: int
++) -> HadamardGaussianLikelihood:
++    """Adapted from :class:`botorch.models.multitask.MultiTaskGP`."""
++    noise_prior = LogNormalPrior(loc=-4.0, scale=1.0)
++    return HadamardGaussianLikelihood(
++        num_tasks=num_tasks,
++        batch_shape=torch.Size(),
++        noise_prior=noise_prior,
++        noise_constraint=GreaterThan(
++            MIN_INFERRED_NOISE_LEVEL,
++            transform=None,
++            initial_value=noise_prior.mode,
++        ),
++        task_feature_index=task_feature,
++    )
+diff --git a/baybe/surrogates/gaussian_process/components/kernel.py b/baybe/surrogates/gaussian_process/components/kernel.py
+index 8b6ddff280..5bc0415da7 100644
+--- a/baybe/surrogates/gaussian_process/components/kernel.py
++++ b/baybe/surrogates/gaussian_process/components/kernel.py
+@@ -70,14 +70,10 @@ def __attrs_post_init__(self):
+                 f"they actually use the selected parameter names."
+             )
+ 
+-    def get_parameter_names(self, searchspace: SearchSpace) -> tuple[str, ...] | None:
++    def get_parameter_names(self, searchspace: SearchSpace) -> tuple[str, ...]:
+         """Get the names of the parameters to be considered by the kernel."""
+-        if self.parameter_selector is None:
+-            return None
+-
+-        return tuple(
+-            p.name for p in searchspace.parameters if self.parameter_selector(p)
+-        )
++        selector = self.parameter_selector or (lambda _: True)
++        return tuple(p.name for p in searchspace.parameters if selector(p))
+ 
+     def _validate_parameter_kinds(self, parameters: Iterable[Parameter]) -> None:
+         """Validate that the given parameters are supported by the factory.
+@@ -102,7 +98,7 @@ def _validate_parameter_kinds(self, parameters: Iterable[Parameter]) -> None:
+     @override
+     def __call__(
+         self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
+-    ) -> Kernel:
++    ) -> Kernel | GPyTorchKernel:
+         """Construct the kernel, validating parameter kinds before construction."""
+         if self.parameter_selector is not None:
+             params = [p for p in searchspace.parameters if self.parameter_selector(p)]
+@@ -115,7 +111,7 @@ def __call__(
+     @abstractmethod
+     def _make(
+         self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
+-    ) -> Kernel:
++    ) -> Kernel | GPyTorchKernel:
+         """Construct the kernel."""
+ 
+ 
+@@ -127,7 +123,7 @@ class _MetaKernelFactory(KernelFactoryProtocol, ABC):
+     @abstractmethod
+     def __call__(
+         self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
+-    ) -> Kernel: ...
++    ) -> Kernel | GPyTorchKernel: ...
+ 
+ 
+ @define
+@@ -170,11 +166,40 @@ def _default_task_kernel_factory(self) -> KernelFactoryProtocol:
+     @override
+     def __call__(
+         self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
+-    ) -> Kernel:
++    ) -> Kernel | GPyTorchKernel:
++        if searchspace.task_idx is None:
++            raise IncompatibleSearchSpaceError(
++                f"'{type(self).__name__}' can only be used with a searchspace that "
++                f"contains a '{TaskParameter.__name__}'."
++            )
++
+         base_kernel = self.base_kernel_factory(searchspace, train_x, train_y)
+         task_kernel = self.task_kernel_factory(searchspace, train_x, train_y)
+         if isinstance(base_kernel, Kernel):
+             base_kernel = base_kernel.to_gpytorch(searchspace)
+         if isinstance(task_kernel, Kernel):
+             task_kernel = task_kernel.to_gpytorch(searchspace)
++
++        # Ensure correct partitioning between base and task kernels active dimensions
++        all_idcs = set(range(len(searchspace.comp_rep_columns)))
++        allowed_task_idcs = {searchspace.task_idx}
++        allowed_base_idcs = all_idcs - allowed_task_idcs
++        base_idcs = (
++            set(d.tolist()) if (d := base_kernel.active_dims) is not None else all_idcs
++        )
++        task_idcs = (
++            set(d.tolist()) if (d := task_kernel.active_dims) is not None else all_idcs
++        )
++
++        if not base_idcs <= allowed_base_idcs:
++            raise ValueError(
++                f"The base kernel's 'active_dims' {base_idcs} must be a subset of "
++                f"the non-task indices {allowed_base_idcs}."
++            )
++        if task_idcs != allowed_task_idcs:
++            raise ValueError(
++                f"The task kernel's 'active_dims' {task_idcs} does not match "
++                f"the task index {allowed_task_idcs}."
++            )
++
+         return base_kernel * task_kernel
+diff --git a/baybe/surrogates/gaussian_process/core.py b/baybe/surrogates/gaussian_process/core.py
+index 3a8d8c9adc..585849a67e 100644
+--- a/baybe/surrogates/gaussian_process/core.py
++++ b/baybe/surrogates/gaussian_process/core.py
+@@ -183,8 +183,8 @@ class GaussianProcessSurrogate(Surrogate):
+         * :class:`gpytorch.likelihoods.Likelihood`
+     """
+ 
+-    criterion_factory: FitCriterionFactoryProtocol = field(
+-        alias="criterion_or_factory",
++    fit_criterion_factory: FitCriterionFactoryProtocol = field(
++        alias="fit_criterion_or_factory",
+         factory=BayBEFitCriterionFactory,
+         converter=partial(  # type: ignore[misc]
+             to_component_factory, component_type=GPComponentType.CRITERION
+@@ -215,7 +215,9 @@ def from_preset(
+         likelihood_or_factory: LikelihoodFactoryProtocol
+         | GPyTorchLikelihood
+         | None = None,
+-        criterion_or_factory: FitCriterion | FitCriterionFactoryProtocol | None = None,
++        fit_criterion_or_factory: FitCriterion
++        | FitCriterionFactoryProtocol
++        | None = None,
+     ) -> Self:
+         """Create a Gaussian process surrogate from one of the defined presets."""
+         preset = GaussianProcessPreset(preset)
+@@ -228,9 +230,13 @@ def from_preset(
+         kernel = kernel_or_factory or getattr(module, "KERNEL_FACTORY")
+         mean = mean_or_factory or getattr(module, "MEAN_FACTORY")
+         likelihood = likelihood_or_factory or getattr(module, "LIKELIHOOD_FACTORY")
+-        criterion = criterion_or_factory or getattr(module, "FIT_CRITERION_FACTORY")
++        fit_criterion = fit_criterion_or_factory or getattr(
++            module, "FIT_CRITERION_FACTORY"
++        )
+ 
+-        return cls(kernel, mean, likelihood, criterion)
++        gp = cls(kernel, mean, likelihood, fit_criterion)
++        gp._custom_kernel = False  # preset are first-party features
++        return gp
+ 
+     @override
+     def to_botorch(self) -> GPyTorchModel:
+@@ -301,7 +307,7 @@ def _fit(self, train_x: Tensor, train_y: Tensor) -> None:
+         likelihood = self.likelihood_factory(context.searchspace, train_x, train_y)
+ 
+         ### Criterion
+-        criterion = self.criterion_factory(context.searchspace, train_x, train_y)
++        criterion = self.fit_criterion_factory(context.searchspace, train_x, train_y)
+ 
+         ### Model construction and fitting
+         self._model = botorch.models.SingleTaskGP(
+@@ -323,7 +329,7 @@ def __str__(self) -> str:
+             to_string("Mean factory", self.mean_factory, single_line=True),
+             to_string("Likelihood factory", self.likelihood_factory, single_line=True),
+             to_string(
+-                "Fit criterion factory", self.criterion_factory, single_line=True
++                "Fit criterion factory", self.fit_criterion_factory, single_line=True
+             ),
+         ]
+         return to_string(super().__str__(), *fields)
+diff --git a/baybe/surrogates/gaussian_process/presets/__init__.py b/baybe/surrogates/gaussian_process/presets/__init__.py
+index 97d73aaae6..189733131b 100644
+--- a/baybe/surrogates/gaussian_process/presets/__init__.py
++++ b/baybe/surrogates/gaussian_process/presets/__init__.py
+@@ -11,6 +11,13 @@
+     BayBEMeanFactory,
+ )
+ 
++# BoTorch preset
++from baybe.surrogates.gaussian_process.presets.botorch import (
++    BotorchKernelFactory,
++    BotorchLikelihoodFactory,
++    BotorchMeanFactory,
++)
++
+ # Chen preset
+ from baybe.surrogates.gaussian_process.presets.chen import (
+     CHENFitCriterionFactory,
+@@ -45,6 +52,10 @@
+     "BayBEKernelFactory",
+     "BayBELikelihoodFactory",
+     "BayBEMeanFactory",
++    # BoTorch preset
++    "BotorchKernelFactory",
++    "BotorchLikelihoodFactory",
++    "BotorchMeanFactory",
+     # Chen preset
+     "CHENFitCriterionFactory",
+     "CHENKernelFactory",
+diff --git a/baybe/surrogates/gaussian_process/presets/botorch.py b/baybe/surrogates/gaussian_process/presets/botorch.py
+new file mode 100644
+index 0000000000..0db9c7aab4
+--- /dev/null
++++ b/baybe/surrogates/gaussian_process/presets/botorch.py
+@@ -0,0 +1,140 @@
++"""BoTorch preset for Gaussian process surrogates."""
++
++from __future__ import annotations
++
++import gc
++from itertools import chain
++from typing import TYPE_CHECKING, ClassVar
++
++from attrs import define
++from typing_extensions import override
++
++from baybe.kernels.base import Kernel
++from baybe.parameters.enum import _ParameterKind
++from baybe.searchspace.core import SearchSpace
++from baybe.surrogates.gaussian_process.components import LikelihoodFactoryProtocol
++from baybe.surrogates.gaussian_process.components.fit_criterion import (
++    FitCriterion,
++    PlainFitCriterionFactory,
++)
++from baybe.surrogates.gaussian_process.components.kernel import (
++    ICMKernelFactory,
++    _PureKernelFactory,
++)
++from baybe.surrogates.gaussian_process.components.mean import MeanFactoryProtocol
++
++if TYPE_CHECKING:
++    from gpytorch.kernels import Kernel as GPyTorchKernel
++    from gpytorch.likelihoods import Likelihood as GPyTorchLikelihood
++    from gpytorch.means import Mean as GPyTorchMean
++    from torch import Tensor
++
++
++@define
++class BotorchKernelFactory(_PureKernelFactory):
++    """A factory providing BoTorch kernels."""
++
++    _uses_parameter_names: ClassVar[bool] = True
++    # See base class.
++
++    _supported_parameter_kinds: ClassVar[_ParameterKind] = (
++        _ParameterKind.REGULAR | _ParameterKind.TASK
++    )
++    # See base class.
++
++    @override
++    def _make(
++        self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
++    ) -> Kernel | GPyTorchKernel:
++        from botorch.models.kernels.positive_index import PositiveIndexKernel
++        from botorch.models.utils.gpytorch_modules import (
++            get_covar_module_with_dim_scaled_prior,
++        )
++
++        parameter_names = self.get_parameter_names(searchspace)
++
++        # For regular parameters, resolve parameter names to active dimension indices
++        active_dims = list(
++            chain.from_iterable(
++                searchspace.get_comp_rep_parameter_indices(name)
++                for name in parameter_names
++                if searchspace.get_parameters_by_name([name])[0]._kind
++                is _ParameterKind.REGULAR
++            )
++        )
++        ard_num_dims = len(active_dims)
++
++        # Create the base kernel for the regular parameters
++        base_kernel = get_covar_module_with_dim_scaled_prior(
++            ard_num_dims=ard_num_dims, active_dims=active_dims
++        )
++
++        # Single-task case
++        if (task_idx := searchspace.task_idx) is None:
++            return base_kernel
++
++        index_kernel = PositiveIndexKernel(
++            num_tasks=searchspace.n_tasks,
++            rank=searchspace.n_tasks,
++            active_dims=[task_idx],
++        )
++        return ICMKernelFactory(base_kernel, index_kernel)(
++            searchspace, train_x, train_y
++        )
++
++
++class BotorchMeanFactory(MeanFactoryProtocol):
++    """A factory providing BoTorch mean functions."""
++
++    @override
++    def __call__(
++        self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
++    ) -> GPyTorchMean:
++        from gpytorch.means import ConstantMean
++
++        from baybe.surrogates.gaussian_process.components._gpytorch import (
++            HadamardConstantMean,
++        )
++
++        if searchspace.n_tasks == 1:
++            return ConstantMean()
++
++        assert searchspace.task_idx is not None
++        return HadamardConstantMean(
++            ConstantMean(), searchspace.n_tasks, searchspace.task_idx
++        )
++
++
++class BotorchLikelihoodFactory(LikelihoodFactoryProtocol):
++    """A factory providing BoTorch likelihoods."""
++
++    @override
++    def __call__(
++        self, searchspace: SearchSpace, train_x: Tensor, train_y: Tensor
++    ) -> GPyTorchLikelihood:
++
++        if searchspace.n_tasks == 1:
++            from botorch.models.utils.gpytorch_modules import (
++                get_gaussian_likelihood_with_lognormal_prior,
++            )
++
++            return get_gaussian_likelihood_with_lognormal_prior()
++
++        from baybe.surrogates.gaussian_process.components._gpytorch import (
++            make_botorch_multitask_likelihood,
++        )
++
++        assert searchspace.task_idx is not None
++        return make_botorch_multitask_likelihood(
++            num_tasks=searchspace.n_tasks, task_feature=searchspace.task_idx
++        )
++
++
++# Collect leftover original slotted classes processed by `attrs.define`
++gc.collect()
++
++# Aliases for generic preset imports
++KERNEL_FACTORY = BotorchKernelFactory()
++MEAN_FACTORY = BotorchMeanFactory()
++LIKELIHOOD_FACTORY = BotorchLikelihoodFactory()
++FIT_CRITERION_FACTORY = PlainFitCriterionFactory(FitCriterion.MARGINAL_LOG_LIKELIHOOD)
+diff --git a/baybe/surrogates/gaussian_process/presets/core.py b/baybe/surrogates/gaussian_process/presets/core.py
+index 5347cf85e5..70d5ac9a7c 100644
+--- a/baybe/surrogates/gaussian_process/presets/core.py
++++ b/baybe/surrogates/gaussian_process/presets/core.py
+@@ -11,6 +11,9 @@ class GaussianProcessPreset(Enum):
+     BAYBE = "BAYBE"
+     """The default BayBE settings of the Gaussian process surrogate class."""
+ 
++    BOTORCH = "BOTORCH"
++    """The BoTorch settings."""
++
+     CHEN = "CHEN"
+     """The adaptive kernel hyperprior settings proposed by :cite:p:`Chen2026`."""
+ 
+diff --git a/pytest.ini b/pytest.ini
+index 350de2c1d5..8d31d610b5 100644
+--- a/pytest.ini
++++ b/pytest.ini
+@@ -34,6 +34,8 @@ filterwarnings =
+     ignore:Setting an item of incompatible dtype is deprecated:FutureWarning:baybe.constraints.discrete
+     ; https://github.com/shap/shap/issues/4280 (fixed in shap>=0.51.0, but only available for Python 3.11+)
+     ignore:Conversion of an array with ndim > 0 to a scalar is deprecated:DeprecationWarning:shap.explainers.other._maple
++    ; https://github.com/cornellius-gp/linear_operator/issues/131
++    ignore:Sparse invariant checks are implicitly disabled.*:UserWarning:linear_operator
+ 
+     ; Numerics/optimization
+     ; ---------------------
+diff --git a/streamlit/surrogate_models.py b/streamlit/surrogate_models.py
+index 83415b91b9..3630f1d2f8 100644
+--- a/streamlit/surrogate_models.py
++++ b/streamlit/surrogate_models.py
+@@ -19,11 +19,12 @@
+ from baybe.acquisition import qLogExpectedImprovement
+ from baybe.acquisition.base import AcquisitionFunction
+ from baybe.exceptions import IncompatibleSurrogateError
+-from baybe.parameters import NumericalDiscreteParameter
++from baybe.parameters import NumericalDiscreteParameter, TaskParameter
+ from baybe.recommenders import BotorchRecommender
+ from baybe.searchspace import SearchSpace
+ from baybe.surrogates import CustomONNXSurrogate, GaussianProcessSurrogate
+ from baybe.surrogates.base import Surrogate
++from baybe.surrogates.gaussian_process.presets import GaussianProcessPreset
+ from baybe.targets import NumericalTarget
+ from baybe.utils.basic import get_subclasses
+ 
+@@ -90,13 +91,36 @@ def main():
+     }
+     acquisition_function_names = list(acquisition_function_classes.keys())
+ 
+-    # Streamlit simulation parameters
++    # >>>>> Sidebar options >>>>>
++    # Domain
+     st.sidebar.markdown("# Domain")
++    st_enable_multitask = st.sidebar.toggle("Multi-task")
++    st_n_tasks = 2 if st_enable_multitask else 1
+     st_random_seed = int(st.sidebar.number_input("Random seed", value=1337))
+     st_function_name = st.sidebar.selectbox(
+         "Test function", list(test_functions.keys())
+     )
+     st_minimize = st.sidebar.checkbox("Minimize")
++
++    # Training data
++    st.sidebar.markdown("---")
++    st.sidebar.markdown("# Training Data")
++    st_n_training_points = st.sidebar.slider(
++        "Number of training points",
++        0 if st_enable_multitask else 1,
++        20,
++        0 if st_enable_multitask else 5,
++    )
++    if st_enable_multitask:
++        st_n_training_points_other = st.sidebar.slider(
++            "Number of source training points", 0, 20, 5
++        )
++        st_offtask_scale = st.sidebar.slider("Source scale factor", -20.0, 20.0, 1.0)
++        st_offtask_offset_factor = st.sidebar.slider(
++            "Source offset", -100.0, 100.0, 0.0
++        )
++
++    # Model
+     st.sidebar.markdown("---")
+     st.sidebar.markdown("# Model")
+     st_surrogate_name = st.sidebar.selectbox(
+@@ -104,13 +128,26 @@ def main():
+         surrogate_model_names,
+         surrogate_model_names.index(GaussianProcessSurrogate.__name__),
+     )
++
++    st_gp_preset = None
++    st_transfer_learning = False
++    if st_surrogate_name == GaussianProcessSurrogate.__name__:
++        preset_names = [preset.value for preset in GaussianProcessPreset]
++        st_gp_preset = st.sidebar.selectbox(
++            "GP Preset",
++            preset_names,
++            index=preset_names.index(GaussianProcessPreset.BAYBE.value),
++        )
++        if st_enable_multitask:
++            st_transfer_learning = st.sidebar.checkbox("Transfer learning", value=True)
+     st_acqf_name = st.sidebar.selectbox(
+         "Acquisition function",
+         acquisition_function_names,
+         acquisition_function_names.index(qLogExpectedImprovement.__name__),
+     )
+-    st_n_training_points = st.sidebar.slider("Number of training points", 1, 20, 5)
+     st_n_recommendations = st.sidebar.slider("Number of recommendations", 1, 20, 5)
++
++    # Surrogate consistency validation
+     st.sidebar.markdown("---")
+     st.sidebar.markdown("# Validation")
+     st.sidebar.markdown(
+@@ -127,6 +164,10 @@ def main():
+     )
+     st_function_amplitude = st.sidebar.slider("Function amplitude", 1.0, 100.0, 1.0)
+     st_function_bias = st.sidebar.slider("Function bias", -100.0, 100.0, 0.0)
++    # <<<<< Sidebar options <<<<<
++
++    # Derived settings
++    st_use_separate_gps = st_n_tasks > 1 and not st_transfer_learning
+ 
+     # Set the chosen random seed
+     active_settings.random_seed = st_random_seed
+@@ -140,68 +181,184 @@ def main():
+         bias=st_function_bias,
+     )
+ 
+-    # Create the training data
+-    train_x = np.random.uniform(
+-        st_lower_parameter_limit, st_upper_parameter_limit, st_n_training_points
+-    )
+-    train_y = fun(train_x)
+-    measurements = pd.DataFrame({"x": train_x, "y": train_y})
++    # Generate task-specific transforms (scale and offset for each task)
++    task_names = ["target", "source"] if st_n_tasks > 1 else ["target"]
++    task_transforms = {}
++    for task_idx in range(st_n_tasks):
++        task_name = task_names[task_idx]
++        if task_idx == 0:
++            # Target: use original function values
++            task_transforms[task_name] = {"scale": 1.0, "offset": 0.0}
++        else:
++            # Source: use user-specified scale and offset
++            scale = st_offtask_scale
++            offset = st_offtask_offset_factor * st_function_amplitude
++            task_transforms[task_name] = {"scale": scale, "offset": offset}
++
++    # Create training data
++    measurements_list = []
++    for task_idx in range(st_n_tasks):
++        task_name = task_names[task_idx]
++        transform = task_transforms[task_name]
++        n_points = st_n_training_points if task_idx == 0 else st_n_training_points_other
++        train_x = np.random.uniform(
++            st_lower_parameter_limit, st_upper_parameter_limit, n_points
++        )
++        task_measurements = pd.DataFrame(
++            {
++                "x": train_x,
++                "task": task_name,
++                "y": fun(train_x) * transform["scale"] + transform["offset"],
++            }
++        )
++        measurements_list.append(task_measurements)
++    measurements = pd.concat(measurements_list, ignore_index=True)
+ 
+     # Create the plotting grid and corresponding target values
+     test_x = np.linspace(
+         st_lower_parameter_limit, st_upper_parameter_limit, N_PARAMETER_VALUES
+     )
+-    test_y = fun(test_x)
+-    candidates = pd.DataFrame({"x": test_x, "y": test_y})
++    candidates_list = []
++    test_ys = {}
++    for task_idx in range(st_n_tasks):
++        task_name = task_names[task_idx]
++        transform = task_transforms[task_name]
++        test_ys[task_name] = fun(test_x) * transform["scale"] + transform["offset"]
++        task_candidates = pd.DataFrame(
++            {"x": test_x, "task": task_name, "y": test_ys[task_name]}
++        )
++        candidates_list.append(task_candidates)
++    candidates = pd.concat(candidates_list, ignore_index=True)
+ 
+     # Create the searchspace and objective
+-    parameter = NumericalDiscreteParameter(
+-        name="x",
+-        values=np.linspace(
+-            st_lower_parameter_limit, st_upper_parameter_limit, N_PARAMETER_VALUES
+-        ),
+-    )
+-    searchspace = SearchSpace.from_product(parameters=[parameter])
++    parameters = [
++        NumericalDiscreteParameter(
++            name="x",
++            values=np.linspace(
++                st_lower_parameter_limit, st_upper_parameter_limit, N_PARAMETER_VALUES
++            ),
++        )
++    ]
++    if st_transfer_learning:
++        parameters.append(
++            TaskParameter(
++                name="task",
++                values=task_names,
++                active_values=["target"],
++            )
++        )
++    searchspace = SearchSpace.from_product(parameters=parameters)
+     objective = NumericalTarget(name="y", minimize=st_minimize).to_objective()
+ 
+-    # Create the acquisition function and the recommender
++    # Create the acquisition function
+     acqf_cls = acquisition_function_classes[st_acqf_name]
+     try:
+         acqf = acqf_cls(maximize=not st_minimize)
+     except TypeError:
+         acqf = acqf_cls()
+-    recommender = BotorchRecommender(
+-        surrogate_model=surrogate_model_classes[st_surrogate_name](),
+-        acquisition_function=acqf,
+-    )
+ 
+-    # Get the recommendations and extract the posterior mean / standard deviation
+-    try:
+-        recommendations = recommender.recommend(
+-            st_n_recommendations, searchspace, objective, measurements
+-        )
+-    except IncompatibleSurrogateError:
+-        st.error(
+-            f"You requested {st_n_recommendations} recommendations but the selected "
+-            f"surrogate class does not support recommending more than one candidate "
+-            f"at a time."
++    def make_surrogate():
++        if st_surrogate_name == GaussianProcessSurrogate.__name__:
++            assert st_gp_preset is not None
++            return GaussianProcessSurrogate.from_preset(
++                preset=GaussianProcessPreset[st_gp_preset]
++            )
++        return surrogate_model_classes[st_surrogate_name]()
++
++    if st_use_separate_gps:
++        # One independent GP per task, each trained without the task column
++        stats_by_task = {}
++        for task_name in task_names:
++            task_meas = measurements[measurements["task"] == task_name][
++                ["x", "y"]
++            ].reset_index(drop=True)
++            task_recommender = BotorchRecommender(
++                surrogate_model=make_surrogate(),
++                acquisition_function=acqf,
++            )
++            if task_name == "target":
++                try:
++                    recommendations = task_recommender.recommend(
++                        st_n_recommendations, searchspace, objective, task_meas
++                    )
++                except IncompatibleSurrogateError:
++                    st.error(
++                        f"You requested {st_n_recommendations} recommendations but "
++                        f"the selected surrogate class does not support recommending "
++                        f"more than one candidate at a time."
++                    )
++                    st.stop()
++            task_surrogate = task_recommender.get_surrogate(
++                searchspace, objective, task_meas
++            )
++            stats_by_task[task_name] = task_surrogate.posterior_stats(
++                pd.DataFrame({"x": test_x})
++            )
++    else:
++        # Single recommender (single task, or multi-task with transfer learning)
++        recommender = BotorchRecommender(
++            surrogate_model=make_surrogate(),
++            acquisition_function=acqf,
+         )
+-        st.stop()
+-    surrogate = recommender.get_surrogate(searchspace, objective, measurements)
+-    stats = surrogate.posterior_stats(candidates)
+-    mean, std = stats["y_mean"], stats["y_std"]
++        try:
++            recommendations = recommender.recommend(
++                st_n_recommendations, searchspace, objective, measurements
++            )
++        except IncompatibleSurrogateError:
++            st.error(
++                f"You requested {st_n_recommendations} recommendations but the "
++                f"selected surrogate class does not support recommending more than "
++                f"one candidate at a time."
++            )
++            st.stop()
++        surrogate = recommender.get_surrogate(searchspace, objective, measurements)
++        stats = surrogate.posterior_stats(candidates)
+ 
+     # Visualize the test function, training points, model predictions, recommendations
+-    fig = plt.figure()
+-    plt.plot(test_x, test_y, color="tab:blue", label="Test function")
+-    plt.plot(train_x, train_y, "o", color="tab:blue")
+-    plt.plot(test_x, mean, color="tab:red", label="Surrogate model")
+-    plt.fill_between(test_x, mean - std, mean + std, alpha=0.2, color="tab:red")
+-    plt.vlines(
+-        recommendations, *plt.gca().get_ylim(), color="k", label="Recommendations"
+-    )
+-    plt.legend()
+-    st.pyplot(fig)
++    if st_n_tasks > 1:
++        cols = st.columns(st_n_tasks)
++
++    for task_idx in range(st_n_tasks):
++        task_name = task_names[task_idx]
++        task_mask = candidates["task"] == task_name if st_n_tasks > 1 else slice(None)
++
++        if st_use_separate_gps:
++            task_stats = stats_by_task[task_name]
++            mean = task_stats["y_mean"].values
++            std = task_stats["y_std"].values
++        elif st_n_tasks > 1:
++            mean = stats["y_mean"][task_mask].values
++            std = stats["y_std"][task_mask].values
++        else:
++            mean = stats["y_mean"].values
++            std = stats["y_std"].values
++
++        test_y = test_ys[task_name]
++        train_mask = (
++            measurements["task"] == task_name if st_n_tasks > 1 else slice(None)
++        )
++        train_y = measurements[train_mask]["y"].values
++        task_train_x = measurements[train_mask]["x"].values
++
++        fig = plt.figure()
++        plt.plot(test_x, test_y, color="tab:blue", label="Test function")
++        plt.plot(task_train_x, train_y, "o", color="tab:blue")
++        plt.plot(test_x, mean, color="tab:red", label="Surrogate model")
++        plt.fill_between(test_x, mean - std, mean + std, alpha=0.2, color="tab:red")
++        if task_name == "target":
++            plt.vlines(
++                recommendations["x"],
++                *plt.gca().get_ylim(),
++                color="k",
++                label="Recommendations",
++            )
++        plt.legend()
++        if st_n_tasks > 1:
++            plt.title(task_name.capitalize())
++            with cols[task_idx]:
++                st.pyplot(fig)
++        else:
++            st.pyplot(fig)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_gp.py b/tests/test_gp.py
+index e5671984dd..2af1250529 100644
+--- a/tests/test_gp.py
++++ b/tests/test_gp.py
+@@ -1,6 +1,11 @@
+ """Tests for the Gaussian Process surrogate."""
+ 
++import pandas as pd
+ import pytest
++import torch
++from botorch.fit import fit_gpytorch_mll
++from botorch.models import MultiTaskGP, SingleTaskGP
++from botorch.models.transforms import Normalize, Standardize
+ from gpytorch.kernels import MaternKernel as GPyTorchMaternKernel
+ from gpytorch.kernels import RBFKernel as GPyTorchRBFKernel
+ from gpytorch.kernels import ScaleKernel as GPyTorchScaleKernel
+@@ -8,23 +13,35 @@
+ from gpytorch.likelihoods import Likelihood as GPyTorchLikelihood
+ from gpytorch.means import ConstantMean
+ from gpytorch.means import Mean as GPyTorchMean
++from gpytorch.mlls import ExactMarginalLogLikelihood
+ from pandas.testing import assert_frame_equal
+ from pytest import param
+ 
++from baybe import active_settings
+ from baybe.kernels.basic import MaternKernel, RBFKernel
+ from baybe.kernels.composite import ScaleKernel
++from baybe.parameters.categorical import TaskParameter
+ from baybe.parameters.numerical import NumericalContinuousParameter
++from baybe.searchspace.core import SearchSpace
+ from baybe.surrogates.gaussian_process.components.fit_criterion import FitCriterion
+ from baybe.surrogates.gaussian_process.components.generic import PlainGPComponentFactory
+ from baybe.surrogates.gaussian_process.core import GaussianProcessSurrogate
+ from baybe.surrogates.gaussian_process.presets import GaussianProcessPreset
+ from baybe.targets.numerical import NumericalTarget
+-from baybe.utils.dataframe import create_fake_input
++from baybe.utils.dataframe import create_fake_input, to_tensor
+ 
+ searchspace = NumericalContinuousParameter("p", (0, 1)).to_searchspace()
++searchspace_mt = SearchSpace.from_product(
++    [
++        NumericalContinuousParameter("p", (0, 1)),
++        TaskParameter("task", ["a", "b", "c"]),
++    ]
++)
+ objective = NumericalTarget("t").to_objective()
+ measurements = create_fake_input(searchspace.parameters, objective.targets, n_rows=100)
+-
++measurements_mt = create_fake_input(
++    searchspace_mt.parameters, objective.targets, n_rows=100
++)
+ baybe_kernel = ScaleKernel(MaternKernel() + RBFKernel())
+ gpytorch_kernel = GPyTorchScaleKernel(GPyTorchMaternKernel() + GPyTorchRBFKernel())
+ 
+@@ -37,6 +54,52 @@ def _dummy_likelihood_factory(*args, **kwargs) -> GPyTorchLikelihood:
+     return GaussianLikelihood()
+ 
+ 
++def _posterior_stats_botorch(
++    searchspace: SearchSpace, measurements: pd.DataFrame
++) -> pd.DataFrame:
++    """The essential BoTorch steps to produce posterior estimates."""
++    train_X = to_tensor(searchspace.transform(measurements, allow_extra=True))
++    train_Y = to_tensor(objective.transform(measurements, allow_extra=True))
++
++    # >>>>> Code adapted from BoTorch landing page: https://botorch.org/ >>>>>
++    # NOTE: We normalize according to the searchspace bounds to ensure consistency with
++    #       the BayBE GP implementation.
++    if searchspace.n_tasks == 1:
++        gp = SingleTaskGP(
++            train_X=train_X,
++            train_Y=train_Y,
++            input_transform=Normalize(
++                d=len(searchspace.comp_rep_columns),
++                bounds=to_tensor(searchspace.scaling_bounds),
++            ),
++            outcome_transform=Standardize(m=1),
++        )
++    else:
++        assert searchspace.task_idx is not None
++        non_task_idcs = [
++            i for i in range(train_X.shape[-1]) if i != searchspace.task_idx
++        ]
++        gp = MultiTaskGP(
++            train_X=train_X,
++            train_Y=train_Y,
++            task_feature=searchspace.task_idx,
++            input_transform=Normalize(
++                d=len(searchspace.comp_rep_columns),
++                indices=non_task_idcs,
++                bounds=to_tensor(searchspace.scaling_bounds),
++            ),
++        )
++    mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
++    fit_gpytorch_mll(mll)
++    # <<<<<<<<<<
++
++    with torch.no_grad():
++        posterior = gp.posterior(train_X)
++    mean = posterior.mean
++    std = posterior.variance.sqrt()
++    return pd.DataFrame({"t_mean": mean.numpy().ravel(), "t_std": std.numpy().ravel()})
++
++
+ @pytest.mark.parametrize(
+     ("component_1", "component_2"),
+     [
+@@ -101,7 +164,7 @@ def test_presets(preset: GaussianProcessPreset):
+         kernel_or_factory=kernel,
+         mean_or_factory=mean,
+         likelihood_or_factory=likelihood,
+-        criterion_or_factory=criterion,
++        fit_criterion_or_factory=criterion,
+     )
+ 
+     # Check that the overrides were applied correctly
+@@ -111,9 +174,9 @@ def test_presets(preset: GaussianProcessPreset):
+     assert gp2.mean_factory.component is mean
+     assert isinstance(gp2.likelihood_factory, PlainGPComponentFactory)
+     assert gp2.likelihood_factory.component is likelihood
+-    assert isinstance(gp2.criterion_factory, PlainGPComponentFactory)
+-    assert gp2.criterion_factory.component == criterion
+-    assert gp2.criterion_factory != gp1.criterion_factory
++    assert isinstance(gp2.fit_criterion_factory, PlainGPComponentFactory)
++    assert gp2.fit_criterion_factory.component == criterion
++    assert gp2.fit_criterion_factory != gp1.fit_criterion_factory
+ 
+     gp2.fit(searchspace, objective, measurements)
+ 
+@@ -129,4 +192,25 @@ def test_invalid_components():
+             likelihood_or_factory=FitCriterion.LEAVE_ONE_OUT_PSEUDOLIKELIHOOD
+         )
+     with pytest.raises(TypeError, match="Component must be one of"):
+-        GaussianProcessSurrogate(criterion_or_factory=MaternKernel())
++        GaussianProcessSurrogate(fit_criterion_or_factory=MaternKernel())
++
++
++@pytest.mark.parametrize("multitask", [False, True], ids=["single-task", "multi-task"])
++def test_botorch_preset(multitask: bool):
++    """The BoTorch preset exactly mimics BoTorch's behavior."""
++    if multitask:
++        sp = searchspace_mt
++        data = measurements_mt
++    else:
++        sp = searchspace
++        data = measurements
++
++    active_settings.random_seed = 1337
++    gp = GaussianProcessSurrogate.from_preset("BOTORCH")
++    gp.fit(sp, objective, data)
++    posterior1 = gp.posterior_stats(data)
++
++    active_settings.random_seed = 1337
++    posterior2 = _posterior_stats_botorch(sp, data)
++
++    assert_frame_equal(posterior1, posterior2)
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 86e50df81f..63be891524 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -65,6 +65,7 @@ def test_imports(module: str):
+         "baybe.acquisition._builder",
+         "baybe.objectives.botorch",
+         "baybe.surrogates._adapter",
++        "baybe.surrogates.gaussian_process.components._gpytorch",
+         "baybe.utils.torch",
+     ],
+     "scipy": [
+@@ -77,6 +78,7 @@ def test_imports(module: str):
+         "baybe.insights.shap",
+         "baybe.objectives.botorch",
+         "baybe.surrogates._adapter",
++        "baybe.surrogates.gaussian_process.components._gpytorch",
+         "baybe.utils.chemistry",
+         "baybe.utils.clustering_algorithms",
+         "baybe.utils.clustering_algorithms.third_party",
+diff --git a/tests/test_kernels.py b/tests/test_kernels.py
+index eb535520f3..88111f25d3 100644
+--- a/tests/test_kernels.py
++++ b/tests/test_kernels.py
+@@ -210,7 +210,7 @@ def test_mul_constant_produces_constant_scale_kernel(left, right, searchspace):
+     # Create a dummy input and compute a loss through the kernel to assert training
+     # does not affect the output scale
+     x = torch.randn(5, 1)
+-    loss = gpytorch_kernel(x).evaluate().sum()
++    loss = gpytorch_kernel(x).to_dense().sum()
+     loss.backward()
+     optimizer = torch.optim.SGD(gpytorch_kernel.parameters(), lr=0.1)
+     optimizer.step()

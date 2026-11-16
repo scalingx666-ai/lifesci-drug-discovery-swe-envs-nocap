@@ -1,0 +1,929 @@
+diff --git a/fingerprintdb_cuda.cpp b/fingerprintdb_cuda.cpp
+index 1ca862c..06d2515 100644
+--- a/fingerprintdb_cuda.cpp
++++ b/fingerprintdb_cuda.cpp
+@@ -18,11 +18,12 @@ using namespace gpusim;
+ using std::vector;
+ 
+ void FingerprintDB::search_cpu(const Fingerprint& query, const QString& dbkey,
++                               unsigned int max_return_count,
++                               float similarity_cutoff,
+                                std::vector<char*>& results_smiles,
+                                std::vector<char*>& results_ids,
+                                std::vector<float>& results_scores,
+-                               unsigned int return_count,
+-                               float similarity_cutoff) const
++                               unsigned long& approximate_result_count) const
+ {
+     if (dbkey != m_dbkey) {
+         qDebug() << "Key check failed, returning empty results";
+@@ -35,16 +36,17 @@ void FingerprintDB::search_cpu(const Fingerprint& query, const QString& dbkey,
+     vector<float> scores(total);
+ 
+     // TODO:  CPU searching broken for >1GB, needs to be fixed below
++    // TODO:  CPU searching broken, not giving approximate total count back
+ 
+     // Scoring parallelizes well, but bottleneck is now sorting
+     QtConcurrent::blockingMap(
+         indices,
+         TanimotoFunctorCPU(query, m_fp_intsize, m_storage[0]->m_data, scores));
+ 
+-    top_results_bubble_sort(indices, scores, return_count);
++    top_results_bubble_sort(indices, scores, max_return_count);
+ 
+     // Push top return_count results to CPU results vectors to be returned
+-    for (unsigned int i = 0; i < return_count; i++) {
++    for (unsigned int i = 0; i < max_return_count; i++) {
+         results_smiles.push_back(m_smiles[indices[i]]);
+         results_ids.push_back(m_ids[indices[i]]);
+         results_scores.push_back(scores[i]);
+diff --git a/fingerprintdb_cuda.cu b/fingerprintdb_cuda.cu
+index 03c108a..c07bdbd 100644
+--- a/fingerprintdb_cuda.cu
++++ b/fingerprintdb_cuda.cu
+@@ -5,11 +5,11 @@
+  * Copyright Schrodinger LLC, All Rights Reserved.
+  --------------------------------------------------------------------------- */
+ 
+-#include <cuda_runtime.h>
+ #include "fingerprintdb_cuda.h"
++#include <cuda_runtime.h>
+ 
+-#include <iostream>
+ #include <cmath>
++#include <iostream>
+ 
+ #include <algorithm>
+ #include <cuda_runtime_api.h>
+@@ -17,10 +17,10 @@
+ #include <thrust/sequence.h>
+ #include <thrust/sort.h>
+ 
+-#include <QtConcurrent/QtConcurrentRun>
+ #include <QDebug>
+ #include <QFuture>
+ #include <QMutex>
++#include <QtConcurrent/QtConcurrentRun>
+ 
+ using std::make_shared;
+ using std::pair;
+@@ -43,7 +43,7 @@ unsigned int get_gpu_count()
+     static int device_count = 0;
+     static bool initialized = false;
+ 
+-    if(!initialized) {
++    if (!initialized) {
+         cudaGetDeviceCount(&device_count);
+         initialized = true;
+     }
+@@ -54,14 +54,16 @@ unsigned int get_gpu_count()
+ unsigned int get_next_gpu(size_t required_memory)
+ {
+     static int next_device = 0;
+-    for(unsigned int i=0; i<get_gpu_count(); i++) {
+-        int gpu = next_device++ % get_gpu_count(); // Divide by 0 if called w/o GPU
++    for (unsigned int i = 0; i < get_gpu_count(); i++) {
++        int gpu =
++            next_device++ % get_gpu_count(); // Divide by 0 if called w/o GPU
+         auto free = get_gpu_free_memory(i);
+-        if(free > required_memory) {
++        if (free > required_memory) {
+             return gpu;
+         }
+     }
+-    throw std::runtime_error("Can't find a GPU with enough memory to copy data.");
++    throw std::runtime_error(
++        "Can't find a GPU with enough memory to copy data.");
+     return 0; // Never gets here, just for compiler happiness
+ }
+ 
+@@ -79,44 +81,48 @@ struct TanimotoFunctor {
+     const float m_similarity_cutoff;
+ 
+     TanimotoFunctor(const DFingerprint& ref_fp, int fp_intsize,
+-            const device_vector<int>& dbdata, float similarity_cutoff) :
+-        m_ref_fp(ref_fp.data().get()),m_fp_intsize(fp_intsize),m_dbdata(dbdata.data().get()),
+-        m_similarity_cutoff(similarity_cutoff)
+-        {};
++                    const device_vector<int>& dbdata, float similarity_cutoff)
++        : m_ref_fp(ref_fp.data().get()), m_fp_intsize(fp_intsize),
++          m_dbdata(dbdata.data().get()),
++          m_similarity_cutoff(similarity_cutoff){};
+ 
+-    __device__ float
+-    operator()(const int& fp_index) const
++    __device__ float operator()(const int& fp_index) const
+     {
+         int total = 0;
+         int common = 0;
+-        int offset = m_fp_intsize*fp_index;
+-        for(int i=0; i<m_fp_intsize; i++) {
++        int offset = m_fp_intsize * fp_index;
++        for (int i = 0; i < m_fp_intsize; i++) {
+             const int fp1 = m_ref_fp[i];
+-            const int fp2 = m_dbdata[offset+i];
+-            total += __popc(fp1) + __popc(fp2); 
++            const int fp2 = m_dbdata[offset + i];
++            total += __popc(fp1) + __popc(fp2);
+             common += __popc(fp1 & fp2);
+         }
+-        float score = static_cast<float>(common) / static_cast<float>(total-common);
++        float score =
++            static_cast<float>(common) / static_cast<float>(total - common);
+         return score >= m_similarity_cutoff ? score : 0;
+     };
+ };
+ 
++struct StorageResultObject {
++    vector<SortableResult> m_result_data;
++    vector<int> m_approximate_matching_results;
++};
+ 
+ class FingerprintDBPriv
+ {
+-    public:
+-        std::shared_ptr<device_vector<int> > d_data;
+-
++  public:
++    std::shared_ptr<device_vector<int>> d_data;
+ };
+ 
+-FingerprintDBStorage::FingerprintDBStorage(FingerprintDB* parent, std::vector<char>& fp_data, 
+-            int index_offset, int fp_bitcount) : m_parent(parent), m_index_offset(index_offset), 
+-                                                 m_count(fp_data.size() / (fp_bitcount / CHAR_BIT))
++FingerprintDBStorage::FingerprintDBStorage(FingerprintDB* parent,
++                                           std::vector<char>& fp_data,
++                                           int index_offset, int fp_bitcount)
++    : m_parent(parent), m_index_offset(index_offset),
++      m_count(fp_data.size() / (fp_bitcount / CHAR_BIT))
+ {
+     const int* int_data = reinterpret_cast<const int*>(fp_data.data());
+     const size_t int_size = fp_data.size() / sizeof(int);
+-    m_data.assign(int_data, int_data+int_size);
+-
++    m_data.assign(int_data, int_data + int_size);
+ }
+ 
+ unsigned int FingerprintDBStorage::getOffsetIndex(unsigned int without_offset)
+@@ -124,81 +130,85 @@ unsigned int FingerprintDBStorage::getOffsetIndex(unsigned int without_offset)
+     return without_offset + m_index_offset;
+ }
+ 
+-FingerprintDB::FingerprintDB(int fp_bitcount, int fp_count, const QString& dbkey,
+-            vector<vector<char> >& data,
+-            vector<char*>& smiles_vector,
+-            std::vector<char*>& ids_vector) : m_dbkey(dbkey)
++FingerprintDB::FingerprintDB(int fp_bitcount, int fp_count,
++                             const QString& dbkey, vector<vector<char>>& data,
++                             vector<char*>& smiles_vector,
++                             std::vector<char*>& ids_vector)
++    : m_dbkey(dbkey)
+ {
+ 
+-    m_fp_intsize = fp_bitcount / (sizeof(int)*8);  //ASSUMES INT-DIVISIBLE SIZE
++    m_fp_intsize = fp_bitcount / (sizeof(int) * 8); // ASSUMES INT-DIVISIBLE
++                                                    // SIZE
+     m_total_count = fp_count;
+ 
+     int current_fp_count = 0;
+-    for(auto& dataset : data) {
+-        auto storage = make_shared<FingerprintDBStorage>(this, dataset,
+-                    current_fp_count, fp_bitcount);
++    for (auto& dataset : data) {
++        auto storage = make_shared<FingerprintDBStorage>(
++            this, dataset, current_fp_count, fp_bitcount);
+         storage->m_priv = make_shared<FingerprintDBPriv>();
+         m_storage.push_back(storage);
+         current_fp_count += storage->m_data.size() / m_fp_intsize;
+     }
+ 
+-    if(current_fp_count != m_total_count) {
+-        throw std::runtime_error("Mismatch between FP count and data, potential database corruption.");
++    if (current_fp_count != m_total_count) {
++        throw std::runtime_error("Mismatch between FP count and data, "
++                                 "potential database corruption.");
+     }
+ 
+     m_total_data_size = static_cast<size_t>(m_total_count) *
+-        static_cast<size_t>(m_fp_intsize)*sizeof(int);
++                        static_cast<size_t>(m_fp_intsize) * sizeof(int);
+     qDebug() << "Database loaded with" << m_total_count << "molecules";
+ 
+-    // Optimization, take the underlying storage of the incoming vectors, 
++    // Optimization, take the underlying storage of the incoming vectors,
+     // which won't be used again in calling code
+     m_smiles.swap(smiles_vector);
+     m_ids.swap(ids_vector);
+-
+ }
+ 
+-
+ void FingerprintDB::copyToGPU(unsigned int fold_factor)
+ {
+     m_fold_factor = fold_factor;
+-    while(m_fp_intsize % m_fold_factor != 0) {
++    while (m_fp_intsize % m_fold_factor != 0) {
+         m_fold_factor++;
+     }
+ 
+-    if(m_fold_factor == 1) {
+-        for(const auto& storage : m_storage) {
+-            storage->m_gpu_device = get_next_gpu(storage->m_data.size() * sizeof(int));
++    if (m_fold_factor == 1) {
++        for (const auto& storage : m_storage) {
++            storage->m_gpu_device =
++                get_next_gpu(storage->m_data.size() * sizeof(int));
+             cudaSetDevice(storage->m_gpu_device);
+             // Have to create vector where correct cuda device is set
+-            storage->m_priv->d_data = make_shared< device_vector<int> >();
++            storage->m_priv->d_data = make_shared<device_vector<int>>();
+             *(storage->m_priv->d_data) = storage->m_data;
+         }
+     } else {
+-        for(const auto& storage : m_storage) {
++        for (const auto& storage : m_storage) {
+             auto folded_data = fold_data(storage->m_data);
+-            storage->m_gpu_device = get_next_gpu(folded_data.size() * sizeof(int));
++            storage->m_gpu_device =
++                get_next_gpu(folded_data.size() * sizeof(int));
+             cudaSetDevice(storage->m_gpu_device);
+             // Have to create vector where correct cuda device is set
+-            storage->m_priv->d_data =  make_shared<device_vector<int> >();
++            storage->m_priv->d_data = make_shared<device_vector<int>>();
+             *(storage->m_priv->d_data) = folded_data;
+         }
+     }
+ }
+ 
+ void FingerprintDB::getStorageAndLocalIndex(unsigned int offset_index,
+-            FingerprintDBStorage** storage, unsigned int* local_index) const
++                                            FingerprintDBStorage** storage,
++                                            unsigned int* local_index) const
+ {
+-    int slice_index_offset=0;
++    int slice_index_offset = 0;
+     *storage = m_storage[0].get();
+-    for(unsigned int i=1; i<m_storage.size(); i++) {
+-        if(m_storage[i]->m_index_offset >= offset_index) break;
++    for (unsigned int i = 1; i < m_storage.size(); i++) {
++        if (m_storage[i]->m_index_offset >= offset_index)
++            break;
+         *storage = m_storage[i].get();
+         slice_index_offset = (*storage)->m_index_offset;
+     }
+     *local_index = offset_index - slice_index_offset;
+ }
+ 
+-
+ Fingerprint FingerprintDB::getFingerprint(unsigned int index) const
+ {
+     Fingerprint output(m_fp_intsize);
+@@ -207,21 +217,21 @@ Fingerprint FingerprintDB::getFingerprint(unsigned int index) const
+     unsigned int local_index;
+     getStorageAndLocalIndex(index, &storage, &local_index);
+ 
+-    unsigned int offset = local_index*m_fp_intsize;
+-    for(int i=0; i<m_fp_intsize; i++) {
+-        output[i] = storage->m_data[offset+i];
++    unsigned int offset = local_index * m_fp_intsize;
++    for (int i = 0; i < m_fp_intsize; i++) {
++        output[i] = storage->m_data[offset + i];
+     }
+ 
+     return output;
+ }
+ 
+-
+-void FingerprintDB::search_storage(const Fingerprint& query,
+-        const std::shared_ptr<FingerprintDBStorage>& storage,
+-        vector<SortableResult>* sortable_results,
+-        unsigned int return_count,
+-        float similarity_cutoff) const
++void FingerprintDB::search_storage(
++    const Fingerprint& query,
++    const std::shared_ptr<FingerprintDBStorage>& storage,
++    StorageResultObject* results, unsigned int max_return_count,
++    float similarity_cutoff) const
+ {
++    auto& sortable_results = results->m_result_data;
+     cudaSetDevice(storage->m_gpu_device);
+     static QMutex mutex;
+     vector<int> indices;
+@@ -230,12 +240,11 @@ void FingerprintDB::search_storage(const Fingerprint& query,
+     std::vector<float> results_scores;
+     device_vector<float> d_results_scores(storage->m_count);
+     device_vector<int> d_results_indices(storage->m_count);
+-    try
+-    {
++    try {
+         // Fill indices [0->N), which will be sorted along with scores at end
+         thrust::sequence(d_results_indices.begin(), d_results_indices.end());
+         DFingerprint d_ref_fp;
+-        if(m_fold_factor == 1) {
++        if (m_fold_factor == 1) {
+             // Copy the query fingerprint up to the GPU
+             d_ref_fp = query;
+         } else {
+@@ -244,114 +253,128 @@ void FingerprintDB::search_storage(const Fingerprint& query,
+         }
+ 
+         const int folded_fp_intsize = m_fp_intsize / m_fold_factor;
+-        // Use Tanimoto to score similarity of all compounds to query fingerprint
++        // Use Tanimoto to score similarity of all compounds to query
++        // fingerprint
+         thrust::transform(d_results_indices.begin(), d_results_indices.end(),
+-                d_results_scores.begin(),
+-                TanimotoFunctor(d_ref_fp, folded_fp_intsize, *(storage->m_priv->d_data),
+-                    similarity_cutoff));
++                          d_results_scores.begin(),
++                          TanimotoFunctor(d_ref_fp, folded_fp_intsize,
++                                          *(storage->m_priv->d_data),
++                                          similarity_cutoff));
+         auto indices_end = d_results_indices.end();
+         auto scores_end = d_results_scores.end();
+-        if(similarity_cutoff > 0) {
+-            indices_end = thrust::remove_if(d_results_indices.begin(),
+-                    d_results_indices.end(), d_results_scores.begin(),
+-                    thrust::logical_not<bool>());
++        if (similarity_cutoff > 0) {
++            indices_end = thrust::remove_if(
++                d_results_indices.begin(), d_results_indices.end(),
++                d_results_scores.begin(), thrust::logical_not<bool>());
+             scores_end = thrust::remove(d_results_scores.begin(),
+-                    d_results_scores.end(), 0);
++                                        d_results_scores.end(), 0);
+         }
+-        unsigned int indices_size = std::distance(d_results_indices.begin(),
+-                indices_end);
++        unsigned int indices_size =
++            std::distance(d_results_indices.begin(), indices_end);
++
++        mutex.lock();
++        results->m_approximate_matching_results.push_back(indices_size);
++        mutex.unlock();
+ 
+         // Sort scores & indices vectors descending on score
+         thrust::sort_by_key(d_results_scores.begin(), scores_end,
+-                d_results_indices.begin(), thrust::greater<float>());
++                            d_results_indices.begin(),
++                            thrust::greater<float>());
+ 
+         int results_to_consider = 0;
+-        results_to_consider = std::min(indices_size,
+-                return_count*m_fold_factor*(int)std::log2(2*m_fold_factor));
++        results_to_consider = std::min(
++            indices_size, max_return_count * m_fold_factor *
++                              static_cast<int>(std::log2(2 * m_fold_factor)));
+ 
+-        indices.assign(d_results_indices.begin(), 
+-                d_results_indices.begin()+results_to_consider);
++        indices.assign(d_results_indices.begin(),
++                       d_results_indices.begin() + results_to_consider);
+ 
+-    } catch(thrust::system_error e) {
++    } catch (thrust::system_error e) {
+         qDebug() << "Error!" << e.what();
+         throw;
+     }
+ 
+-    if(m_fold_factor == 1) { // If we don't fold, we can take exact GPU results
+-        // Push top return_count results to CPU results vectors to be returned
+-        for(auto index : indices) {
++    if (m_fold_factor == 1) { // If we don't fold, we can take exact GPU results
++        // Push top max_return_count results to CPU results vectors to be
++        // returned
++        for (auto index : indices) {
+             int offset_index = storage->getOffsetIndex(index);
+             results_smiles.push_back(m_smiles[offset_index]);
+             results_ids.push_back(m_ids[offset_index]);
+         }
+         results_scores.assign(d_results_scores.begin(),
+-                d_results_scores.begin()+indices.size());
+-    } else { // If we folded, we need to recalculate scores with full fingerprints
++                              d_results_scores.begin() + indices.size());
++    } else { // If we folded, we need to recalculate scores with full
++             // fingerprints
+         results_scores.resize(indices.size());
+-        for(unsigned int i=0;i<indices.size();i++) {
++        for (unsigned int i = 0; i < indices.size(); i++) {
+             int offset_index = storage->getOffsetIndex(indices[i]);
+-            results_scores[i] = tanimoto_similarity_cpu(query,
+-                    getFingerprint(offset_index));
++            results_scores[i] =
++                tanimoto_similarity_cpu(query, getFingerprint(offset_index));
+             // Uncomment below to debug pre vs post folding scores
+             // qDebug() << results_scores[i] << " vs " << d_results_scores[i];
+         }
+-        top_results_bubble_sort(indices, results_scores, return_count);
++        top_results_bubble_sort(indices, results_scores, max_return_count);
+ 
+-        return_count = std::min((size_t)return_count, indices.size());
+-        results_scores.resize(return_count);
+-        for(unsigned int i=0;i<return_count;i++) {
++        max_return_count = std::min((size_t) max_return_count, indices.size());
++        results_scores.resize(max_return_count);
++        for (unsigned int i = 0; i < max_return_count; i++) {
+             // Check whether the re-scored similarity is too low
+-            if(results_scores[i] < similarity_cutoff) {
++            if (results_scores[i] < similarity_cutoff) {
+                 results_scores.resize(i);
+                 break;
+             }
+             results_ids.push_back(m_ids[storage->getOffsetIndex(indices[i])]);
+-            results_smiles.push_back(m_smiles[storage->getOffsetIndex(indices[i])]);
++            results_smiles.push_back(
++                m_smiles[storage->getOffsetIndex(indices[i])]);
+         }
+     }
+ 
+     mutex.lock();
+-    for(unsigned int i=0; i<results_smiles.size(); i++) {
+-        sortable_results->push_back(SortableResult(results_scores[i], 
+-                    ResultData(results_smiles[i], results_ids[i])));
++    for (unsigned int i = 0; i < results_smiles.size(); i++) {
++        sortable_results.push_back(SortableResult(
++            results_scores[i], ResultData(results_smiles[i], results_ids[i])));
+     }
+     mutex.unlock();
+ }
+ 
+-
+-void FingerprintDB::search(const Fingerprint& query,
+-        const QString& dbkey,
+-        std::vector<char*>& results_smiles,
+-        std::vector<char*>& results_ids,
+-        std::vector<float>& results_scores,
+-        unsigned int return_count,
+-        float similarity_cutoff) const
++void FingerprintDB::search(const Fingerprint& query, const QString& dbkey,
++                           unsigned int max_return_count,
++                           float similarity_cutoff,
++                           std::vector<char*>& results_smiles,
++                           std::vector<char*>& results_ids,
++                           std::vector<float>& results_scores,
++                           unsigned long& approximate_result_count) const
+ {
+-    if(dbkey != m_dbkey) {
++    if (dbkey != m_dbkey) {
+         qDebug() << "Key check failed, returning empty results";
+         return;
+     }
+-    vector<SortableResult> sortable_results;
+-
+-    vector<QFuture<void> > futures;
+-    for(auto& storage : m_storage) {
+-        QFuture<void> future = QtConcurrent::run(this,
+-                &FingerprintDB::search_storage, query, storage,
+-                &sortable_results, return_count, similarity_cutoff);
++    StorageResultObject results;
++    auto& sortable_results = results.m_result_data;
++
++    vector<QFuture<void>> futures;
++    for (auto& storage : m_storage) {
++        QFuture<void> future = QtConcurrent::run(
++            this, &FingerprintDB::search_storage, query, storage, &results,
++            max_return_count, similarity_cutoff);
+         futures.push_back(future);
+     }
+-    for(auto& future : futures) {
++    for (auto& future : futures) {
+         future.waitForFinished();
+     }
+-    std::sort(sortable_results.begin(), sortable_results.end());
+-    std::reverse(sortable_results.begin(), sortable_results.end());
++    std::sort(sortable_results.rbegin(), sortable_results.rend());
++    approximate_result_count =
++        std::accumulate(results.m_approximate_matching_results.begin(),
++                        results.m_approximate_matching_results.end(), 0);
+ 
+-    for(auto result : sortable_results) {
++    for (auto result : sortable_results) {
+         results_scores.push_back(result.first);
+         results_smiles.push_back(result.second.first);
+         results_ids.push_back(result.second.second);
+     }
+-    int result_size = std::min((int)return_count, (int)results_scores.size());
++    int result_size = std::min(static_cast<int>(max_return_count),
++                               static_cast<int>(results_scores.size()));
+     results_scores.resize(result_size);
+     results_smiles.resize(result_size);
+     results_ids.resize(result_size);
+@@ -362,24 +385,23 @@ void FingerprintDB::search(const Fingerprint& query,
+  * A CPU implementation of tanimoto similarity, meant purely for testing.
+  */
+ float FingerprintDB::tanimoto_similarity_cpu(const Fingerprint& fp1,
+-        const Fingerprint& fp2) const
++                                             const Fingerprint& fp2) const
+ {
+ 
+     int total = 0;
+     int common = 0;
+-    for(int i=0; i<m_fp_intsize; i++) {
+-        total += __builtin_popcount(fp1[i]) + __builtin_popcount(fp2[i]); 
++    for (int i = 0; i < m_fp_intsize; i++) {
++        total += __builtin_popcount(fp1[i]) + __builtin_popcount(fp2[i]);
+         common += __builtin_popcount(fp1[i] & fp2[i]);
+     }
+ 
+-    return (float)common / (float)(total-common);
++    return (float) common / (float) (total - common);
+ }
+ 
+-
+ size_t get_available_gpu_memory()
+ {
+-    size_t free=0;
+-    for(unsigned int gpu=0; gpu<get_gpu_count(); gpu++) {
++    size_t free = 0;
++    for (unsigned int gpu = 0; gpu < get_gpu_count(); gpu++) {
+         auto lfree = get_gpu_free_memory(gpu);
+         free += lfree;
+     }
+diff --git a/fingerprintdb_cuda.h b/fingerprintdb_cuda.h
+index 93bb7b8..bef6384 100644
+--- a/fingerprintdb_cuda.h
++++ b/fingerprintdb_cuda.h
+@@ -24,6 +24,7 @@ namespace gpusim
+ 
+ class FingerprintDB;
+ class FingerprintDBPriv;
++struct StorageResultObject;
+ 
+ typedef std::pair<char*, char*> ResultData;
+ typedef std::pair<float, ResultData> SortableResult;
+@@ -103,16 +104,18 @@ class FingerprintDB : public QObject
+      * @param similarity_cutoff: Minimum similarity score to return
+      */
+     void search(const Fingerprint& query, const QString& dbkey,
++                unsigned int max_return_count, float similarity_cutoff,
+                 std::vector<char*>& results_smiles,
+                 std::vector<char*>& results_ids,
+-                std::vector<float>& results_scores, unsigned int return_count,
+-                float similarity_cutoff) const;
++                std::vector<float>& results_scores,
++                unsigned long& approximate_result_count) const;
+ 
+     void search_cpu(const Fingerprint& query, const QString& dbkey,
++                    unsigned int max_return_count, float similarity_cutoff,
+                     std::vector<char*>& results_smiles,
+                     std::vector<char*>& results_ids,
+                     std::vector<float>& results_scores,
+-                    unsigned int return_count, float similarity_cutoff) const;
++                    unsigned long& approximate_result_count) const;
+ 
+     char* getSmiles(int index) const { return m_smiles[index]; }
+     char* getID(int index) const { return m_ids[index]; }
+@@ -125,8 +128,7 @@ class FingerprintDB : public QObject
+ 
+     void search_storage(const Fingerprint& query,
+                         const std::shared_ptr<FingerprintDBStorage>& storage,
+-                        std::vector<SortableResult>* sortable_results,
+-                        unsigned int return_count,
++                        StorageResultObject* results, unsigned int return_count,
+                         float similarity_cutoff) const;
+ 
+   protected:
+diff --git a/gpusim.cpp b/gpusim.cpp
+index 9e2ad89..0aa3fff 100644
+--- a/gpusim.cpp
++++ b/gpusim.cpp
+@@ -273,22 +273,22 @@ bool GPUSimServer::setupSocket()
+     return true;
+ }
+ 
+-void GPUSimServer::similaritySearch(const Fingerprint& reference,
+-                                    const QString& dbname, const QString& dbkey,
+-                                    vector<char*>& results_smiles,
+-                                    vector<char*>& results_ids,
+-                                    vector<float>& results_scores,
+-                                    unsigned int return_count,
+-                                    float similarity_cutoff, CalcType calc_type)
++void GPUSimServer::similaritySearch(
++    const Fingerprint& reference, const QString& dbname, const QString& dbkey,
++    unsigned int max_return_count, float similarity_cutoff, CalcType calc_type,
++    vector<char*>& results_smiles, vector<char*>& results_ids,
++    vector<float>& results_scores, unsigned long& approximate_result_count)
+ {
+     if (calc_type == CalcType::GPU) {
+-        m_databases[dbname]->search(reference, dbkey, results_smiles,
+-                                    results_ids, results_scores, return_count,
+-                                    similarity_cutoff);
++        m_databases[dbname]->search(reference, dbkey, max_return_count,
++                                    similarity_cutoff, results_smiles,
++                                    results_ids, results_scores,
++                                    approximate_result_count);
+     } else {
+-        m_databases[dbname]->search_cpu(reference, dbkey, results_smiles,
++        m_databases[dbname]->search_cpu(reference, dbkey, max_return_count,
++                                        similarity_cutoff, results_smiles,
+                                         results_ids, results_scores,
+-                                        return_count, similarity_cutoff);
++                                        approximate_result_count);
+     }
+ };
+ 
+@@ -306,7 +306,8 @@ void GPUSimServer::newConnection()
+ void GPUSimServer::searchDatabases(
+     const Fingerprint& query, int results_requested, float similarity_cutoff,
+     map<QString, QString>& dbname_to_key, vector<char*>& results_smiles,
+-    vector<char*>& results_ids, vector<float>& results_scores)
++    vector<char*>& results_ids, vector<float>& results_scores,
++    unsigned long& approximate_result_count)
+ {
+     typedef pair<char*, char*> ResultData;
+     typedef pair<float, ResultData> SortableResult;
+@@ -322,10 +323,13 @@ void GPUSimServer::searchDatabases(
+             qDebug() << "Unknown database " << local_dbname << " requested.";
+             continue;
+         }
+-        similaritySearch(query, local_dbname, local_key, l_results_smiles,
+-                         l_results_ids, l_results_scores, results_requested,
++        unsigned long local_approximate_result_count;
++        similaritySearch(query, local_dbname, local_key, results_requested,
+                          similarity_cutoff,
+-                         usingGPU() ? CalcType::GPU : CalcType::CPU);
++                         usingGPU() ? CalcType::GPU : CalcType::CPU,
++                         l_results_smiles, l_results_ids, l_results_scores,
++                         local_approximate_result_count);
++        approximate_result_count += local_approximate_result_count;
+         for (unsigned int i = 0; i < l_results_smiles.size(); i++) {
+             sortable_results.push_back(SortableResult(
+                 l_results_scores[i],
+@@ -416,8 +420,10 @@ void GPUSimServer::incomingSearchRequest()
+     QTime timer;
+     timer.start();
+ 
++    unsigned long approximate_result_count = 0;
+     searchDatabases(query, results_requested, similarity_cutoff, dbname_to_key,
+-                    results_smiles, results_ids, results_scores);
++                    results_smiles, results_ids, results_scores,
++                    approximate_result_count);
+ 
+     qDebug() << "Search completed, time elapsed:"
+              << (float) timer.elapsed() / 1000.0f;
+@@ -438,6 +444,7 @@ void GPUSimServer::incomingSearchRequest()
+     QDataStream ints_qds(&ints_qba, QIODevice::WriteOnly);
+     ints_qds << request_num;
+     ints_qds << (int) results_smiles.size();
++    ints_qds << (quint64) approximate_result_count;
+ 
+     clientConnection->write(ints_qba);
+     clientConnection->write(output_smiles);
+diff --git a/gpusim.h b/gpusim.h
+index 9b17d57..6e07888 100644
+--- a/gpusim.h
++++ b/gpusim.h
+@@ -37,30 +37,31 @@ class GPUSimServer : public QObject
+      * Finds the most similar compounds stored in the database
+      * to the reference fingerprint provided
+      *
+-     * @param query: Fingerprint to find closest matches to
++     * @param reference: Fingerprint to find closest matches to
+      * @param dbname: Which database to search against
+-     * @param results_smiles: Vector to store smiles of results
+-     * @param results_ids: Vector to store IDs of results
+-     * @param results_scores: Vector to store scores of results
+-     * @param return_count: Maximum number of results to return
++     * @param dbkey: Key to access that database
++     * @param max_return_count: Maximum number of results to return
+      * @param similarity_cutoff: Minimum similarity score to return molecules
+-     * for
+      * @param calc_type: Whether to search on CPU or GPU
++     * @param results_smiles: Vector to store smiles of results
++     * @param results_ids: Vector to store IDs of results
++     * @param results_scores: Vector to store scores of results for
+      */
+     void similaritySearch(const Fingerprint& reference, const QString& dbname,
+-                          const QString& dbkey,
++                          const QString& dbkey, unsigned int max_return_count,
++                          float similarity_cutoff, CalcType calc_type,
+                           std::vector<char*>& results_smiles,
+                           std::vector<char*>& results_ids,
+                           std::vector<float>& results_scores,
+-                          unsigned int return_count, float similarity_cutoff,
+-                          CalcType calc_type = CalcType::GPU);
++                          unsigned long& approximate_result_count);
+ 
+     void searchDatabases(const Fingerprint& reference, int results_requested,
+                          float similarity_cutoff,
+                          std::map<QString, QString>& dbname_to_key,
+                          std::vector<char*>& results_smiles,
+                          std::vector<char*>& results_ids,
+-                         std::vector<float>& results_scores);
++                         std::vector<float>& results_scores,
++                         unsigned long& approximate_result_count);
+ 
+     /**
+      * @brief
+diff --git a/python/gpusim_search.py b/python/gpusim_search.py
+index 2067457..0175a13 100644
+--- a/python/gpusim_search.py
++++ b/python/gpusim_search.py
+@@ -61,6 +61,7 @@ def main():
+             raise RuntimeError("Incorrect result ID returned!")
+ 
+         return_count = data_reader.readInt()
++        approximate_matches = data_reader.readUInt64()
+ 
+         for i in range(return_count):
+             smiles.append(data_reader.readString())
+@@ -69,6 +70,8 @@ def main():
+         for i in range(return_count):
+             scores.append(data_reader.readFloat())
+ 
++        print("Approximate total matches: {0}, returning {1}".format(
++            approximate_matches, return_count))
+         for cid, smi, score in zip(ids, smiles, scores):
+             print("{0} {1}: {2}".format(cid, smi, score))
+         smiles = input("Smiles: ")
+diff --git a/python/gpusim_server.py b/python/gpusim_server.py
+index 726ecf2..5dddd8e 100644
+--- a/python/gpusim_server.py
++++ b/python/gpusim_server.py
+@@ -110,13 +110,13 @@ def search_for_results(self):
+                                        return_count, similarity_cutoff,
+                                        request_num)
+             try:
+-                return_count, smiles, ids, scores = self.deserialize_results(
+-                    request_num, output_qba)
++                approximate_results, return_count, smiles, ids, scores = \
++                    self.deserialize_results(request_num, output_qba)
+             except RuntimeError:
+                 self.flush_socket()
+                 raise
+ 
+-            return smiles, ids, scores, src_smiles
++            return approximate_results, smiles, ids, scores, src_smiles
+         finally:
+             search_mutex.unlock()
+ 
+@@ -129,10 +129,10 @@ def do_POST(self):
+         if not self.path.startswith("/similarity_search_json"):
+             return
+         try:
+-            smiles, ids, scores, _ = self.search_for_results()
++            approx_results, smiles, ids, scores, _ = self.search_for_results()
+         except ValueError:
+             return
+-        self.do_json_POST(smiles, ids, scores)
++        self.do_json_POST(approx_results, smiles, ids, scores)
+ 
+     def deserialize_results(self, request_num, output_qba):
+         data_reader = QtCore.QDataStream(output_qba)
+@@ -140,6 +140,7 @@ def deserialize_results(self, request_num, output_qba):
+         if request_num != returned_request:
+             raise RuntimeError("Incorrect result ID returned!")
+         return_count = data_reader.readInt()
++        approximate_matches = data_reader.readUInt64()
+         smiles, ids, scores = [], [], []
+         for i in range(return_count):
+             smiles.append(data_reader.readString().decode("utf-8"))
+@@ -147,20 +148,23 @@ def deserialize_results(self, request_num, output_qba):
+             ids.append(data_reader.readString().decode("utf-8"))
+         for i in range(return_count):
+             scores.append(data_reader.readFloat())
+-        return return_count, smiles, ids, scores
++        return approximate_matches, return_count, smiles, ids, scores
+ 
+-    def results2json(self, smiles, ids, scores):
+-        results = []
++    def results2json(self, approx_results, smiles, ids, scores):
++        results = {}
++        results["approximate_count"] = approx_results
++        results_list = []
+         for cid, smi, score in zip(ids, smiles, scores):
+-            results.append([cid, smi, score])
++            results_list.append([cid, smi, score])
++        results["results"] = results_list
+         return results
+ 
+-    def do_json_POST(self, smiles, ids, scores):
++    def do_json_POST(self, approx_results, smiles, ids, scores):
+         self.send_response(200)
+         self.send_header('Content-type', 'text/json')
+         self.end_headers()
+ 
+-        results_json = self.results2json(smiles, ids, scores)
++        results_json = self.results2json(approx_results, smiles, ids, scores)
+         self.wfile.write(json.dumps(results_json).encode('utf8'))
+ 
+ 
+@@ -174,7 +178,10 @@ def _generateImageIfNeeded(self, fullpath):
+                 '_-2-_', '\\').replace('_-3-_', '#')
+             gpusim_utils.smiles_to_image_file(smi, fullpath)
+ 
+-    def write_results_html(self, src_smiles, smiles, scores, ids):
++    def write_results_html(self, approx_results, src_smiles, smiles, scores, ids):
++        self.wfile.write(
++            "Approximate Total Matching Compounds: {0}, returning {1}<p>".format(
++                approx_results, len(smiles)).encode())
+         for smi, score, cid in zip(smiles, scores, ids):
+             id_html = cid
+             if cid.startswith('ZINC'):
+@@ -225,22 +232,24 @@ def do_POST(self):
+             return
+ 
+         try:
+-            smiles, ids, scores, src_smiles = self.search_for_results()
++            approx_results, smiles, ids, scores, src_smiles = \
++                self.search_for_results()
+         except ValueError:
+             return
+         if self.path.startswith("/similarity_search_json"):
+-            self.do_json_POST(smiles, ids, scores)
++            self.do_json_POST(approx_results, smiles, ids, scores)
+         elif self.path.startswith("/similarity_search"):
+-            self.do_html_POST(smiles, ids, scores, src_smiles)
++            self.do_html_POST(approx_results, smiles, ids, scores, src_smiles)
+ 
+-    def do_html_POST(self, smiles, ids, scores, src_smiles):
++    def do_html_POST(self, approx_results, smiles, ids, scores, src_smiles):
+         self.send_response(200)
+         self.send_header('Content-type', 'text/html')
+         self.end_headers()
+ 
+         f = open(os.path.join(SCRIPT_DIR, "index.html"), 'rb+')
+         self.wfile.write(f.read())
+-        self.write_results_html(src_smiles, smiles, scores, ids)
++        self.write_results_html(approx_results, src_smiles, smiles, scores,
++                                ids)
+ 
+ 
+ def parse_args():
+diff --git a/test/small.fsim b/test/small.fsim
+index 8038a1c..a5fe77e 100644
+Binary files a/test/small.fsim and b/test/small.fsim differ
+diff --git a/test/test_gpusim.cpp b/test/test_gpusim.cpp
+index 12cfd9d..001e40a 100644
+--- a/test/test_gpusim.cpp
++++ b/test/test_gpusim.cpp
+@@ -44,21 +44,22 @@ BOOST_AUTO_TEST_CASE(CompareGPUtoCPU)
+     const vector<int> return_counts = {10, 15};
+     const float similarity_cutoff = 0;
+     const QString dbkey = "pass"; // Passed to database during creation
++    unsigned long approximate_result_count;
+ 
+     for (auto return_count : return_counts) {
+         std::vector<char*> gpu_smiles;
+         std::vector<char*> gpu_ids;
+         std::vector<float> gpu_scores;
+-        server.similaritySearch(fp, "small", dbkey, gpu_smiles, gpu_ids,
+-                                gpu_scores, return_count, similarity_cutoff,
+-                                CalcType::GPU);
++        server.similaritySearch(fp, "small", dbkey, return_count,
++                                similarity_cutoff, CalcType::GPU, gpu_smiles,
++                                gpu_ids, gpu_scores, approximate_result_count);
+ 
+         std::vector<char*> cpu_smiles;
+         std::vector<char*> cpu_ids;
+         std::vector<float> cpu_scores;
+-        server.similaritySearch(fp, "small", dbkey, cpu_smiles, cpu_ids,
+-                                cpu_scores, return_count, similarity_cutoff,
+-                                CalcType::CPU);
++        server.similaritySearch(fp, "small", dbkey, return_count,
++                                similarity_cutoff, CalcType::CPU, cpu_smiles,
++                                cpu_ids, cpu_scores, approximate_result_count);
+ 
+         BOOST_CHECK_EQUAL(gpu_smiles.size(), return_count);
+         for (unsigned int i = 0; i < gpu_smiles.size(); i++) {
+@@ -88,12 +89,13 @@ BOOST_AUTO_TEST_CASE(TestSearchMultiple)
+     dbname_to_key["small"] = "pass";
+     dbname_to_key["small_copy"] = "pass";
+ 
++    unsigned long approximate_result_count;
+     server.searchDatabases(fp, return_count, similarity_cutoff, dbname_to_key,
+-                           smiles, ids, scores);
++                           smiles, ids, scores, approximate_result_count);
+ 
+     BOOST_REQUIRE_EQUAL(smiles.size(), return_count);
+-    // Two copies of the database should always have duplicate top 2 results
+-    BOOST_REQUIRE_EQUAL(smiles[0], smiles[1]);
++    // Results should have two copies of each ID, one from each DB loaded
++    BOOST_REQUIRE_EQUAL(ids[0], "ZINC00000022;:;ZINC00000022");
+ }
+ 
+ BOOST_AUTO_TEST_CASE(TestSimilarityCutoff)
+@@ -108,17 +110,20 @@ BOOST_AUTO_TEST_CASE(TestSimilarityCutoff)
+     const vector<float> similarity_cutoffs = {0, 0.1, 0.3, 0.4};
+     // Results returned for each cutoff range
+     const vector<int> result_counts = {10, 10, 3, 1};
++    const vector<unsigned long> approximate_counts = {100, 86, 3, 1};
+     const QString dbkey = "pass"; // Passed to database during creation
++    unsigned long approximate_result_count;
+ 
+     for (unsigned int i = 0; i < similarity_cutoffs.size(); i++) {
+         std::vector<char*> smiles;
+         std::vector<char*> ids;
+         std::vector<float> scores;
+-        server.similaritySearch(fp, "small", dbkey, smiles, ids, scores,
+-                                return_count, similarity_cutoffs[i],
+-                                CalcType::GPU);
++        server.similaritySearch(fp, "small", dbkey, return_count,
++                                similarity_cutoffs[i], CalcType::GPU, smiles,
++                                ids, scores, approximate_result_count);
+ 
+         BOOST_CHECK_EQUAL(smiles.size(), result_counts[i]);
++        BOOST_CHECK_EQUAL(approximate_result_count, approximate_counts[i]);
+     }
+ }
+ 

@@ -1,0 +1,248 @@
+diff --git a/src/DFTK.jl b/src/DFTK.jl
+index 69aa2c5c14..a812986bbb 100644
+--- a/src/DFTK.jl
++++ b/src/DFTK.jl
+@@ -45,6 +45,7 @@ include("common/hankel.jl")
+ include("common/hydrogenic.jl")
+ include("common/derivatives.jl")
+ include("common/linalg.jl")
++include("common/random.jl")
+ 
+ export PspHgh
+ export PspUpf
+diff --git a/src/common/random.jl b/src/common/random.jl
+new file mode 100644
+index 0000000000..5865516351
+--- /dev/null
++++ b/src/common/random.jl
+@@ -0,0 +1,28 @@
++"""
++Seeds the task local RNG across all MPI ranks.
++A seed can be provided for reproducibility with previous runs
++(for the same Julia version and Manifest.toml).
++If no seed is provided, a random seed is generated on the master process.
++The returned seed can be used to reproduce the run.
++
++If any subtask is spawned, it will be seeded based on the task local RNG of its parent,
++as explained in the documentation of `Random.TaskLocalRNG`.
++Seeding the task local RNG at the beginning of a computation is thus sufficient.
++"""
++function seed_task_local_rng!(seed::Union{Nothing,Integer}, comm)
++    if mpi_master(comm) && isnothing(seed)
++        # Using negative seeds requires Julia 1.11 and DFTK still supports 1.10
++        seed = rand(UInt64)
++    end
++    seed = MPI.bcast(seed, comm)
++    if mpi_master(comm)
++        Random.seed!(seed)
++        # Generate a different seed for each process
++        local_seeds = rand(typeof(seed), mpi_nprocs(comm))
++        local_seed = MPI.scatter(local_seeds, comm)
++    else
++        local_seed = MPI.scatter(nothing, comm)
++    end
++    Random.seed!(local_seed)
++    seed
++end
+diff --git a/src/postprocess/band_structure.jl b/src/postprocess/band_structure.jl
+index c17a88477c..8e264da302 100644
+--- a/src/postprocess/band_structure.jl
++++ b/src/postprocess/band_structure.jl
+@@ -15,7 +15,8 @@ All kwargs not specified below are passed to [`diagonalize_all_kblocks`](@ref):
+                                kgrid::Union{AbstractKgrid,AbstractKgridGenerator};
+                                n_bands=default_n_bands_bandstructure(basis.model),
+                                n_extra=3, ρ=nothing, τ=nothing, εF=nothing,
+-                               eigensolver=lobpcg_hyper, tol=1e-3, kwargs...)
++                               eigensolver=lobpcg_hyper, tol=1e-3, seed=nothing,
++                               kwargs...)
+     # kcoords are the kpoint coordinates in fractional coordinates
+     if isnothing(ρ)
+         if any(t isa TermNonlinear for t in basis.terms)
+@@ -30,6 +31,7 @@ All kwargs not specified below are passed to [`diagonalize_all_kblocks`](@ref):
+               "quantity to compute_bands as the τ keyword argument or use the " *
+               "compute_bands(scfres) function.")
+     end
++    seed = seed_task_local_rng!(seed, MPI.COMM_WORLD)
+ 
+     # Create new basis with new kpoints
+     bs_basis = PlaneWaveBasis(basis, kgrid)
+@@ -54,7 +56,7 @@ All kwargs not specified below are passed to [`diagonalize_all_kblocks`](@ref):
+     #      types subtype. In a first version the ScfResult could just contain
+     #      the currently used named tuple and forward all operations to it.
+     (; basis=bs_basis, ψ=eigres.X, eigenvalues=eigres.λ, ρ, εF, occupation,
+-     diagonalization=[eigres])
++     diagonalization=[eigres], seed)
+ end
+ 
+ """
+diff --git a/src/scf/direct_minimization.jl b/src/scf/direct_minimization.jl
+index da2403bb26..a48e622c63 100644
+--- a/src/scf/direct_minimization.jl
++++ b/src/scf/direct_minimization.jl
+@@ -75,11 +75,13 @@ function direct_minimization(basis::PlaneWaveBasis{T};
+                              optim_method=Optim.LBFGS,
+                              alphaguess=LineSearches.InitialStatic(),
+                              linesearch=LineSearches.BackTracking(),
++                             seed=nothing,
+                              kwargs...) where {T}
+     if mpi_nprocs() > 1
+         # need synchronization in Optim
+         error("Direct minimization with MPI is not supported yet")
+     end
++    seed = seed_task_local_rng!(seed, MPI.COMM_WORLD)
+     model = basis.model
+     @assert iszero(model.temperature)  # temperature is not yet supported
+     @assert isnothing(model.εF)        # neither are computations with fixed Fermi level
+@@ -189,7 +191,7 @@ function direct_minimization(basis::PlaneWaveBasis{T};
+     # We rely on the fact that the last point where fg! was called is the minimizer to
+     # avoid recomputing at ψ
+     info = (; ham, basis, energies, converged, ρ, eigenvalues, occupation, εF,
+-            n_bands_converge=n_bands, n_iter=Optim.iterations(res),
++            n_bands_converge=n_bands, n_iter=Optim.iterations(res), seed,
+             runtime_ns=time_ns() - start_ns, history_Δρ, history_Etot,
+             ψ, stage=:finalize, algorithm="DM", optim_res=res)
+     callback(info)
+diff --git a/src/scf/newton.jl b/src/scf/newton.jl
+index 879ae321d0..9bf60b9b1c 100644
+--- a/src/scf/newton.jl
++++ b/src/scf/newton.jl
+@@ -81,8 +81,10 @@ from the solution.
+ function newton(basis::PlaneWaveBasis{T}, ψ0;
+                 tol=1e-6, tol_cg=tol / 100, maxiter=20,
+                 callback=ScfDefaultCallback(),
+-                is_converged=ScfConvergenceDensity(tol)) where {T}
++                is_converged=ScfConvergenceDensity(tol),
++                seed=nothing) where {T}
+ 
++    seed = seed_task_local_rng!(seed, MPI.COMM_WORLD)
+     # setting parameters
+     model = basis.model
+     @assert iszero(model.temperature)  # temperature is not yet supported
+@@ -149,7 +151,7 @@ function newton(basis::PlaneWaveBasis{T}, ψ0;
+     # return results and call callback one last time with final state for clean
+     # up
+     info = (; ham=H, basis, energies, converged, ρ, eigenvalues, occupation, εF, n_iter, ψ,
+-            stage=:finalize, algorithm="Newton", runtime_ns=time_ns() - start_ns)
++            stage=:finalize, algorithm="Newton", seed, runtime_ns=time_ns() - start_ns)
+     callback(info)
+     info
+ end
+diff --git a/src/scf/potential_mixing.jl b/src/scf/potential_mixing.jl
+index 89a5335ee1..5ea3a52b80 100644
+--- a/src/scf/potential_mixing.jl
++++ b/src/scf/potential_mixing.jl
+@@ -175,6 +175,7 @@ Simple SCF algorithm using potential mixing. Parameters are largely the same as
+     acceleration=AndersonAcceleration(;m=10),
+     accept_step=ScfAcceptStepAll(),
+     max_backtracks=3,  # Maximal number of backtracking line searches
++    seed=nothing,
+ )
+     # TODO Test other mixings and lift this
+     @assert (   mixing isa SimpleMixing
+@@ -185,6 +186,7 @@ Simple SCF algorithm using potential mixing. Parameters are largely the same as
+     if !isnothing(ψ)
+         @assert length(ψ) == length(basis.kpoints)
+     end
++    seed = seed_task_local_rng!(seed, MPI.COMM_WORLD)
+ 
+     # Initial guess for V (if none given)
+     ham = energy_hamiltonian(basis, nothing, nothing; ρ).ham
+@@ -284,7 +286,7 @@ Simple SCF algorithm using potential mixing. Parameters are largely the same as
+     info = (; ham, basis, info.energies, converged, ρ=info.ρout, info.eigenvalues,
+             info.occupation, info.εF, n_iter, info.ψ, info.n_bands_converge,
+             info.diagonalization, stage=:finalize, algorithm="SCF",
+-            history_Δρ, history_Etot, info.occupation_threshold,
++            history_Δρ, history_Etot, info.occupation_threshold, seed,
+             runtime_ns=time_ns() - start_ns)
+     callback(info)
+     info
+diff --git a/src/scf/self_consistent_field.jl b/src/scf/self_consistent_field.jl
+index 6d04cd8435..699935aaf7 100644
+--- a/src/scf/self_consistent_field.jl
++++ b/src/scf/self_consistent_field.jl
+@@ -146,6 +146,7 @@ Overview of parameters:
+     fermialg::AbstractFermiAlgorithm=default_fermialg(basis.model),
+     callback=ScfDefaultCallback(; show_damping=false),
+     compute_consistent_energies=true,
++    seed=nothing,
+     response=ResponseOptions(),  # Dummy here, only for AD
+ ) where {T}
+     if !isnothing(ψ)
+@@ -153,6 +154,7 @@ Overview of parameters:
+     end
+     start_ns = time_ns()
+     timeout_date = Dates.now() + maxtime
++    seed = seed_task_local_rng!(seed, MPI.COMM_WORLD)
+ 
+     # We do density mixing in the real representation
+     # TODO support other mixing types
+@@ -182,7 +184,7 @@ Overview of parameters:
+         # Update info with results gathered so far
+         info_next = (; ham, basis, converged, stage=:iterate, algorithm="SCF",
+                        ρin, τ, α=damping, n_iter, nbandsalg.occupation_threshold,
+-                       runtime_ns=time_ns() - start_ns, nextstate...,
++                       seed, runtime_ns=time_ns() - start_ns, nextstate...,
+                        diagonalization=[nextstate.diagonalization])
+ 
+         # Compute the energy of the new state
+@@ -226,7 +228,7 @@ Overview of parameters:
+     scfres = (; ham, basis, energies, converged, nbandsalg.occupation_threshold,
+                 ρ=ρout, τ, α=damping, eigenvalues, occupation, εF, info.n_bands_converge,
+                 info.n_iter, info.n_matvec, ψ, info.diagonalization, stage=:finalize,
+-                info.history_Δρ, info.history_Etot, info.timedout, mixing,
++                info.history_Δρ, info.history_Etot, info.timedout, mixing, seed,
+                 runtime_ns=time_ns() - start_ns, algorithm="SCF")
+     callback(scfres)
+     scfres
+diff --git a/src/workarounds/forwarddiff_rules.jl b/src/workarounds/forwarddiff_rules.jl
+index 13711f18ba..a491f23e0c 100644
+--- a/src/workarounds/forwarddiff_rules.jl
++++ b/src/workarounds/forwarddiff_rules.jl
+@@ -275,7 +275,7 @@ function self_consistent_field(basis_dual::PlaneWaveBasis{T};
+        scfres.converged, scfres.occupation_threshold, scfres.α, scfres.n_iter,
+        scfres.n_bands_converge, scfres.n_matvec, scfres.diagonalization, scfres.stage,
+        scfres.history_Δρ, scfres.history_Etot, scfres.timedout, scfres.mixing,
+-       scfres.algorithm, scfres.runtime_ns)
++       scfres.seed, scfres.algorithm, scfres.runtime_ns)
+ end
+ 
+ function hankel(r::AbstractVector, r2_f::AbstractVector, l::Integer, p::TT) where {TT <: ForwardDiff.Dual}
+diff --git a/test/reproducibility.jl b/test/reproducibility.jl
+new file mode 100644
+index 0000000000..0db8bfacfb
+--- /dev/null
++++ b/test/reproducibility.jl
+@@ -0,0 +1,20 @@
++@testitem "Reproducibility of seeded SCF runs" setup=[TestCases] begin
++using DFTK
++silicon = TestCases.silicon
++
++model = model_DFT(silicon.lattice, silicon.atoms, silicon.positions; functionals=LDA())
++Ecut = 15
++kgrid = [2, 2, 2]
++
++basis = PlaneWaveBasis(model; Ecut, kgrid)
++scfres1 = self_consistent_field(basis; tol=1e-7)
++
++# Use seed from scfres1 for reproducibility
++scfres2 = self_consistent_field(basis; tol=1e-7, scfres1.seed)
++
++# Should be exactly equal if the computation is reproducible, no need for epsilons.
++@assert scfres1.history_Etot == scfres2.history_Etot
++@assert scfres1.history_Δρ == scfres2.history_Δρ
++@assert scfres1.ψ == scfres2.ψ
++@assert scfres1.ρ == scfres2.ρ
++end
+diff --git a/test/serialisation.jl b/test/serialisation.jl
+index 5fe8ddf0bf..359940ea7f 100644
+--- a/test/serialisation.jl
++++ b/test/serialisation.jl
+@@ -40,6 +40,8 @@ function test_scfres_agreement(tested, ref; test_ψ=true)
+     if test_ψ
+         @test tested.ψ == ref.ψ
+     end
++
++    @test tested.seed == ref.seed
+ end
+ end
+ 

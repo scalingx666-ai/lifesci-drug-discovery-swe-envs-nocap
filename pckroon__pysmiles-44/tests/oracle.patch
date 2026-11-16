@@ -1,0 +1,449 @@
+diff --git a/pysmiles/__init__.py b/pysmiles/__init__.py
+index 6c9fed6..1476f04 100644
+--- a/pysmiles/__init__.py
++++ b/pysmiles/__init__.py
+@@ -45,6 +45,7 @@ def _read_pte(pte_file_name):
+     for row in data['Rows']:
+         element = dict(zip(data['Columns'], row))
+         pte[element['Symbol']] = element
++        pte[element['AtomicNumber']] = element
+     return pte
+ 
+ 
+diff --git a/pysmiles/read_smiles.py b/pysmiles/read_smiles.py
+index 1ae3c4a..7c6dd98 100644
+--- a/pysmiles/read_smiles.py
++++ b/pysmiles/read_smiles.py
+@@ -22,12 +22,14 @@
+ 
+ import networkx as nx
+ 
++from . import PTE
+ from .smiles_helper import (add_explicit_hydrogens, remove_explicit_hydrogens,
+                             parse_atom, fill_valence, mark_aromatic_edges,
+-                            mark_aromatic_atoms)
+-
++                            mark_aromatic_atoms, bonds_missing, format_atom)
++from .write_smiles import write_smiles_component
+ LOGGER = logging.getLogger(__name__)
+ 
++
+ @enum.unique
+ class TokenType(enum.Enum):
+     """Possible SMILES token types"""
+@@ -184,7 +186,7 @@ def read_smiles(smiles, explicit_hydrogen=False, zero_order_bonds=True,
+                 next_bond = None
+         elif tokentype == TokenType.EZSTEREO:
+             LOGGER.warning('E/Z stereochemical information, which is specified by "%s", will be discarded', token)
+-    if ring_nums:
++    if ring_nums and strict:
+         raise KeyError('Unmatched ring indices {}'.format(list(ring_nums.keys())))
+ 
+     if reinterpret_aromatic:
+@@ -193,8 +195,21 @@ def read_smiles(smiles, explicit_hydrogen=False, zero_order_bonds=True,
+     else:
+         mark_aromatic_edges(mol)
+ 
++    # This is a bit of an overreach, we should only add implicit hydrogens to
++    # atoms in the organic subset. However, all non-organic atoms already have
++    # a hcount, so all is well.
+     fill_valence(mol)
+ 
++    if strict:
++        for node in mol:
++            element = mol.nodes[node].get('element', '*')
++            if element != '*' and element not in PTE:
++                raise KeyError(f'Unknown element {element}')
++            elif element != '*' and bonds_missing(mol, node):
++                debug_smiles = write_smiles_component(nx.ego_graph(mol, node))
++                raise KeyError(f'Node {node} ({format_atom(mol, node)}) has'
++                               f' non-standard valence: ...{debug_smiles}...')
++
+     if explicit_hydrogen:
+         add_explicit_hydrogens(mol)
+     else:
+diff --git a/pysmiles/smiles_helper.py b/pysmiles/smiles_helper.py
+index 4d32b09..70ded6a 100644
+--- a/pysmiles/smiles_helper.py
++++ b/pysmiles/smiles_helper.py
+@@ -38,14 +38,20 @@
+                           STEREO_PATTERN + HCOUNT_PATTERN + CHARGE_PATTERN +
+                           CLASS_PATTERN + r'\]$')
+ 
+-AROMATIC_ATOMS = "B C N O P S Se As *".split()
++# Used to parse the electron config we get from the PTE. These configs look like
++# [Rn]7s27p65f146d10(predicted) (for Og). We don't care about the core electrons
++# ([Rn] in this case), nor whether it's predicted or measured. Note that the
++# order of the orbitals is *not* consistent, but seems to be related to their
++# energy. We capture the \d[spdf]\d+, and in particular the second number which
++# is the number of electrons in that orbital. In addition, we capture the full
++# electron config (from 7s...d10) in case we need to find the order of the
++# orbitals later.
++ELECTRON_CONFIG_PATTERN = (r'(?:\[[A-Z][a-z]?\])?((?:'
++                           r'(?:[1-9]s(?P<s>[1-2]))|(?:[1-9]p(?P<p>[1-6]))|(?:[1-9]d(?P<d>10|[1-9]))|(?:[1-9]f(?P<f>1[0-4]|[1-9]))'
++                           r'){1,4})(?:\(predicted\))?')
++ELECTRON_CONFIG_PATTERN = re.compile(ELECTRON_CONFIG_PATTERN)
+ 
+-ORBITAL_SIZES = [[2],  # 1s
+-                 [2,  6],  # 2s, 2p
+-                 [2,  6],  # 3s, 3p
+-                 [2,  10, 6],  # 4s, 3d, 4p
+-                 [2,  10, 6],  # 5s, 4d, 5p
+-                 [2,  14, 10, 6],]  # 6s, 4f, 5d, 6p
++AROMATIC_ATOMS = "B C N O P S Se As *".split()
+ 
+ 
+ def parse_atom(atom):
+@@ -295,8 +301,10 @@ def fill_valence(mol, respect_hcount=True, respect_bond_order=True,
+     """
+     Sets the attribute 'hcount' on all nodes in `mol` that don't have it yet.
+     The value to which it is set is based on the node's 'element', and the
+-    number of bonds it has. Default valences are as specified by the global
+-    variable VALENCES.
++    number of bonds it has. Default valences are determined based on the charge
++    and the electron configuration from the PTE. If we can't determine the
++    valence (for example for transition metals), then the 'hcount' will be set
++    to 0.
+ 
+     Parameters
+     ----------
+@@ -349,8 +357,10 @@ def bonds_missing(mol, node_idx, use_order=True):
+     bonds += mol.nodes[node_idx].get('hcount', 0)
+ 
+     val = valence(mol.nodes[node_idx])
+-    val = [v for v in val if v >= bonds] or [0]
+-    return int(max(val[0] - bonds, 0))
++    if not val:
++        return 0
++    val = [v for v in val if v >= bonds] or val[-1:]
++    return int(val[0] - bonds)
+ 
+ 
+ def valence(atom):
+@@ -365,34 +375,37 @@ def valence(atom):
+     Returns
+     -------
+     list[int]
+-        The valences for the given atom.
++        The valences for the given atom. Returns an empty list if we don't know.
+     """
+     element = atom.get("element", '*')
+     if element == '*':
+-        electrons = 0
+-    else:
+-        electrons = PTE[element.capitalize()]['AtomicNumber']
+-    electrons -= atom.get('charge', 0)
++        return []
+ 
+-    if electrons < 0:
+-        raise ValueError(f"Atom {atom} has a negative number of electrons: {electrons}")
+-
+-    # Let's start by filling complete shells:
+-    for shell_idx, shell in enumerate(ORBITAL_SIZES):
+-        shell_size = sum(shell)
+-        if shell_size <= electrons:
+-            electrons -= shell_size
+-        else:
+-            break
+-    else:  # nobreak
+-        raise ValueError(f'Too many electrons for sanity for {atom}: {electrons+sum(map(sum, ORBITAL_SIZES))}')
+-
+-    # Any electrons we have leftover we distribute over the orbitals. First 1
++    electrons = PTE[element.capitalize()]['AtomicNumber']
++    electrons -= atom.get('charge', 0)
++    if not electrons:
++        return [0]
++    try:
++        pte_data = PTE[electrons]
++    except KeyError as error:
++        raise ValueError(f"Can't figure out an electron configuration for {atom}"
++                         f" with {electrons} electrons") from error
++    electron_config = pte_data['ElectronConfiguration']
++    match = ELECTRON_CONFIG_PATTERN.match(electron_config)
++    electron_config = {k: int(v) for k, v in match.groupdict(default=0).items()}
++    # No idea how d or f electrons contribute to valency. The last case (p+s==0)
++    # is there for Pd, which has config s0p0d10f0...
++    if (electron_config['d'] not in (0, 10) or electron_config['f'] not in (0, 14)
++            or (not electron_config['s']+electron_config['p'])):
++        return []  # No clue what the valence should be or even means
++
++    electrons = electron_config['s'] + electron_config['p']
++    # Any sp-electrons we have we distribute over their orbitals. First 1
+     # electron in each, then we start making pairs. The resulting valence will
+     # be the number of unpaired electrons. Added bonus/complication: electrons
+     # in pairs we can excite to higher shells, increasing the number of unpaired
+     # electrons
+-    number_of_orbitals = sum(shell)//2
++    number_of_orbitals = 4  # 1*s + 3*p
+     # Round 1: assign single electrons to orbitals
+     single_electrons = min(number_of_orbitals, electrons)
+     electrons -= single_electrons
+@@ -405,13 +418,13 @@ def valence(atom):
+     empty_orbitals = number_of_orbitals - single_electrons - paired_electrons
+     assert electrons == 0, f"There are {electrons=}"
+ 
+-    if shell_idx >= 2:
+-        # Excite any paired electrons to a higher orbital to deal with
+-        # multi-valency. Naturally, each electron pair consists of 2 electrons,
+-        # and results in 2 new bonding electrons
+-        val = [single_electrons + 2*n for n in range(paired_electrons+1)]
+-    else:
+-        val = [single_electrons]
++    # Excite any paired electrons to a higher orbital to deal with
++    # multi-valency. Naturally, each electron pair consists of 2 electrons,
++    # and results in 2 new bonding electrons
++    # This is actually kind of wrong since spd hybridization just doesn't
++    # happen. Produces the right answer though. Most of the time.
++    # https://dx.doi.org/10.1021/ed084p783
++    val = [single_electrons + 2*n for n in range(paired_electrons+1)]
+ 
+     return val
+ 
+@@ -690,7 +703,7 @@ def increment_bond_orders(molecule, max_bond_order=3):
+     # Gather the number of open spots for all atoms beforehand, since some
+     # might have multiple oxidation states (e.g. S). We don't want to change
+     # oxidation state halfway through for some funny reason. It shouldn't be
+-    # nescessary, but it can't hurt.
++    # necessary, but it can't hurt.
+     missing_bonds = {}
+     for idx in molecule:
+         missing_bonds[idx] = max(bonds_missing(molecule, idx), 0)
+@@ -700,7 +713,7 @@ def increment_bond_orders(molecule, max_bond_order=3):
+         missing_jdx = missing_bonds[jdx]
+         edge_missing = min(missing_idx, missing_jdx)
+         current_order = molecule.edges[idx, jdx].get("order", 1)
+-        if current_order == 1.5:
++        if current_order == 1.5 or current_order >= max_bond_order:
+             continue
+         new_order = edge_missing + current_order
+         new_order = min(new_order, max_bond_order)
+diff --git a/tests/test_hypothesis.py b/tests/test_hypothesis.py
+index 420d0d6..be62284 100644
+--- a/tests/test_hypothesis.py
++++ b/tests/test_hypothesis.py
+@@ -15,7 +15,7 @@
+ from hypothesis import strategies as st
+ from hypothesis.stateful import (RuleBasedStateMachine, rule, invariant,
+                                  initialize, precondition)
+-from hypothesis import note, settings, assume
++from hypothesis import note, settings, assume, HealthCheck
+ from hypothesis_networkx import graph_builder
+ 
+ from pysmiles import read_smiles
+@@ -142,5 +142,5 @@ def write_read_cycle(self):
+             assertEqualGraphs(ref_mol, found)
+ 
+ 
+-SMILESTest.TestCase.settings = settings(max_examples=500, stateful_step_count=10, deadline=None)
++SMILESTest.TestCase.settings = settings(max_examples=500, stateful_step_count=10, deadline=None, suppress_health_check=[HealthCheck.filter_too_much])
+ Tester = SMILESTest.TestCase
+diff --git a/tests/test_read_smiles.py b/tests/test_read_smiles.py
+index a662b07..a64d56f 100644
+--- a/tests/test_read_smiles.py
++++ b/tests/test_read_smiles.py
+@@ -289,17 +289,17 @@
+         False
+     ),
+     (
+-        '[H]O([H])[H]O([H])[H]',
+-        [(1, {'charge': 0, 'element': 'O', 'hcount': 2, 'aromatic': False}),
++        '[H][O+]([H])[H].O([H])[H]',
++        [(1, {'charge': 1, 'element': 'O', 'hcount': 2, 'aromatic': False}),
+          (3, {'charge': 0, 'element': 'H', 'hcount': 0, 'aromatic': False}),
+          (4, {'charge': 0, 'element': 'O', 'hcount': 2, 'aromatic': False})],
+         [(1, 3, {'order': 1}),
+-         (3, 4, {'order': 1})],
++         (3, 4, {'order': 0})],
+         False
+     ),
+     (
+-        '[H]=C',
+-        [(0, {'charge': 0, 'element': 'H', 'hcount': 0, 'aromatic': False}),
++        '[O]=C',
++        [(0, {'charge': 0, 'element': 'O', 'hcount': 0, 'aromatic': False}),
+          (1, {'charge': 0, 'element': 'C', 'hcount': 2, 'aromatic': False}),],
+         [(0, 1, {'order': 2})],
+         False
+@@ -324,27 +324,35 @@
+         False
+     ),
+     (
+-        '[Cu++]',
+-        [(0, {'charge': 2, 'element': 'Cu', 'hcount': 0, 'aromatic': False})],
+-        [],
++        'Cl[Cu++]Cl',
++        [
++            (0, {'charge': 0, 'element': 'Cl', 'hcount': 0, 'aromatic': False}),
++            (1, {'charge': 2, 'element': 'Cu', 'hcount': 0, 'aromatic': False}),
++            (2, {'charge': 0, 'element': 'Cl', 'hcount': 0, 'aromatic': False}),
++        ],
++        [(0, 1, {'order': 1}), (1, 2, {'order': 1})],
+         False
+     ),
+     (
+-        '[Cu+2]',
+-        [(0, {'charge': 2, 'element': 'Cu', 'hcount': 0, 'aromatic': False})],
+-        [],
++        '[Cu+2](Cl)Cl',
++        [
++            (0, {'charge': 2, 'element': 'Cu', 'hcount': 0, 'aromatic': False}),
++            (1, {'charge': 0, 'element': 'Cl', 'hcount': 0, 'aromatic': False}),
++            (2, {'charge': 0, 'element': 'Cl', 'hcount': 0, 'aromatic': False}),
++        ],
++        [(0, 1, {'order': 1}), (0, 2, {'order': 1})],
+         False
+     ),
+     (
+-        '[Uuo+4]',
+-        [(0, {'charge': 4, 'element': 'Uuo', 'hcount': 0, 'aromatic': False})],
++        '[OgH4+4]',
++        [(0, {'charge': 4, 'element': 'Og', 'hcount': 4, 'aromatic': False})],
+         [],
+         False
+     ),
+     (
+-        '[2H][CH2]',
++        '[2H][CH2+]',
+         [(0, {'charge': 0, 'element': 'H', 'hcount': 0, 'isotope': 2, 'aromatic': False}),
+-         (1, {'charge': 0, 'element': 'C', 'hcount': 2, 'aromatic': False})],
++         (1, {'charge': 1, 'element': 'C', 'hcount': 2, 'aromatic': False})],
+         [(0, 1, {'order': 1})],
+         False
+     ),
+diff --git a/tests/test_smiles_helpers.py b/tests/test_smiles_helpers.py
+index 6198fd4..7bb2edd 100644
+--- a/tests/test_smiles_helpers.py
++++ b/tests/test_smiles_helpers.py
+@@ -167,7 +167,7 @@
+         [(0, {'element': 'Tc'}),
+          (1, {'element': 'C', 'hcount': 5})],
+         [(0, 1, {'order': 1})],
+-        [(0, {'element': 'Tc', 'hcount': 6}),
++        [(0, {'element': 'Tc', 'hcount': 0}),
+          (1, {'element': 'C', 'hcount': 5})],
+         [(0, 1, {'order': 1})],
+     ),
+@@ -506,7 +506,7 @@ def test_helper(helper, kwargs, n_data_in, e_data_in, n_data_out, e_data_out):
+ 
+ @pytest.mark.parametrize('atom, expected', [
+     ({'element': 'C'}, [4]),
+-    ({'element': 'N'}, [3]),
++    ({'element': 'N'}, [3, 5]),
+     ({'element': 'S'}, [2, 4, 6]),
+     ({'element': 'P'}, [3, 5]),
+     ({'element': 'N', 'charge': 1}, [4]),
+@@ -518,8 +518,8 @@ def test_valence(atom, expected):
+ 
+ 
+ @pytest.mark.parametrize('atom', [
+-    {"charge": 1},
+-    {"charge": -10000}
++    {"element": "H", "charge": 5},
++    {"element": "H", "charge": -10000}
+ ])
+ def test_valence_error(atom):
+     with pytest.raises(ValueError):
+diff --git a/tests/test_write_smiles.py b/tests/test_write_smiles.py
+index a4cc482..9e0a765 100644
+--- a/tests/test_write_smiles.py
++++ b/tests/test_write_smiles.py
+@@ -41,11 +41,11 @@
+         dict(explicit_hydrogen=False, zero_order_bonds=True, reinterpret_aromatic=True),
+     ),
+     (
+-        [(0, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 3}),
+-         (1, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 2}),
++        [(0, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 2}),
++         (1, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 1}),
+          (2, {'element': 'O', 'charge': 0, 'aromatic': False, 'hcount': 0}),
+-         (3, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 2}),
+-         (4, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 3})],
++         (3, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 1}),
++         (4, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 2})],
+         [(0, 1, {'order': 2}),
+          (1, 2, {'order': 1}),
+          (2, 3, {'order': 1}),
+@@ -56,7 +56,7 @@
+         [(0, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+          (1, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+          (2, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+-         (3, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
++         (3, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 0}),
+          (4, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+          (5, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+          (6, {'element': 'O', 'charge': 0, 'aromatic': False, 'hcount': 1})],
+@@ -70,21 +70,19 @@
+         dict(explicit_hydrogen=False, zero_order_bonds=True, reinterpret_aromatic=False),
+     ),
+     (
+-        [(0, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+-         (1, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+-         (2, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+-         (3, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+-         (4, {'element': 'O', 'charge': 0, 'aromatic': True, 'hcount': 0}),
+-         (5, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+-         (6, {'element': 'O', 'charge': 0, 'aromatic': False, 'hcount': 0})],
+-        [(0, 1, {'order': 1.5}),
+-         (1, 2, {'order': 1.5}),
+-         (2, 3, {'order': 1.5}),
+-         (3, 4, {'order': 1.5}),
+-         (4, 5, {'order': 1.5}),
+-         (5, 0, {'order': 1.5}),
+-         (3, 6, {'order': 2})],
+-        dict(explicit_hydrogen=False, zero_order_bonds=True, reinterpret_aromatic=False),
++        [(0, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 1}),
++         (1, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 1}),
++         (2, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 1}),
++         (3, {'element': 'C', 'charge': 0, 'aromatic': False, 'hcount': 0}),
++         (4, {'element': 'O', 'charge': 0, 'aromatic': False, 'hcount': 0}),
++         (6, {'element': 'O', 'charge': 0, 'aromatic': False, 'hcount': 1})],
++        [(0, 1, {'order': 2}),
++         (1, 2, {'order': 1}),
++         (2, 3, {'order': 2}),
++         (3, 4, {'order': 1}),
++         (4, 0, {'order': 1}),
++         (3, 6, {'order': 1})],
++        dict(explicit_hydrogen=False, zero_order_bonds=True, reinterpret_aromatic=True),
+     ),
+     (
+         [(0, {'element': 'C', 'charge': 0, 'aromatic': True, 'hcount': 1}),
+@@ -113,18 +111,18 @@
+     (
+         [(0, {'element': 'C', 'charge': -1, 'aromatic': False, 'hcount': 3}),
+          (1, {'element': 'Cl', 'charge': 0, 'aromatic': False, 'hcount': 2}),
+-         (2, {'element': 'Tc', 'charge': 0, 'aromatic': False, 'hcount': 2}),
+-         (3, {'element': 'C', 'charge': 1, 'aromatic': False, 'hcount': 3})],
++         (2, {'element': 'Tc', 'charge': 0, 'aromatic': False, 'hcount': 5}),
++         (3, {'element': 'C', 'charge': 1, 'aromatic': False, 'hcount': 2})],
+         [(0, 1, {'order': 1}),
+-         (1, 2, {'order': 1}),
++         (0, 2, {'order': 1}),
+          (2, 3, {'order': 1})],
+         dict(explicit_hydrogen=False, zero_order_bonds=True, reinterpret_aromatic=True),
+     ),
+     (
+-        [(0, {'element': 'C', 'charge': -1, 'aromatic': False, 'hcount': 3}),
++        [(0, {'element': 'C', 'charge': -1, 'aromatic': False, 'hcount': 4}),
+          (1, {'element': 'C', 'charge': -2, 'aromatic': False, 'hcount': 2}),
+-         (2, {'element': 'C', 'charge': 5, 'aromatic': False, 'hcount': 2, 'class': 1}),
+-         (3, {'element': 'C', 'charge': 1, 'aromatic': False, 'hcount': 3})],
++         (2, {'element': 'C', 'charge': -2, 'aromatic': False, 'hcount': 4, 'class': 1}),
++         (3, {'element': 'C', 'charge': 1, 'aromatic': False, 'hcount': 2})],
+         [(0, 1, {'order': 1}),
+          (1, 2, {'order': 1}),
+          (2, 3, {'order': 1})],
+@@ -143,12 +141,12 @@
+         dict(explicit_hydrogen=False, zero_order_bonds=False, reinterpret_aromatic=True),
+     ),
+     (
+-      [(0, {'element': 'Se', 'charge': 0, 'aromatic': False, 'hcount': 0})],
++      [(0, {'element': 'Se', 'charge': 0, 'aromatic': False, 'hcount': 2})],
+       [],
+       dict(explicit_hydrogen=False, zero_order_bonds=False, reinterpret_aromatic=True),
+     ),
+     (
+-      [(0, {'element': 'As', 'charge': 0, 'aromatic': False, 'hcount': 0})],
++      [(0, {'element': 'As', 'charge': 0, 'aromatic': False, 'hcount': 3})],
+       [],
+       dict(explicit_hydrogen=False, zero_order_bonds=False, reinterpret_aromatic=True),
+     ),

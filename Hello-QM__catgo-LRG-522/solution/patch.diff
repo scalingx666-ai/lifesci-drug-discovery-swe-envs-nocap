@@ -1,0 +1,136 @@
+diff --git a/src/lib/structure/controllers/tool-handler.ts b/src/lib/structure/controllers/tool-handler.ts
+index b588beeb0..12f553e33 100644
+--- a/src/lib/structure/controllers/tool-handler.ts
++++ b/src/lib/structure/controllers/tool-handler.ts
+@@ -124,6 +124,12 @@ export function start_mcp_bridge(deps: McpBridgeDeps): {
+   let last_push_at = 0
+   const MIN_PUSH_INTERVAL = 50
+   const HEARTBEAT_INTERVAL = 5000
++  // Heartbeat dedupe (trace: ~550 ms of main-thread JSON.stringify per 30 s
++  // of trajectory playback re-pushing an identical frozen structure). Real
++  // edits go through request_push() and always push; the heartbeat only
++  // re-pushes when the structure identity or selection actually changed.
++  let last_pushed_structure: unknown = null
++  let last_pushed_selection = ``
+ 
+   async function do_push_now() {
+     const structure = deps.get_structure()
+@@ -158,6 +164,8 @@ export function start_mcp_bridge(deps: McpBridgeDeps): {
+       headers: { 'Content-Type': `application/json` },
+       body: JSON.stringify({ indices: deps.get_selected_sites() }),
+     })
++    last_pushed_structure = structure
++    last_pushed_selection = JSON.stringify(deps.get_selected_sites())
+   }
+ 
+   async function push_loop() {
+@@ -166,13 +174,22 @@ export function start_mcp_bridge(deps: McpBridgeDeps): {
+       const elapsed = now - last_push_at
+       const heartbeat_due = elapsed >= HEARTBEAT_INTERVAL
+       if ((push_dirty || heartbeat_due) && elapsed >= MIN_PUSH_INTERVAL) {
+-        try {
+-          await do_push_now()
+-        } catch (err) {
+-          console.debug(`[CatGo] push error:`, err)
++        if (
++          !push_dirty &&
++          deps.get_structure() === last_pushed_structure &&
++          JSON.stringify(deps.get_selected_sites()) === last_pushed_selection
++        ) {
++          // Heartbeat with nothing new — skip the 3-POST serialization.
++          last_push_at = now
++        } else {
++          try {
++            await do_push_now()
++          } catch (err) {
++            console.debug(`[CatGo] push error:`, err)
++          }
++          push_dirty = false
++          last_push_at = Date.now()
+         }
+-        push_dirty = false
+-        last_push_at = Date.now()
+       }
+       await new Promise((r) => setTimeout(r, 50))
+     }
+diff --git a/src/lib/trajectory/parse.ts b/src/lib/trajectory/parse.ts
+index d45a14ed2..1d8a125b6 100644
+--- a/src/lib/trajectory/parse.ts
++++ b/src/lib/trajectory/parse.ts
+@@ -362,7 +362,11 @@ async function parse_with_unified_loader(
+   )
+ 
+   on_progress?.({ current: 50, total: 100, stage: `Loading initial frames...` })
+-  const initial_frame_count = Math.min(10, total_frames)
++  // First render needs frame 0 (topology) + a couple of lookahead frames; the
++  // loader parses the rest on demand. Each initial frame of a 20k-atom file
++  // costs a full chunk parse + site-object build, so eager-loading 10 was a
++  // visible slice of time-to-first-frame.
++  const initial_frame_count = Math.min(4, total_frames)
+   const frame_promises = Array.from(
+     { length: initial_frame_count },
+     (_, idx) => loader.load_frame(data, idx),
+@@ -370,25 +374,18 @@ async function parse_with_unified_loader(
+   const loaded_frames = await Promise.all(frame_promises)
+   const frames = loaded_frames.filter((frame): frame is TrajectoryFrame => frame !== null)
+ 
+-  let plot_metadata: TrajectoryMetadata[] | undefined
++  // The plot-metadata extraction walks EVERY frame of the file (seconds for a
++  // 48 MB trajectory) — never block first render on it. Ship the trajectory
++  // now with the in-flight scan attached; Trajectory.svelte adopts it on
++  // arrival (same contract as load_remote_trajectory).
++  let plot_metadata_promise: Promise<TrajectoryMetadata[]> | undefined
+   if (extract_plot_metadata) {
+-    on_progress?.({ current: 70, total: 100, stage: `Extracting plot metadata...` })
+-    try {
+-      plot_metadata = await loader.extract_plot_metadata(
+-        data,
+-        { sample_rate: 1 },
+-        (progress) => {
+-          const adjusted = 70 + (progress.current / 100) * 20
+-          on_progress?.({
+-            current: adjusted,
+-            total: 100,
+-            stage: `Extracting: ${progress.stage}`,
+-          })
+-        },
+-      )
+-    } catch (error) {
+-      console.warn(`Failed to extract plot metadata:`, error)
+-    }
++    plot_metadata_promise = loader
++      .extract_plot_metadata(data, { sample_rate: 1 })
++      .catch((error) => {
++        console.warn(`Failed to extract plot metadata:`, error)
++        return [] as TrajectoryMetadata[]
++      })
+   }
+ 
+   const stage = `Ready: ${total_frames} frames indexed`
+@@ -404,7 +401,7 @@ async function parse_with_unified_loader(
+     },
+     total_frames,
+     indexed_frames: frame_index,
+-    plot_metadata,
++    plot_metadata_promise,
+     is_indexed: true,
+   }
+ }
+diff --git a/tests/vitest/trajectory/streaming.test.ts b/tests/vitest/trajectory/streaming.test.ts
+index 691c270bd..6ad2b861c 100644
+--- a/tests/vitest/trajectory/streaming.test.ts
++++ b/tests/vitest/trajectory/streaming.test.ts
+@@ -259,7 +259,12 @@ describe(`Trajectory Streaming`, () => {
+       // Should have streaming metadata even for small file
+       expect(result.is_indexed).toBe(true)
+       expect(result.indexed_frames).toBeDefined()
+-      expect(result.plot_metadata).toBeDefined()
++      // Plot metadata is deferred so first render isn't blocked on the
++      // whole-file scan — the trajectory ships with the in-flight promise
++      // and Trajectory.svelte adopts the result on arrival.
++      expect(result.plot_metadata_promise).toBeDefined()
++      const plot_metadata = await result.plot_metadata_promise
++      expect(plot_metadata).toBeDefined()
+     })
+   })
+ 

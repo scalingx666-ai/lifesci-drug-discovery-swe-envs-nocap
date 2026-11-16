@@ -1,0 +1,1146 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c0a621a00a..3f8eb8b715 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+   number of required models instead of the number of transform outputs
+ 
+ ### Added
+-- `optimizers` subpackage with `OptimizerProtocol` and `ContinuousOptimizer`
++- `optimizers` subpackage 
+ - `coefficients` attribute for `DiscreteSumConstraint`, enabling weighted sums. Follows
+   the same pattern as `ContinuousLinearConstraint.coefficients`
+ - `simplex_coefficients` keyword argument to `SubspaceDiscrete.from_simplex` for
+diff --git a/baybe/optimizers/__init__.py b/baybe/optimizers/__init__.py
+index 8fc872699b..bab138bb74 100644
+--- a/baybe/optimizers/__init__.py
++++ b/baybe/optimizers/__init__.py
+@@ -1,9 +1,17 @@
+ """Optimizers."""
+ 
+ from baybe.optimizers.base import OptimizerProtocol
++from baybe.optimizers.composite import (
++    BlockCoordinateOptimizer,
++    CyclicOptimizationSchedule,
++    OptimizationStep,
++)
+ from baybe.optimizers.continuous import ContinuousOptimizer
+ 
+ __all__ = [
++    "BlockCoordinateOptimizer",
+     "ContinuousOptimizer",
++    "CyclicOptimizationSchedule",
++    "OptimizationStep",
+     "OptimizerProtocol",
+ ]
+diff --git a/baybe/optimizers/base.py b/baybe/optimizers/base.py
+index 73300961e2..d27d9d4f5f 100644
+--- a/baybe/optimizers/base.py
++++ b/baybe/optimizers/base.py
+@@ -2,30 +2,27 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Callable
+-from typing import (
+-    TYPE_CHECKING,
+-    Generic,
+-    Protocol,
+-    TypeAlias,
+-    TypeVar,
+-    runtime_checkable,
+-)
++from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+ 
+-from baybe.searchspace import SearchSpace, SubspaceContinuous, SubspaceDiscrete
+-
+-TSpace = TypeVar("TSpace", bound=SearchSpace | SubspaceDiscrete | SubspaceContinuous)
+-"The type of space to optimize over."
++from baybe.searchspace import SearchSpace
+ 
+ if TYPE_CHECKING:
++    from botorch.acquisition import AcquisitionFunction as BoAcquisitionFunction
+     from torch import Tensor
+ 
+-    ScoreFunction: TypeAlias = Callable[[Tensor], Tensor]
+-    "Type alias for a callable to be optimized."
++    ScoreFunction: TypeAlias = BoAcquisitionFunction
++    """Type alias for a callable that scores (batches of) candidates."""
++
++    OptimizationResult: TypeAlias = tuple[Tensor, Tensor]
++    """Type alias for the result of an optimization call.
++
++    The first tensor holds the optimal parameter configurations in computational
++    representation, the second holds the corresponding acquisition function scores.
++    """
+ 
+ 
+ @runtime_checkable
+-class OptimizerProtocol(Protocol, Generic[TSpace]):  # type: ignore[misc]
++class OptimizerProtocol(Protocol):
+     """Type protocol specifying the interface optimizers need to implement."""
+ 
+     # Use slots so that derived classes also remain slotted
+@@ -33,14 +30,14 @@ class OptimizerProtocol(Protocol, Generic[TSpace]):  # type: ignore[misc]
+     __slots__ = ()
+ 
+     def __call__(
+-        self, batch_size: int, score_function: ScoreFunction, space: TSpace
+-    ) -> tuple[Tensor, Tensor]:
++        self, batch_size: int, score_function: ScoreFunction, searchspace: SearchSpace
++    ) -> OptimizationResult:
+         """Optimize a given callable over the specified space.
+ 
+         Args:
+             batch_size: The number of points to find.
+             score_function: The callable to be optimized.
+-            space: The space to optimize over.
++            searchspace: The space to optimize over.
+ 
+         Returns:
+             The optimal parameter configurations and their corresponding scores.
+diff --git a/baybe/optimizers/composite.py b/baybe/optimizers/composite.py
+new file mode 100644
+index 0000000000..1b63a7b7a4
+--- /dev/null
++++ b/baybe/optimizers/composite.py
+@@ -0,0 +1,246 @@
++"""Composite optimizers."""
++
++from __future__ import annotations
++
++import gc
++import warnings
++from abc import ABC, abstractmethod
++from collections.abc import Generator
++from typing import TYPE_CHECKING, Any
++
++import pandas as pd
++from attrs import define, field
++from attrs.validators import deep_iterable, gt, instance_of, min_len
++from typing_extensions import override
++
++from baybe.constraints import DiscreteBatchConstraint
++from baybe.exceptions import (
++    IncompatibleAcquisitionFunctionError,
++    IncompatibleSearchSpaceError,
++)
++from baybe.optimizers.base import OptimizerProtocol
++from baybe.parameters.selectors import ParameterSelectorProtocol, to_parameter_selector
++from baybe.searchspace import SearchSpace
++from baybe.serialization.mixin import SerialMixin
++from baybe.settings import active_settings
++from baybe.utils.basic import to_tuple
++
++if TYPE_CHECKING:
++    from baybe.optimizers.base import OptimizationResult, ScoreFunction
++
++
++@define(frozen=True)
++class OptimizationStep(SerialMixin):
++    """A parameter selector paired with the optimizer responsible for it."""
++
++    selector: ParameterSelectorProtocol = field(converter=to_parameter_selector)
++    """The selector identifying which parameters this step optimizes."""
++
++    optimizer: OptimizerProtocol = field(validator=instance_of(OptimizerProtocol))
++    """The optimizer to apply to the selected parameters."""
++
++
++@define(frozen=True, slots=False)
++class OptimizationSchedule(ABC, SerialMixin):
++    """Base class for optimization schedules.
++
++    An optimization schedule controls which parts of the search space are optimized
++    and in what order. It yields :class:`OptimizationStep` instances on each
++    iteration, one step at a time.
++    """
++
++    @abstractmethod
++    def __call__(
++        self, searchspace: SearchSpace
++    ) -> Generator[OptimizationStep, OptimizationResult, None]:
++        """Yield optimization steps to apply in sequence.
++
++        Each time the generator yields an :class:`OptimizationStep`, the caller
++        resolves the selector against the space, optimizes the free parameters while
++        holding all others fixed, and sends back the resulting ``(point, score)`` pair
++        via :meth:`~Generator.send`. The schedule may use this feedback to decide which
++        step to yield next (e.g., adaptive schedules) or ignore it (e.g., fixed
++        schedules). The generator terminates by returning when the sequence is complete.
++
++        Args:
++            searchspace: The full search space to optimize over.
++
++        Yields:
++            The next optimization step to apply.
++        """
++
++
++@define(frozen=True)
++class CyclicOptimizationSchedule(OptimizationSchedule):
++    """Cycle through steps in round-robin for a fixed number of cycles."""
++
++    steps: tuple[OptimizationStep, ...] = field(
++        converter=to_tuple,
++        validator=[min_len(1), deep_iterable(instance_of(OptimizationStep))],
++    )
++    """The optimization steps to be cycled through."""
++
++    n_cycles: int = field(default=1, validator=[instance_of(int), gt(0)])
++    """The number of full cycles to perform."""
++
++    @override
++    def __call__(
++        self, searchspace: SearchSpace
++    ) -> Generator[OptimizationStep, OptimizationResult, None]:
++        """Yield steps in round-robin for the specified number of cycles."""
++        active_steps = [
++            step
++            for step in self.steps
++            if any(step.selector(p) for p in searchspace.parameters)
++        ]
++        if not active_steps:
++            raise IncompatibleSearchSpaceError(
++                "No optimization can be performed because none of the specified steps "
++                "matched any parameter in the given search space."
++            )
++        if n_skipped := len(self.steps) - len(active_steps):
++            warnings.warn(
++                f"{n_skipped} of {len(self.steps)} optimization step(s) matched no "
++                "parameters in the given search space and will be skipped.",
++                UserWarning,
++                stacklevel=2,
++            )
++        for _ in range(self.n_cycles):
++            for step in active_steps:
++                _ = yield step
++
++
++@define(frozen=True)
++class BlockCoordinateOptimizer(OptimizerProtocol):
++    """An optimizer that performs block optimization over specified subspaces.
++
++    Each subspace is assigned to a dedicated optimizer in the form of an
++    :class:`~OptimizationSchedule`. The subspaces are then optimized block-wise
++    according to the schedule, holding the respective other part of the search space
++    fixed. See also: https://en.wikipedia.org/wiki/Coordinate_descent
++
++    For batch optimization, the same schedule is applied repeatedly per point,
++    resulting in a greedy optimization strategy.
++    """
++
++    schedule: OptimizationSchedule = field(
++        validator=instance_of(OptimizationSchedule),
++    )
++    """The schedule controlling which subspaces are optimized and in what order."""
++
++    def _optimize_single_point(
++        self,
++        score_function: ScoreFunction,
++        searchspace: SearchSpace,
++        steps: Generator[OptimizationStep, OptimizationResult, None],
++    ) -> OptimizationResult:
++        """Optimize a single point.
++
++        Args:
++            score_function: The callable to optimize.
++            searchspace: The full search space.
++            steps: A generator yielding :class:`~OptimizationStep`s.
++
++        Returns:
++            The optimization result for a single point of the batch.
++        """
++        dfs: list[pd.DataFrame] = []
++        if not searchspace.discrete.is_empty:
++            dfs.append(
++                searchspace.discrete.exp_rep.sample(1, replace=True).reset_index(
++                    drop=True
++                )
++            )
++        if not searchspace.continuous.is_empty:
++            dfs.append(searchspace.continuous.sample_uniform(1))
++
++        current_point: dict[str, Any] = {
++            str(k): v for k, v in pd.concat(dfs, axis=1).iloc[0].items()
++        }
++
++        step = next(steps)
++
++        while True:
++            free_names = {p.name for p in searchspace.parameters if step.selector(p)}
++            fixed_values = {
++                k: v for k, v in current_point.items() if k not in free_names
++            }
++            constrained_space = searchspace._fix_parameters(**fixed_values)
++
++            result_point, result_score = step.optimizer(
++                1, score_function, constrained_space
++            )
++            result_point = result_point.squeeze(0)
++            result_score = result_score.squeeze(0)
++
++            # Merge optimized free-parameter values back into current exp-rep point.
++            result_comp = dict(zip(searchspace.comp_rep_columns, result_point.tolist()))
++            current_point.update(searchspace._comp_rep_to_exp_rep(result_comp))
++
++            try:
++                step = steps.send((result_point, result_score))
++            except StopIteration:
++                break
++
++        return result_point, result_score
++
++    @override
++    def __call__(
++        self,
++        batch_size: int,
++        score_function: ScoreFunction,
++        searchspace: SearchSpace,
++    ) -> OptimizationResult:
++        import torch
++        from botorch.acquisition import AnalyticAcquisitionFunction
++
++        n_cols = len(searchspace.comp_rep_columns)
++        points = torch.empty(batch_size, n_cols, dtype=active_settings.DTypeFloatTorch)
++        scores = torch.empty(batch_size, dtype=active_settings.DTypeFloatTorch)
++
++        if batch_size == 1:
++            steps = self.schedule(searchspace)
++            points[0], scores[0] = self._optimize_single_point(
++                score_function, searchspace, steps
++            )
++            return points, scores
++
++        if searchspace.continuous.has_interpoint_constraints:
++            raise IncompatibleSearchSpaceError(
++                f"'{type(self).__name__}' does not support batch recommendation "
++                f"when interpoint constraints are present."
++            )
++
++        if any(isinstance(c, DiscreteBatchConstraint) for c in searchspace.constraints):
++            raise IncompatibleSearchSpaceError(
++                f"'{type(self).__name__}' does not support batch recommendation "
++                f"when discrete batch constraints are present."
++            )
++
++        if isinstance(score_function, AnalyticAcquisitionFunction):
++            raise IncompatibleAcquisitionFunctionError(
++                f"'{type(self).__name__}' does not support batch recommendation "
++                f"for analytic acquisition functions but was called with an "
++                f"acquisition function of type '{type(score_function).__name__}'."
++            )
++
++        base_X_pending = score_function.X_pending
++
++        for b in range(batch_size):
++            steps = self.schedule(searchspace)
++            points[b], scores[b] = self._optimize_single_point(
++                score_function, searchspace, steps
++            )
++
++            pending = points[: b + 1]
++            if base_X_pending is not None:
++                pending = torch.cat([base_X_pending, pending], dim=0)
++            score_function.set_X_pending(pending)
++
++        score_function.set_X_pending(base_X_pending)
++
++        return points, scores
++
++
++# Collect leftover original slotted classes processed by `attrs.define`
++gc.collect()
+diff --git a/baybe/optimizers/continuous.py b/baybe/optimizers/continuous.py
+index dad1e6625d..fc98130cfc 100644
+--- a/baybe/optimizers/continuous.py
++++ b/baybe/optimizers/continuous.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ import gc
+-from typing import TYPE_CHECKING, cast
++from typing import TYPE_CHECKING
+ 
+ from attrs import define, field, fields
+ from attrs.validators import gt, instance_of
+@@ -11,19 +11,16 @@
+ 
+ from baybe.exceptions import IncompatibilityError, IncompatibleSearchSpaceError
+ from baybe.optimizers.base import OptimizerProtocol
+-from baybe.parameters.numerical import _FixedNumericalContinuousParameter
+-from baybe.searchspace import SubspaceContinuous
++from baybe.searchspace import SearchSpace
+ from baybe.settings import AutoBool
+ from baybe.utils.basic import flatten
+ 
+ if TYPE_CHECKING:
+-    from torch import Tensor
+-
+-    from baybe.optimizers.base import ScoreFunction
++    from baybe.optimizers.base import OptimizationResult, ScoreFunction
+ 
+ 
+ @define(kw_only=True)
+-class ContinuousOptimizer(OptimizerProtocol[SubspaceContinuous]):
++class ContinuousOptimizer(OptimizerProtocol):
+     """Optimizer wrapping BoTorch's :func:`botorch.optim.optimize_acqf`."""
+ 
+     n_starts: int = field(validator=[instance_of(int), gt(0)], default=10)
+@@ -43,17 +40,24 @@ def __call__(
+         self,
+         batch_size: int,
+         score_function: ScoreFunction,
+-        space: SubspaceContinuous,
+-    ) -> tuple[Tensor, Tensor]:
++        searchspace: SearchSpace,
++    ) -> OptimizationResult:
+         import torch
+-        from botorch.acquisition import AcquisitionFunction as BoAcquisitionFunction
+         from botorch.optim import optimize_acqf
+ 
++        subspace = searchspace.continuous
++
+         sequential = self.sequential.evaluate(
+-            lambda: not space.has_interpoint_constraints
++            lambda: not subspace.has_interpoint_constraints
+         )
+ 
+-        if sequential and space.has_interpoint_constraints:
++        if subspace.is_empty:
++            raise IncompatibleSearchSpaceError(
++                f"'{self.__class__.__name__}' expects a non-empty continuous space, "
++                f"i.e., containing at least one continuous parameter."
++            )
++
++        if sequential and subspace.has_interpoint_constraints:
+             raise IncompatibilityError(
+                 f"Setting the "
+                 f"'{fields(self.__class__).sequential.alias}' "
+@@ -61,43 +65,42 @@ def __call__(
+                 f"supported. Set it to either 'False'/'Auto'."
+             )
+ 
+-        if space.n_subsets > 0:
++        if subspace.n_subsets > 0:
+             raise IncompatibleSearchSpaceError(
+                 f"'{self.__class__.__name__}' "
+                 f"expects single continuous space, i.e., containing no subsets."
+             )
+ 
+-        fixed_features = {
+-            i: p.value
+-            for i, p in enumerate(space.parameters)
+-            if isinstance(p, _FixedNumericalContinuousParameter)
+-        }
++        bounds_df = searchspace.comp_rep_bounds
++        fixed_features = searchspace._fixed_values or None
+ 
+         # NOTE: The explicit `or None` conversions are added as an additional safety net
+         #   because it is unclear if the corresponding presence checks for these
+         #   arguments is correctly implemented in all invoked BoTorch subroutines.
+         #   For details: https://github.com/pytorch/botorch/issues/2042
+         points, acqf_values = optimize_acqf(
+-            acq_function=cast(BoAcquisitionFunction, score_function),
+-            bounds=torch.from_numpy(space.comp_rep_bounds.to_numpy(copy=True)),
++            acq_function=score_function,
++            bounds=torch.from_numpy(bounds_df.to_numpy(copy=True)),
+             q=batch_size,
+             num_restarts=self.n_starts,
+             raw_samples=self.n_initial_samples,
+-            fixed_features=fixed_features or None,
++            fixed_features=fixed_features,
+             equality_constraints=flatten(
+                 c.to_botorch(
+-                    space.parameters,
++                    subspace.parameters,
++                    idx_offset=len(searchspace.discrete.comp_rep_columns),
+                     batch_size=batch_size if c.is_interpoint else None,
+                 )
+-                for c in space.constraints_lin_eq
++                for c in subspace.constraints_lin_eq
+             )
+             or None,
+             inequality_constraints=flatten(
+                 c.to_botorch(
+-                    space.parameters,
++                    subspace.parameters,
++                    idx_offset=len(searchspace.discrete.comp_rep_columns),
+                     batch_size=batch_size if c.is_interpoint else None,
+                 )
+-                for c in space.constraints_lin_ineq
++                for c in subspace.constraints_lin_ineq
+             )
+             or None,
+             sequential=sequential,
+diff --git a/baybe/parameters/selectors.py b/baybe/parameters/selectors.py
+index 170177e581..a2dc280fdf 100644
+--- a/baybe/parameters/selectors.py
++++ b/baybe/parameters/selectors.py
+@@ -3,7 +3,7 @@
+ import re
+ from abc import ABC, abstractmethod
+ from collections.abc import Collection
+-from typing import Protocol
++from typing import Protocol, runtime_checkable
+ 
+ from attrs import Converter, define, field
+ from attrs.validators import deep_iterable, instance_of, min_len
+@@ -14,6 +14,7 @@
+ from baybe.utils.conversion import nonstring_to_tuple
+ 
+ 
++@runtime_checkable
+ class ParameterSelectorProtocol(Protocol):
+     """Type protocol specifying the interface parameter selectors need to implement."""
+ 
+diff --git a/baybe/recommenders/pure/bayesian/continuous.py b/baybe/recommenders/pure/bayesian/continuous.py
+index 27933d2b56..f12fa8376e 100644
+--- a/baybe/recommenders/pure/bayesian/continuous.py
++++ b/baybe/recommenders/pure/bayesian/continuous.py
+@@ -30,7 +30,7 @@ def recommend_continuous_torch(
+         )
+     else:
+         return recommender.optimizer(
+-            batch_size, recommender._botorch_acqf, subspace_continuous
++            batch_size, recommender._botorch_acqf, subspace_continuous.to_searchspace()
+         )
+ 
+ 
+diff --git a/baybe/searchspace/continuous.py b/baybe/searchspace/continuous.py
+index 43db04b2d6..4b907b34c7 100644
+--- a/baybe/searchspace/continuous.py
++++ b/baybe/searchspace/continuous.py
+@@ -80,6 +80,9 @@ class SubspaceContinuous(SerialMixin):
+     )
+     """Nonlinear constraints."""
+ 
++    _fixed_values: dict[str, float] = field(factory=dict, init=False)
++    """Exp-rep parameter values held constant during optimization."""
++
+     @override
+     def __str__(self) -> str:
+         if self.is_empty:
+diff --git a/baybe/searchspace/core.py b/baybe/searchspace/core.py
+index 1c3aea889d..c9433583d6 100644
+--- a/baybe/searchspace/core.py
++++ b/baybe/searchspace/core.py
+@@ -6,12 +6,12 @@
+ from collections.abc import Collection, Iterable, Iterator, Sequence
+ from enum import Enum
+ from itertools import product
+-from typing import TYPE_CHECKING, ClassVar, cast
++from typing import TYPE_CHECKING, Any, ClassVar, cast
+ 
+ import numpy as np
+ import numpy.typing as npt
+ import pandas as pd
+-from attrs import define, field
++from attrs import define, evolve, field
+ from typing_extensions import override
+ 
+ from baybe.constraints import validate_constraints
+@@ -199,6 +199,93 @@ def from_dataframe(
+             ),
+         )
+ 
++    @property
++    def _fixed_values(self) -> dict[int, float]:
++        """Fixed comp-rep column indices and their values.
++
++        Merges externally fixed values from both subspaces, transforms them to
++        computational representation, and maps each resulting column to its
++        positional index in :attr:`comp_rep_columns`.
++
++        Note:
++            There is no concept of batching on this level, i.e., each column is fixed to
++            a single value.
++
++        Returns:
++            Mapping from comp-rep column index to fixed value.
++        """
++        exp_values = {**self.discrete._fixed_values, **self.continuous._fixed_values}
++        if not exp_values:
++            return {}
++        comp_rep = self.transform(pd.DataFrame([exp_values]), allow_missing=True)
++        comp_row = comp_rep.iloc[0]
++        return {
++            idx: comp_row[self.comp_rep_columns[idx]]
++            for name in exp_values
++            for idx in self.get_comp_rep_parameter_indices(name)
++        }
++
++    def _fix_parameters(self, **values: Any) -> SearchSpace:
++        """Return a copy with parameters fixed to the given experimental values.
++
++        Only the parameters passed as keyword arguments are fixed; all others
++        remain free. Any previously fixed values are replaced, not accumulated.
++
++        Args:
++            **values: Parameter names mapped to their experimental-representation
++                values to fix.
++
++        Raises:
++            ValueError: If any key is not a valid parameter name.
++
++        Returns:
++            A new search space with the specified parameters fixed.
++        """
++        if unknown := set(values) - {p.name for p in self.parameters}:
++            raise ValueError(f"Unknown parameter names: {unknown}")
++
++        discrete = evolve(self.discrete)
++        discrete._fixed_values = {
++            k: v for k, v in values.items() if k in self.discrete.parameter_names
++        }
++
++        continuous = evolve(self.continuous)
++        continuous._fixed_values = {
++            k: v for k, v in values.items() if k in self.continuous.parameter_names
++        }
++
++        return evolve(self, discrete=discrete, continuous=continuous)
++
++    def _comp_rep_to_exp_rep(self, comp_rep: dict[str, float]) -> dict[str, Any]:
++        """Convert a single comp-rep point to experimental representation.
++
++        For discrete parameters, the matching exp-rep row is looked up from the
++        candidate set. For continuous parameters, values are read directly since
++        their comp-rep equals their exp-rep.
++
++        Args:
++            comp_rep: A mapping from comp-rep column names to their values.
++
++        Returns:
++            A mapping from parameter names to their experimental-representation values.
++        """
++        result: dict[str, Any] = {}
++
++        if not self.discrete.is_empty:
++            disc_comp_cols = list(self.discrete.comp_rep_columns)
++            query = pd.DataFrame([{c: comp_rep[c] for c in disc_comp_cols}])
++            mask = (self.discrete.comp_rep[disc_comp_cols] == query.iloc[0]).all(axis=1)
++            result.update(
++                {str(k): v for k, v in self.discrete.exp_rep.loc[mask].iloc[0].items()}
++            )
++
++        if not self.continuous.is_empty:
++            result.update(
++                {name: comp_rep[name] for name in self.continuous.parameter_names}
++            )
++
++        return result
++
+     @property
+     def parameters(self) -> tuple[Parameter, ...]:
+         """Return the list of parameters of the search space."""
+diff --git a/baybe/searchspace/discrete.py b/baybe/searchspace/discrete.py
+index 0a7f76d251..48051c531d 100644
+--- a/baybe/searchspace/discrete.py
++++ b/baybe/searchspace/discrete.py
+@@ -117,6 +117,9 @@ class SubspaceDiscrete(SerialMixin):
+     and thereby speed up construction. If not provided, the default hook will derive it
+     from ``exp_rep``."""
+ 
++    _fixed_values: dict[str, Any] = field(factory=dict, init=False)
++    """Exp-rep parameter values held constant during optimization."""
++
+     @override
+     def __str__(self) -> str:
+         if self.is_empty:
+diff --git a/baybe/utils/validation.py b/baybe/utils/validation.py
+index b61dfe2a7f..b43f72e2f4 100644
+--- a/baybe/utils/validation.py
++++ b/baybe/utils/validation.py
+@@ -294,3 +294,29 @@ def validate_unique_values(  # noqa: DOC101, DOC103
+             f"Entries appearing multiple times: {duplicates}. "
+             f"All entries of '{attribute.alias}' must be unique."
+         )
++
++
++def validate_optimizer_input(self: Any, attribute: Attribute, value: Any) -> None:
++    """Attrs-compatible validator to evaluate composite optimizer input."""
++    from baybe.optimizers.base import OptimizerProtocol
++    from baybe.parameters.selectors import ParameterSelectorProtocol
++
++    for i, entry in enumerate(value):
++        if not isinstance(entry, tuple) or len(entry) != 2:
++            raise TypeError(
++                f"Each entry in '{attribute.name}' must be a tuple of "
++                f"({ParameterSelectorProtocol.__name__}, "
++                f"{OptimizerProtocol.__name__}), got '{entry!r}'."
++            )
++        if not isinstance(entry[0], ParameterSelectorProtocol):
++            raise TypeError(
++                f"Entry {i} in '{attribute.name}': expected a "
++                f"'{ParameterSelectorProtocol.__name__}' as first element, "
++                f"got '{type(entry[0]).__name__}'."
++            )
++        if not isinstance(entry[1], OptimizerProtocol):
++            raise TypeError(
++                f"Entry {i} in '{attribute.name}': expected an "
++                f"'{OptimizerProtocol.__name__}' as second element, "
++                f"got '{type(entry[1]).__name__}'."
++            )
+diff --git a/tests/optimizers/test_composite.py b/tests/optimizers/test_composite.py
+new file mode 100644
+index 0000000000..6bee0c351a
+--- /dev/null
++++ b/tests/optimizers/test_composite.py
+@@ -0,0 +1,192 @@
++"""Tests for composite optimizers."""
++
++from __future__ import annotations
++
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++from pytest import param
++
++from baybe.exceptions import IncompatibleSearchSpaceError
++from baybe.optimizers.composite import (
++    BlockCoordinateOptimizer,
++    CyclicOptimizationSchedule,
++    OptimizationStep,
++)
++from baybe.parameters import NumericalContinuousParameter
++from baybe.searchspace import SearchSpace
++
++_PC1 = NumericalContinuousParameter("x1", bounds=(0, 1))
++_PC2 = NumericalContinuousParameter("x2", bounds=(-1, 0))
++
++_SS = SearchSpace.from_product([_PC1, _PC2])
++_N_COLS = len(_SS.comp_rep_columns)
++
++_STEP1 = OptimizationStep(selector="x1", optimizer=MagicMock())
++_STEP2 = OptimizationStep(selector="x2", optimizer=MagicMock())
++
++
++def _make_inner_optimizer(n_cols: int = _N_COLS) -> MagicMock:
++    """Return a mock inner optimizer whose return value has the expected shapes."""
++    mock = MagicMock()
++    mock.return_value = (torch.zeros(1, n_cols), torch.zeros(1))
++    return mock
++
++
++def _make_bco(
++    selector: str = ".*",
++    inner_optimizer: MagicMock | None = None,
++    n_cycles: int = 1,
++) -> BlockCoordinateOptimizer:
++    """Construct a :class:`BlockCoordinateOptimizer` with a single step."""
++    if inner_optimizer is None:
++        inner_optimizer = _make_inner_optimizer()
++    step = OptimizationStep(selector=selector, optimizer=inner_optimizer)
++    schedule = CyclicOptimizationSchedule(steps=(step,), n_cycles=n_cycles)
++    return BlockCoordinateOptimizer(schedule=schedule)
++
++
++@pytest.fixture(name="mock_score_fn")
++def fixture_mock_score_fn() -> MagicMock:
++    """A mock acquisition function with no pending experiments."""
++    mock = MagicMock()
++    mock.X_pending = None
++    mock.set_X_pending = MagicMock()
++    return mock
++
++
++class TestCyclicOptimizationSchedule:
++    """Tests for ``CyclicOptimizationSchedule``."""
++
++    @pytest.mark.parametrize(
++        ("steps", "n_cycles", "expected"),
++        [
++            param((_STEP1,), 1, [_STEP1], id="1step_1cycle"),
++            param((_STEP1,), 3, [_STEP1, _STEP1, _STEP1], id="1step_3cycles"),
++            param((_STEP1, _STEP2), 1, [_STEP1, _STEP2], id="2steps_1cycle"),
++            param(
++                (_STEP1, _STEP2),
++                2,
++                [_STEP1, _STEP2, _STEP1, _STEP2],
++                id="2steps_2cycles",
++            ),
++        ],
++    )
++    def test_cyclic_iteration_order(self, steps, n_cycles, expected):
++        """Steps are yielded in round-robin order for the given number of cycles."""
++        schedule = CyclicOptimizationSchedule(steps=steps, n_cycles=n_cycles)
++        assert list(schedule(_SS)) == expected
++
++    def test_skipped_step_warns_and_is_excluded(self):
++        """A step matching no parameters emits *one* warning and is dropped."""
++        step_active = OptimizationStep(selector=".*", optimizer=MagicMock())
++        step_skipped = OptimizationStep(selector="nomatch", optimizer=MagicMock())
++        schedule = CyclicOptimizationSchedule(
++            steps=(step_active, step_skipped), n_cycles=2
++        )
++
++        with pytest.warns(UserWarning, match="will be skipped") as record:
++            yielded = list(schedule(_SS))
++
++        assert len(record) == 1
++        assert yielded == [step_active, step_active]
++
++    def test_all_steps_skipped_raises(self):
++        """When no step matches any parameter an error is raised."""
++        step = OptimizationStep(selector="nomatch", optimizer=MagicMock())
++        schedule = CyclicOptimizationSchedule(steps=(step,), n_cycles=1)
++
++        with pytest.raises(
++            IncompatibleSearchSpaceError, match="none of the specified steps"
++        ):
++            list(schedule(_SS))
++
++
++class TestBlockCoordinateOptimizer:
++    """Tests for ``BlockCoordinateOptimizer``."""
++
++    @pytest.mark.parametrize(
++        ("n_cycles", "n_steps"),
++        [
++            param(1, 1, id="one_step_one_cycle"),
++            param(3, 1, id="one_step_three_cycles"),
++            param(1, 2, id="two_steps_one_cycle"),
++            param(3, 2, id="two_steps_three_cycles"),
++        ],
++    )
++    def test_inner_optimizer_call_count(self, n_cycles, n_steps, mock_score_fn):
++        """Each inner optimizer is called once per active cycle."""
++        inners = [_make_inner_optimizer() for _ in range(n_steps)]
++        selectors = ["x1", "x2"][:n_steps]
++        steps = tuple(
++            OptimizationStep(selector=s, optimizer=i) for s, i in zip(selectors, inners)
++        )
++        schedule = CyclicOptimizationSchedule(steps=steps, n_cycles=n_cycles)
++        bco = BlockCoordinateOptimizer(schedule=schedule)
++
++        bco(1, mock_score_fn, _SS)
++
++        for inner in inners:
++            assert inner.call_count == n_cycles
++
++    def test_inner_optimizer_receives_batch_size_one(self, mock_score_fn):
++        """The inner optimizer is always invoked with ``batch_size=1``."""
++        inner = _make_inner_optimizer()
++        bco = _make_bco(inner_optimizer=inner)
++        bco(1, mock_score_fn, _SS)
++        assert inner.call_args[0][0] == 1
++
++    @pytest.mark.parametrize(
++        "batch_size", [param(1, id="single"), param(3, id="batch")]
++    )
++    def test_return_value_shape(self, batch_size, mock_score_fn):
++        """Output shapes are ``(batch_size, n_comp_cols)`` and ``(batch_size,)``."""
++        bco = _make_bco()
++        pts, scores = bco(batch_size, mock_score_fn, _SS)
++        assert tuple(pts.shape) == (batch_size, _N_COLS)
++        assert tuple(scores.shape) == (batch_size,)
++
++    @pytest.mark.parametrize(
++        "original_pending",
++        [
++            param(None, id="none"),
++            param(torch.zeros(2, _N_COLS), id="tensor"),
++        ],
++    )
++    def test_x_pending_behaviour_in_batch(self, original_pending, mock_score_fn):
++        """``set_X_pending`` is called after each greedy step and the original value is restored."""  # noqa: E501
++        mock_score_fn.X_pending = original_pending
++        bco = _make_bco()
++        bco(3, mock_score_fn, _SS)
++        assert (
++            mock_score_fn.set_X_pending.call_count == 4
++        )  # 3 greedy updates + 1 restore
++        assert mock_score_fn.set_X_pending.call_args[0][0] is original_pending
++
++    def test_block_coordinate_mechanism(self, mock_score_fn):
++        """Each inner optimizer sees a space with the expected free/fixed parameters."""
++        step1_x1_value = 0.5
++        inner1 = MagicMock(
++            return_value=(torch.tensor([[step1_x1_value, 0.0]]), torch.zeros(1))
++        )
++        inner2 = MagicMock(return_value=(torch.tensor([[0.0, -0.5]]), torch.zeros(1)))
++
++        steps = (
++            OptimizationStep(selector="x1", optimizer=inner1),
++            OptimizationStep(selector="x2", optimizer=inner2),
++        )
++        schedule = CyclicOptimizationSchedule(steps=steps, n_cycles=1)
++        bco = BlockCoordinateOptimizer(schedule=schedule)
++        bco(1, mock_score_fn, _SS)
++
++        # Step 1: x1 is free, so x2 must be fixed to some value
++        space_seen_by_step1 = inner1.call_args[0][2]
++        assert "x2" in space_seen_by_step1.continuous._fixed_values
++        assert "x1" not in space_seen_by_step1.continuous._fixed_values
++
++        # Step 2: x2 is free, so x1 must be fixed to exactly what Step 1 returned.
++        space_seen_by_step2 = inner2.call_args[0][2]
++        assert "x1" in space_seen_by_step2.continuous._fixed_values
++        assert "x2" not in space_seen_by_step2.continuous._fixed_values
++        assert space_seen_by_step2.continuous._fixed_values["x1"] == step1_x1_value
+diff --git a/tests/optimizers/test_continuous_optimizer.py b/tests/optimizers/test_continuous.py
+similarity index 94%
+rename from tests/optimizers/test_continuous_optimizer.py
+rename to tests/optimizers/test_continuous.py
+index c8b2b1ccac..fa4bdbd722 100644
+--- a/tests/optimizers/test_continuous_optimizer.py
++++ b/tests/optimizers/test_continuous.py
+@@ -12,7 +12,7 @@
+ from baybe.exceptions import IncompatibilityError
+ from baybe.optimizers.continuous import ContinuousOptimizer
+ from baybe.parameters.numerical import NumericalContinuousParameter
+-from baybe.searchspace import SubspaceContinuous
++from baybe.searchspace import SearchSpace
+ 
+ _PC1 = NumericalContinuousParameter("x1", bounds=(0, 1))
+ _PC2 = NumericalContinuousParameter("x2", bounds=(-1, 0))
+@@ -22,8 +22,8 @@
+ _MOCK_SCORES = torch.zeros(1)
+ _MOCK_RESULT = (_MOCK_PTS, _MOCK_SCORES)
+ 
+-_SS = SubspaceContinuous.from_product([_PC1, _PC2])
+-_SS_EQ = SubspaceContinuous.from_product(
++_SS = SearchSpace.from_product([_PC1, _PC2])
++_SS_EQ = SearchSpace.from_product(
+     [_PC1, _PC2],
+     constraints=[
+         ContinuousLinearConstraint(
+@@ -31,7 +31,7 @@
+         )
+     ],
+ )
+-_SS_INEQ = SubspaceContinuous.from_product(
++_SS_INEQ = SearchSpace.from_product(
+     [_PC1, _PC2],
+     constraints=[
+         ContinuousLinearConstraint(
+@@ -39,7 +39,7 @@
+         )
+     ],
+ )
+-_SS_INTERPOINT = SubspaceContinuous.from_product(
++_SS_INTERPOINT = SearchSpace.from_product(
+     [_PC1, _PC2],
+     constraints=[
+         ContinuousLinearConstraint(
+diff --git a/tests/validation/optimizers/test_composite_validation.py b/tests/validation/optimizers/test_composite_validation.py
+new file mode 100644
+index 0000000000..a4338c6e33
+--- /dev/null
++++ b/tests/validation/optimizers/test_composite_validation.py
+@@ -0,0 +1,133 @@
++"""Validation tests for BlockCoordinateOptimizer and CyclicOptimizationSchedule."""
++
++from unittest.mock import MagicMock
++
++import pytest
++from botorch.acquisition import AnalyticAcquisitionFunction
++from pytest import param
++
++from baybe.constraints.continuous import ContinuousLinearConstraint
++from baybe.constraints.discrete import DiscreteBatchConstraint
++from baybe.exceptions import (
++    IncompatibleAcquisitionFunctionError,
++    IncompatibleSearchSpaceError,
++)
++from baybe.optimizers.composite import (
++    BlockCoordinateOptimizer,
++    CyclicOptimizationSchedule,
++    OptimizationStep,
++)
++from baybe.parameters.numerical import (
++    NumericalContinuousParameter,
++    NumericalDiscreteParameter,
++)
++from baybe.searchspace import SearchSpace
++
++_PC1 = NumericalContinuousParameter("x1", bounds=(0, 1))
++_PC2 = NumericalContinuousParameter("x2", bounds=(-1, 0))
++_PD = NumericalDiscreteParameter("d", values=[1.0, 2.0, 3.0])
++
++_SS = SearchSpace.from_product([_PC1, _PC2])
++_SS_INTERPOINT = SearchSpace.from_product(
++    [_PC1, _PC2],
++    constraints=[
++        ContinuousLinearConstraint(
++            parameters=["x1"],
++            coefficients=[1.0],
++            operator="=",
++            rhs=0.3,
++            interpoint=True,
++        )
++    ],
++)
++_SS_DISCRETE_BATCH = SearchSpace.from_product(
++    [_PD],
++    constraints=[DiscreteBatchConstraint(parameters=["d"])],
++)
++
++_MOCK_OPTIMIZER = MagicMock()
++_MOCK_STEP = OptimizationStep(selector="", optimizer=_MOCK_OPTIMIZER)
++_MOCK_BCO = BlockCoordinateOptimizer(
++    schedule=CyclicOptimizationSchedule(steps=(_MOCK_STEP,))
++)
++_MOCK_BCO_NOMATCH = BlockCoordinateOptimizer(
++    schedule=CyclicOptimizationSchedule(
++        steps=(OptimizationStep(selector="nomatch", optimizer=_MOCK_OPTIMIZER),)
++    )
++)
++
++
++@pytest.mark.parametrize(
++    ("steps", "error", "match"),
++    [
++        param((), ValueError, "Length of 'steps' must be >= 1", id="empty"),
++        param(
++            ("not_a_step",),
++            TypeError,
++            "must be <class '.*OptimizationStep'>",
++            id="wrong_type",
++        ),
++    ],
++)
++def test_steps_invalid(steps, error, match):
++    """Invalid ``steps`` values raise an error."""
++    with pytest.raises(error, match=match):
++        CyclicOptimizationSchedule(steps=steps)
++
++
++@pytest.mark.parametrize(
++    ("n_cycles", "error", "match"),
++    [
++        param(1.5, TypeError, "must be <class 'int'>", id="float"),
++        param("2", TypeError, "must be <class 'int'>", id="string"),
++        param(0, ValueError, "must be > 0", id="zero"),
++        param(-1, ValueError, "must be > 0", id="negative"),
++    ],
++)
++def test_n_cycles(n_cycles, error, match):
++    """Invalid ``n_cycles`` values raise an error."""
++    with pytest.raises(error, match=match):
++        CyclicOptimizationSchedule(steps=(_MOCK_STEP,), n_cycles=n_cycles)
++
++
++@pytest.mark.parametrize(
++    ("bco", "score_fn", "searchspace", "error", "match"),
++    [
++        param(
++            _MOCK_BCO,
++            MagicMock(),
++            _SS_INTERPOINT,
++            IncompatibleSearchSpaceError,
++            "interpoint",
++            id="interpoint_constraints",
++        ),
++        param(
++            _MOCK_BCO,
++            MagicMock(),
++            _SS_DISCRETE_BATCH,
++            IncompatibleSearchSpaceError,
++            "discrete batch",
++            id="discrete_batch_constraint",
++        ),
++        param(
++            _MOCK_BCO,
++            MagicMock(spec=AnalyticAcquisitionFunction),
++            _SS,
++            IncompatibleAcquisitionFunctionError,
++            "analytic",
++            id="analytic_acqf",
++        ),
++        param(
++            _MOCK_BCO_NOMATCH,
++            MagicMock(),
++            _SS,
++            IncompatibleSearchSpaceError,
++            "none of the specified steps",
++            id="all_steps_skipped",
++        ),
++    ],
++)
++def test_raises_on_incompatible_call(bco, score_fn, searchspace, error, match):
++    """Calling the optimizer with incompatible arguments raises an error."""
++    with pytest.raises(error, match=match):
++        bco(2, score_fn, searchspace)
+diff --git a/tests/validation/optimizers/test_continuous_optimizer_validation.py b/tests/validation/optimizers/test_continuous_validation.py
+similarity index 74%
+rename from tests/validation/optimizers/test_continuous_optimizer_validation.py
+rename to tests/validation/optimizers/test_continuous_validation.py
+index dac248e10b..a0aeece0ed 100644
+--- a/tests/validation/optimizers/test_continuous_optimizer_validation.py
++++ b/tests/validation/optimizers/test_continuous_validation.py
+@@ -1,6 +1,5 @@
+ """Validation tests for ContinuousOptimizer."""
+ 
+-from contextlib import nullcontext
+ from unittest.mock import MagicMock
+ 
+ import pytest
+@@ -13,15 +12,14 @@
+     NumericalContinuousParameter,
+     NumericalDiscreteParameter,
+ )
+-from baybe.searchspace.continuous import SubspaceContinuous
++from baybe.searchspace import SearchSpace
+ 
+ _P1 = NumericalContinuousParameter("x1", bounds=(0, 1))
+ _P2 = NumericalContinuousParameter("x2", bounds=(-1, 0))
+ _PD = NumericalDiscreteParameter("d", values=[1, 2, 3])
+ 
+-_SS_DISCRETE = SubspaceContinuous.from_product([_PD])
+-_SS_HYBRID = SubspaceContinuous.from_product([_P1, _PD])
+-_SS_SUBSETS = SubspaceContinuous.from_product(
++_SS_DISCRETE = SearchSpace.from_product([_PD])
++_SS_SUBSETS = SearchSpace.from_product(
+     [_P1, _P2],
+     constraints=[
+         ContinuousCardinalityConstraint(
+@@ -34,8 +32,6 @@
+ @pytest.mark.parametrize(
+     ("n_starts", "error", "match"),
+     [
+-        param(10, None, None, id="valid"),
+-        param(1, None, None, id="valid_minimum"),
+         param(1.5, TypeError, "must be <class 'int'>", id="float"),
+         param("5", TypeError, "must be <class 'int'>", id="string"),
+         param(0, ValueError, "must be > 0", id="zero"),
+@@ -44,15 +40,13 @@
+ )
+ def test_n_starts(n_starts, error, match):
+     """Invalid ``n_starts`` values raise an error."""
+-    with pytest.raises(error, match=match) if error is not None else nullcontext():
++    with pytest.raises(error, match=match):
+         ContinuousOptimizer(n_starts=n_starts)
+ 
+ 
+ @pytest.mark.parametrize(
+     ("n_initial_samples", "error", "match"),
+     [
+-        param(64, None, None, id="valid"),
+-        param(1, None, None, id="valid_minimum"),
+         param(1.5, TypeError, "must be <class 'int'>", id="float"),
+         param("64", TypeError, "must be <class 'int'>", id="string"),
+         param(0, ValueError, "must be > 0", id="zero"),
+@@ -61,7 +55,7 @@ def test_n_starts(n_starts, error, match):
+ )
+ def test_n_initial_samples(n_initial_samples, error, match):
+     """Invalid ``n_initial_samples`` values raise an error."""
+-    with pytest.raises(error, match=match) if error is not None else nullcontext():
++    with pytest.raises(error, match=match):
+         ContinuousOptimizer(n_initial_samples=n_initial_samples)
+ 
+ 
+@@ -74,9 +68,8 @@ def test_sequential():
+ @pytest.mark.parametrize(
+     ("searchspace", "match"),
+     [
+-        param(_SS_DISCRETE, "discrete component", id="discrete_only"),
+-        param(_SS_HYBRID, "discrete component", id="hybrid"),
+-        param(_SS_SUBSETS, "subsets", id="with_subsets"),
++        param(_SS_DISCRETE, "non-empty continuous space", id="discrete_only"),
++        param(_SS_SUBSETS, "containing no subsets", id="with_subsets"),
+     ],
+ )
+ def test_raises_on_incompatible_searchspace(searchspace, match):

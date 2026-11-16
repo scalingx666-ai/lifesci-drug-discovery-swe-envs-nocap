@@ -1,0 +1,873 @@
+diff --git a/Project.toml b/Project.toml
+index f9ace4be65..4a4423ddc5 100644
+--- a/Project.toml
++++ b/Project.toml
+@@ -19,6 +19,7 @@ GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
+ Interpolations = "a98d9a8b-a2ab-59e6-89dd-64a1c18fca59"
+ IterTools = "c8e1da08-722c-5040-9ed9-7db0dc04731e"
+ KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
++LOBPCGEigensolver = "87a0849e-8492-4fcc-8734-ba6a5d902784"
+ Libxc = "66e17ffc-8502-11e9-23b5-c9248d0eb96d"
+ LineSearches = "d3d80556-e9d4-5f37-9878-2ab0fcc64255"
+ LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+@@ -102,6 +103,7 @@ IterTools = "1"
+ JLD2 = "0.4, 0.5, 0.6"
+ JSON3 = "1"
+ KrylovKit = "0.8.3, 0.9, 0.10"
++LOBPCGEigensolver = "0.1.1"
+ Libxc = "0.3.24"
+ LineSearches = "7"
+ LinearAlgebra = "1"
+diff --git a/ext/DFTKAMDGPUExt.jl b/ext/DFTKAMDGPUExt.jl
+index f870c129d2..4c61c0aefe 100644
+--- a/ext/DFTKAMDGPUExt.jl
++++ b/ext/DFTKAMDGPUExt.jl
+@@ -11,19 +11,9 @@ function DFTK.memory_usage(::GPU{<:AMDGPU.ROCArray})
+     merge(DFTK.memory_usage(CPU()), (; gpu=AMDGPU.memory_stats().live))
+ end
+ 
+-# Temporary workaround for 5-argumet mul!, where performance is very bad when array
+-# element types and scaling factors types differ.
+-# See https://github.com/JuliaGPU/AMDGPU.jl/issues/866#issuecomment-3636981853
+-# Scaling a Float/Complex matrix with an Integer:
+-function LinearAlgebra.mul!(C::AMDGPU.ROCArray{T}, A::AMDGPU.ROCArray{T}, B::AMDGPU.ROCArray{T},
+-                            α::U, β::U) where {T<:Union{AbstractFloat,Complex}, U<:Integer}
+-    LinearAlgebra.mul!(C, A, B, T(α), T(β))
+-end
+-# Scaling a Complex matrix with a Float:
+-function LinearAlgebra.mul!(C::AMDGPU.ROCArray{T}, A::AMDGPU.ROCArray{T}, B::AMDGPU.ROCArray{T},
+-                            α::U, β::U) where {T<:Complex, U<:AbstractFloat}
+-    LinearAlgebra.mul!(C, A, B, T(α), T(β))
+-end
++# Additional performance-related workarounds and fixes can be found in the file
++# ext/LOBPCGEigensolverAMDGPUExt.jl in https://github.com/JuliaMolSim/LOBPCGEigensolver.jl
++# As of August 2026 this is mostly for the 5-argument mul! function.
+ 
+ # Ensure precompilation is only performed if an AMD GPU is available
+ # AMDGPU pre-compiliation is currently broken on Julia 1.11,
+diff --git a/src/DFTK.jl b/src/DFTK.jl
+index 36a42f9fb5..9c6fce2706 100644
+--- a/src/DFTK.jl
++++ b/src/DFTK.jl
+@@ -13,8 +13,10 @@ using GPUArraysCore
+ using Random
+ using PrecompileTools
+ using PseudoPotentialData
++using LOBPCGEigensolver
++import LOBPCGEigensolver: lobpcg, precondprep!, DefaultLobpcgCallback
+ 
+-@template (FUNCTIONS, METHODS, MACROS) = 
++@template (FUNCTIONS, METHODS, MACROS) =
+     """
+     $(TYPEDSIGNATURES)
+     $(DOCSTRING)
+diff --git a/src/common/timer.jl b/src/common/timer.jl
+index 3a5fdbdf6f..c73ad8dca0 100644
+--- a/src/common/timer.jl
++++ b/src/common/timer.jl
+@@ -7,6 +7,12 @@ using Preferences
+ """TimerOutput object used to store DFTK timings."""
+ const timer = TimerOutput()
+ 
++# `@timing` expands to nothing when timings are disabled, but external packages we hand
++# `timer` to (LOBPCGEigensolver) would still record into it, so switch the object off too.
++@static if @load_preference("timer_enabled", "true") != "true"
++    disable_timer!(timer)
++end
++
+ """
+ Shortened version of the `@timeit` macro from `TimerOutputs`,
+ which writes to the DFTK timer.
+diff --git a/src/eigen/diag.jl b/src/eigen/diag.jl
+index 116621d55f..d5b01694d8 100644
+--- a/src/eigen/diag.jl
++++ b/src/eigen/diag.jl
+@@ -74,6 +74,8 @@ function select_eigenpairs_all_kblocks(eigres, range)
+                    residual_norms=[resk[range] for resk in eigres.residual_norms]))
+ end
+ 
+-# The actual implementations using the above primitives
++# The actual implementations using the above primitives. `lobpcg_hyper` is a thin
++# wrapper around the LOBPCG solver from the standalone LOBPCGEigensolver.jl package
++# (imported at the top of DFTK.jl); `diag_full` is a dense reference solver.
+ include("diag_full.jl")
+ include("diag_lobpcg_hyper.jl")
+diff --git a/src/eigen/diag_lobpcg_hyper.jl b/src/eigen/diag_lobpcg_hyper.jl
+index 27795bb3c0..9ed9fd75f4 100644
+--- a/src/eigen/diag_lobpcg_hyper.jl
++++ b/src/eigen/diag_lobpcg_hyper.jl
+@@ -1,14 +1,14 @@
+-include("lobpcg_hyper_impl.jl")
+-
++# Thin DFTK-flavored wrapper around the LOBPCG solver from the LOBPCGEigensolver.jl package:
++# picks a sensible default tolerance and reports convergence / iteration count.
+ # Note that this function will return λ on the CPU,
+ # but X and the history on the device (for GPU runs)
+-function lobpcg_hyper(A, X0; maxiter=100, prec=nothing,
+-                      tol=20size(A, 2)*eps(real(eltype(A))),
+-                      largest=false, n_conv_check=nothing, kwargs...)
++@timing function lobpcg_hyper(A, X0; maxiter=100, prec=nothing,
++                              tol=20size(A, 2)*eps(real(eltype(A))),
++                              largest=false, n_conv_check=nothing, kwargs...)
+     prec === nothing && (prec = I)
+ 
+     @assert !largest "Only seeking the smallest eigenpairs is implemented."
+-    result = LOBPCG(A, X0, I, prec, tol, maxiter; n_conv_check, kwargs...)
++    result = lobpcg(A, X0, I, prec, tol, maxiter; n_conv_check, timer, kwargs...)
+ 
+     n_conv_check === nothing && (n_conv_check = size(X0, 2))
+     converged = maximum(result.residual_norms[1:n_conv_check]) < tol
+diff --git a/src/eigen/lobpcg_hyper_impl.jl b/src/eigen/lobpcg_hyper_impl.jl
+deleted file mode 100644
+index 2f3b1c75c1..0000000000
+--- a/src/eigen/lobpcg_hyper_impl.jl
++++ /dev/null
+@@ -1,613 +0,0 @@
+-# Implementation of the LOBPCG algorithm, seeking optimal performance
+-# and stability (it should be very, very hard to break, even at tight
+-# tolerance criteria). The code is not 100% optimized yet, but the
+-# most time-consuming parts (BLAS3 and matvecs) should be OK. The
+-# implementation follows the scheme of Hetmaniuk & Lehoucq (see also
+-# the refinements in Duersch et. al.), with the following
+-# modifications:
+-
+-# - Cholesky factorizations are used instead of the eigenvalue
+-# decomposition of Stathopolous & Wu for the orthogonalization.
+-# Cholesky orthogonalization is fast but has an unwarranted bad
+-# reputation: when applied twice to a matrix X with κ(X) <~
+-# sqrt(1/ε), where ε is the machine epsilon, it will produce a set
+-# of very orthogonal vectors, just as the eigendecomposition-based
+-# method. It can fail when κ >~ sqrt(1/ε), but that can be fixed by
+-# shifting the overlap matrix. This is very reliable while being
+-# much faster than eigendecompositions.
+-
+-# - Termination criteria for the orthogonalization are based on cheap
+-# estimates instead of costly explicit checks.
+-
+-# - The default tolerances are very tight, yielding a very stable
+-# algorithm. This can be tweaked (see keyword ortho_tol) to
+-# compromise on stability for less Cholesky factorizations.
+-
+-# - Implicit product updates (reuse of matvecs) are performed whenever
+-# it is safe to do so, ie only with orthogonal transformations. An
+-# exception is the B matrix reuse, which seems to be OK even with very
+-# badly conditioned B matrices. The code is easy to modify if this is
+-# not the case.
+-
+-# - The locking is performed carefully to ensure minimal impact on the
+-# other eigenvectors (which is not the case in many - all ? - other
+-# implementations)
+-
+-# - Some generic linear algebra functions are used in this implementation. They can be
+-#   found in src/common/linalg.jl. GPU optimized versions of these functions are located
+-#   in src/gpu/linalg.jl.
+-
+-
+-## TODO micro-optimization of buffer reuse
+-## TODO write a version that doesn't assume that B is well-conditioned, and doesn't reuse B applications at all
+-## TODO it seems there is a lack of orthogonalization immediately after locking, maybe investigate this to save on some Choleskys
+-## TODO debug orthogonalizations when A=I
+-
+-using LinearAlgebra
+-import LinearAlgebra: BlasFloat
+-import Base: *
+-import Base.size, Base.adjoint, Base.Array
+-
+-"""
+-Simple wrapper to represent a matrix formed by the concatenation of
+-column blocks: it is mostly equivalent to hcat, but doesn't allocate
+-the full matrix.
+-
+-A multiplication involving this structure will always yield a plain
+-array (and not a LazyHcat structure).
+-
+-LazyHcat is a lightweight subset of BlockArrays.jl's functionalities,
+-but has the advantage to be able to store GPU Arrays (BlockArrays is
+-heavily built on Julia's CPU Array). LazyHcat only supports a few
+-multiplication routines, those needed by LOBPCG : A'B with A and B
+-LazyHcat, and A*B with A LazyHCat and B a plain matrix.
+-"""
+-struct LazyHcat{T<:Number, D<:Tuple} <: AbstractMatrix{T}
+-    blocks::D
+-end
+-
+-# Convenience functions
+-function LazyHcat(arrays::AbstractArray...)
+-    @assert length(arrays) != 0
+-    n_ref = size(arrays[1], 1)
+-    @assert  all(size.(arrays, 1) .== n_ref)
+-
+-    T = promote_type(map(eltype, arrays)...)
+-
+-    LazyHcat{T, typeof(arrays)}(arrays)
+-end
+-function Base.size(A::LazyHcat)
+-    n = size(A.blocks[1], 1)
+-    m = sum(size(block, 2) for block in A.blocks)
+-    (n, m)
+-end
+-Base.Array(A::LazyHcat)   = stack(A.blocks)
+-Base.adjoint(A::LazyHcat) = Adjoint(A)
+-
+-# Computes A*B matrix product when B is a LazyHcat and A is a LazyVcat (adjoint of LazyHcat).
+-# Special case if product is known to be Hermitian, since only the upper block diagonal is needed.
+-# This _mul function is used for the standard and Hermitian cases (see mul_hermi function below)
+-@views function _mul(A::Adjoint{T,<:LazyHcat}, B::LazyHcat; hermitian=Val(false)) where {T}
+-    Ap = A.parent
+-    rows = size(Ap, 2)
+-    cols = size(B, 2)
+-    ret = similar(B.blocks[1], rows, cols)
+-
+-    # Only populate the upper block diagonal in Hermitian case
+-    ocol = 0  # column offset
+-    for (ib, blB) in enumerate(B.blocks)
+-        orow = 0  # row offset
+-        for (ia, blA) in enumerate(Ap.blocks)
+-            (hermitian isa Val{true} && ib < ia) && continue
+-            ret[orow .+ (1:size(blA, 2)), ocol .+ (1:size(blB, 2))] .= blA' * blB
+-            orow += size(blA, 2)
+-        end
+-        ocol += size(blB, 2)
+-    end
+-
+-    if hermitian isa Val{true}
+-        Hermitian(ret)
+-    else
+-        ret
+-    end
+-end
+-Base.:*(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}       = _mul(A, B)
+-Base.:*(A::Adjoint{T,<:LazyHcat}, B::AbstractMatrix) where {T} = A * LazyHcat(B)
+-
+-# General A*B product when the result is known to be Hermitian
+-mul_hermi(A, B) = Hermitian(A * B)
+-function mul_hermi(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}
+-    _mul(A, B; hermitian=Val(true))
+-end
+-
+-# LazyHCat * Matrix
+-@views function LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat,
+-                                   B::AbstractMatrix, α::Number, β::Number)
+-    offset = 0
+-    for (i, block) in enumerate(Ablock.blocks)
+-        mul!(res, block, B[offset .+ (1:size(block, 2)), :], α, i == 1 ? β : true)
+-        offset += size(block, 2)
+-    end
+-    res
+-end
+-mul!(res::AbstractMatrix, Ablock::LazyHcat, B::AbstractMatrix) = mul!(res, Ablock, B, true, false)
+-function *(Ablock::LazyHcat, B::AbstractMatrix)
+-    res = zeros_like(B, size(Ablock, 1), size(B, 2))
+-    mul!(res, Ablock, B)
+-end
+-
+-
+-# Perform a Rayleigh-Ritz for the N first eigenvectors.
+-@timing function rayleigh_ritz(X, AX, N)
+-    XAX = mul_hermi(X', AX)
+-    @assert !any(isnan, UpperTriangular(parent(XAX)))
+-    rayleigh_ritz(XAX, N)
+-end
+-@views function rayleigh_ritz(XAX::Hermitian, N)
+-    # Fallback: Use whatever is the default dense eigensolver.
+-    # Note: GenericLinearAlgebra uses a QR-based algorithm, which is pretty safe in terms
+-    #       of keeping the vectors orthogonal
+-    values, vectors = eigen(XAX)
+-    vectors[:, 1:N], values[1:N]
+-end
+-@views function rayleigh_ritz(XAX::Hermitian{<:BlasFloat, <:Array}, N)
+-    # LAPACK sysevr (the Julia default eigensolver up to 1.11 ) can actually return
+-    # eigenvectors that are significantly non-orthogonal (1e-4 in Float32 in some tests)
+-    # here, presumably because it tries hard to make them eigenvectors in the presence
+-    # of small gaps. syevd (or DivideAndConquer()) does a much better job, see
+-    # https://github.com/JuliaLang/julia/pull/49262 and
+-    # https://github.com/JuliaLang/julia/pull/49355. It will be the default in 1.12.
+-    # For versions < 1.12, since we mainly care about eigenvectors being orthogonal
+-    # we re-orthogonalise explicitly.
+-    @static if VERSION >= v"1.12"
+-        values, vectors = eigen(XAX; alg=LinearAlgebra.DivideAndConquer())
+-        return vectors[:, 1:N], values[1:N]
+-    else
+-        values, vectors = eigen(XAX)
+-        v = vectors[:, 1:N]
+-        ortho!(v)
+-        return v, values[1:N]
+-    end
+-end
+-
+-# B-orthogonalize X (in place) using only one B apply.
+-# This uses an unstable method which is only OK if X is already
+-# orthogonal (not B-orthogonal) and B is relatively well-conditioned
+-# (which implies that X'BX is relatively well-conditioned, and
+-# therefore that it is safe to cholesky it and reuse the B apply)
+-function B_ortho!(X, BX)
+-    O = mul_hermi(X', BX)
+-    U = cholesky(O).U
+-    @assert !any(isnan, U)
+-    rdiv!(X, U)
+-    rdiv!(BX, U)
+-end
+-
+-# Gets a Cholesky factorization of an Hermitian O = R'R, protecting for failure,
+-# in which case gets something *ressembling* a Cholesky factorization
+-# Standard Cholesky factorization can fail when O is ill-conditioned.
+-# On the GPU, it fails silently, and NaN elements start appearing.
+-function safe_cholesky(O::AbstractArray{T}; nchol=0, α=100) where {T}
+-    local R
+-    local invR
+-    nchol >= 5 && return nothing, nothing, 10000 # give up
+-    try
+-        nchol += 1
+-        R = cholesky(O).U
+-        invR = inv(R)
+-        @assert !any(isnan, invR)
+-    catch err
+-        @debug "Cholesky failed in ortho(X)"
+-        # see https://arxiv.org/pdf/1809.11085.pdf for a nice analysis
+-        # We are not being very clever here; but this should very rarely happen
+-        # so it should be OK
+-        O += α*eps(real(T))*norm(O)*I
+-        α *= 10
+-        return safe_cholesky(O; nchol, α)
+-    end
+-
+-    R, invR, nchol # we also return invR because it's used in the caller
+-end
+-
+-normest(M) = maximum(abs, diag(M)) + norm(M - Diagonal(diag(M)))
+-# Orthogonalizes X to tol
+-# Returns the new X, the number of Cholesky factorizations algorithm, and the
+-# growth factor by which small perturbations of X can have been magnified
+-@timing function ortho!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
+-    growth_factor   = one(real(T))
+-    estimated_error = one(real(T))
+-
+-    nchol_total = 0
+-    while true
+-        # get cholesky factor
+-        O = mul_hermi(X', X)
+-        R, invR, nchol = safe_cholesky(O)
+-        nchol_total += nchol
+-        if nchol > 10
+-            @error("Ortho(X) is failing badly, falling back to SVD",
+-                   estimated_error=round(estimated_error; sigdigits=2), tol=tol)
+-            U, _, V = svd(X)
+-            return (; X=U*V', nchol=100, growth_factor=1)
+-        end
+-
+-        # attempt to orthogonalize using it
+-        rmul!(X, invR)
+-
+-        # We would like growth_factor *= opnorm(inv(R)) but it's too
+-        # expensive, so we use an upper bound which is sharp enough to
+-        # be close to 1 when R is close to I, which we need for the
+-        # outer loop to terminate anyway
+-        # ||invR|| = ||D + E|| ≤ ||D|| + ||E|| ≤ ||D|| + ||E||_F,
+-        # where ||.|| is the 2-norm and ||.||_F the Frobenius
+-
+-        norminvR = normest(invR)
+-        growth_factor *= norminvR
+-        # condR = 1/LAPACK.trcon!('I', 'U', 'N', Array(R))
+-        condR = normest(R)*norminvR  # in practice this seems to be an OK estimate
+-
+-        @debug "Ortho(X) nchol_total $nchol_total $(eps(real(T))*condR^2) < $tol"
+-
+-        # a good a posteriori error (without actually recomputing X'X) is that X'X - I is eps()*κ(R)^2;
+-        # in practice this seems to be sometimes very overconservative
+-        estimated_error = eps(real(T))*condR^2
+-        # we loop until 1) cholesky succeeded at first attempt
+-        #               2) the a posteriori error estimate is sufficiently small
+-        nchol == 1 && estimated_error < tol && break
+-    end
+-
+-    # @assert norm(X'X - I) < tol
+-
+-    (; X, nchol=nchol_total, growth_factor)
+-end
+-
+-# Randomize the columns of X if the norm is below tol
+-function drop_small!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
+-    dropped = findall(n -> n <= tol, columnwise_norms(X))
+-    @views randn!(TaskLocalRNG(), X[:, dropped])
+-    dropped
+-end
+-
+-# Find X that is orthogonal, and B-orthogonal to Y, up to a tolerance tol.
+-@timing "ortho! X vs Y" function ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T))) where {T}
+-    # normalize to try to cheaply improve conditioning
+-    X ./= columnwise_norms(X)'
+-
+-    niter = 1
+-    ninners = zeros(Int, 0)
+-    while true
+-        BYX = BY' * X
+-        mul!(X, Y, BYX, -1, 1)  # X -= Y*BY'X
+-        # If the orthogonalization has produced results below 2eps, we drop them
+-        # This is to be able to orthogonalize eg [1;0] against [e^iθ;0],
+-        # as can happen in extreme cases in the ortho!(cP, cX)
+-        dropped = drop_small!(X; tol)
+-        if !isempty(dropped)
+-            X[:, dropped] .-= Y * (BY' * X[:, dropped])
+-        end
+-
+-        if norm(BYX) < tol && niter > 1
+-            push!(ninners, 0)
+-            break
+-        end
+-        X, ninner, growth_factor = ortho!(X; tol)
+-        push!(ninners, ninner)
+-
+-        # norm(BY'X) < tol && break should be the proper check, but
+-        # usually unnecessarily costly. Instead, we predict the error
+-        # according to the growth factor of the orthogonalization.
+-        # Assuming BY'Y = 0 to machine precision, after the
+-        # Y-orthogonalization, BY'X is O(eps), so BY'X will be bounded
+-        # by O(eps * growth_factor).
+-
+-        # If we're at a fixed point, growth_factor is 1 and if tol > eps(),
+-        # the loop will terminate, even if BY'Y != 0
+-        estimated_error = growth_factor * eps(real(T))
+-        estimated_error < tol && break
+-
+-        if niter > 10
+-            U, _, V = svd(X)  # Fall back to gold standard
+-            X = U*V'
+-            @error("Ortho(X, Y) is failing badly, falling back to SVD",
+-                   ninners=ninners, error=round(norm(BY'X); sigdigits=2), tol=tol,
+-                   estimated_error=round(estimated_error; sigdigits=2))
+-            return X
+-        end
+-        niter += 1
+-    end
+-    @debug "Required $ninners choleskys in ortho!(X, Y)"
+-
+-    # @assert (norm(BY'X)) < tol
+-    # @assert (norm(X'X-I)) < tol
+-
+-    X
+-end
+-
+-function final_retval(X, AX, BX, λ, resid_history, niter, n_matvec)
+-    λ_host = to_cpu(λ)  # Copy to CPU for element-wise access
+-    if !issorted(λ_host)
+-        p = sortperm(λ_host)
+-        λ_host = λ_host[p]
+-        X  = X[:, p]
+-        AX = AX[:, p]
+-        BX = BX[:, p]
+-        resid_history = resid_history[p, :]
+-    end
+-    (; λ=λ_host, X, AX, BX,
+-     residual_norms=resid_history[:, niter+1],
+-     residual_history=resid_history[:, 1:niter+1], n_matvec)
+-end
+-
+-# Computes λ = real((X' * AX) / (X' *BX)), for each column of X
+-function compute_λ(X, AX, BX)
+-    λs = @views [real((X[:, n]'*AX[:, n]) / (X[:, n]'BX[:, n])) for n=1:size(X, 2)]
+-    oftype(real(X[:, 1]), λs)  # Offload to GPU if needed
+-end
+-
+-### The algorithm is Xn+1 = rayleigh_ritz(hcat(Xn, A*Xn, Xn-Xn-1))
+-### We follow the strategy of Hetmaniuk and Lehoucq, and maintain a B-orthonormal basis Y = (X,R,P)
+-### After each rayleigh_ritz step, the B-orthonormal X and P are deduced by an orthogonal rotation from Y
+-### R is then recomputed, and orthonormalized explicitly wrt BX and BP
+-### We reuse applications of A/B when it is safe to do so, ie only with orthogonal transformations
+-
+-# Note that this function will return λ on the CPU,
+-# but X and the history on the device (for GPU runs)
+-@timing function LOBPCG(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
+-                        miniter=1, ortho_tol=2eps(real(eltype(X))),
+-                        n_conv_check=nothing, callback=identity)
+-    N, M = size(X)
+-
+-    # If N is too small, we will likely get in trouble
+-    error_message(verb) = "The eigenproblem is too small, and the iterative " *
+-                           "eigensolver $verb fail; increase the number of " *
+-                           "degrees of freedom, or use a dense eigensolver."
+-    N > 3M    || error(error_message("will"))
+-    N >= 3M+5 || @warn error_message("might")
+-
+-    isnothing(n_conv_check) && (n_conv_check = M)
+-    resid_history = zeros(real(eltype(X)), M, maxiter+1)
+-
+-    # B-orthogonalize X
+-    X = ortho!(copy(X), tol=ortho_tol)[1]
+-    if B != I
+-        BX = similar(X)
+-        BX = mul!(BX, B, X)
+-        B_ortho!(X, BX)
+-    end
+-
+-    n_matvec = M  # Count number of matrix-vector products
+-    AX = similar(X)
+-    AX = mul!(AX, A, X)
+-    @assert !any(isnan, AX)
+-    # full_X/AX/BX will always store the full (including locked) X.
+-    # X/AX/BX only point to the active part
+-    P = zero(X)
+-    AP = zero(X)
+-    R = zero(X)
+-    AR = zero(X)
+-    # Pre-allocating work arrays
+-    new_R = zero(X)
+-    new_X = copy(X)
+-    new_AX = copy(AX)
+-    new_P = zero(X)
+-    new_AP = zero(X)
+-    if B != I
+-        BR = zero(X)
+-        # BX was already computed
+-        BP = zero(X)
+-    else
+-        # The B arrays are just pointers to the same data
+-        BR = R
+-        BX = X
+-        BP = P
+-    end
+-    nlocked = 0
+-    niter = 0  # the first iteration is fake
+-    λs = compute_λ(X, AX, BX)
+-    new_BX = BX
+-    # The full_ arrays contain all the vectors, the others only get the active ones
+-    full_X  = X
+-    full_AX = AX
+-    full_BX = BX
+-    full_λs = λs
+-
+-    while true
+-        if niter > 0  # first iteration is just to compute the residuals (no X update)
+-            ###  Perform the Rayleigh-Ritz
+-            mul!(AR, A, R)
+-            n_matvec += size(R, 2)
+-
+-            # Form Rayleigh-Ritz subspace
+-            if niter > 1
+-                Y  = LazyHcat(X, R, P)
+-                AY = LazyHcat(AX, AR, AP)
+-                BY = LazyHcat(BX, BR, BP)  # data shared with (X, R, P) in non-general case
+-            else
+-                Y  = LazyHcat(X, R)
+-                AY = LazyHcat(AX, AR)
+-                BY = LazyHcat(BX, BR)  # data shared with (X, R) in non-general case
+-            end
+-            cX, λs_RR = rayleigh_ritz(Y, AY, M-nlocked)
+-            λs .= λs_RR
+-
+-            # Update X. By contrast to some other implementations, we
+-            # wait on updating P because we have to know which vectors
+-            # to lock (and therefore the residuals) before computing P
+-            # only for the unlocked vectors. This results in better convergence.
+-            mul!(new_X, Y, cX)
+-            mul!(new_AX, AY, cX)  # no accuracy loss, since cX orthogonal
+-            new_BX = (B == I) ? new_X : BY * cX
+-        end
+-
+-        ### Compute new residuals
+-        @timing "Update residuals" begin
+-            new_R .= new_AX .- new_BX .* λs'
+-            norms = to_cpu(columnwise_norms(new_R))
+-            @views resid_history[1 + nlocked: size(new_R, 2) + nlocked, niter+1] .= norms[:]
+-        end
+-        @debug niter resid_history[:, niter+1]
+-
+-        # it is actually a good question of knowing when to
+-        # precondition. Here seems sensible, but it could plausibly be
+-        # done before or after
+-        if precon !== I
+-            @timing "preconditioning" begin
+-                precondprep!(precon, new_X)  # update preconditioner if needed; defaults to noop
+-                ldiv!(precon, new_R)
+-            end
+-        end
+-
+-        ### Compute number of locked vectors
+-        prev_nlocked = nlocked
+-        if niter ≥ miniter  # No locking if below miniter
+-            for i=nlocked+1:M
+-                if resid_history[i, niter+1] < tol
+-                    nlocked += 1
+-                    @debug "Locked eigenvector $nlocked"
+-                else
+-                    # We lock in order, assuming that the lowest
+-                    # eigenvectors converge first; might be tricky otherwise
+-                    break
+-                end
+-            end
+-        end
+-
+-        # TODO: Some of these info field have not so canonical names compared to the
+-        #       rest of DFTK, we should change this in the future.
+-        info = (; n_iter=niter, n_matvec, n_locked=nlocked, resid_history,
+-                  n_conv_check, λs, X, AX, BX, stage=:iterate)
+-        callback(info)
+-
+-        if nlocked >= n_conv_check  # Converged!
+-            X  .= new_X  # Update the part of X which is still active
+-            AX .= new_AX
+-            return final_retval(full_X, full_AX, full_BX, full_λs, resid_history, niter, n_matvec)
+-        end
+-        newly_locked = nlocked - prev_nlocked
+-        active = newly_locked+1:size(X,2)  # newly active vectors
+-
+-        if niter > 0
+-            ### compute P = Y*cP only for the newly active vectors
+-            Xn_indices = newly_locked+1:M-prev_nlocked
+-            # TODO understand this for a potential save of an
+-            # orthogonalization, see Hetmaniuk & Lehoucq, and Duersch et. al.
+-            # cP = copy(cX)
+-            # cP[Xn_indices,:] .= 0
+-
+-            lenXn = length(Xn_indices)
+-            e = zeros_like(X, size(cX, 1), M - prev_nlocked)
+-            lower_diag = one(similar(X, lenXn, lenXn))
+-            # e has zeros everywhere except on one of its lower diagonal
+-            e[Xn_indices[1]:last(Xn_indices), 1:lenXn] = lower_diag
+-
+-            cP = cX .- e
+-            cP = cP[:, Xn_indices]
+-            # orthogonalize against all Xn (including newly locked)
+-            ortho!(cP, cX, cX, tol=ortho_tol)
+-
+-            @views begin
+-                new_P = new_P[:, Xn_indices]
+-                new_AP = new_AP[:, Xn_indices]
+-                B != I && (new_BP = new_BP[:, Xn_indices])
+-            end
+-
+-            # Get new P
+-            mul!(new_P, Y, cP)
+-            mul!(new_AP, AY, cP)
+-            if B != I
+-                new_BP = BY * cP
+-            else
+-                new_BP = new_P
+-            end
+-        end
+-
+-        # Update all X, even newly locked
+-        X  .= new_X
+-        AX .= new_AX
+-        R  .= new_R
+-        if B != I
+-            BX .= new_BX
+-        end
+-
+-        # Quick sanity check
+-        diffs = abs.(columnwise_dots(BX, X) .-1)
+-        if any(diffs .>= sqrt(eps(real(eltype(X)))))
+-           error("LOBPCG is badly failing to keep the vectors normalized; this should never happen")
+-        end
+-
+-        # Restrict all views to active
+-        @views begin
+-            X = X[:, active]
+-            new_X = new_X[:, active]
+-            AX = AX[:, active]
+-            new_AX = new_AX[:, active]
+-            BX = BX[:, active]
+-            R = R[:, active]
+-            new_R = new_R[:, active]
+-            AR = AR[:, active]
+-            BR = BR[:, active]
+-            P = P[:, active]
+-            AP = AP[:, active]
+-            BP = BP[:, active]
+-            λs = λs[active]
+-        end
+-
+-        # Update newly active P
+-        if niter > 0
+-            P .= new_P
+-            AP .= new_AP
+-            if B != I
+-                BP .= new_BP
+-            end
+-        end
+-
+-        # Orthogonalize R wrt all X, newly active P
+-        if niter > 0
+-            Z  = LazyHcat(full_X, P)
+-            BZ = LazyHcat(full_BX, BP)  # data shared with (full_X, P) in non-general case
+-        else
+-            Z  = full_X
+-            BZ = full_BX
+-        end
+-        ortho!(R, Z, BZ; tol=ortho_tol)
+-        if B != I
+-            mul!(BR, B, R)
+-            B_ortho!(R, BR)
+-        end
+-
+-        niter >= maxiter && break
+-        niter = niter + 1
+-    end
+-
+-    final_retval(full_X, full_AX, full_BX, full_λs, resid_history, maxiter, n_matvec)
+-end
+-
+-struct DefaultLobpcgCallback
+-    prev_time::Ref{UInt64}
+-end
+-DefaultLobpcgCallback() = DefaultLobpcgCallback(Ref(zero(UInt64)))
+-
+-function (cb::DefaultLobpcgCallback)(info)
+-    if info.stage == :finalize
+-        info.converged || @warn "Lobpcg not converged."
+-        return info
+-    end
+-
+-    if info.n_iter == 0
+-        cb.prev_time[] = time_ns()
+-        println("Iter     Converged     log10(resid)    time  \n")
+-        println("----   -------------   ------------   -------\n")
+-    end
+-
+-    current_time = time_ns()
+-    runtime_ns = current_time - cb.prev_time[]
+-    cb.prev_time[] = current_time
+-
+-    time = @sprintf "% 6s" TimerOutputs.prettytime(runtime_ns)
+-    resid_norm = norm(info.resid_history[1:info.n_conv_check, info.n_iter+1])
+-    resid_str = " " * format_log8(resid_norm)
+-
+-    @printf("% 4d   %5d / %5d   %s       %s\n",
+-            info.n_iter, info.n_locked, info.n_conv_check, resid_str, time)
+-    flush(stdout)
+-    info
+-end
+diff --git a/src/eigen/preconditioners.jl b/src/eigen/preconditioners.jl
+index dd0335a0b0..9bb1a84840 100644
+--- a/src/eigen/preconditioners.jl
++++ b/src/eigen/preconditioners.jl
+@@ -7,12 +7,12 @@
+ # ldiv! and mul! (both 2 and 3-arg versions)
+ # Additionally if the solver supports adaptive preconditioning
+ # it will call `precondprep!(P,X)` right before calling `ldiv!`
++# The generic `precondprep!` API lives in LOBPCGEigensolver.jl (imported in DFTK.jl); the
++# methods below extend it for DFTK's preconditioner types.
+ 
+ import LinearAlgebra: ldiv!
+ import LinearAlgebra: mul!
+ 
+-precondprep!(P, X) = P  # This API is also used in Optim.jl
+-
+ """
+ No preconditioning.
+ """
+diff --git a/src/gpu/linalg.jl b/src/gpu/linalg.jl
+index 7cef0eb43f..de4f340c19 100644
+--- a/src/gpu/linalg.jl
++++ b/src/gpu/linalg.jl
+@@ -1,19 +1,14 @@
+-### GPU-specific implementations of functions called during LOBPCG
++### GPU-specific implementations of DFTK's column-wise linear algebra helpers.
+ # The massive parallelism of the GPU can only be fully exploited when
+ # operating on whole arrays. For performance reasons, one should avoid
+ # explicitly looping over columns or elements. This approach is not
+ # necessarily the most performant on CPU, as the allocation of large
+ # temporary arrays hurts cache locality. It is also harder to read.
++# (The analogous helpers used *inside* the eigensolver live in LOBPCGEigensolver.jl.)
+ 
+ using LinearAlgebra
+ using GPUArraysCore
+ 
+-function compute_λ(X::AbstractGPUArray{T}, AX::AbstractGPUArray{T}, BX::AbstractGPUArray{T}) where {T}
+-    num = sum(conj(X) .* AX, dims=1)
+-    den = sum(conj(X) .* BX, dims=1)
+-    vec(real.(num ./ den))
+-end
+-
+ function columnwise_dots(A::AbstractGPUArray{T}, B::AbstractGPUArray{T}) where {T}
+     vec(sum(conj(A) .* B; dims=1))
+ end
+diff --git a/src/response/hessian.jl b/src/response/hessian.jl
+index 0aa53b258d..1c9e5ca08c 100644
+--- a/src/response/hessian.jl
++++ b/src/response/hessian.jl
+@@ -419,7 +419,7 @@ end
+     Ax = vec(δρ - χ0δV)  # (1 - χ0 K) δρ
+     (; Ax, info=(; rtol, res...))
+ end
+-function size(ε_adj::DielectricAdjoint, i::Integer)
++function Base.size(ε_adj::DielectricAdjoint, i::Integer)
+     if 1 ≤ i ≤ 2
+         return prod(size(ε_adj.ρ))
+     else
+diff --git a/test/forwarddiff/parameters.jl b/test/forwarddiff/parameters.jl
+index 23d9cddda4..52c4e850af 100644
+--- a/test/forwarddiff/parameters.jl
++++ b/test/forwarddiff/parameters.jl
+@@ -26,10 +26,10 @@ function run_test(; architecture)
+                           functionals=LDA(), temperature=1e-2, smearing=Smearing.Gaussian())
+         basis = PlaneWaveBasis(model; Ecut=5, kgrid=[2, 2, 2], architecture)
+ 
+-        is_converged = DFTK.ScfConvergenceDensity(1e-10)
+-        scfres = self_consistent_field(basis; is_converged, mixing=KerkerMixing(),
++        scfres = self_consistent_field(basis; tol=1e-12, mixing=KerkerMixing(),
+                                        nbandsalg=FixedBands(; n_bands_converge=10),
+-                                       damping=0.6, response=ResponseOptions(; verbose=true))
++                                       damping=0.6,
++                                       response=ResponseOptions(; tol=1e-12, verbose=true))
+ 
+         ComponentArray(
+            eigenvalues=stack([ev[1:10] for ev in DFTK.to_cpu(scfres.eigenvalues)]),
+@@ -266,4 +266,4 @@ end
+     if AMDGPU.has_rocm_gpu()
+         TemperatureSensitivity.run_test(; architecture=DFTK.GPU(ROCArray))
+     end
+-end
+\ No newline at end of file
++end
+diff --git a/test/lobpcg.jl b/test/lobpcg.jl
+index 52da5a71cc..fe2093acb0 100644
+--- a/test/lobpcg.jl
++++ b/test/lobpcg.jl
+@@ -121,43 +121,7 @@ end
+     end
+ end
+ 
+-@testitem "LOBPCG Internal data structures" setup=[TestCases] begin
+-    using DFTK
+-    using LinearAlgebra
+-    import DFTK: mul_hermi
+-
+-    a1 = rand(10, 5)
+-    a2 = rand(10, 2)
+-    a3 = rand(10, 7)
+-    b1 = rand(10, 6)
+-    b2 = rand(10, 2)
+-    A = hcat(a1,a2,a3)
+-    B = hcat(b1,b2)
+-    Ablock = DFTK.LazyHcat(a1, a2, a3)
+-    Bblock = DFTK.LazyHcat(b1, b2)
+-    @test Ablock'*Bblock ≈ A'*B
+-    @test Ablock'*B ≈ A'*B
+-
+-    C = rand(14, 4)
+-    @test Ablock*C ≈ A*C
+-
+-    D = rand(10, 4)
+-    @test mul!(D,Ablock, C, 1, 0) ≈ A*C
+-
+-    @test mul_hermi(Ablock', Ablock) ≈ A' * A
+-end
+-
+-@testitem "LOBPCG print callback" setup=[TestCases] begin
+-    using DFTK
+-    using LinearAlgebra
+-
+-    A = randn(40, 40)
+-    A = A+A' + 20I
+-    X = randn(40, 3)
+-
+-    # Run the callback to make sure it works, but don't print anything
+-    res = redirect_stdout(devnull) do
+-        lobpcg_hyper(A, X; prec= Diagonal(A), callback=DFTK.DefaultLobpcgCallback(), tol=1e-6)
+-    end
+-    @test res.converged
+-end
++# The LOBPCG-internal unit tests (LazyHcat data structures, print callback, and standalone
++# diagonalization of dense matrices) now live in the LOBPCGEigensolver.jl package.
++# The tests kept here exercise DFTK's k-block diagonalization machinery on actual
++# Hamiltonians.

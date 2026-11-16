@@ -1,0 +1,506 @@
+diff --git a/app/main.py b/app/main.py
+index 8ac60200..a3f28d1a 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import os
++from importlib.util import find_spec
+ from typing import Dict
+ 
+ from app.limiter import limiter
+@@ -30,6 +31,10 @@
+ if os.getenv("INCLUDE_OCSR", "true").lower() == "true":
+     from .routers import ocsr
+ 
++# Docling pulls in torch, so the lite image ships without it and its PDF routes
++if find_spec("docling"):
++    from .routers import pdf
++
+ 
+ def create_app_metadata() -> Dict:
+     return {
+@@ -75,6 +80,9 @@ def create_app_metadata() -> Dict:
+ if os.getenv("INCLUDE_OCSR", "true").lower() == "true":
+     app.include_router(ocsr.router)
+ 
++if find_spec("docling"):
++    app.include_router(pdf.router)
++
+ app = VersionedFastAPI(
+     app,
+     version_format="{major}",
+diff --git a/app/modules/docling_wrapper.py b/app/modules/docling_wrapper.py
+new file mode 100644
+index 00000000..5a038bb8
+--- /dev/null
++++ b/app/modules/docling_wrapper.py
+@@ -0,0 +1,138 @@
++from __future__ import annotations
++
++import io
++import re
++import threading
++from functools import lru_cache
++
++SKIP_LABELS = {"page_header", "page_footer"}
++STOP_HEADERS = ("RESULTS", "DISCUSSION")
++CONVERT_TIMEOUT = 120  # seconds Docling may spend on one document
++LOCK_TIMEOUT = 30  # seconds a request waits for the converter before giving up
++
++# ponytail: one converter behind a global lock, a converter pool if PDF throughput matters
++_convert_lock = threading.Lock()
++
++
++class ConverterBusyError(RuntimeError):
++    """Raised when the converter stays busy for longer than LOCK_TIMEOUT."""
++
++
++@lru_cache(maxsize=1)
++def _get_converter():
++    # Imported lazily: docling pulls in torch, and the lite image ships without it.
++    from docling.datamodel.base_models import InputFormat
++    from docling.datamodel.pipeline_options import PdfPipelineOptions
++    from docling.document_converter import DocumentConverter
++    from docling.document_converter import PdfFormatOption
++
++    options = PdfPipelineOptions(document_timeout=CONVERT_TIMEOUT)
++    return DocumentConverter(
++        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)}
++    )
++
++
++def get_converted_document(pdf_bytes: bytes, number_of_pages: int = 3) -> dict:
++    """Convert the first pages of a PDF into a Docling document dictionary.
++
++    Args:
++        pdf_bytes (bytes): Raw content of the PDF file.
++        number_of_pages (int): Number of pages to convert, counted from the first page.
++
++    Returns:
++        dict: The DoclingDocument exported as a dictionary.
++    """
++    from docling.datamodel.base_models import DocumentStream
++
++    source = DocumentStream(name="upload.pdf", stream=io.BytesIO(pdf_bytes))
++    if not _convert_lock.acquire(timeout=LOCK_TIMEOUT):
++        raise ConverterBusyError("PDF converter is busy")
++    try:
++        result = _get_converter().convert(source, page_range=(1, number_of_pages))
++    finally:
++        _convert_lock.release()
++    return result.document.export_to_dict()
++
++
++def _clean(text: str) -> str:
++    text = re.sub(r"\s+", " ", text)
++    return re.sub(r"\s+([.,;:?!])", r"\1", text).strip()
++
++
++def _body_texts(doc: dict) -> list:
++    return [
++        t
++        for t in doc.get("texts", [])
++        if t.get("text", "").strip() and t.get("label") not in SKIP_LABELS
++    ]
++
++
++def extract_paper_content(doc: dict) -> dict:
++    """Extract the title, abstract and the text before the results section.
++
++    Args:
++        doc (dict): A Docling document dictionary.
++
++    Returns:
++        dict: The keys "title", "abstract" and "main_text".
++    """
++    texts = _body_texts(doc)
++    headers = [t["text"] for t in texts if t.get("label") == "section_header"]
++
++    title = next((t["text"] for t in texts if t.get("label") == "title"), "") or next(
++        (
++            h
++            for h in headers
++            if len(h) > 10 and not any(s in h.upper() for s in STOP_HEADERS)
++        ),
++        "",
++    )
++
++    # Texts after the first one that mentions "abstract", up to the results section
++    start = next(
++        (i for i, t in enumerate(texts) if "abstract" in t["text"].lower()), None
++    )
++    abstract, main_text = "", []
++    if start is not None:
++        abstract = re.sub(r"^\s*abstract\s*[:.]?", "", texts[start]["text"], flags=re.I)
++        for t in texts[start + 1 :]:
++            if t.get("label") != "section_header":
++                main_text.append(t["text"])
++            elif any(s in t["text"].upper() for s in STOP_HEADERS):
++                break
++        if not abstract.strip() and main_text:
++            # A bare "Abstract" heading: the abstract is the next paragraph.
++            abstract = main_text.pop(0)
++
++    return {
++        "title": title,
++        "abstract": abstract.strip(),
++        "main_text": " ".join(main_text),
++    }
++
++
++def combine_to_paragraph(content: dict) -> str:
++    """Join the title, abstract and main text into one clean paragraph."""
++    return _clean(
++        " ".join(content.get(k, "") for k in ("title", "abstract", "main_text"))
++    )
++
++
++def first_page_text(doc: dict) -> str:
++    """Return all body text found on the first page of a Docling document."""
++    return _clean(
++        " ".join(
++            t["text"]
++            for t in _body_texts(doc)
++            if any(p.get("page_no") == 1 for p in t.get("prov", []))
++        )
++    )
++
++
++def extract_text(doc: dict) -> str:
++    """Return the title, abstract and introduction as one paragraph.
++
++    Falls back to all text on the first page when 10 words or fewer are found.
++    """
++    text = combine_to_paragraph(extract_paper_content(doc))
++    return text if len(text.split()) > 10 else first_page_text(doc)
+diff --git a/app/routers/pdf.py b/app/routers/pdf.py
+new file mode 100644
+index 00000000..02b55dcf
+--- /dev/null
++++ b/app/routers/pdf.py
+@@ -0,0 +1,117 @@
++from __future__ import annotations
++
++import logging
++import os
++
++from fastapi import APIRouter
++from fastapi import File
++from fastapi import Form
++from fastapi import HTTPException
++from fastapi import Request
++from fastapi import status
++from fastapi import UploadFile
++
++from app.limiter import limiter
++from app.modules.docling_wrapper import ConverterBusyError
++from app.modules.docling_wrapper import extract_text
++from app.modules.docling_wrapper import get_converted_document
++from app.schemas.error import BadRequestModel
++from app.schemas.error import ErrorResponse
++
++logger = logging.getLogger(__name__)
++
++MAX_PDF_SIZE = 10 * 1024 * 1024
++MAX_PDF_PAGES = 20
++
++PDF_FILE_PARAM = File(
++    ..., description=f"PDF file, {MAX_PDF_SIZE // (1024 * 1024)} MB or smaller"
++)
++PAGES_PARAM = Form(1, ge=1, le=MAX_PDF_PAGES, description="Number of pages to process")
++
++# Same /tools prefix as the tools router; kept apart so main.py can leave it out
++# of the lite image, which ships without docling.
++router = APIRouter(
++    prefix="/tools",
++    tags=["tools"],
++    responses={
++        400: {"description": "Bad Request", "model": BadRequestModel},
++        422: {"description": "Unprocessable Entity", "model": ErrorResponse},
++    },
++)
++
++
++def _convert_upload(pdf_file: UploadFile, pages: int) -> dict:
++    """Validate an uploaded PDF and convert its first pages with Docling."""
++    content = pdf_file.file.read(MAX_PDF_SIZE + 1)
++    if len(content) > MAX_PDF_SIZE:
++        raise HTTPException(
++            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
++            detail=f"PDF must be {MAX_PDF_SIZE // (1024 * 1024)} MB or smaller",
++        )
++    if not content.startswith(b"%PDF-"):
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail="Uploaded file must be a PDF",
++        )
++    try:
++        return get_converted_document(content, number_of_pages=pages)
++    except ConverterBusyError:
++        raise HTTPException(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            detail="PDF converter is busy, please retry later",
++        )
++    except Exception:
++        logger.exception("Error converting PDF")
++        raise HTTPException(status_code=422, detail="Error processing the PDF")
++
++
++@router.post(
++    "/extract_json",
++    summary="Extract the document structure of a PDF as JSON using Docling",
++    response_description="Return the Docling document as JSON",
++    status_code=status.HTTP_200_OK,
++)
++@limiter.limit("5/minute")
++def extract_pdf_json(
++    request: Request,
++    pdf_file: UploadFile = PDF_FILE_PARAM,
++    pages: int = PAGES_PARAM,
++):
++    """## Extract the document structure of a PDF using Docling.
++
++    Parameters:
++    - **pdf_file**: required (File): The PDF file to process.
++    - **pages**: optional (int): Number of pages to process from the start. Defaults to 1.
++
++    Returns:
++    - JSON: The Docling document structure.
++    """
++    return _convert_upload(pdf_file, pages)
++
++
++@router.post(
++    "/extract_text",
++    summary="Extract the title, abstract and introduction of a PDF as text",
++    response_description="Return the combined text extracted from the PDF",
++    status_code=status.HTTP_200_OK,
++)
++@limiter.limit("5/minute")
++def extract_pdf_text(
++    request: Request,
++    pdf_file: UploadFile = PDF_FILE_PARAM,
++    pages: int = PAGES_PARAM,
++):
++    """## Extract the title, abstract and introduction of a PDF as one paragraph.
++
++    Falls back to all text on the first page when 10 words or fewer are found.
++
++    Parameters:
++    - **pdf_file**: required (File): The PDF file to process.
++    - **pages**: optional (int): Number of pages to process from the start. Defaults to 1.
++
++    Returns:
++    - JSON: The combined text and the name of the uploaded file.
++    """
++    doc = _convert_upload(pdf_file, pages)
++    filename = os.path.basename(pdf_file.filename or "").replace(" ", "_")
++    return {"text": extract_text(doc), "pdf_filename": filename}
+diff --git a/requirements.txt b/requirements.txt
+index c0b7cdce..65108b56 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -37,6 +37,7 @@ slowapi
+ imantics==0.1.12
+ rdkit
+ openbabel-wheel
++docling
+ uvicorn[standard]
+ pytest
+ pytest-asyncio
+diff --git a/tests/test_docling.py b/tests/test_docling.py
+new file mode 100644
+index 00000000..e8706dd5
+--- /dev/null
++++ b/tests/test_docling.py
+@@ -0,0 +1,188 @@
++from __future__ import annotations
++
++from importlib.util import find_spec
++from types import SimpleNamespace
++
++import pytest
++from fastapi.testclient import TestClient
++
++from app.modules import docling_wrapper
++from app.modules.docling_wrapper import combine_to_paragraph
++from app.modules.docling_wrapper import ConverterBusyError
++from app.modules.docling_wrapper import extract_paper_content
++from app.modules.docling_wrapper import extract_text
++from app.modules.docling_wrapper import first_page_text
++from app.routers.pdf import MAX_PDF_SIZE
++
++
++def _text(label, text, page=1):
++    return {"label": label, "text": text, "prov": [{"page_no": page}]}
++
++
++# Same shape as DoclingDocument.export_to_dict() from docling 2.x
++DOC = {
++    "schema_name": "DoclingDocument",
++    "texts": [
++        _text("page_header", "J. Chem. Inf. 2026"),
++        _text("section_header", "Deep Learning for Chemical Structure Recognition"),
++        _text("text", "ABSTRACT: We convert images of molecules into SMILES."),
++        _text("section_header", "INTRODUCTION"),
++        _text("text", "Structures in papers are often only images."),
++        _text("section_header", "RESULTS AND DISCUSSION"),
++        _text("text", "The model reaches 95 percent accuracy."),
++        _text("text", "Text on the second page.", page=2),
++    ],
++}
++
++
++def test_extract_paper_content():
++    content = extract_paper_content(DOC)
++    assert content == {
++        "title": "Deep Learning for Chemical Structure Recognition",
++        "abstract": "We convert images of molecules into SMILES.",
++        "main_text": "Structures in papers are often only images.",
++    }
++    assert combine_to_paragraph(content) == (
++        "Deep Learning for Chemical Structure Recognition"
++        " We convert images of molecules into SMILES."
++        " Structures in papers are often only images."
++    )
++
++
++def test_title_label_wins_over_section_header():
++    doc = {
++        "texts": [
++            _text("section_header", "Long section heading"),
++            _text("title", "Real Title"),
++        ]
++    }
++    assert extract_paper_content(doc)["title"] == "Real Title"
++
++
++def test_abstract_after_bare_heading():
++    doc = {
++        "texts": [
++            _text("section_header", "Abstract"),
++            _text("text", "The abstract body."),
++        ]
++    }
++    assert extract_paper_content(doc)["abstract"] == "The abstract body."
++
++
++def test_first_page_text_skips_headers_and_other_pages():
++    text = first_page_text(DOC)
++    assert "J. Chem. Inf." not in text
++    assert "second page" not in text
++    assert text.startswith("Deep Learning")
++
++
++def test_extract_text_falls_back_to_first_page():
++    doc = {"texts": [_text("text", "Only a short note.")]}
++    assert extract_text(doc) == "Only a short note."
++
++
++docling_routes = pytest.mark.skipif(
++    not find_spec("docling"),
++    reason="docling routes are only registered when docling is installed",
++)
++
++
++@pytest.fixture
++def client(monkeypatch):
++    from app.main import app
++    from app.routers import pdf
++
++    # Skip the real model run; the wrapper functions are tested above.
++    monkeypatch.setattr(
++        pdf, "get_converted_document", lambda content, number_of_pages: DOC
++    )
++    return TestClient(app)
++
++
++@docling_routes
++def test_extract_text(client):
++    response = client.post(
++        "/latest/tools/extract_text",
++        files={"pdf_file": ("my paper.pdf", b"%PDF-1.7 fake", "application/pdf")},
++    )
++    assert response.status_code == 200
++    assert response.json()["pdf_filename"] == "my_paper.pdf"
++    assert response.json()["text"].startswith("Deep Learning")
++
++
++@docling_routes
++def test_extract_json(client):
++    response = client.post(
++        "/latest/tools/extract_json",
++        files={"pdf_file": ("paper.pdf", b"%PDF-1.7 fake", "application/pdf")},
++        data={"pages": "2"},
++    )
++    assert response.status_code == 200
++    assert response.json()["schema_name"] == "DoclingDocument"
++
++
++@docling_routes
++@pytest.mark.parametrize(
++    "content, code",
++    [(b"not a pdf", 400), (b"%PDF-" + b"0" * MAX_PDF_SIZE, 413)],
++)
++def test_extract_text_rejects_bad_uploads(client, content, code):
++    response = client.post(
++        "/latest/tools/extract_text",
++        files={"pdf_file": ("paper.pdf", content, "application/pdf")},
++    )
++    assert response.status_code == code
++
++
++def _raise(exc):
++    def convert(content, number_of_pages):
++        raise exc
++
++    return convert
++
++
++@docling_routes
++@pytest.mark.parametrize(
++    "exc, code", [(ConverterBusyError("busy"), 503), (ValueError("bad PDF"), 422)]
++)
++def test_extract_json_maps_converter_errors(client, monkeypatch, exc, code):
++    from app.routers import pdf
++
++    monkeypatch.setattr(pdf, "get_converted_document", _raise(exc))
++    response = client.post(
++        "/latest/tools/extract_json",
++        files={"pdf_file": ("paper.pdf", b"%PDF-1.7 fake", "application/pdf")},
++    )
++    assert response.status_code == code
++
++
++@docling_routes
++def test_get_converter_sets_timeout():
++    from docling.datamodel.base_models import InputFormat
++
++    docling_wrapper._get_converter.cache_clear()
++    converter = docling_wrapper._get_converter()
++    options = converter.format_to_options[InputFormat.PDF].pipeline_options
++    assert options.document_timeout == docling_wrapper.CONVERT_TIMEOUT
++
++
++class _FakeConverter:
++    def convert(self, source, page_range):
++        self.page_range = page_range
++        return SimpleNamespace(document=SimpleNamespace(export_to_dict=lambda: DOC))
++
++
++@docling_routes
++def test_get_converted_document(monkeypatch):
++    fake = _FakeConverter()
++    monkeypatch.setattr(docling_wrapper, "_get_converter", lambda: fake)
++    assert docling_wrapper.get_converted_document(b"%PDF-", number_of_pages=2) is DOC
++    assert fake.page_range == (1, 2)
++
++
++@docling_routes
++def test_get_converted_document_when_busy(monkeypatch):
++    monkeypatch.setattr(docling_wrapper, "LOCK_TIMEOUT", 0.01)
++    with docling_wrapper._convert_lock:
++        with pytest.raises(ConverterBusyError):
++            docling_wrapper.get_converted_document(b"%PDF-")

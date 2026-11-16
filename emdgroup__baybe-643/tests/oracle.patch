@@ -1,0 +1,241 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eb8251e88a..e41423e8b8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+ 
++## [Unreleased]
++### Changed
++- `add_fake_measurements` now generates values inside each target's image / codomain
++
++### Fixed
++- Crash in `simulate_experiment` when calculating cumulative best values for
++  `batch_size>1`
++- Crash with minimized targets constructed via the legacy interface
++
+ ## [0.14.0] - 2025-09-10
+ ### Added
+ - `transformations` subpackage 
+diff --git a/baybe/simulation/core.py b/baybe/simulation/core.py
+index 44fb572cdb..90e327c7a7 100644
+--- a/baybe/simulation/core.py
++++ b/baybe/simulation/core.py
+@@ -82,6 +82,12 @@ def simulate_experiment(
+           respective iteration
+         * for each target a column ``{targetname}_Measurements``:
+           The individual measurements obtained for the respective target and iteration
++
++        Important: The calculation of "best" targets is done independently per target.
++        For multi-target scenarios with batch_size > 1 this means that the "best" values
++        do not necessarily belong to the same point. In practice, however, one wants to
++        find a point that is "generally" the best and should thus look at the best
++        target values that can be found while belonging to the very same point.
+     """
+     # TODO: Use a `will_terminate` campaign property to decide if the campaign will
+     #   run indefinitely or not, and allow omitting `n_doe_iterations` for the latter.
+@@ -204,24 +210,29 @@ def simulate_experiment(
+             cumbest_col = f"{target.name}_CumBest"
+ 
+             # Collect raw and transformed measurements
++            # We treat the target as a single-target objective to utilize its
++            # transformation incorporating the optimization direction such that we only
++            # have to look for the largest transformed values to find the best
++            # untransformed values
++            # TODO: This takes the best values for the targets per batch independent of
++            #  whether they belong to the same point or not. This is not necessarily
++            #  reasonable, as experimentally one is usually interested in the best
++            #  overall point
+             raw = np.array(results[measurement_col].tolist())
+             objective = target.to_objective()
+-            transformed = results[measurement_col].apply(
+-                lambda x: objective.transform(pd.Series(x).to_frame(target.name))
+-                .iloc[:, 0]
+-                .tolist()
+-            )
++            transformed = objective.transform(
++                pd.DataFrame(raw.flatten(), columns=[target.name])
++            ).values.reshape(raw.shape)
+ 
+             # Compute the instantaneous best
+-            iterbest_idx = transformed.apply(np.argmax)
+-            iterbest_transformed = transformed.apply(np.max)
+-            results[iterbest_col] = np.take_along_axis(
+-                raw, iterbest_idx.values[:, None], axis=1
+-            )
++            iterbest_idx = np.argmax(transformed, axis=1)
++            iterbest_transformed = np.max(transformed, axis=1)
++            iterbest = np.take_along_axis(raw, iterbest_idx[:, None], axis=1)
++            results[iterbest_col] = iterbest
+ 
+             # Compute the cumulative best
+-            cumargmax = _cumargmax(iterbest_transformed.values)
+-            results[cumbest_col] = np.take_along_axis(raw, cumargmax[:, None], axis=0)
++            cumargmax = _cumargmax(iterbest_transformed)
++            results[cumbest_col] = iterbest[cumargmax]
+ 
+         return results
+ 
+diff --git a/baybe/utils/dataframe.py b/baybe/utils/dataframe.py
+index 9b4800a4bc..5854eb966f 100644
+--- a/baybe/utils/dataframe.py
++++ b/baybe/utils/dataframe.py
+@@ -89,7 +89,17 @@ def add_fake_measurements(
+                 [target.failure_value, target.success_value], size=len(data)
+             )
+         elif isinstance(target, NumericalTarget):
+-            data[target.name] = np.random.uniform(-100, 100, size=len(data))
++            # We respect expected target bounds. The main reason is to avoid causing
++            # degenerate points, which make testing harder
++            transformation = target.transformation
++            try:
++                interval = transformation.get_image()
++            except NotImplementedError:
++                interval = transformation.get_codomain()
++            lower = interval.lower if np.isfinite(interval.lower) else -100
++            upper = interval.upper if np.isfinite(interval.upper) else 100
++
++            data[target.name] = np.random.uniform(lower, upper, size=len(data))
+ 
+     return data
+ 
+diff --git a/benchmarks/domains/hartmann/hartmann_3d_discretized.py b/benchmarks/domains/hartmann/hartmann_3d_discretized.py
+index 3c7cfbf521..66b762d085 100644
+--- a/benchmarks/domains/hartmann/hartmann_3d_discretized.py
++++ b/benchmarks/domains/hartmann/hartmann_3d_discretized.py
+@@ -46,7 +46,7 @@ def hartmann_3d_discretized(settings: ConvergenceBenchmarkSettings) -> DataFrame
+         NumericalDiscreteParameter("x3", np.linspace(0, 1, 25)),
+     ]
+ 
+-    target = NumericalTarget(name="target", minimmize=True)
++    target = NumericalTarget(name="target", minimize=True)
+     searchspace = SearchSpace.from_product(parameters=parameters)
+     objective = target.to_objective()
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ead26ed80e..bf554ab66f 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -402,7 +402,7 @@ def fixture_targets(target_names: list[str]):
+         NumericalTarget.match_bell(
+             name="Target_match_bell",
+             match_value=50,
+-            sigma=50,
++            sigma=5,
+         ),
+         NumericalTarget.match_triangular(
+             name="Target_match_triangular",
+diff --git a/tests/test_simulation.py b/tests/test_simulation.py
+new file mode 100644
+index 0000000000..0b684e1ac2
+--- /dev/null
++++ b/tests/test_simulation.py
+@@ -0,0 +1,107 @@
++"""Tests for the simulation module."""
++
++import os
++from collections.abc import Callable, Sequence
++from functools import partial
++
++import numpy as np
++import pandas as pd
++import pytest
++from pytest import param
++
++from baybe.simulation import simulate_scenarios
++
++pytestmark = pytest.mark.skipif(
++    os.environ.get("BAYBE_TEST_ENV") != "FULLTEST",
++    reason="Only tested in FULLTEST environment.",
++)
++
++
++def _match_aggregator(x: Sequence, /, match_value):
++    idx = np.abs(np.asarray(x) - match_value).argmin()
++    return x[idx]
++
++
++_aggregators: dict[str, Callable] = {
++    "Target_max": max,
++    "Target_max_bounded": max,
++    "Target_min": min,
++    "Target_min_bounded": min,
++    "Target_match_bell": partial(_match_aggregator, match_value=50.0),
++}
++
++
++@pytest.mark.parametrize(
++    "target_names",
++    [
++        param(["Target_max"], id="single_max"),
++        param(["Target_min"], id="single_min"),
++        param(["Target_match_bell"], id="single_match"),
++        param(
++            ["Target_max_bounded", "Target_min_bounded", "Target_match_bell"],
++            id="multi",
++        ),
++    ],
++)
++def test_simulate_scenarios_structure(campaign, batch_size):
++    """Test simulate_scenarios output structure and correctness."""
++    doe_iterations = 2
++    n_mc_iterations = 2
++    simulation_random_seed = 1337
++    scenarios = {"test": campaign}
++
++    result = simulate_scenarios(
++        scenarios,
++        None,  # use random data for lookup
++        n_doe_iterations=doe_iterations,
++        batch_size=batch_size,
++        random_seed=simulation_random_seed,
++        n_mc_iterations=n_mc_iterations,
++        parallel_runs=False,
++    )
++
++    assert isinstance(result, pd.DataFrame)
++    assert len(result) == doe_iterations * n_mc_iterations * len(scenarios)
++    expected_cols = [
++        "Scenario",
++        "Monte_Carlo_Run",
++        "Iteration",
++        "Num_Experiments",
++        "Random_Seed",
++    ]
++    for t in campaign.targets:
++        expected_cols += [
++            f"{t.name}_Measurements",
++            f"{t.name}_IterBest",
++            f"{t.name}_CumBest",
++        ]
++    assert set(result.columns) == set(expected_cols), (result.columns, expected_cols)
++    assert set(result["Scenario"].unique()) == set(scenarios.keys())
++    assert set(result["Monte_Carlo_Run"].unique()) == set(range(n_mc_iterations))
++    assert set(result["Iteration"].unique()) == set(range(doe_iterations))
++
++    expected_seed_values = list(
++        range(simulation_random_seed, simulation_random_seed + n_mc_iterations)
++    )
++    assert set(result["Random_Seed"].unique()) == set(expected_seed_values)
++    for mc_run in result["Monte_Carlo_Run"].unique():
++        mc_data = result[result["Monte_Carlo_Run"] == mc_run]
++
++        for t in campaign.targets:
++            aggregator = _aggregators[t.name]
++            assert np.isclose(
++                mc_data[f"{t.name}_IterBest"].values,
++                mc_data[f"{t.name}_Measurements"].apply(aggregator).values,
++            ).all()
++
++            all_measurements = [
++                m
++                for measurements in mc_data[f"{t.name}_Measurements"]
++                for m in measurements
++            ]
++            cum_lens = mc_data[f"{t.name}_Measurements"].apply(len).cumsum().values
++            expected_cum_best = [
++                aggregator(all_measurements[:cum_len]) for cum_len in cum_lens
++            ]
++
++            assert list(mc_data[f"{t.name}_CumBest"]) == expected_cum_best

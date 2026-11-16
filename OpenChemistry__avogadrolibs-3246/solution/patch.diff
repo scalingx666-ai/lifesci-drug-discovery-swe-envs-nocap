@@ -1,0 +1,285 @@
+diff --git a/avogadro/qtgui/commandregistry.cpp b/avogadro/qtgui/commandregistry.cpp
+index 51b4d5dbbda..471644c2ec8 100644
+--- a/avogadro/qtgui/commandregistry.cpp
++++ b/avogadro/qtgui/commandregistry.cpp
+@@ -11,6 +11,7 @@
+ #include <QtCore/QDebug>
+ #include <QtCore/QJsonArray>
+ #include <QtCore/QMetaType>
++#include <QtCore/QSet>
+ #include <QtGui/QColor>
+ 
+ #include <algorithm>
+@@ -773,6 +774,29 @@ bool CommandRegistry::add(CommandSpec spec)
+                << "is already registered; ignoring the duplicate.";
+     return false;
+   }
++
++  // Options are looked up by name or alias, so every key must be unique
++  // across the whole command or the schema and the handler would disagree.
++  QSet<QString> seen;
++  for (const auto& argument : spec.arguments) {
++    QStringList keys{ argument.name };
++    keys << argument.aliases;
++    for (const auto& key : keys) {
++      if (key.isEmpty()) {
++        qWarning() << "CommandRegistry: command" << spec.name
++                   << "has an option with an empty name or alias.";
++        return false;
++      }
++      if (seen.contains(key)) {
++        qWarning() << "CommandRegistry: command" << spec.name
++                   << "uses the option name or alias" << key
++                   << "more than once.";
++        return false;
++      }
++      seen.insert(key);
++    }
++  }
++
+   m_commands.push_back(std::move(spec));
+   return true;
+ }
+@@ -1042,26 +1066,44 @@ QJsonObject CommandRegistry::schema(const QString& name) const
+ 
+   QJsonObject properties;
+   QJsonArray required;
+-  QJsonArray anyOfGroups; // one "anyOf" per required option with aliases
++  // Cross-key constraints for options with aliases, in argument order.
++  QJsonArray constraints;
+   for (const auto& argument : command->arguments) {
+     const QJsonObject property = argumentSchema(argument);
+     properties[argument.name] = property;
+ 
+-    if (argument.required) {
+-      if (argument.aliases.isEmpty()) {
++    if (argument.aliases.isEmpty()) {
++      if (argument.required)
+         required.append(argument.name);
+-      } else {
+-        // Any one of the name or its aliases satisfies the requirement.
++    } else {
++      // Runtime validation accepts only one of the name and its aliases.
++      QStringList keys{ argument.name };
++      keys << argument.aliases;
++      QJsonObject constraint;
++      if (argument.required) {
++        // exactly one of the keys
+         QJsonArray alternatives;
+-        QStringList keys{ argument.name };
+-        keys << argument.aliases;
+         for (const auto& key : keys) {
+           QJsonObject alternative;
+           alternative[QStringLiteral("required")] = QJsonArray{ key };
+           alternatives.append(alternative);
+         }
+-        anyOfGroups.append(alternatives);
++        constraint[QStringLiteral("oneOf")] = alternatives;
++      } else {
++        // at most one of the keys: no pair may appear together
++        QJsonArray pairs;
++        for (qsizetype i = 0; i < keys.size(); ++i) {
++          for (qsizetype j = i + 1; j < keys.size(); ++j) {
++            QJsonObject pair;
++            pair[QStringLiteral("required")] = QJsonArray{ keys[i], keys[j] };
++            pairs.append(pair);
++          }
++        }
++        QJsonObject anyOf;
++        anyOf[QStringLiteral("anyOf")] = pairs;
++        constraint[QStringLiteral("not")] = anyOf;
+       }
++      constraints.append(constraint);
+     }
+ 
+     for (const auto& alias : argument.aliases) {
+@@ -1078,17 +1120,8 @@ QJsonObject CommandRegistry::schema(const QString& name) const
+   result[QStringLiteral("description")] = command->description;
+   result[QStringLiteral("properties")] = properties;
+   result[QStringLiteral("required")] = required;
+-  if (anyOfGroups.size() == 1) {
+-    result[QStringLiteral("anyOf")] = anyOfGroups.at(0).toArray();
+-  } else if (anyOfGroups.size() > 1) {
+-    QJsonArray allOf;
+-    for (const auto& group : anyOfGroups) {
+-      QJsonObject wrapper;
+-      wrapper[QStringLiteral("anyOf")] = group.toArray();
+-      allOf.append(wrapper);
+-    }
+-    result[QStringLiteral("allOf")] = allOf;
+-  }
++  if (!constraints.isEmpty())
++    result[QStringLiteral("allOf")] = constraints;
+   result[QStringLiteral("additionalProperties")] = command->allowUnknownOptions;
+   result[QStringLiteral("x-avogadro-async")] = command->async;
+   result[QStringLiteral("x-avogadro-needs-molecule")] = command->needsMolecule;
+diff --git a/avogadro/qtgui/commandregistry.h b/avogadro/qtgui/commandregistry.h
+index 9a346c1012f..d569ec7bc08 100644
+--- a/avogadro/qtgui/commandregistry.h
++++ b/avogadro/qtgui/commandregistry.h
+@@ -237,6 +237,8 @@ struct AVOGADROQTGUI_EXPORT CommandSpec
+  * spec as JSON Schema (draft 2020-12).
+  *
+  * Command names share one flat namespace, so add() rejects a duplicate.
++ * add() also rejects a command with an empty option name or with any option
++ * name or alias used more than once, since options are looked up by either.
+  */
+ class AVOGADROQTGUI_EXPORT CommandRegistry
+ {
+@@ -288,7 +290,10 @@ class AVOGADROQTGUI_EXPORT CommandRegistry
+   /** @return A JSON Schema (draft 2020-12) for the options object of
+    *  @p name, or {} if it is not registered. Aliases appear as deprecated
+    *  properties; "x-avogadro-async" and "x-avogadro-needs-molecule" carry
+-   *  the metadata flags. */
++   *  the metadata flags. A required option with aliases needs exactly one of
++   *  its name and aliases ("oneOf"); an optional one allows at most one
++   *  ("not" + "anyOf" over each pair). These constraints are collected in a
++   *  top-level "allOf", in argument order. */
+   QJsonObject schema(const QString& name) const;
+ 
+   /** @name Validators, usable without a registry.
+diff --git a/tests/qtgui/commandregistrytest.cpp b/tests/qtgui/commandregistrytest.cpp
+index a52b33fb64f..8169f0ecd1b 100644
+--- a/tests/qtgui/commandregistrytest.cpp
++++ b/tests/qtgui/commandregistrytest.cpp
+@@ -423,6 +423,40 @@ TEST(CommandRegistryTest, unregisteredAndDuplicate)
+   EXPECT_TRUE(quiet.handle("q", {}, nullptr));
+ }
+ 
++TEST(CommandRegistryTest, rejectsConflictingOptionKeys)
++{
++  Harness h;
++  const auto real = [](const char* name) {
++    return CommandArgumentSpec::real(name, "x");
++  };
++
++  // duplicate argument names
++  EXPECT_FALSE(h.add("dupName", { real("x"), real("x") }));
++  // alias equal to another argument's name
++  EXPECT_FALSE(
++    h.add("aliasIsName", { real("x"), real("y").withAliases({ "x" }) }));
++  // alias shared by two arguments
++  EXPECT_FALSE(h.add("sharedAlias", { real("x").withAliases({ "z" }),
++                                      real("y").withAliases({ "z" }) }));
++  // alias equal to its own argument's name
++  EXPECT_FALSE(h.add("ownName", { real("x").withAliases({ "x" }) }));
++  // alias repeated within one argument
++  EXPECT_FALSE(h.add("dupAlias", { real("x").withAliases({ "z", "z" }) }));
++  // empty argument name or alias
++  EXPECT_FALSE(h.add("emptyName", { real("") }));
++  EXPECT_FALSE(h.add("emptyAlias", { real("x").withAliases({ "" }) }));
++
++  for (const char* name : { "dupName", "aliasIsName", "sharedAlias", "ownName",
++                            "dupAlias", "emptyName", "emptyAlias" })
++    EXPECT_FALSE(h.registry.contains(name)) << name;
++  EXPECT_TRUE(h.registry.names().isEmpty());
++
++  // distinct keys are still accepted
++  EXPECT_TRUE(h.add("ok", { real("x").withAliases({ "a", "b" }),
++                            real("y").withAliases({ "c" }) }));
++  EXPECT_TRUE(h.registry.contains("ok"));
++}
++
+ TEST(CommandRegistryTest, announceVisitsCommandsInOrder)
+ {
+   Harness h;
+@@ -554,20 +588,22 @@ TEST(CommandRegistryTest, schemaRequiredAliased)
+   const QJsonObject s = h.registry.schema("one");
+   // the aliased option is not unconditionally required...
+   EXPECT_EQ(s["required"].toArray(), QJsonArray{ "value" });
+-  EXPECT_FALSE(s.contains("allOf"));
+-  // ...any of its names satisfies the requirement
+-  const QJsonArray anyOf = s["anyOf"].toArray();
+-  ASSERT_EQ(anyOf.size(), 3);
+-  EXPECT_EQ(anyOf[0].toObject()["required"].toArray(), QJsonArray{ "atoms" });
+-  EXPECT_EQ(anyOf[1].toObject()["required"].toArray(), QJsonArray{ "indices" });
+-  EXPECT_EQ(anyOf[2].toObject()["required"].toArray(), QJsonArray{ "ids" });
++  EXPECT_FALSE(s.contains("anyOf"));
++  // ...exactly one of its names is needed
++  const QJsonArray allOf = s["allOf"].toArray();
++  ASSERT_EQ(allOf.size(), 1);
++  const QJsonArray oneOf = allOf[0].toObject()["oneOf"].toArray();
++  ASSERT_EQ(oneOf.size(), 3);
++  EXPECT_EQ(oneOf[0].toObject()["required"].toArray(), QJsonArray{ "atoms" });
++  EXPECT_EQ(oneOf[1].toObject()["required"].toArray(), QJsonArray{ "indices" });
++  EXPECT_EQ(oneOf[2].toObject()["required"].toArray(), QJsonArray{ "ids" });
+ 
+   // and handle() agrees with the schema
+   Molecule mol = makeMolecule();
+   EXPECT_TRUE(h.registry.handle(
+     "one", { { "indices", list({ 0, 1 }) }, { "value", 1.0 } }, &mol));
+ 
+-  // a command with no required aliased option has neither key
++  // a command with no aliased option has neither key
+   Harness g;
+   g.add("plain", { CommandArgumentSpec::real("x", "x").withRequired() });
+   EXPECT_FALSE(g.registry.schema("plain").contains("anyOf"));
+@@ -596,16 +632,66 @@ TEST(CommandRegistryTest, schemaTwoRequiredAliased)
+   EXPECT_FALSE(s.contains("anyOf"));
+   const QJsonArray allOf = s["allOf"].toArray();
+   ASSERT_EQ(allOf.size(), 2);
+-  const QJsonArray first = allOf[0].toObject()["anyOf"].toArray();
++  const QJsonArray first = allOf[0].toObject()["oneOf"].toArray();
+   ASSERT_EQ(first.size(), 2);
+   EXPECT_EQ(first[0].toObject()["required"].toArray(), QJsonArray{ "atoms" });
+   EXPECT_EQ(first[1].toObject()["required"].toArray(), QJsonArray{ "indices" });
+-  const QJsonArray second = allOf[1].toObject()["anyOf"].toArray();
++  const QJsonArray second = allOf[1].toObject()["oneOf"].toArray();
+   ASSERT_EQ(second.size(), 2);
+   EXPECT_EQ(second[0].toObject()["required"].toArray(), QJsonArray{ "value" });
+   EXPECT_EQ(second[1].toObject()["required"].toArray(), QJsonArray{ "amount" });
+ }
+ 
++TEST(CommandRegistryTest, schemaOptionalAliased)
++{
++  Harness h;
++  ASSERT_TRUE(h.add("opt", { CommandArgumentSpec::atomIndices("atoms", "Atoms.")
++                               .withAliases({ "indices", "ids" }) }));
++
++  const QJsonObject s = h.registry.schema("opt");
++  EXPECT_TRUE(s["required"].toArray().isEmpty());
++  EXPECT_FALSE(s.contains("anyOf"));
++  const QJsonArray allOf = s["allOf"].toArray();
++  ASSERT_EQ(allOf.size(), 1);
++  const QJsonObject constraint = allOf[0].toObject();
++  EXPECT_FALSE(constraint.contains("oneOf"));
++  // at most one: no pair of keys may appear together
++  const QJsonArray pairs = constraint["not"].toObject()["anyOf"].toArray();
++  ASSERT_EQ(pairs.size(), 3);
++  EXPECT_EQ(pairs[0].toObject()["required"].toArray(),
++            (QJsonArray{ "atoms", "indices" }));
++  EXPECT_EQ(pairs[1].toObject()["required"].toArray(),
++            (QJsonArray{ "atoms", "ids" }));
++  EXPECT_EQ(pairs[2].toObject()["required"].toArray(),
++            (QJsonArray{ "indices", "ids" }));
++}
++
++TEST(CommandRegistryTest, schemaMixedAliased)
++{
++  Harness h;
++  ASSERT_TRUE(h.add(
++    "mix",
++    { CommandArgumentSpec::atomIndices("atoms", "Atoms.")
++        .withRequired()
++        .withAliases({ "indices" }),
++      CommandArgumentSpec::real("value", "Value.").withAliases({ "amount" }),
++      CommandArgumentSpec::boolean("flag", "Flag.") }));
++
++  const QJsonObject s = h.registry.schema("mix");
++  EXPECT_TRUE(s["required"].toArray().isEmpty());
++  const QJsonArray allOf = s["allOf"].toArray();
++  ASSERT_EQ(allOf.size(), 2);
++  // argument order: the required one first, then the optional one
++  const QJsonArray oneOf = allOf[0].toObject()["oneOf"].toArray();
++  ASSERT_EQ(oneOf.size(), 2);
++  EXPECT_EQ(oneOf[1].toObject()["required"].toArray(), QJsonArray{ "indices" });
++  const QJsonArray pairs =
++    allOf[1].toObject()["not"].toObject()["anyOf"].toArray();
++  ASSERT_EQ(pairs.size(), 1);
++  EXPECT_EQ(pairs[0].toObject()["required"].toArray(),
++            (QJsonArray{ "value", "amount" }));
++}
++
+ TEST(CommandRegistryTest, schemaAliasCarriesType)
+ {
+   Harness h;

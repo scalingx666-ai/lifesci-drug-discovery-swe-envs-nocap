@@ -1,0 +1,942 @@
+diff --git a/tools/flux/.shed.yml b/tools/flux/.shed.yml
+index 720713d52d..ee0b32d333 100644
+--- a/tools/flux/.shed.yml
++++ b/tools/flux/.shed.yml
+@@ -1,10 +1,11 @@
+ name: black_forest_labs_flux
+ owner: bgruening
+-description: Using the black forest labs FLUX.1 models to generate image based on user input.
++description: Generate and edit images with the FLUX models by Black Forest Labs.
+ long_description: |
+-  This tool uses the black forest labs FLUX.1 models to generate image based on user input.
+-  Users can specify the model (dev,schnell),and provide prompt.
+-  The tool will then generate and return the corresponding image based on the input provided.
++  Generates images from a text prompt with the FLUX models by Black Forest Labs
++  (FLUX.1 [dev], FLUX.1 [schnell], FLUX.2 [klein] 4B and FLUX 3 Image Klein).
++  FLUX.2 [klein] and FLUX 3 Image Klein also edit images from reference images.
++  The models are read from the shared huggingface data table.
+ remote_repository_url: https://github.com/bgruening/galaxytools/tree/master/tools/flux
+ homepage_url: https://github.com/bgruening/galaxytools/tree/master/tools/flux
+ type:
+diff --git a/tools/flux/download_models.py b/tools/flux/download_models.py
+new file mode 100644
+index 0000000000..975dd1c1f3
+--- /dev/null
++++ b/tools/flux/download_models.py
+@@ -0,0 +1,124 @@
++"""Download the models of the Galaxy FLUX tool into one directory.
++
++Run it inside the tool's container, so the models are fetched by the same
++diffusers version the tool uses:
++
++    docker run --rm --user "$(id -u):$(id -g)" \\
++        -v /data/db/flux_models:/models \\
++        -v "$PWD/download_models.py:/download_models.py:ro" \\
++        -e HF_TOKEN=<token> \\
++        quay.io/galaxy/black_forest_labs_flux:2026-0 \\
++        python3 /download_models.py --model-dir /models
++
++With rootless Docker, leave out --user. Both models need about 55 GB;
++--models downloads only one of them. FLUX 3 Image Klein is gated:
++accept their terms on Hugging Face with the account of the token first. The directory is the `path` of the flux rows in the huggingface data
++table.
++"""
++
++import argparse
++import os
++import sys
++from pathlib import Path
++
++BFL = "black-forest-labs/"
++# The value column of the rows in tool-data/huggingface.loc.sample
++MODELS = [
++    BFL + "FLUX.2-klein-4B",
++    BFL + "flux-3-image-klein",
++]
++UNGATED = {BFL + "FLUX.2-klein-4B"}
++# FLUX 3 uses a modular pipeline: no model_index.json
++MODULAR = {BFL + "flux-3-image-klein"}
++# other models the tool loads with these, which have no row of their own
++EXTRA = {
++    BFL + "flux-3-image-klein": [BFL + "flux-3-image-klein-pup"],
++}
++
++
++def modular_files(api, model, token):
++    # the diffusers layout only; the FLUX 3 repo also has a single-file copy of
++    # the transformer, quantized variants and example images, which the tool
++    # does not load
++    return [
++        f
++        for f in api.list_repo_files(model, token=token)
++        if f.endswith(".json")
++        or ("/" in f and not f.startswith(("assets/", "variants/")))
++    ]
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Download the models of the Galaxy FLUX tool"
++    )
++    parser.add_argument(
++        "--model-dir", required=True, help="Directory to store the models"
++    )
++    parser.add_argument(
++        "--models",
++        nargs="+",
++        choices=MODELS,
++        default=MODELS,
++        help="Models to download (default: all)",
++    )
++    parser.add_argument(
++        "--hf-token",
++        # an empty HF_TOKEN counts as none; the Hub rejects an empty Bearer header
++        default=os.getenv("HF_TOKEN") or None,
++        help="Hugging Face token for the gated models (default: $HF_TOKEN)",
++    )
++    args = parser.parse_args()
++    gated = sorted(set(args.models) - UNGATED)
++    if gated and not args.hf_token:
++        parser.error(f"set HF_TOKEN or --hf-token (needed for {', '.join(gated)})")
++
++    root = Path(args.model_dir).resolve()
++    root.mkdir(parents=True, exist_ok=True)
++    # the tool sets HF_HOME to this directory
++    os.environ["HF_HOME"] = str(root)
++    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
++
++    from diffusers import DiffusionPipeline, ModularPipeline
++    from huggingface_hub import HfApi, snapshot_download
++
++    api = HfApi()
++    token = args.hf_token
++
++    def fetch(model):
++        if model in MODULAR:
++            snapshot_download(
++                model, allow_patterns=modular_files(api, model, token), token=token
++            )
++            # resolves every component from the cache, as the tool does
++            ModularPipeline.from_pretrained(model, local_files_only=True)
++        elif model.startswith(BFL) and not model.endswith("-pup"):
++            DiffusionPipeline.download(model, token=token)
++            # fails if a file the pipeline needs is missing from the cache
++            DiffusionPipeline.download(model, local_files_only=True)
++        else:
++            # the upsampler is a plain transformers model
++            snapshot_download(model, token=token)
++
++    failed = []
++    done = set()
++    for model in args.models:
++        for repo in [model] + EXTRA.get(model, []):
++            if repo in done:
++                continue
++            print(f"Downloading {repo} ...", flush=True)
++            try:
++                fetch(repo)
++                print(f"OK: {repo}", flush=True)
++                done.add(repo)
++            except Exception as e:
++                print(f"Failed: {repo}: {e}", flush=True)
++                failed.append(repo)
++
++    if failed:
++        print(f"Failed to download {len(failed)} model(s): {', '.join(failed)}")
++        sys.exit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/flux/flux.py b/tools/flux/flux.py
+index 0b3e70bb18..519b4890cc 100644
+--- a/tools/flux/flux.py
++++ b/tools/flux/flux.py
+@@ -1,42 +1,153 @@
+-import os
++"""Generate or edit an image with a FLUX model from the huggingface data table.
++
++The model is loaded by its Hugging Face ID from the cache in HF_HOME, which
++the tool points at the `path` of the data table row (HF_HUB_OFFLINE=1).
++"""
++
++import argparse
+ import sys
+ 
+ import torch
+-from diffusers import FluxPipeline
++from PIL import Image
++
++BFL = "black-forest-labs/"
++
++# One entry per supported model, keyed by the value column of the data table.
++# tasks: what the model can do (the form only offers it for these);
++# steps, guidance: the defaults of each model card; references: how many
++# reference images it takes for editing.
++MODELS = {
++    BFL
++    + "FLUX.2-klein-4B": dict(
++        pipeline="flux2_klein",
++        tasks={"generate", "edit", "inpaint"},
++        steps=4,
++        guidance=1.0,
++        references=10,
++    ),
++    BFL
++    + "flux-3-image-klein": dict(
++        pipeline="flux3",
++        tasks={"generate", "edit"},
++        steps=16,
++        guidance=None,
++        references=10,
++    ),
++}
++IMAGES = {"generate": (0, 0), "inpaint": (1, 1)}
++
++
++def load_pipeline(model_id, spec, task, upsample):
++    if spec["pipeline"] == "flux3":
++        from diffusers import ComponentsManager, ModularPipeline
++
++        manager = ComponentsManager()
++        manager.enable_auto_cpu_offload(device="cuda")
++        blocks = ModularPipeline.from_pretrained(model_id).blocks
++        if not upsample:
++            # the prompt is used as the full caption, as on the model card
++            blocks.sub_blocks.pop("prompt_upsampler")
++        pipe = blocks.init_pipeline(model_id, components_manager=manager)
++        # diffusers 0.42.1 modular pipelines ignore HF_HUB_OFFLINE for sharded
++        # checkpoints and ask the Hub for the shard list
++        pipe.load_components(
++            dtype={"vae": torch.float32, "default": torch.bfloat16},
++            local_files_only=True,
++        )
++        return pipe
++    import diffusers
++
++    name = {
++        "flux2_klein": "Flux2KleinPipeline",
++    }[spec["pipeline"]]
++    if task == "inpaint" and spec["pipeline"] == "flux2_klein":
++        name = "Flux2KleinInpaintPipeline"
++    pipe = getattr(diffusers, name).from_pretrained(
++        model_id, torch_dtype=torch.bfloat16
++    )
++    pipe.enable_model_cpu_offload()
++    return pipe
+ 
+-model_path = sys.argv[1]
+ 
+-prompt_type = sys.argv[2]
+-if prompt_type == "file":
+-    with open(sys.argv[3], "r") as f:
++def default_size(images):
++    # the size of the first input image, in multiples of 16 within the form's limits
++    if not images:
++        return 1024, 1024
++    return tuple(max(256, min(2048, side // 16 * 16)) for side in images[0].size)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", required=True, help="Hugging Face model ID")
++    parser.add_argument(
++        "--task", required=True, choices=["generate", "edit", "inpaint"]
++    )
++    parser.add_argument("--prompt-file", required=True, help="File with the prompt")
++    parser.add_argument(
++        "--image", action="append", default=[], help="Input image (repeatable)"
++    )
++    parser.add_argument("--mask", help="inpaint: white where the image is redrawn")
++    parser.add_argument("--width", type=int, help="Default: 1024 or the input image's")
++    parser.add_argument("--height", type=int, help="Default: 1024 or the input image's")
++    parser.add_argument("--steps", type=int, help="Default: the model's")
++    parser.add_argument("--guidance", type=float, help="Default: the model's")
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument(
++        "--no-upsample", action="store_true", help="FLUX 3: skip the prompt upsampler"
++    )
++    parser.add_argument("--output", default="output.png")
++    args = parser.parse_args()
++
++    spec = MODELS.get(args.model)
++    if spec is None:
++        sys.exit(f"Unsupported model: {args.model}. Supported: {', '.join(MODELS)}")
++    if args.task not in spec["tasks"]:
++        sys.exit(f"{args.model} cannot be used for the task '{args.task}'")
++    low, high = IMAGES.get(args.task, (1, spec.get("references", 0)))
++    if not low <= len(args.image) <= high:
++        sys.exit(
++            f"The task '{args.task}' with {args.model} takes {low} to {high} images"
++        )
++    if args.task == "inpaint" and not args.mask:
++        sys.exit("The task 'inpaint' needs a mask")
++    if not torch.cuda.is_available():
++        sys.exit("FLUX needs a CUDA GPU")
++
++    with open(args.prompt_file) as f:
+         prompt = f.read().strip()
+-elif prompt_type == "text":
+-    prompt = sys.argv[3]
+-print(f"Creating image from prompt: {prompt}")
+-
+-if "dev" in model_path:
+-    num_inference_steps = 20
+-elif "schnell" in model_path:
+-    num_inference_steps = 4
+-else:
+-    print("Invalid model!")
+-    sys.exit(1)
+-
+-snapshots = []
+-for d in os.listdir(os.path.join(model_path, "snapshots")):
+-    snapshots.append(os.path.join(model_path, "snapshots", d))
+-latest_snapshot_path = max(snapshots, key=os.path.getmtime)
+-
+-pipe = FluxPipeline.from_pretrained(latest_snapshot_path, torch_dtype=torch.bfloat16)
+-pipe.enable_sequential_cpu_offload()
+-pipe.vae.enable_slicing()
+-pipe.vae.enable_tiling()
+-pipe.to(torch.float16)
+-
+-image = pipe(
+-    prompt,
+-    num_inference_steps=num_inference_steps,
+-    generator=torch.Generator("cpu").manual_seed(42),
+-).images[0]
+-
+-image.save("output.png")
++    if not prompt:
++        sys.exit("The prompt is empty")
++    print(f"Model: {args.model}\nTask: {args.task}\nPrompt: {prompt}", flush=True)
++
++    images = [Image.open(path).convert("RGB") for path in args.image]
++    width, height = default_size(images)
++    kwargs = {
++        "prompt": prompt,
++        "num_inference_steps": args.steps or spec["steps"],
++        "generator": torch.Generator("cpu").manual_seed(args.seed),
++        "width": args.width or width,
++        "height": args.height or height,
++    }
++    guidance = args.guidance if args.guidance is not None else spec["guidance"]
++    if guidance is not None:
++        kwargs["guidance_scale"] = guidance
++    if args.task == "inpaint":
++        kwargs["image"] = images[0]
++        kwargs["mask_image"] = Image.open(args.mask).convert("L")
++    elif images:
++        kwargs["image"] = images if len(images) > 1 else images[0]
++
++    pipe = load_pipeline(args.model, spec, args.task, not args.no_upsample)
++    if spec["pipeline"] == "flux3":
++        out = pipe(**kwargs, output=["images", "prompt"])
++        if not args.no_upsample:
++            print(f"Upsampled prompt: {out['prompt']}", flush=True)
++        image = out["images"][0]
++    else:
++        image = pipe(**kwargs).images[0]
++    image.save(args.output)
++    print(f"Saved {args.output} ({image.width}x{image.height})")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/flux/flux.xml b/tools/flux/flux.xml
+index 2361506de3..a8ffc00011 100644
+--- a/tools/flux/flux.xml
++++ b/tools/flux/flux.xml
+@@ -1,90 +1,188 @@
+-<tool id="black_forest_labs_flux" name="FLUX" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="23.0">
+-    <description>text-to-image model</description>
++<tool id="black_forest_labs_flux" name="FLUX" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="25.0">
++    <description>generate and edit images</description>
+     <macros>
+-        <token name="@TOOL_VERSION@">2024</token>
+-        <token name="@VERSION_SUFFIX@">4</token>
++        <token name="@TOOL_VERSION@">2026</token>
++        <token name="@VERSION_SUFFIX@">0</token>
++        <import>macros_for_testing.xml</import>
++        <!-- the flux rows of the huggingface table. Each task adds a filter on
++             the Hugging Face ID, so it only offers the models flux.py supports
++             for that task; the FLUX.1 rows of 2024+galaxy4 and older never match -->
++        <xml name="model_select">
++            <param name="flux_models" label="Model" type="select" help="Contact the administrator of this Galaxy instance if a model is missing">
++                <options from_data_table="huggingface">
++                    <filter type="static_value" column="4" value="flux"/>
++                    <yield/>
++                </options>
++                <validator message="No FLUX model for this task is available" type="no_options"/>
++            </param>
++        </xml>
++        <xml name="image_input" tokens="label,help">
++            <param name="image" type="data" format="png,jpg" label="@LABEL@" help="@HELP@"/>
++        </xml>
+     </macros>
+     <requirements>
+-        <container type="docker">quay.io/galaxy/black_forest_labs_flux:2024-0</container>
++        <container type="docker">quay.io/galaxy/black_forest_labs_flux:@TOOL_VERSION@-0</container>
+     </requirements>
++    <required_files>
++        <include path="flux.py"/>
++    </required_files>
+     <command detect_errors="exit_code"><![CDATA[
++export HF_HOME='$task.flux_models.fields.path' &&
++export HF_HUB_OFFLINE=1 &&
++export HF_HUB_DISABLE_TELEMETRY=1 &&
+ python3 '$__tool_directory__/flux.py'
+-'$flux_models.fields.path'
+-'$input_type_selector'
+-'$prompt'
++--model '$task.flux_models'
++--task '$task.task_selector'
++#if $input_type.input_type_selector == 'file':
++    --prompt-file '$input_type.prompt'
++#else:
++    --prompt-file '$prompt_text'
++#end if
++#if $task.task_selector == 'edit':
++    #for $image in $task.images:
++        --image '$image'
++    #end for
++#elif $task.task_selector != 'generate':
++    --image '$task.image'
++#end if
++#if $task.task_selector == 'inpaint':
++    --mask '$task.mask'
++#end if
++#if $advanced.width:
++    --width $advanced.width
++#end if
++#if $advanced.height:
++    --height $advanced.height
++#end if
++#if $advanced.steps:
++    --steps $advanced.steps
++#end if
++#if str($advanced.guidance):
++    --guidance $advanced.guidance
++#end if
++--seed $advanced.seed
++#if not $advanced.upsample:
++    --no-upsample
++#end if
++--output output.png
+     ]]></command>
+     <configfiles>
++        <configfile name="prompt_text"><![CDATA[#if $input_type.input_type_selector == 'text'
++$input_type.prompt
++#end if]]></configfile>
+     </configfiles>
+     <inputs>
+-        <param name="flux_models" label="Model data" type="select" help="Contact the administrator of our Galaxy instance if you miss model data">
+-            <options from_data_table="huggingface">
+-                <filter type="static_value" column="4" value="flux"/>
+-                <filter type="static_value" column="5" value="1"/>
+-            </options>
+-            <validator message="No model annotation is available for FLUX" type="no_options"/>
+-        </param>
++        <conditional name="task">
++            <param name="task_selector" type="select" label="Task">
++                <option value="generate" selected="true">Generate an image from the prompt</option>
++                <option value="edit">Edit or combine reference images</option>
++                <option value="inpaint">Redraw a masked part of an image (inpainting)</option>
++            </param>
++            <when value="generate">
++                <expand macro="model_select">
++                    <filter type="regexp" column="0" value="black-forest-labs/(FLUX\.2-klein-4B|flux-3-image-klein)$"/>
++                </expand>
++            </when>
++            <when value="edit">
++                <expand macro="model_select">
++                    <filter type="regexp" column="0" value="black-forest-labs/(FLUX\.2-klein-4B|flux-3-image-klein)$"/>
++                </expand>
++                <param name="images" type="data" format="png,jpg" multiple="true" label="Reference images"
++                    help="Up to 10. The prompt describes the change, or how to combine the images."/>
++            </when>
++            <when value="inpaint">
++                <expand macro="model_select">
++                    <filter type="regexp" column="0" value="black-forest-labs/FLUX\.2-klein-4B$"/>
++                </expand>
++                <expand macro="image_input" label="Image" help="The image to redraw a part of"/>
++                <param name="mask" type="data" format="png,jpg" label="Mask" help="Same size as the image: white where the image is redrawn from the prompt, black where it is kept"/>
++            </when>
++        </conditional>
+         <conditional name="input_type">
+             <param name="input_type_selector" type="select" label="Choose the type of input">
+                 <option value="file" selected="true">File based input</option>
+                 <option value="text">Text based input</option>
+             </param>
+             <when value="file">
+-                <param name="prompt" type="data" optional="false" format="txt" label="Prompt file" help="This data will be used as prompt"/>
++                <param name="prompt" type="data" format="txt" label="Prompt file" help="The text in this file is used as the prompt"/>
+             </when>
+             <when value="text">
+-                <param name="prompt" type="text" optional="false" label="Prompt" help="This text will be used as prompt" area="true">
++                <param name="prompt" type="text" label="Prompt" help="This text is used as the prompt" area="true">
+                     <validator type="empty_field"/>
+                 </param>
+             </when>
+         </conditional>
++        <section name="advanced" title="Advanced options">
++            <param name="width" type="integer" optional="true" min="256" max="2048" label="Width"
++                help="In pixels, a multiple of 16. Leave empty for 1024, or the size of the (first) input image"/>
++            <param name="height" type="integer" optional="true" min="256" max="2048" label="Height"
++                help="In pixels, a multiple of 16. Leave empty for 1024, or the size of the (first) input image"/>
++            <param name="steps" type="integer" optional="true" min="1" max="100" label="Inference steps" help="Leave empty for the model's recommended number"/>
++            <param name="guidance" type="float" optional="true" min="0" max="100" label="Guidance scale"
++                help="How closely the image follows the prompt. Leave empty for the model's recommended value; FLUX 3 Image Klein (distilled) has none"/>
++            <param name="seed" type="integer" value="42" label="Seed" help="The same seed and inputs give the same image"/>
++            <param name="upsample" type="boolean" checked="true" label="Expand the prompt (FLUX 3 Image Klein only)"
++                help="FLUX 3 Image Klein expects a full scene description. With this on, its prompt upsampler expands a short prompt first. Turn it off if the prompt already is a full description."/>
++        </section>
+     </inputs>
+     <outputs>
+-        <data name="output" format="png" label="${tool.name} on ${on_string if $input_type_selector=='file' else 'text prompt'}" from_work_dir="./output.png"/>
++        <data name="output" format="png" label="${tool.name} on ${on_string if $input_type.input_type_selector == 'file' else 'text prompt'}" from_work_dir="output.png"/>
+     </outputs>
+     <tests>
+-        <test expect_exit_code="1" expect_failure="true">
+-            <param name="flux_models" value="unknown"/>
+-            <param name="input_type_selector" value="file"/>
+-            <param name="prompt" value="flux_test.txt"/>
+-            <assert_stdout>
+-                <has_text text="Invalid model!"/>
+-            </assert_stdout>
+-        </test>
++        <expand macro="ci_tests"/>
+     </tests>
+     <help><![CDATA[
+-
+ .. class:: infomark
+ 
+ **What it does**
+ 
+-FLUX is a text-to-image model that generates images from textual descriptions.
++Generates and edits images with the FLUX models by Black Forest Labs: from a text prompt, by editing or combining reference images, or by redrawing a masked part of an image.
+ 
+-Usage
+-.....
++**Tasks and models**
+ 
+-**Input**
++================================= =========================================
++Task                              Models
++================================= =========================================
++Generate an image from the prompt FLUX.2 [klein] 4B, FLUX 3 Image Klein
++Edit or combine reference images  FLUX.2 [klein] 4B, FLUX 3 Image Klein (up to 10 images)
++Inpainting                        FLUX.2 [klein] 4B
++================================= =========================================
+ 
+-1. **Model data**:
+-    Select the model data from the dropdown list. The available models are dev and schnell.
+-    For using dev model, make sure to not use it for commercial purposes.
++FLUX.2 [klein] 4B is licensed under Apache 2.0. FLUX 3 Image Klein (FLUX Kommunity License) may not be used commercially. Which models are offered depends on what the administrator installed.
+ 
+-2. **Input Prompt**: You can provide the input prompt in two ways:
+-    - **File based input**: Upload a txt file containing the prompt.
+-    - **Text based input**: Enter the prompt text in the text area.
++**Input**
+ 
+-**Output**
++1. **Task** and **Model**, with the images the task needs. Images are PNG or JPG.
++2. **Prompt**: a txt file, or text typed in the form. For editing it describes the change.
++3. **Advanced options**: image size (default 1024x1024, or the size of the input image), inference steps and guidance scale (default: the model's recommended values), seed, and whether FLUX 3 Image Klein expands the prompt first.
+ 
+-This response is saved in the `output.png` file.
++**Output**
+ 
++A PNG image.
+     ]]></help>
+     <citations>
+         <citation type="bibtex">
+             @misc{flux,
+-                author = {black forest labs},
+-                title = {FLUX github repository},
++                author = {{Black Forest Labs}},
++                title = {FLUX},
+                 howpublished = {\url{https://github.com/black-forest-labs/flux}},
+-                year = {2024},
+-                note = {Accessed: 2024-09-04}
++                year = {2024}
++            }
++        </citation>
++        <citation type="bibtex">
++            @misc{flux2,
++                author = {{Black Forest Labs}},
++                title = {FLUX.2},
++                howpublished = {\url{https://github.com/black-forest-labs/flux2}},
++                year = {2025}
++            }
++        </citation>
++        <citation type="bibtex">
++            @misc{flux3,
++                author = {{Black Forest Labs}},
++                title = {FLUX 3 Image Klein},
++                howpublished = {\url{https://github.com/black-forest-labs/flux-3-image-klein}},
++                year = {2026}
+             }
+         </citation>
+     </citations>
+diff --git a/tools/flux/macros_for_testing.xml b/tools/flux/macros_for_testing.xml
+new file mode 100644
+index 0000000000..84037cb36f
+--- /dev/null
++++ b/tools/flux/macros_for_testing.xml
+@@ -0,0 +1,249 @@
++<macros>
++    <!-- ci_tests run without models and without a GPU (as in CI): each job
++         starts flux.py, which stops at the GPU check, and the tests check the
++         command line built from the huggingface data table.
++
++         real_tests need a GPU and the models from download_models.py mounted
++         at /data/db/flux_models. To run them, use a copy of flux.xml:
++           sed -i 's/macro="ci_tests"/macro="real_tests"/' flux.xml
++         GPU output is not bit-exact, so they check the image size. An empty
++         width/height gives the size of the input image (fox.png is 256x256).
++         Both sets read test-data/huggingface.loc, which also has rows of other
++         tools and the FLUX.1 rows of the older FLUX versions, to show the
++         model select only offers the models flux.py supports. -->
++
++    <!-- the decoy is the FLUX.1 [dev] row of FLUX 2024+galaxy4 and older
++         (as on usegalaxy.eu), so Galaxy must reject the value before any job
++         runs (expect_failure then skips the assertions). If
++         the filter let the row through, a job would be built and
++         assert_command fails -->
++    <xml name="decoy_test">
++        <test expect_failure="true">
++            <conditional name="task">
++                <param name="task_selector" value="generate"/>
++                <param name="flux_models" value="black-forest-labs-FLUX.1-dev"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="file"/>
++                <param name="prompt" value="flux_test.txt"/>
++            </conditional>
++            <assert_command>
++                <not_has_text text="flux.py"/>
++            </assert_command>
++        </test>
++    </xml>
++
++    <xml name="ci_tests">
++        <test expect_failure="true">
++            <conditional name="task">
++                <param name="task_selector" value="generate"/>
++                <param name="flux_models" value="black-forest-labs/FLUX.2-klein-4B"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="text"/>
++                <param name="prompt" value="A red fox reading a newspaper in a cozy library"/>
++            </conditional>
++            <section name="advanced">
++                <param name="width" value="512"/>
++                <param name="height" value="768"/>
++                <param name="seed" value="7"/>
++            </section>
++            <assert_command>
++                <has_text text="export HF_HOME='/data/db/flux_models'"/>
++                <has_text text="export HF_HUB_OFFLINE=1"/>
++                <has_text text="export HF_HUB_DISABLE_TELEMETRY=1"/>
++                <has_text text="--model 'black-forest-labs/FLUX.2-klein-4B'"/>
++                <has_text text="--task 'generate'"/>
++                <has_text text="--prompt-file"/>
++                <has_text text="--width 512"/>
++                <has_text text="--height 768"/>
++                <has_text text="--seed 7"/>
++                <not_has_text text="--image"/>
++                <not_has_text text="--mask"/>
++                <not_has_text text="--steps"/>
++                <not_has_text text="--guidance"/>
++                <not_has_text text="--no-upsample"/>
++            </assert_command>
++            <assert_stderr>
++                <has_text text="FLUX needs a CUDA GPU"/>
++            </assert_stderr>
++        </test>
++        <test expect_failure="true">
++            <conditional name="task">
++                <param name="task_selector" value="generate"/>
++                <param name="flux_models" value="black-forest-labs/flux-3-image-klein"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="file"/>
++                <param name="prompt" value="flux_test.txt"/>
++            </conditional>
++            <assert_command>
++                <has_text text="--model 'black-forest-labs/flux-3-image-klein'"/>
++                <has_text text="--task 'generate'"/>
++                <not_has_text text="--image"/>
++                <not_has_text text="--width"/>
++                <not_has_text text="--height"/>
++            </assert_command>
++            <assert_stderr>
++                <has_text text="FLUX needs a CUDA GPU"/>
++            </assert_stderr>
++        </test>
++        <test expect_failure="true">
++            <conditional name="task">
++                <param name="task_selector" value="edit"/>
++                <param name="flux_models" value="black-forest-labs/flux-3-image-klein"/>
++                <param name="images" value="fox.png,fox_mask.png" ftype="png"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="file"/>
++                <param name="prompt" value="flux_test.txt"/>
++            </conditional>
++            <section name="advanced">
++                <param name="steps" value="8"/>
++                <param name="guidance" value="2.5"/>
++                <param name="upsample" value="false"/>
++            </section>
++            <assert_command>
++                <has_text text="--task 'edit'"/>
++                <has_text text="--image '"/>
++                <has_text text="--steps 8"/>
++                <has_text text="--guidance 2.5"/>
++                <has_text text="--no-upsample"/>
++            </assert_command>
++            <assert_stderr>
++                <has_text text="FLUX needs a CUDA GPU"/>
++            </assert_stderr>
++        </test>
++        <test expect_failure="true">
++            <conditional name="task">
++                <param name="task_selector" value="inpaint"/>
++                <param name="flux_models" value="black-forest-labs/FLUX.2-klein-4B"/>
++                <param name="image" value="fox.png" ftype="png"/>
++                <param name="mask" value="fox_mask.png" ftype="png"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="file"/>
++                <param name="prompt" value="flux_test.txt"/>
++            </conditional>
++            <assert_command>
++                <has_text text="--model 'black-forest-labs/FLUX.2-klein-4B'"/>
++                <has_text text="--task 'inpaint'"/>
++                <has_text text="--mask '"/>
++            </assert_command>
++            <assert_stderr>
++                <has_text text="FLUX needs a CUDA GPU"/>
++            </assert_stderr>
++        </test>
++        <expand macro="decoy_test"/>
++    </xml>
++
++    <xml name="real_tests">
++        <test expect_num_outputs="1">
++            <conditional name="task">
++                <param name="task_selector" value="generate"/>
++                <param name="flux_models" value="black-forest-labs/FLUX.2-klein-4B"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="text"/>
++                <param name="prompt" value="A red fox reading a newspaper in a cozy library"/>
++            </conditional>
++            <section name="advanced">
++                <param name="width" value="512"/>
++                <param name="height" value="512"/>
++            </section>
++            <output name="output" ftype="png">
++                <assert_contents>
++                    <has_image_width width="512"/>
++                    <has_image_height height="512"/>
++                    <has_image_channels channels="3"/>
++                </assert_contents>
++            </output>
++        </test>
++        <test expect_num_outputs="1">
++            <conditional name="task">
++                <param name="task_selector" value="edit"/>
++                <param name="flux_models" value="black-forest-labs/FLUX.2-klein-4B"/>
++                <param name="images" value="fox.png" ftype="png"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="text"/>
++                <param name="prompt" value="Make it night time with moonlight through the window"/>
++            </conditional>
++            <section name="advanced">
++                <param name="width" value="512"/>
++                <param name="height" value="512"/>
++            </section>
++            <output name="output" ftype="png">
++                <assert_contents>
++                    <has_image_width width="512"/>
++                    <has_image_height height="512"/>
++                    <has_image_channels channels="3"/>
++                </assert_contents>
++            </output>
++        </test>
++        <test expect_num_outputs="1">
++            <conditional name="task">
++                <param name="task_selector" value="inpaint"/>
++                <param name="flux_models" value="black-forest-labs/FLUX.2-klein-4B"/>
++                <param name="image" value="fox.png" ftype="png"/>
++                <param name="mask" value="fox_mask.png" ftype="png"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="text"/>
++                <param name="prompt" value="A small red scarf"/>
++            </conditional>
++            <output name="output" ftype="png">
++                <assert_contents>
++                    <has_image_width width="256"/>
++                    <has_image_height height="256"/>
++                    <has_image_channels channels="3"/>
++                </assert_contents>
++            </output>
++        </test>
++        <test expect_num_outputs="1">
++            <conditional name="task">
++                <param name="task_selector" value="generate"/>
++                <param name="flux_models" value="black-forest-labs/flux-3-image-klein"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="text"/>
++                <param name="prompt" value="A red fox reading a newspaper in a cozy library"/>
++            </conditional>
++            <section name="advanced">
++                <param name="width" value="512"/>
++                <param name="height" value="512"/>
++            </section>
++            <output name="output" ftype="png">
++                <assert_contents>
++                    <has_image_width width="512"/>
++                    <has_image_height height="512"/>
++                    <has_image_channels channels="3"/>
++                </assert_contents>
++            </output>
++        </test>
++        <test expect_num_outputs="1">
++            <conditional name="task">
++                <param name="task_selector" value="edit"/>
++                <param name="flux_models" value="black-forest-labs/flux-3-image-klein"/>
++                <param name="images" value="fox.png" ftype="png"/>
++            </conditional>
++            <conditional name="input_type">
++                <param name="input_type_selector" value="text"/>
++                <param name="prompt" value="Put a small red scarf around the fox's neck"/>
++            </conditional>
++            <section name="advanced">
++                <param name="width" value="512"/>
++                <param name="height" value="512"/>
++                <param name="upsample" value="false"/>
++            </section>
++            <output name="output" ftype="png">
++                <assert_contents>
++                    <has_image_width width="512"/>
++                    <has_image_height height="512"/>
++                    <has_image_channels channels="3"/>
++                </assert_contents>
++            </output>
++        </test>
++        <expand macro="decoy_test"/>
++    </xml>
++</macros>
+diff --git a/tools/flux/test-data/fox.png b/tools/flux/test-data/fox.png
+new file mode 100644
+index 0000000000..cb0f855606
+Binary files /dev/null and b/tools/flux/test-data/fox.png differ
+diff --git a/tools/flux/test-data/fox_mask.png b/tools/flux/test-data/fox_mask.png
+new file mode 100644
+index 0000000000..57762daf52
+Binary files /dev/null and b/tools/flux/test-data/fox_mask.png differ
+diff --git a/tools/flux/test-data/huggingface.loc b/tools/flux/test-data/huggingface.loc
+new file mode 100644
+index 0000000000..32a0a722a5
+--- /dev/null
++++ b/tools/flux/test-data/huggingface.loc
+@@ -0,0 +1,9 @@
++black-forest-labs/FLUX.2-klein-4B	FLUX.2 [klein] 4B (fast, generation, editing and inpainting)	image-to-image	image	flux	2	/data/db/flux_models
++black-forest-labs/flux-3-image-klein	FLUX 3 Image Klein (best quality, editing with up to 10 references, non-commercial)	image-to-image	image	flux	3	/data/db/flux_models
++# rows of other tools in the shared table
++Systran/faster-whisper-tiny	Whisper tiny (~10x faster than large)	automatic-speech-recognition	audio	faster-whisper	1	/data/db/whisperx_models
++sentence-transformers/all-MiniLM-L6-v2	all-MiniLM-L6-v2	feature-extraction	embedding	vector-rag	1	/data/db/models/huggingface/embeddings/sentence-transformers/all-MiniLM-L6-v2
++1038lab-sam3	Segment Anything Model 3 (SAM 3)	mask-generation	image	sam3	1	/data/db/models/huggingface/sam3/sam3.pt
++# the FLUX.1 rows of FLUX 2024+galaxy4 and older (as on usegalaxy.eu); a test checks the model select never offers them
++black-forest-labs-FLUX.1-dev	FLUX.1 [dev] is an open-weight, guidance-distilled model for non-commercial applications	text-to-image	image	flux	1	/data/db/databases/huggingface/flux/black-forest-labs/FLUX.1-dev/hub/models--black-forest-labs--FLUX.1-dev/
++black-forest-labs-FLUX.1-schnell	FLUX.1 [schnell] is the fastest model, tailored for personal use	text-to-image	image	flux	1	/data/db/databases/huggingface/flux/black-forest-labs/FLUX.1-schnell/hub/models--black-forest-labs--FLUX.1-schnell/
+diff --git a/tools/flux/tool-data/huggingface.loc.sample b/tools/flux/tool-data/huggingface.loc.sample
+index 882def3718..70c4ef606d 100644
+--- a/tools/flux/tool-data/huggingface.loc.sample
++++ b/tools/flux/tool-data/huggingface.loc.sample
+@@ -1,18 +1,37 @@
+-
+-#This is a sample file distributed with Galaxy that is used to define huggingface
+-#models, using 7 columns tab separated
+-#(longer whitespace are TAB characters):
++# FLUX rows for the shared huggingface data table.
++# Column conventions: https://docs.galaxyproject.org/en/latest/admin/data_tables.html
+ #
+-#The entries are as follows:
++# Columns: value <TAB> name <TAB> pipeline_tag <TAB> domain <TAB> free_tag <TAB> version <TAB> path
+ #
+-#<unique_build_id>	<display_name>	<pipeline_tag>	<domain>	<free_tag>	<version>	<folder_base_path>
++#   value        : Hugging Face model ID; flux.py loads the model by this ID
++#                  and only supports the IDs below
++#   pipeline_tag : the model's tag on Hugging Face
++#   domain       : image
++#   free_tag     : flux
++#   version      : the FLUX generation of the model (FLUX.2: 2, FLUX 3: 3).
++#                  FLUX 2024+galaxy4 and older read only version 1, the FLUX.1
++#                  rows with a models--* folder each; keep those while such a
++#                  version is installed
++#   path         : model root directory created by download_models.py
++#                  (the directory that contains hub/); the tool sets HF_HOME to it
+ #
+-#pipeline_tag (see this URL: https://huggingface.co/models?pipeline_tag=text-to-image they call it that way)
+-#domain (defined by the Galaxy community, e.g. image / sequence / text)
+-#free_tag (not idea yet, but could be freely used by an admin to specify more filter options)
+-#version (if available)
+-#Your huggingface.loc file should include the huggingface cached model folder you have stored.
+-#For example:
++# Some models need a second model in the same root, which has no row;
++# download_models.py downloads it with the model:
++#   FLUX 3 Image Klein: its prompt upsampler,
++#     black-forest-labs/flux-3-image-klein-pup
+ #
+-#black-forest-labs/FLUX.1-dev	FLUX.1 [dev] is an open-weight, guidance-distilled model for non-commercial applications.	text-to-image	image	flux	1	/path/to/huggingface/that-contains/hub/models--black-forest-labs--FLUX.1-dev
+-#black-forest-labs/FLUX.1-schnell	FLUX.1 [schnell] is the fastest model, tailored for personal use.	text-to-image	image	flux	1	/path/to/huggingface/that-contains/hub/models--black-forest-labs--FLUX.1-schnell
++# To configure:
++# 1. Run download_models.py inside the tool's container (see the command at
++#    the top of the script), with /data/db/flux_models mounted. Both
++#    models need about 55 GB; --models downloads only one of them.
++#    FLUX 3 Image Klein is gated: accept its terms on Hugging Face first
++# 2. Copy the rows below, without the leading '#', to the huggingface.loc
++#    you share with other tools, and replace /data/db/flux_models with that
++#    directory. Leave out models you did not download. The rows are commented
++#    out so that installing the tool from a Tool Shed does not add rows with
++#    this placeholder path to the table
++# 3. Keep value as the Hugging Face ID: the tool passes it to flux.py, so a
++#    renamed value cannot be loaded
++#
++#black-forest-labs/FLUX.2-klein-4B	FLUX.2 [klein] 4B (fast, generation, editing and inpainting)	image-to-image	image	flux	2	/data/db/flux_models
++#black-forest-labs/flux-3-image-klein	FLUX 3 Image Klein (best quality, editing with up to 10 references, non-commercial)	image-to-image	image	flux	3	/data/db/flux_models
+diff --git a/tools/flux/tool_data_table_conf.xml.sample b/tools/flux/tool_data_table_conf.xml.sample
+index 95e9538e7d..a140308e0e 100644
+--- a/tools/flux/tool_data_table_conf.xml.sample
++++ b/tools/flux/tool_data_table_conf.xml.sample
+@@ -1,7 +1,7 @@
+-<!-- Paths are relative to the value of `tool_data_path` in galaxy.ini -->
++<!-- The shared huggingface table: https://docs.galaxyproject.org/en/latest/admin/data_tables.html -->
+ <tables>
+     <table name="huggingface" comment_char="#" allow_duplicate_entries="False">
+         <columns>value, name, pipeline_tag, domain, free_tag, version, path</columns>
+-        <file path="huggingface.loc" />
++        <file path="tool-data/huggingface.loc" />
+     </table>
+-</tables>
+\ No newline at end of file
++</tables>
+diff --git a/tools/flux/tool_data_table_conf.xml.test b/tools/flux/tool_data_table_conf.xml.test
+new file mode 100644
+index 0000000000..a5d77a9058
+--- /dev/null
++++ b/tools/flux/tool_data_table_conf.xml.test
+@@ -0,0 +1,6 @@
++<tables>
++    <table name="huggingface" comment_char="#" allow_duplicate_entries="False">
++        <columns>value, name, pipeline_tag, domain, free_tag, version, path</columns>
++        <file path="${__HERE__}/test-data/huggingface.loc" />
++    </table>
++</tables>

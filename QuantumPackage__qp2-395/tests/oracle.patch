@@ -1,0 +1,640 @@
+diff --git a/ocaml/TaskServer.ml b/ocaml/TaskServer.ml
+index 5d9d24165..6628491b9 100644
+--- a/ocaml/TaskServer.ml
++++ b/ocaml/TaskServer.ml
+@@ -42,6 +42,24 @@ let debug str =
+     Printf.eprintf "TASK : %s%!" str
+ 
+ 
++(** [pub_bind_error] is set when the PUB socket could not be bound
++    (only possible on the legacy path where qp_run does not pre-bind it).
++    Reported to the launcher via [pub_error]. *)
++let pub_bind_error : string option ref = ref None
++
++(** [pub_pair_alive] is false once the PUB thread is gone: state updates
++    must then be skipped, since an inproc PAIR send to a missing peer
++    would queue up and eventually block the main loop. *)
++let pub_pair_alive = ref true
++
++let pub_error () = !pub_bind_error
++
++(** Send a state to the PUB thread, if it is still alive. *)
++let pub_send pair_socket state =
++  if !pub_pair_alive then
++    Zmq.Socket.send pair_socket (string_of_pub_state state)
++
++
+ 
+ let zmq_context =
+   Zmq.Context.create ()
+@@ -77,6 +95,12 @@ let hostname = lazy (
+ external get_ipv4_address_for_interface : string -> string =
+   "get_ipv4_address_for_interface" ;;
+ 
++(** Resolved TCP address of the task server. This lazy is forced at
++    most once per process, always from the main thread (qp_run,
++    qp_tunnel) before any server thread is started: a concurrent
++    Lazy.force on a still-evaluating native lazy is a race that can
++    kill one of the threads with CamlinternalLazy.Undefined
++    (issue #393). Preserve this single-main-thread-force discipline. *)
+ let ip_address = lazy (
+   let interface = 
+     try Some (Sys.getenv "QP_NIC")
+@@ -131,8 +155,23 @@ let stop ~port =
+     |> Message.to_string
+     |> Zmq.Socket.send req_socket ;
+ 
++    (* Time-bounded wait for the Terminate answer: a dead server must
++       not hang the launcher forever (issue #393). *)
++    let pollitem =
++      Zmq.Poll.mask_of [| (req_socket, Zmq.Poll.In) |]
++    in
++    let deadline = Unix.time () +. 30. in
++    let rec wait_for_answer () =
++      let polling = Zmq.Poll.poll ~timeout:1000 pollitem in
++      if polling.(0) = Some Zmq.Poll.In then
++        Zmq.Socket.recv req_socket
++      else if Unix.time () > deadline then
++        failwith "TaskServer: no answer to the Terminate request (the task server thread is dead)"
++      else
++        wait_for_answer ()
++    in
+     let msg =
+-      Zmq.Socket.recv req_socket
++      wait_for_answer ()
+       |> Message.of_string
+     in
+     let () =
+@@ -168,8 +207,7 @@ let new_job msg program_state rep_socket pair_socket =
+       }
+     in
+     reply_ok rep_socket;
+-    string_of_pub_state Waiting
+-    |> Zmq.Socket.send pair_socket ;
++    pub_send pair_socket Waiting;
+     result
+ 
+ let change_pub_state msg program_state rep_socket pair_socket =
+@@ -188,8 +226,7 @@ let change_pub_state msg program_state rep_socket pair_socket =
+       end
+   in
+   reply_ok rep_socket;
+-  string_of_pub_state msg
+-  |> Zmq.Socket.send pair_socket ;
++  pub_send pair_socket msg;
+ 
+   program_state
+ 
+@@ -229,14 +266,12 @@ let end_job msg program_state rep_socket pair_socket =
+       begin
+         if (msg.Message.Endjob_msg.state = force_state) then
+           begin
+-            string_of_pub_state Waiting
+-            |> Zmq.Socket.send pair_socket ;
++            pub_send pair_socket Waiting;
+               success ()
+           end
+         else if (msg.Message.Endjob_msg.state = state) then
+           begin
+-            string_of_pub_state Waiting
+-            |> Zmq.Socket.send pair_socket ;
++            pub_send pair_socket Waiting;
+             if (Queuing_system.number_of_clients program_state.queue = 0) then
+               success ()
+             else
+@@ -431,11 +466,9 @@ let get_task msg program_state rep_socket pair_socket =
+         in
+ 
+         if no_task then
+-          string_of_pub_state Waiting
+-          |> Zmq.Socket.send pair_socket
++          pub_send pair_socket Waiting
+         else
+-          string_of_pub_state (Running (Message.State.to_string state))
+-          |> Zmq.Socket.send pair_socket;
++          pub_send pair_socket (Running (Message.State.to_string state));
+ 
+         let new_program_state =
+             { program_state with
+@@ -503,11 +536,9 @@ let get_tasks msg program_state rep_socket pair_socket =
+         in
+ 
+         if no_task then
+-          string_of_pub_state Waiting
+-          |> Zmq.Socket.send pair_socket
++          pub_send pair_socket Waiting
+         else
+-          string_of_pub_state (Running (Message.State.to_string state))
+-          |> Zmq.Socket.send pair_socket;
++          pub_send pair_socket (Running (Message.State.to_string state));
+ 
+         let new_program_state =
+             { program_state with
+@@ -711,7 +742,7 @@ let error msg program_state rep_socket =
+     |> Zmq.Socket.send rep_socket ;
+     program_state
+ 
+-let start_pub_thread ~port =
++let start_pub_thread ~pub_socket ~port =
+     Thread.create (fun () ->
+       let timeout =
+         1000
+@@ -724,59 +755,98 @@ let start_pub_thread ~port =
+       in
+       Zmq.Socket.connect pair_socket address;
+ 
++      let pre_bound = Option.is_some pub_socket in
+       let pub_socket =
+-        Zmq.Socket.create zmq_context Zmq.Socket.pub
++        match pub_socket with
++        | Some s -> s
++        | None -> Zmq.Socket.create zmq_context Zmq.Socket.pub
+       in
+-      bind_socket ~socket_type:"PUB" ~socket:pub_socket ~port;
+ 
+-      let pollitem =
+-        Zmq.Poll.mask_of
+-          [| (pair_socket, Zmq.Poll.In) |]
++      let bind_failed =
++        if pre_bound then false
++        else
++          (try
++             bind_socket ~socket_type:"PUB" ~socket:pub_socket ~port;
++             false
++           with
++           | Failure msg ->
++               pub_pair_alive := false;
++               pub_bind_error := Some msg;
++               Printf.eprintf
++                 "TaskServer: %s -- the state channel is unavailable; the calculation continues, qp_run will exit with an error.\n%!"
++                 msg;
++               true
++           | other ->
++               pub_pair_alive := false;
++               pub_bind_error := Some (Printexc.to_string other);
++               true)
+       in
+ 
+-      let rec run state =
+-        let new_state =
+-          let polling =
+-            Zmq.Poll.poll ~timeout pollitem
+-          in
+-          if (polling.(0) = Some Zmq.Poll.In) then
+-            Zmq.Socket.recv ~block:false pair_socket
+-            |> pub_state_of_string
+-          else
+-            state
+-        in
+-        Zmq.Socket.send pub_socket @@ string_of_pub_state new_state;
+-        match state with
+-        | Stopped -> ()
+-        | _ -> run new_state
+-      in
+-      run Waiting;
+-      Zmq.Socket.set_linger_period pair_socket 1000 ;
+-      Zmq.Socket.close pair_socket;
+-      Zmq.Socket.set_linger_period pub_socket 1000 ;
+-      Zmq.Socket.close pub_socket;
++      if bind_failed then
++        (* Close our own sockets so Zmq.Context.terminate in run()
++           cannot deadlock on them (issue #393). *)
++        (Zmq.Socket.set_linger_period pair_socket 0;
++         Zmq.Socket.close pair_socket;
++         Zmq.Socket.set_linger_period pub_socket 0;
++         Zmq.Socket.close pub_socket)
++      else
++        (let pollitem =
++           Zmq.Poll.mask_of
++             [| (pair_socket, Zmq.Poll.In) |]
++         in
++
++         let rec run state =
++           let new_state =
++             let polling =
++               Zmq.Poll.poll ~timeout pollitem
++             in
++             if (polling.(0) = Some Zmq.Poll.In) then
++               Zmq.Socket.recv ~block:false pair_socket
++               |> pub_state_of_string
++             else
++               state
++           in
++           Zmq.Socket.send pub_socket @@ string_of_pub_state new_state;
++           match state with
++           | Stopped -> ()
++           | _ -> run new_state
++         in
++         run Waiting;
++         Zmq.Socket.set_linger_period pair_socket 1000 ;
++         Zmq.Socket.close pair_socket;
++         Zmq.Socket.set_linger_period pub_socket 1000 ;
++         Zmq.Socket.close pub_socket)
+     )
+ 
+-let run ~port =
++(** [address] is the resolved TCP address (built by the caller): the
++    server thread must not force the shared [ip_address] lazy, since
++    concurrent Lazy.force on a still-evaluating native lazy is a race
++    that kills the server thread with CamlinternalLazy.Undefined
++    (issue #393). *)
++let run ~rep_socket ~pub_socket ~port ~address =
+ 
+     (** Bind inproc socket for changing state of pub *)
+     let pair_socket =
+       Zmq.Socket.create zmq_context Zmq.Socket.pair
+-    and address =
++    and pair_address =
+       "inproc://pair"
+     in
+-    Zmq.Socket.bind pair_socket address;
++    Zmq.Socket.bind pair_socket pair_address;
+ 
+     let pub_thread =
+-      start_pub_thread ~port:(port+1) ()
++      start_pub_thread ~pub_socket ~port:(port+1) ()
+     in
+ 
+-    (** Bind REP socket *)
++    (** Bind REP socket, unless qp_run pre-bound it *)
+     let rep_socket =
+-      Zmq.Socket.create zmq_context Zmq.Socket.rep
++      match rep_socket with
++      | Some s -> s
++      | None ->
++          let s = Zmq.Socket.create zmq_context Zmq.Socket.rep in
++          Zmq.Socket.set_linger_period s 1_000_000;
++          bind_socket ~socket_type:"REP" ~socket:s ~port;
++          s
+     in
+-    Zmq.Socket.set_linger_period rep_socket 1_000_000;
+-    bind_socket ~socket_type:"REP" ~socket:rep_socket ~port;
+ 
+     let initial_program_state =
+     {   queue = Queuing_system.create () ;
+@@ -796,9 +866,6 @@ let run ~port =
+         [| (rep_socket, Zmq.Poll.In) |]
+     in
+ 
+-    let address =
+-      Printf.sprintf "tcp://%s:%d" (Lazy.force ip_address) port
+-    in
+     Printf.printf "Task server running : %s\n%!" address;
+ 
+ 
+@@ -883,7 +950,7 @@ let run ~port =
+           end
+     in main_loop initial_program_state true;
+ 
+-    Zmq.Socket.send pair_socket @@ string_of_pub_state Stopped;
++    pub_send pair_socket Stopped;
+     Thread.join pub_thread;
+     Zmq.Socket.close pair_socket;
+     Zmq.Socket.close rep_socket;
+diff --git a/ocaml/TaskServer.mli b/ocaml/TaskServer.mli
+index e4bd87cff..22907dc49 100644
+--- a/ocaml/TaskServer.mli
++++ b/ocaml/TaskServer.mli
+@@ -24,6 +24,10 @@ val debug : string -> unit
+ (** ZeroMQ context *)
+ val zmq_context : Zmq.Context.t
+ 
++(** Error (if any) of the PUB socket bind. Always [None] when qp_run
++    pre-binds the PUB socket (the normal path). *)
++val pub_error : unit -> string option
++
+ (** Bind a Zmq socket to a TCP port and to an IPC file /tmp/qp_run.<port> *)
+ val bind_socket :
+   socket_type:string -> socket:'a Zmq.Socket.t -> port:int -> unit
+@@ -73,6 +77,20 @@ val terminate : t -> [> `Req ] Zmq.Socket.t -> t
+ (** Reply an Error message *)
+ val error : string -> t -> [> `Req ] Zmq.Socket.t -> t
+ 
+-(** Run server *)
+-val run : port:int -> unit
++(** Run server.
++    [rep_socket] / [pub_socket] are pre-bound sockets (the qp_run path,
++    [Some]); pass [None] to let the server create and bind them
++    (PUB on port+1). All arguments are mandatory: an optional argument
++    left out would make the call a partial application and the server
++    thread would never start.
++    [address] is the resolved TCP address for the "Task server running"
++    message; the caller builds it (forcing [ip_address] exactly once,
++    in the main thread) because a concurrent Lazy.force in the server
++    thread would race the main thread's force and could kill the
++    server thread (CamlinternalLazy.Undefined, issue #393). *)
++val run :
++  rep_socket:[`Rep] Zmq.Socket.t option ->
++  pub_socket:[`Pub] Zmq.Socket.t option ->
++  port:int ->
++  address:string -> unit
+ 
+diff --git a/ocaml/qp_run.ml b/ocaml/qp_run.ml
+index 8d5e74cfd..838ff38dc 100644
+--- a/ocaml/qp_run.ml
++++ b/ocaml/qp_run.ml
+@@ -18,34 +18,62 @@ let () =
+ 
+ let run slave ?prefix exe ezfio_file =
+ 
+-  (** Check availability of the ports *)
+-  let port_number =
++  (** Port selection.
++
++      A window of 10 ports (P..P+9) is reserved up front:
++        - P        : bound by the pre-check socket, which becomes the
++                     real REP socket and stays bound for the whole
++                     life of the process;
++        - P+1      : bound by the pre-check socket, which becomes the
++                     real PUB socket;
++        - P+2..P+9 : probed (bound then released) to reject a window
++                     already used by another qp_run (the Fortran
++                     collector binds its PULL socket on P+2).
++
++      Because the pre-check sockets ARE the real sockets, the binds
++      cannot fail later: a concurrent qp_run that wants the same
++      window fails its own pre-check bind and re-scans, instead of
++      killing one of the two task servers (issue #393).
++      `tcp://*` (all interfaces) is used so TaskServer.stop can reach
++      the REP socket via tcp://localhost. *)
++  let (port_number, task_context, rep_socket, pub_socket) =
++    let exception Port_taken in
+     let zmq_context =
+       Zmq.Context.create ()
+     in
+-    let dummy_socket =
+-      Zmq.Socket.create zmq_context Zmq.Socket.rep
+-    in
+     let rec try_new_port port_number =
++      let rep =
++        Zmq.Socket.create zmq_context Zmq.Socket.rep
++      and pub =
++        Zmq.Socket.create zmq_context Zmq.Socket.pub
++      in
+       try
++        Zmq.Socket.bind rep (Printf.sprintf "tcp://*:%d" port_number);
++        Zmq.Socket.bind pub (Printf.sprintf "tcp://*:%d" (port_number + 1));
+         List.iter (fun i ->
+-            let address =
+-              Printf.sprintf "tcp://%s:%d" (Lazy.force TaskServer.ip_address) (port_number+i)
++            let probe =
++              Zmq.Socket.create zmq_context Zmq.Socket.rep
+             in
+-            Zmq.Socket.bind dummy_socket address;
+-            Zmq.Socket.unbind dummy_socket address;
+-        ) [ 0;1;2;3;4;5;6;7;8;9 ] ;
+-        port_number
++            (try
++               Zmq.Socket.bind probe (Printf.sprintf "tcp://*:%d" (port_number + i))
++             with
++             | Unix.Unix_error _ ->
++                 (Zmq.Socket.close probe; raise Port_taken));
++            Zmq.Socket.close probe
++          ) [ 2; 3; 4; 5; 6; 7; 8; 9 ];
++        (port_number, rep, pub)
+       with
+-      | Unix.Unix_error _ -> try_new_port (port_number+100)
++      | Port_taken | Unix.Unix_error _ ->
++          (Zmq.Socket.close rep;
++           Zmq.Socket.close pub;
++           try_new_port (port_number + 100))
+     in
+-    let result =
+-      let port = 10*(Unix.getpid () mod 2823) + 32_769 in
+-      try_new_port port
++    let (port_number, rep_socket, pub_socket) =
++      try_new_port (10 * (Unix.getpid () mod 2823) + 32_769)
+     in
+-    Zmq.Socket.close dummy_socket;
+-    Zmq.Context.terminate zmq_context;
+-    result
++    Zmq.Socket.set_linger_period rep_socket 1_000_000;
++    Zmq.Socket.set_linger_period pub_socket 1_000;
++    (port_number, zmq_context, rep_socket, pub_socket)
+   in
+ 
+   let time_start =
+@@ -112,17 +140,36 @@ let run slave ?prefix exe ezfio_file =
+       with Sys_error _ -> failwith "No master is not running"
+   in
+ 
++  (** Resolve the task server address ONCE, in the main thread, before
++      the server thread is started: the server thread must not force
++      [TaskServer.ip_address] itself. Concurrent Lazy.force on a lazy
++      whose thunk is still evaluating is a race in the native runtime
++      (the second thread invokes the "raise_undefined" placeholder as
++      if it were the thunk, and the server thread dies with
++      CamlinternalLazy.Undefined before the main loop starts -- the
++      dead-server hang of issue #393). *)
++  let address =
++    Printf.sprintf "tcp://%s:%d" (Lazy.force TaskServer.ip_address) port_number
++  in
++
+   (** Start task server *)
+   let task_thread =
+      let thread =
+       Thread.create ( fun () ->
+-         TaskServer.run ~port:port_number )
++         (* DIAGNOSTIC (issue #393): report the backtrace of any crash in
++            the task server thread instead of dying silently. *)
++         try
++           TaskServer.run ~port:port_number
++                           ~rep_socket:(Some rep_socket)
++                           ~pub_socket:(Some pub_socket)
++                           ~address:address
++         with e ->
++           (Printf.eprintf "TASK SERVER CRASH: %s\nBACKTRACE:\n%s\n%!"
++              (Printexc.to_string e) (Printexc.get_backtrace ());
++            raise e) )
+      in
+      thread ();
+   in
+-  let address =
+-    Printf.sprintf "tcp://%s:%d" (Lazy.force TaskServer.ip_address) port_number
+-  in
+   Unix.putenv "QP_RUN_ADDRESS" address;
+   let () =
+     if (not slave) then
+@@ -150,8 +197,13 @@ let run slave ?prefix exe ezfio_file =
+     | i -> (Printf.printf "Program exited with code %d.\n%!" i; i)
+   in
+ 
+-  TaskServer.stop ~port:port_number;
++  (try
++     TaskServer.stop ~port:port_number
++   with
++   | Failure msg ->
++       (Printf.eprintf "qp_run: %s\n%!" msg; exit 1));
+   Thread.join task_thread;
++  Zmq.Context.terminate task_context;
+   if (not slave) then
+     Sys.remove qp_run_address_filename;
+ 
+@@ -165,6 +217,14 @@ let run slave ?prefix exe ezfio_file =
+   Unix.sleep 1;
+   if (exit_code <> 0) then
+     exit exit_code
++  else
++    (match TaskServer.pub_error () with
++     | None -> ()
++     | Some msg ->
++         (Printf.eprintf
++            "qp_run: %s -- the calculation finished, but the task server state channel was down\n%!"
++            msg;
++         exit 1))
+ 
+ 
+ 
+diff --git a/ocaml/test_taskserver_fix.ml b/ocaml/test_taskserver_fix.ml
+new file mode 100644
+index 000000000..f932ce2a9
+--- /dev/null
++++ b/ocaml/test_taskserver_fix.ml
+@@ -0,0 +1,118 @@
++(* test_taskserver_fix.ml — deterministic regression tests for GitHub
++   issue #393 (qp_run hangs at 0% CPU after the calculation completes
++   when the TaskServer PUB socket cannot be bound).
++
++   Usage: ./test_taskserver_fix <case>
++     1: TaskServer.stop against a dead server: must fail with a clear
++        error after ~30 s (a dead server must not hang the launcher).
++     2: legacy TaskServer.run with the PUB port pre-occupied: the REP
++        must still answer; after the 60 s PUB bind retries fail,
++        run() must return (no Zmq.Context.terminate deadlock) and
++        pub_error() must be set.
++     3: TaskServer.run with pre-bound REP+PUB sockets (the qp_run
++        path): clean start/stop, pub_error() = None.
++
++   Every case prints "PASS <case> ..." and exits 0 on success.
++   The test harness wraps each case in a `timeout` as a backstop. *)
++
++let port_base = 43_210
++
++let fail msg =
++  Printf.eprintf "FAIL: %s\n%!" msg;
++  exit 1
++
++let expect_ok port =
++  let ctx = Zmq.Context.create () in
++  let sock = Zmq.Socket.create ctx Zmq.Socket.req in
++  Zmq.Socket.set_linger_period sock 1000;
++  Zmq.Socket.connect sock (Printf.sprintf "tcp://localhost:%d" port);
++  (try
++     Printf.sprintf "new_job scf tcp://localhost:%d inproc://scf" port
++     |> Zmq.Socket.send sock;
++     let reply = Zmq.Socket.recv sock in
++     if reply <> "ok" then fail (Printf.sprintf "expected ok, got %s" reply)
++   with other ->
++     fail (Printf.sprintf "REQ failed: %s" (Printexc.to_string other));
++   (* fail exits, so the cleanup below runs on every non-failing path
++      (OCaml has no try...finally). *)
++   Zmq.Socket.close sock;
++   Zmq.Context.terminate ctx)
++
++let () =
++  if Array.length Sys.argv <> 2 then
++    failwith "usage: test_taskserver_fix <1|2|3>"
++  else
++    let case = int_of_string Sys.argv.(1) in
++    let port = port_base + 10 * case in
++    match case with
++    | 1 ->
++        let t0 = Unix.time () in
++        (try
++           TaskServer.stop ~port:port;
++           fail "stop() returned against a dead server (expected a failure)"
++         with
++         | Failure msg ->
++             let dt = Unix.time () -. t0 in
++             if dt < 20. || dt > 60. then
++               fail (Printf.sprintf "stop() gave up after %.0f s (expected ~30 s)" dt)
++             else
++               (Printf.printf "PASS 1: stop() failed cleanly after %.0f s: %s\n%!" dt msg;
++                exit 0))
++    | 2 ->
++        (* The harness occupies port+1 (PUB) externally for 300 s.
++           None/None: legacy path, the server creates and binds its
++           sockets itself (the PUB bind must fail after 60 s). *)
++        let thread =
++          Thread.create
++            (fun () -> TaskServer.run
++                         ~rep_socket:None ~pub_socket:None ~port:port
++                         ~address:(Printf.sprintf "tcp://localhost:%d" port))
++            ()
++        in
++        Thread.delay 3.;
++        (match TaskServer.pub_error () with
++         | Some _ -> fail "pub_error set before the 60 s PUB retries finished"
++         | None -> ());
++        expect_ok port;  (* REP must answer mid-failure *)
++        let t_stop = Unix.time () in
++        TaskServer.stop ~port:port;
++        Thread.join thread;
++        let dt = Unix.time () -. t_stop in
++        let () =
++          if dt > 120. then
++            fail (Printf.sprintf "run() took %.0f s after stop (deadlock?)" dt)
++        in
++        (match TaskServer.pub_error () with
++         | None -> fail "pub_error() is None but the PUB port was occupied"
++         | Some msg ->
++             Printf.printf "PASS 2: run() returned after %.0f s; pub_error: %s\n%!" dt msg;
++             exit 0)
++    | 3 ->
++        let ctx = Zmq.Context.create () in
++        let rep = Zmq.Socket.create ctx Zmq.Socket.rep in
++        let pub = Zmq.Socket.create ctx Zmq.Socket.pub in
++        Zmq.Socket.set_linger_period rep 1_000_000;
++        Zmq.Socket.bind rep (Printf.sprintf "tcp://*:%d" port);
++        Zmq.Socket.bind pub (Printf.sprintf "tcp://*:%d" (port + 1));
++        let thread =
++          Thread.create (fun () ->
++              TaskServer.run ~port:port
++                            ~rep_socket:(Some rep) ~pub_socket:(Some pub)
++                            ~address:(Printf.sprintf "tcp://localhost:%d" port)) ()
++        in
++        Thread.delay 2.;
++        expect_ok port;
++        let t_stop = Unix.time () in
++        TaskServer.stop ~port:port;
++        Thread.join thread;
++        Zmq.Context.terminate ctx;
++        let dt = Unix.time () -. t_stop in
++        let () =
++          if dt > 10. then fail (Printf.sprintf "case 3: stop/join took %.0f s" dt)
++        in
++        (match TaskServer.pub_error () with
++         | Some msg -> fail (Printf.sprintf "case 3: pub_error set: %s" msg)
++         | None ->
++             Printf.printf "PASS 3: pre-bound run/stop clean in %.1f s\n%!" dt;
++             exit 0)
++    | _ -> failwith "unknown case"
+diff --git a/ocaml/tests/test_task_server.ml b/ocaml/tests/test_task_server.ml
+index 00573a9d2..8ed4b4780 100644
+--- a/ocaml/tests/test_task_server.ml
++++ b/ocaml/tests/test_task_server.ml
+@@ -1,3 +1,3 @@
+ let () =
+-  TaskServer.run 12345
+-
++  TaskServer.run ~rep_socket:None ~pub_socket:None ~port:12345
++                 ~address:(Printf.sprintf "tcp://%s:%d" (Lazy.force TaskServer.ip_address) 12345)
+diff --git a/src/zmq/utils.irp.f b/src/zmq/utils.irp.f
+index 2cb230c71..fd9a93bb9 100644
+--- a/src/zmq/utils.irp.f
++++ b/src/zmq/utils.irp.f
+@@ -369,10 +369,10 @@ function new_zmq_sub_socket()
+      stop 'Unable to create zmq sub socket'
+   endif
+ 
+-!  rc = f77_zmq_setsockopt(new_zmq_sub_socket,ZMQ_RCVTIMEO,10000,4)
+-!  if (rc /= 0) then
+-!    stop 'Unable to set timeout in new_zmq_sub_socket'
+-!  endif
++  rc = f77_zmq_setsockopt(new_zmq_sub_socket,ZMQ_RCVTIMEO,10000,4)
++  if (rc /= 0) then
++    stop 'Unable to set recv timeout in new_zmq_sub_socket'
++  endif
+ 
+   rc = f77_zmq_setsockopt(new_zmq_sub_socket,ZMQ_CONFLATE,1,4)
+   if (rc /= 0) then

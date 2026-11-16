@@ -1,0 +1,2258 @@
+diff --git a/skfp/fingerprints/_new_mordred/calculator.py b/skfp/fingerprints/_new_mordred/calculator.py
+index 849952f3d..f4678eda8 100644
+--- a/skfp/fingerprints/_new_mordred/calculator.py
++++ b/skfp/fingerprints/_new_mordred/calculator.py
+@@ -1,5 +1,5 @@
+ import numpy as np
+-from rdkit.Chem import GetMolFrags, Mol
++from rdkit.Chem import GetMolFrags, GetSymmSSSR, Mol
+ 
+ from skfp.fingerprints._new_mordred.descriptors import (
+     abc_index,
+@@ -8,6 +8,7 @@
+     atom_count,
+     autocorrelation,
+     carbon_types,
++    extended_topochemical_atom,
+     morse,
+     rdkit_descriptors,
+     ring_count,
+@@ -57,7 +58,6 @@ def compute(mol: Mol, use_3D: bool) -> np.ndarray:
+ 
+     # classic, RDKit-standardized molecule
+     mol_regular = preprocess_mol(mol)
+-    mol_kekulized = preprocess_mol(mol, kekulize=True)
+     distance_matrix_regular = DistanceMatrix(mol_regular)
+     adjacency_matrix_regular = AdjacencyMatrix(mol_regular)
+ 
+@@ -65,6 +65,14 @@ def compute(mol: Mol, use_3D: bool) -> np.ndarray:
+     mol_hydrogens = preprocess_mol(mol, explicit_hydrogens=True)
+     distance_matrix_hydrogens = DistanceMatrix(mol_hydrogens)
+ 
++    # kekulized molecule (aromatic -> single/double bonds)
++    mol_kekulized = preprocess_mol(mol, kekulize=True)
++    distance_matrix_kekulized = DistanceMatrix(mol_kekulized)
++    mol_kekulized_hydrogens = preprocess_mol(
++        mol, kekulize=True, explicit_hydrogens=True
++    )
++    num_rings = len(GetSymmSSSR(mol_kekulized))
++
+     # 2D descriptors
+     descriptors_2d = [
+         abc_index.calc(mol_regular, distance_matrix_regular),
+@@ -83,6 +91,13 @@ def compute(mol: Mol, use_3D: bool) -> np.ndarray:
+         carbon_types.calc(mol_kekulized),
+         rotatable_bond.calc(mol_regular),
+         ring_count.calc(mol_regular),
++        extended_topochemical_atom.calc(
++            mol_kekulized,
++            distance_matrix_kekulized,
++            mol_kekulized_hydrogens,
++            num_rings,
++            n_frags,
++        ),
+     ]
+ 
+     for values, feature_names in descriptors_2d:
+diff --git a/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py b/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py
+new file mode 100644
+index 000000000..16b46df96
+--- /dev/null
++++ b/skfp/fingerprints/_new_mordred/descriptors/extended_topochemical_atom.py
+@@ -0,0 +1,479 @@
++import numpy as np
++from rdkit.Chem import AddHs, Atom, BondType, Kekulize, Mol, RWMol, SanitizeMol
++
++from skfp.fingerprints._new_mordred.utils.atomic_properties import _RDKIT_PERIODIC_TABLE
++from skfp.fingerprints._new_mordred.utils.graph_matrix import DistanceMatrix
++from skfp.fingerprints._new_mordred.utils.periodic_table import PERIOD
++
++"""
++This code has been adapted from the BSD-licensed mordred-community library.
++https://github.com/JacksonBurns/mordred-community
++
++See skfp/fingerprints/data/mordred-community_bsd_license.txt for the license text.
++"""
++
++_GET_N_OUTER_ELECS = _RDKIT_PERIODIC_TABLE.GetNOuterElecs
++
++FEATURE_NAMES = [
++    "ETA_alpha",
++    "AETA_alpha",
++    "ETA_shape_p",
++    "ETA_shape_y",
++    "ETA_shape_x",
++    "ETA_beta",
++    "AETA_beta",
++    "ETA_beta_s",
++    "AETA_beta_s",
++    "ETA_beta_ns",
++    "AETA_beta_ns",
++    "ETA_beta_ns_d",
++    "AETA_beta_ns_d",
++    "ETA_eta",
++    "AETA_eta",
++    "ETA_eta_L",
++    "AETA_eta_L",
++    "ETA_eta_R",
++    "AETA_eta_R",
++    "ETA_eta_RL",
++    "AETA_eta_RL",
++    "ETA_eta_F",
++    "AETA_eta_F",
++    "ETA_eta_FL",
++    "AETA_eta_FL",
++    "ETA_eta_B",
++    "AETA_eta_B",
++    "ETA_eta_BR",
++    "AETA_eta_BR",
++    "ETA_dAlpha_A",
++    "ETA_dAlpha_B",
++    "ETA_epsilon_1",
++    "ETA_epsilon_2",
++    "ETA_epsilon_3",
++    "ETA_epsilon_4",
++    "ETA_epsilon_5",
++    "ETA_dEpsilon_A",
++    "ETA_dEpsilon_B",
++    "ETA_dEpsilon_C",
++    "ETA_dEpsilon_D",
++    "ETA_dBeta",
++    "AETA_dBeta",
++    "ETA_psi_1",
++    "ETA_dPsi_A",
++    "ETA_dPsi_B",
++]
++
++
++def calc(
++    mol_kekulized: Mol,
++    distance_matrix: DistanceMatrix,
++    mol_kekulized_hydrogens: Mol,
++    ring_count: int,
++    n_frags: int,
++) -> tuple[np.ndarray, list[str]]:
++    # ETA descriptors require a connected molecule
++    if n_frags != 1:
++        return np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32), FEATURE_NAMES
++
++    num_atoms = mol_kekulized.GetNumAtoms()
++
++    # atomic properties
++    atomic_nums, core_counts, epsilons = _atom_properties(mol_kekulized)
++    degrees = np.fromiter(
++        (atom.GetDegree() for atom in mol_kekulized.GetAtoms()),
++        dtype=np.int32,
++        count=num_atoms,
++    )
++    gamma, beta_sigma, beta_non_sigma, beta_delta = _beta_and_gamma(
++        mol_kekulized, atomic_nums, core_counts, epsilons
++    )
++
++    # reference variants of the molecule; each may fail to build (e.g. heavy atom
++    # with degree > 4), in which case the descriptors depending on it become NaN
++    mol_alkane = build_reference_mol(mol_kekulized)
++    mol_alkane_hydrogens = build_reference_mol(mol_kekulized, explicit_hydrogens=True)
++    mol_saturated = build_reference_mol(
++        mol_kekulized, explicit_hydrogens=True, saturated=True
++    )
++
++    core_count = core_counts.sum()
++    core_count_mean = core_count / num_atoms
++
++    # ETA_shape_{p,y,x}: fraction of total core count from atoms of degree 1/3/4
++    shape = np.array([core_counts[degrees == d].sum() / core_count for d in (1, 3, 4)])
++
++    # ETA VEM counts (sums and averages of beta / beta_s / beta_ns / beta_ns_d)
++    vem_beta_s = beta_sigma.sum() / 2.0
++    vem_beta_ns = beta_non_sigma.sum() / 2.0 + beta_delta.sum()
++    vem_beta_ns_d = beta_delta.sum()
++    vem_beta = vem_beta_s + vem_beta_ns
++    eta_vem_counts = np.array(
++        [
++            vem_beta,
++            vem_beta / num_atoms,
++            vem_beta_s,
++            vem_beta_s / num_atoms,
++            vem_beta_ns,
++            vem_beta_ns / num_atoms,
++            vem_beta_ns_d,
++            vem_beta_ns_d / num_atoms,
++        ],
++        dtype=np.float32,
++    )
++
++    # composite + functionality indices
++    if mol_alkane is None:
++        gamma_alkane = None
++        distance_matrix_alkane = None
++    else:
++        z_a, core_a, eps_a = _atom_properties(mol_alkane)
++        gamma_alkane, *_ = _beta_and_gamma(mol_alkane, z_a, core_a, eps_a)
++        distance_matrix_alkane = DistanceMatrix(mol_alkane).matrix
++
++    eta_composite = _composite_and_functionality(
++        gamma,
++        distance_matrix.matrix,
++        gamma_alkane,
++        distance_matrix_alkane,
++        num_atoms,
++    )
++
++    eta_branching = _branching_indices(eta_composite[6], ring_count, num_atoms)
++
++    # ETA delta alpha
++    if mol_alkane is None:
++        eta_delta_alpha = np.array([np.nan, np.nan], dtype=np.float32)
++    else:
++        core_count_alkane = core_a.sum()
++        d_a = max((core_count - core_count_alkane) / num_atoms, 0.0)
++        d_b = max((core_count_alkane - core_count) / num_atoms, 0.0)
++        eta_delta_alpha = np.array([d_a, d_b], dtype=np.float32)
++
++    eta_epsilon_values = _epsilon_values(
++        epsilons,
++        mol_kekulized_hydrogens,
++        mol_alkane_hydrogens,
++        mol_saturated,
++    )
++
++    # ETA delta beta
++    delta_beta = vem_beta_ns - vem_beta_s
++    eta_delta_beta = np.array([delta_beta, delta_beta / num_atoms], dtype=np.float32)
++
++    # ETA psi
++    psi = core_count / (num_atoms * eta_epsilon_values[1])
++    eta_psi = np.array(
++        [psi, max(0.714 - psi, 0.0), max(psi - 0.714, 0.0)], dtype=np.float32
++    )
++
++    values = np.concatenate(
++        [
++            [core_count, core_count_mean],
++            shape,
++            eta_vem_counts,
++            eta_composite,
++            eta_branching,
++            eta_delta_alpha,
++            eta_epsilon_values,
++            eta_delta_beta,
++            eta_psi,
++        ],
++        dtype=np.float32,
++    )
++    return values, FEATURE_NAMES
++
++
++def _atom_properties(mol: Mol) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """
++    Return per-atom arrays of (atomic number, core count alpha, epsilon).
++    """
++    num_atoms = mol.GetNumAtoms()
++    atomic_nums = np.empty(num_atoms, dtype=np.int32)
++    core_counts = np.empty(num_atoms, dtype=np.float32)
++    epsilons = np.empty(num_atoms, dtype=np.float32)
++
++    for atom in mol.GetAtoms():
++        i = atom.GetIdx()
++        z = atom.GetAtomicNum()
++        zv = _GET_N_OUTER_ELECS(z)
++        alpha = 0.0 if z == 1 else (z - zv) / (zv * (PERIOD[z] - 1))
++        atomic_nums[i] = z
++        core_counts[i] = alpha
++        epsilons[i] = 0.3 * zv - alpha
++
++    return atomic_nums, core_counts, epsilons
++
++
++def _beta_and_gamma(
++    mol: Mol,
++    atomic_nums: np.ndarray,
++    core_counts: np.ndarray,
++    epsilons: np.ndarray,
++) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++    """
++    Compute per-atom sigma, non-sigma, and delta beta contributions and gamma.
++    """
++    num_atoms = mol.GetNumAtoms()
++    beta_sigma = np.zeros(num_atoms, dtype=np.float32)
++    beta_non_sigma = np.zeros(num_atoms, dtype=np.float32)
++
++    for bond in mol.GetBonds():
++        a = bond.GetBeginAtomIdx()
++        b = bond.GetEndAtomIdx()
++        za = atomic_nums[a]
++        zb = atomic_nums[b]
++
++        # sigma contribution: only between heavy-atom neighbors
++        if za != 1 and zb != 1:
++            weight = 0.5 if abs(epsilons[a] - epsilons[b]) <= 0.3 else 0.75
++            beta_sigma[a] += weight
++            beta_sigma[b] += weight
++
++        # non-sigma (pi / aromatic) bond contribution
++        contribution = _nonsigma_contribute(bond, epsilons)
++        if contribution:
++            if zb != 1:
++                beta_non_sigma[a] += contribution
++            if za != 1:
++                beta_non_sigma[b] += contribution
++
++    beta_delta = np.fromiter(
++        (_beta_delta(atom) for atom in mol.GetAtoms()),
++        dtype=np.float32,
++        count=num_atoms,
++    )
++
++    beta = beta_sigma + beta_non_sigma + beta_delta
++    with np.errstate(divide="ignore", invalid="ignore"):
++        gamma = np.where(beta == 0.0, np.nan, core_counts / beta)
++
++    return gamma, beta_sigma, beta_non_sigma, beta_delta
++
++
++def _nonsigma_contribute(bond, epsilons: np.ndarray) -> float:
++    """
++    Non-sigma (pi, aromatic) contribution of a single bond to the ETA beta index.
++    """
++    if bond.GetBondType() is BondType.SINGLE:
++        return 0.0
++
++    f = 2.0 if bond.GetBondTypeAsDouble() == BondType.TRIPLE else 1.0
++
++    if bond.GetIsAromatic():
++        y = 2.0
++    else:
++        d_eps = abs(epsilons[bond.GetBeginAtomIdx()] - epsilons[bond.GetEndAtomIdx()])
++        y = 1.5 if d_eps > 0.3 else 1.0
++
++    return y * f
++
++
++def _beta_delta(atom) -> float:
++    """
++    Lone-pair (delta) contribution: 0.5 for an acyclic atom with lone pairs that
++    is adjacent to an aromatic neighbor, otherwise 0.
++    """
++    if atom.GetIsAromatic() or atom.IsInRing():
++        return 0.0
++    if _GET_N_OUTER_ELECS(atom.GetAtomicNum()) - atom.GetTotalValence() <= 0:
++        return 0.0
++    for neighbor in atom.GetNeighbors():
++        if neighbor.GetIsAromatic():
++            return 0.5
++    return 0.0
++
++
++def _composite_index_pair(gamma: np.ndarray, dists: np.ndarray) -> tuple[float, float]:
++    """
++    ETA composite index, returning (non_local, local) together.
++
++    ``non_local = sum_{i<j} sqrt(gamma_i gamma_j / r_ij^2)`` and ``local`` is the
++    same sum restricted to bonded pairs (``r_ij == 1``).
++    """
++    upper_i, upper_j = np.triu_indices(gamma.shape[0], k=1)
++    d = dists[upper_i, upper_j]
++    terms = np.sqrt(gamma[upper_i] * gamma[upper_j] / d**2)
++    non_local = terms.sum()
++    local = terms[d == 1.0].sum()
++    return float(non_local), float(local)
++
++
++def _composite_and_functionality(
++    gamma: np.ndarray,
++    distance_matrix: np.ndarray,
++    gamma_alkane: np.ndarray | None,
++    distance_matrix_alkane: np.ndarray | None,
++    num_atoms: int,
++) -> np.ndarray:
++    """
++    ETA composite and functionality index descriptors.
++
++    Reference-alkane values (and the functionality indices derived from them)
++    are NaN when the reference alkane could not be built.
++    """
++    regular_non_local, regular_local = _composite_index_pair(gamma, distance_matrix)
++    regular_non_local_avg = regular_non_local / num_atoms
++    regular_local_avg = regular_local / num_atoms
++
++    if gamma_alkane is None:
++        alkane_non_local = alkane_non_local_avg = np.nan
++        alkane_local = alkane_local_avg = np.nan
++    else:
++        num_atoms_alkane = gamma_alkane.shape[0]
++        alkane_non_local, alkane_local = _composite_index_pair(
++            gamma_alkane, distance_matrix_alkane
++        )
++        alkane_non_local_avg = alkane_non_local / num_atoms_alkane
++        alkane_local_avg = alkane_local / num_atoms_alkane
++
++    functionality_non_local = alkane_non_local - regular_non_local
++    functionality_local = alkane_local - regular_local
++
++    return np.array(
++        [
++            regular_non_local,
++            regular_non_local_avg,
++            regular_local,
++            regular_local_avg,
++            alkane_non_local,
++            alkane_non_local_avg,
++            alkane_local,
++            alkane_local_avg,
++            functionality_non_local,
++            functionality_non_local / num_atoms,
++            functionality_local,
++            functionality_local / num_atoms,
++        ],
++        dtype=np.float32,
++    )
++
++
++def _branching_indices(
++    composite_index_alkane_local: float, ring_count: int, num_atoms: int
++) -> np.ndarray:
++    """
++    ETA branching index descriptors.
++    """
++    if num_atoms <= 1:
++        return np.full(4, np.nan, dtype=np.float32)
++
++    if num_atoms == 2:
++        reference_alkane_branching = 1.0
++    else:
++        reference_alkane_branching = np.sqrt(2) + 0.5 * (num_atoms - 3)
++
++    non_ring = reference_alkane_branching - composite_index_alkane_local
++    ring = non_ring + 0.086 * ring_count
++
++    return np.array(
++        [non_ring, non_ring / num_atoms, ring, ring / num_atoms], dtype=np.float32
++    )
++
++
++def _epsilon_values(
++    epsilons: np.ndarray,
++    mol_hydrogens: Mol,
++    mol_alkane_hydrogens: Mol | None,
++    mol_saturated: Mol | None,
++) -> np.ndarray:
++    """
++    ETA epsilon and epsilon delta descriptors.
++
++    Types 3 and 4 (and the epsilon deltas derived from them) are NaN when the
++    respective reference molecule could not be built.
++    """
++    _, _, eps_hydrogens = _atom_properties(mol_hydrogens)
++
++    eps_1 = eps_hydrogens.mean()
++    eps_2 = epsilons.mean()
++    eps_3 = (
++        _atom_properties(mol_alkane_hydrogens)[2].mean()
++        if mol_alkane_hydrogens is not None
++        else np.nan
++    )
++    eps_4 = (
++        _atom_properties(mol_saturated)[2].mean()
++        if mol_saturated is not None
++        else np.nan
++    )
++
++    # heavy atoms and hydrogens bonded to heteroatoms, on the H-explicit molecule
++    keep = [
++        atom.GetIdx()
++        for atom in mol_hydrogens.GetAtoms()
++        if atom.GetAtomicNum() != 1 or atom.GetNeighbors()[0].GetAtomicNum() != 6
++    ]
++    eps_5 = eps_hydrogens[keep].mean()
++
++    return np.array(
++        [
++            eps_1,
++            eps_2,
++            eps_3,
++            eps_4,
++            eps_5,
++            eps_1 - eps_3,
++            eps_1 - eps_4,
++            eps_3 - eps_4,
++            eps_2 - eps_5,
++        ],
++        dtype=np.float32,
++    )
++
++
++def build_reference_mol(
++    mol: Mol, explicit_hydrogens: bool = False, saturated: bool = False
++) -> Mol | None:
++    """
++    Build an simplified reference analog of the molecule.
++
++    saturated=False gives a carbon alkane-like skeleton, replacing heavy atoms
++    with carbons and all bonds with single ones.
++
++    saturated=True keeps atom elements and formal charges, carbon-carbon bonds
++    become single, while bonds touching a heteroatom keep their original order.
++
++    Input hydrogens are dropped and only re-added at the end when
++    `explicit_hydrogens` is set.
++    """
++    new_mol = RWMol()
++    old_to_new = {}
++
++    # copy heavy atoms
++    for atom in mol.GetAtoms():
++        if atom.GetAtomicNum() == 1:
++            continue
++        if saturated:
++            new_atom = Atom(atom.GetAtomicNum())
++            new_atom.SetFormalCharge(atom.GetFormalCharge())
++        else:
++            new_atom = Atom(6)  # carbon
++
++        old_to_new[atom.GetIdx()] = new_mol.AddAtom(new_atom)
++
++    # copy bonds between kept atoms
++    for bond in mol.GetBonds():
++        begin = bond.GetBeginAtom()
++        end = bond.GetEndAtom()
++
++        if not saturated and (begin.GetDegree() > 4 or end.GetDegree() > 4):
++            return None
++
++        i = old_to_new.get(begin.GetIdx())
++        j = old_to_new.get(end.GetIdx())
++        if i is None or j is None:
++            continue  # one end was a hydrogen
++
++        keep_order = saturated and (
++            begin.GetAtomicNum() != 6 or end.GetAtomicNum() != 6
++        )
++        new_mol.AddBond(i, j, bond.GetBondType() if keep_order else BondType.SINGLE)
++
++    new_mol = new_mol.GetMol()
++    if SanitizeMol(new_mol, catchErrors=True) != 0:
++        return None
++
++    if explicit_hydrogens:
++        new_mol = AddHs(new_mol)
++
++    Kekulize(new_mol)
++    return new_mol
+diff --git a/skfp/fingerprints/_new_mordred/utils/atomic_properties.py b/skfp/fingerprints/_new_mordred/utils/atomic_properties.py
+index d8b878d28..a687eb5bd 100644
+--- a/skfp/fingerprints/_new_mordred/utils/atomic_properties.py
++++ b/skfp/fingerprints/_new_mordred/utils/atomic_properties.py
+@@ -1,6 +1,6 @@
+ import numpy as np
+ from rdkit import Chem
+-from rdkit.Chem.rdchem import Atom, Bond
++from rdkit.Chem.rdchem import Atom
+ 
+ from .periodic_table import (
+     ALLRED_ROCHOW_ELECTRONEGATIVITY,
+@@ -127,119 +127,3 @@ def get_intrinsic_state(atom: Atom) -> float:
+         return np.nan
+     dv = get_valence_electrons(atom)
+     return ((2.0 / PERIOD[atom.GetAtomicNum()]) ** 2 * dv + 1) / d
+-
+-
+-def get_core_count(atom: Atom) -> float:
+-    """
+-    Atomic core-count term (alpha) used as a building block of ETA indices.
+-    Reflects the relative number of non-valence (core) electrons, scaled by period.
+-    """
+-    Z = atom.GetAtomicNum()
+-    if Z == 1:
+-        return 0.0
+-    Zv = _RDKIT_PERIODIC_TABLE.GetNOuterElecs(Z)
+-    PN = PERIOD[Z]
+-    return (Z - Zv) / (Zv * (PN - 1))
+-
+-
+-def get_eta_epsilon(atom: Atom) -> float:
+-    """
+-    ETA electronegativity-like measure (epsilon) for a single atom.
+-    Differences in epsilon between bonded atoms encode bond polarity.
+-    """
+-    Zv = _RDKIT_PERIODIC_TABLE.GetNOuterElecs(atom.GetAtomicNum())
+-    return 0.3 * Zv - get_core_count(atom)
+-
+-
+-def get_eta_beta_sigma(atom: Atom) -> float:
+-    """
+-    Sigma-bond contribution to an atom's ETA beta index, summed over
+-    non-hydrogen neighbors and weighted by similarity of their epsilon values.
+-    """
+-    e = get_eta_epsilon(atom)
+-    return sum(
+-        0.5 if abs(get_eta_epsilon(a) - e) <= 0.3 else 0.75
+-        for a in atom.GetNeighbors()
+-        if a.GetAtomicNum() != 1
+-    )
+-
+-
+-def get_other_bond_atom(bond: Bond, atom: Atom) -> Atom:
+-    begin = bond.GetBeginAtom()
+-    if atom.GetIdx() != begin.GetIdx():
+-        return begin
+-    return bond.GetEndAtom()
+-
+-
+-def get_eta_nonsigma_contribute(bond: Bond) -> float:
+-    """
+-    Non-sigma (pi, aromatic) contribution of a single bond to the ETA beta index.
+-    Weighted by bond order, aromaticity, and the epsilon difference of its endpoints.
+-    """
+-    if bond.GetBondType() is Chem.BondType.SINGLE:
+-        return 0.0
+-
+-    f = 1.0
+-    if bond.GetBondTypeAsDouble() == Chem.BondType.TRIPLE:
+-        f = 2.0
+-
+-    a = bond.GetBeginAtom()
+-    b = bond.GetEndAtom()
+-    dEps = abs(get_eta_epsilon(a) - get_eta_epsilon(b))
+-
+-    if bond.GetIsAromatic():
+-        y = 2.0
+-    elif dEps > 0.3:
+-        y = 1.5
+-    else:
+-        y = 1.0
+-
+-    return y * f
+-
+-
+-def get_eta_beta_delta(atom: Atom) -> float:
+-    """
+-    Lone-pair (delta) contribution to an atom's ETA beta index.
+-    Nonzero only for acyclic atoms with lone pairs adjacent to an aromatic neighbor.
+-    """
+-    if (
+-        atom.GetIsAromatic()
+-        or atom.IsInRing()
+-        or _RDKIT_PERIODIC_TABLE.GetNOuterElecs(atom.GetAtomicNum())
+-        - atom.GetTotalValence()
+-        <= 0
+-    ):
+-        return 0.0
+-
+-    for b in atom.GetNeighbors():
+-        if b.GetIsAromatic():
+-            return 0.5
+-
+-    return 0.0
+-
+-
+-def get_eta_beta_non_sigma(atom: Atom) -> float:
+-    """
+-    Total non-sigma (pi, aromatic) bond contribution to an atom's ETA beta index,
+-    summed over all bonds to non-hydrogen neighbors.
+-    """
+-    return sum(
+-        get_eta_nonsigma_contribute(b)
+-        for b in atom.GetBonds()
+-        if get_other_bond_atom(b, atom).GetAtomicNum() != 1
+-    )
+-
+-
+-def get_eta_gamma(atom: Atom) -> float:
+-    """
+-    ETA gamma index for an atom: core count divided by total beta contribution.
+-    Represents an atom's topochemical "hardness" in the ETA framework.
+-    """
+-    beta = (
+-        get_eta_beta_sigma(atom)
+-        + get_eta_beta_non_sigma(atom)
+-        + get_eta_beta_delta(atom)
+-    )
+-    if beta == 0:
+-        return np.nan
+-    return get_core_count(atom) / beta
+diff --git a/tests/fingerprints/_new_mordred/extended_topochemical_atom.py b/tests/fingerprints/_new_mordred/extended_topochemical_atom.py
+new file mode 100644
+index 000000000..13e7f6ebd
+--- /dev/null
++++ b/tests/fingerprints/_new_mordred/extended_topochemical_atom.py
+@@ -0,0 +1,64 @@
++import json
++from pathlib import Path
++
++import numpy as np
++import pytest
++from numpy.testing import assert_allclose
++from rdkit.Chem import GetMolFrags, GetSymmSSSR, MolFromSmiles
++
++from skfp.fingerprints._new_mordred.descriptors.extended_topochemical_atom import calc
++from skfp.fingerprints._new_mordred.utils.graph_matrix import DistanceMatrix
++from skfp.fingerprints._new_mordred.utils.mol_preprocess import preprocess_mol
++
++"""
++This code has been adapted from the BSD-licensed mordred-community library.
++https://github.com/JacksonBurns/mordred-community
++
++Reference values were generated with mordred-community and are stored at
++./references/eta.json as expected[molecule][feature_name], with null for NaN.
++
++See skfp/fingerprints/data/mordred-community_bsd_license.txt for the license text.
++"""
++
++with open(Path(__file__).parent / "references" / "eta.json") as file:
++    _REFERENCE = json.load(file)
++
++
++def _compute(mol):
++    mol_kekulized = preprocess_mol(mol, kekulize=True)
++    distance_matrix = DistanceMatrix(mol_kekulized)
++    mol_kekulized_hydrogens = preprocess_mol(
++        mol, kekulize=True, explicit_hydrogens=True
++    )
++    ring_count = len(GetSymmSSSR(mol_kekulized))
++    n_frags = len(GetMolFrags(mol))
++
++    values, feature_names = calc(
++        mol_kekulized,
++        distance_matrix,
++        mol_kekulized_hydrogens,
++        ring_count,
++        n_frags,
++    )
++    return dict(zip(feature_names, values, strict=True))
++
++
++@pytest.mark.parametrize("molecule", list(_REFERENCE["expected"]))
++def test_eta_reference_values(molecule, mordred_test_mols):
++    mol = mordred_test_mols[molecule]
++    computed = _compute(mol)
++
++    expected = _REFERENCE["expected"][molecule]
++    vals_mordred = np.array(
++        [np.nan if expected[f] is None else expected[f] for f in computed],
++        dtype=float,
++    )
++    vals_skfp = np.array([computed[f] for f in computed], dtype=float)
++
++    assert_allclose(vals_skfp, vals_mordred, atol=1e-3, equal_nan=True)
++
++
++def test_disconnected_mol_all_nan():
++    mol = MolFromSmiles("[Na].[Cl]")
++    computed = _compute(mol)
++    assert_allclose(list(computed.values()), np.nan)
+diff --git a/tests/fingerprints/_new_mordred/references/eta.json b/tests/fingerprints/_new_mordred/references/eta.json
+new file mode 100644
+index 000000000..05ac27d6b
+--- /dev/null
++++ b/tests/fingerprints/_new_mordred/references/eta.json
+@@ -0,0 +1,1508 @@
++{
++ "feature_names": [
++  "ETA_alpha",
++  "AETA_alpha",
++  "ETA_shape_p",
++  "ETA_shape_y",
++  "ETA_shape_x",
++  "ETA_beta",
++  "AETA_beta",
++  "ETA_beta_s",
++  "AETA_beta_s",
++  "ETA_beta_ns",
++  "AETA_beta_ns",
++  "ETA_beta_ns_d",
++  "AETA_beta_ns_d",
++  "ETA_eta",
++  "AETA_eta",
++  "ETA_eta_L",
++  "AETA_eta_L",
++  "ETA_eta_R",
++  "AETA_eta_R",
++  "ETA_eta_RL",
++  "AETA_eta_RL",
++  "ETA_eta_F",
++  "AETA_eta_F",
++  "ETA_eta_FL",
++  "AETA_eta_FL",
++  "ETA_eta_B",
++  "AETA_eta_B",
++  "ETA_eta_BR",
++  "AETA_eta_BR",
++  "ETA_dAlpha_A",
++  "ETA_dAlpha_B",
++  "ETA_epsilon_1",
++  "ETA_epsilon_2",
++  "ETA_epsilon_3",
++  "ETA_epsilon_4",
++  "ETA_epsilon_5",
++  "ETA_dEpsilon_A",
++  "ETA_dEpsilon_B",
++  "ETA_dEpsilon_C",
++  "ETA_dEpsilon_D",
++  "ETA_dBeta",
++  "AETA_dBeta",
++  "ETA_psi_1",
++  "ETA_dPsi_A",
++  "ETA_dPsi_B"
++ ],
++ "expected": {
++  "Hexane": {
++   "ETA_alpha": 3.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.3333333333333333,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 2.5,
++   "AETA_beta": 0.4166666666666667,
++   "ETA_beta_s": 2.5,
++   "AETA_beta_s": 0.4166666666666667,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 5.312944921610615,
++   "AETA_eta": 0.8854908202684358,
++   "ETA_eta_L": 2.914213562373095,
++   "AETA_eta_L": 0.48570226039551584,
++   "ETA_eta_R": 5.312944921610615,
++   "AETA_eta_R": 0.8854908202684358,
++   "ETA_eta_RL": 2.914213562373095,
++   "AETA_eta_RL": 0.48570226039551584,
++   "ETA_eta_F": 0.0,
++   "AETA_eta_F": 0.0,
++   "ETA_eta_FL": 0.0,
++   "AETA_eta_FL": 0.0,
++   "ETA_eta_B": 0.0,
++   "AETA_eta_B": 0.0,
++   "ETA_eta_BR": 0.0,
++   "AETA_eta_BR": 0.0,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.41999999999999993,
++   "ETA_epsilon_2": 0.7000000000000001,
++   "ETA_epsilon_3": 0.41999999999999993,
++   "ETA_epsilon_4": 0.41999999999999993,
++   "ETA_epsilon_5": 0.7000000000000001,
++   "ETA_dEpsilon_A": 0.0,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": 0.0,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -2.5,
++   "AETA_dBeta": -0.4166666666666667,
++   "ETA_psi_1": 0.7142857142857143,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.00028571428571433355
++  },
++  "Benzene": {
++   "ETA_alpha": 3.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 9.0,
++   "AETA_beta": 1.5,
++   "ETA_beta_s": 3.0,
++   "AETA_beta_s": 0.5,
++   "ETA_beta_ns": 6.0,
++   "AETA_beta_ns": 1.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 1.6666666666666667,
++   "AETA_eta": 0.2777777777777778,
++   "ETA_eta_L": 0.9999999999999999,
++   "AETA_eta_L": 0.16666666666666666,
++   "ETA_eta_R": 5.0,
++   "AETA_eta_R": 0.8333333333333334,
++   "ETA_eta_RL": 3.0,
++   "AETA_eta_RL": 0.5,
++   "ETA_eta_F": 3.333333333333333,
++   "AETA_eta_F": 0.5555555555555555,
++   "ETA_eta_FL": 2.0,
++   "AETA_eta_FL": 0.3333333333333333,
++   "ETA_eta_B": -0.08578643762690508,
++   "AETA_eta_B": -0.01429773960448418,
++   "ETA_eta_BR": 0.00021356237309491655,
++   "AETA_eta_BR": 3.559372884915276e-05,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.49999999999999994,
++   "ETA_epsilon_2": 0.7000000000000001,
++   "ETA_epsilon_3": 0.43333333333333324,
++   "ETA_epsilon_4": 0.43333333333333324,
++   "ETA_epsilon_5": 0.7000000000000001,
++   "ETA_dEpsilon_A": 0.06666666666666671,
++   "ETA_dEpsilon_B": 0.06666666666666671,
++   "ETA_dEpsilon_C": 0.0,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": 3.0,
++   "AETA_dBeta": 0.5,
++   "ETA_psi_1": 0.7142857142857143,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.00028571428571433355
++  },
++  "Caffeine": {
++   "ETA_alpha": 6.266666666666667,
++   "AETA_alpha": 0.44761904761904764,
++   "ETA_shape_p": 0.3457446808510638,
++   "ETA_shape_y": 0.5106382978723404,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 18.75,
++   "AETA_beta": 1.3392857142857142,
++   "ETA_beta_s": 10.75,
++   "AETA_beta_s": 0.7678571428571429,
++   "ETA_beta_ns": 8.0,
++   "AETA_beta_ns": 0.5714285714285714,
++   "ETA_beta_ns_d": 1.0,
++   "AETA_beta_ns_d": 0.07142857142857142,
++   "ETA_eta": 8.370777480207035,
++   "AETA_eta": 0.5979126771576454,
++   "ETA_eta_L": 2.735604016896348,
++   "AETA_eta_L": 0.1954002869211677,
++   "ETA_eta_R": 20.953604752777277,
++   "AETA_eta_R": 1.4966860537698055,
++   "ETA_eta_RL": 6.5365812602091875,
++   "AETA_eta_RL": 0.4668986614435134,
++   "ETA_eta_F": 12.582827272570242,
++   "AETA_eta_F": 0.8987733766121602,
++   "ETA_eta_FL": 3.8009772433128397,
++   "AETA_eta_FL": 0.2714983745223457,
++   "ETA_eta_B": 0.3776323021639074,
++   "AETA_eta_B": 0.02697373586885053,
++   "ETA_eta_BR": 0.5496323021639073,
++   "AETA_eta_BR": 0.039259450154564814,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.05238095238095238,
++   "ETA_epsilon_1": 0.6638888888888891,
++   "ETA_epsilon_2": 0.9238095238095237,
++   "ETA_epsilon_3": 0.4400000000000004,
++   "ETA_epsilon_4": 0.6358974358974361,
++   "ETA_epsilon_5": 0.9238095238095237,
++   "ETA_dEpsilon_A": 0.2238888888888887,
++   "ETA_dEpsilon_B": 0.027991452991453003,
++   "ETA_dEpsilon_C": -0.1958974358974357,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -2.75,
++   "AETA_dBeta": -0.19642857142857142,
++   "ETA_psi_1": 0.48453608247422686,
++   "ETA_dPsi_A": 0.2294639175257731,
++   "ETA_dPsi_B": 0.0
++  },
++  "Cyanidin": {
++   "ETA_alpha": 9.500000000000002,
++   "AETA_alpha": 0.45238095238095244,
++   "ETA_shape_p": 0.17543859649122803,
++   "ETA_shape_y": 0.4736842105263157,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 31.75,
++   "AETA_beta": 1.5119047619047619,
++   "ETA_beta_s": 13.25,
++   "AETA_beta_s": 0.6309523809523809,
++   "ETA_beta_ns": 18.5,
++   "AETA_beta_ns": 0.8809523809523809,
++   "ETA_beta_ns_d": 2.5,
++   "AETA_beta_ns_d": 0.11904761904761904,
++   "ETA_eta": 11.904276516499404,
++   "AETA_eta": 0.5668703103094954,
++   "ETA_eta_L": 3.5219646178345916,
++   "AETA_eta_L": 0.16771260084926626,
++   "ETA_eta_R": 35.54645621413821,
++   "AETA_eta_R": 1.6926883911494386,
++   "ETA_eta_RL": 9.952397498181153,
++   "AETA_eta_RL": 0.4739236903895787,
++   "ETA_eta_F": 23.642179697638806,
++   "AETA_eta_F": 1.1258180808399432,
++   "ETA_eta_FL": 6.430432880346562,
++   "AETA_eta_FL": 0.30621108954031245,
++   "ETA_eta_B": 0.4618160641919431,
++   "AETA_eta_B": 0.02199124115199729,
++   "ETA_eta_BR": 0.7198160641919431,
++   "AETA_eta_BR": 0.03427695543771157,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.04761904761904753,
++   "ETA_epsilon_1": 0.70625,
++   "ETA_epsilon_2": 0.9190476190476188,
++   "ETA_epsilon_3": 0.4423728813559325,
++   "ETA_epsilon_4": 0.5826086956521742,
++   "ETA_epsilon_5": 0.7999999999999999,
++   "ETA_dEpsilon_A": 0.26387711864406754,
++   "ETA_dEpsilon_B": 0.12364130434782583,
++   "ETA_dEpsilon_C": -0.1402358142962417,
++   "ETA_dEpsilon_D": 0.11904761904761885,
++   "ETA_dBeta": 5.25,
++   "AETA_dBeta": 0.25,
++   "ETA_psi_1": 0.49222797927461165,
++   "ETA_dPsi_A": 0.22177202072538832,
++   "ETA_dPsi_B": 0.0
++  },
++  "Lycopene": {
++   "ETA_alpha": 20.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.25,
++   "ETA_shape_y": 0.2,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 32.5,
++   "AETA_beta": 0.8125,
++   "ETA_beta_s": 19.5,
++   "AETA_beta_s": 0.4875,
++   "ETA_beta_ns": 13.0,
++   "AETA_beta_ns": 0.325,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 52.801084164287985,
++   "AETA_eta": 1.3200271041071996,
++   "ETA_eta_L": 12.244979841219548,
++   "AETA_eta_L": 0.3061244960304887,
++   "ETA_eta_R": 77.57218931311773,
++   "AETA_eta_R": 1.9393047328279434,
++   "ETA_eta_RL": 18.988978758390342,
++   "AETA_eta_RL": 0.47472446895975856,
++   "ETA_eta_F": 24.771105148829747,
++   "AETA_eta_F": 0.6192776287207437,
++   "ETA_eta_FL": 6.743998917170794,
++   "AETA_eta_FL": 0.16859997292926984,
++   "ETA_eta_B": 0.9252348039827538,
++   "AETA_eta_B": 0.023130870099568844,
++   "ETA_eta_BR": 0.9252348039827538,
++   "AETA_eta_BR": 0.023130870099568844,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.4666666666666653,
++   "ETA_epsilon_2": 0.6999999999999995,
++   "ETA_epsilon_3": 0.43114754098360486,
++   "ETA_epsilon_4": 0.43114754098360486,
++   "ETA_epsilon_5": 0.6999999999999995,
++   "ETA_dEpsilon_A": 0.035519125683060426,
++   "ETA_dEpsilon_B": 0.035519125683060426,
++   "ETA_dEpsilon_C": 0.0,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -6.5,
++   "AETA_dBeta": -0.1625,
++   "ETA_psi_1": 0.7142857142857149,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.00028571428571488866
++  },
++  "Epicatechin": {
++   "ETA_alpha": 9.500000000000002,
++   "AETA_alpha": 0.45238095238095244,
++   "ETA_shape_p": 0.17543859649122803,
++   "ETA_shape_y": 0.4736842105263157,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 27.25,
++   "AETA_beta": 1.2976190476190477,
++   "ETA_beta_s": 13.25,
++   "AETA_beta_s": 0.6309523809523809,
++   "ETA_beta_ns": 14.0,
++   "AETA_beta_ns": 0.6666666666666666,
++   "ETA_beta_ns_d": 2.0,
++   "AETA_beta_ns_d": 0.09523809523809523,
++   "ETA_eta": 15.01778633388195,
++   "AETA_eta": 0.7151326825658072,
++   "ETA_eta_L": 4.446735088527229,
++   "AETA_eta_L": 0.21174928992986808,
++   "ETA_eta_R": 35.5464562141382,
++   "AETA_eta_R": 1.6926883911494381,
++   "ETA_eta_RL": 9.952397498181153,
++   "AETA_eta_RL": 0.4739236903895787,
++   "ETA_eta_F": 20.528669880256253,
++   "AETA_eta_F": 0.9775557085836311,
++   "ETA_eta_FL": 5.505662409653923,
++   "AETA_eta_FL": 0.26217440045971063,
++   "ETA_eta_B": 0.4618160641919431,
++   "AETA_eta_B": 0.02199124115199729,
++   "ETA_eta_BR": 0.7198160641919431,
++   "AETA_eta_BR": 0.03427695543771157,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.04761904761904753,
++   "ETA_epsilon_1": 0.6714285714285715,
++   "ETA_epsilon_2": 0.9190476190476188,
++   "ETA_epsilon_3": 0.4423728813559325,
++   "ETA_epsilon_4": 0.5765957446808513,
++   "ETA_epsilon_5": 0.7999999999999999,
++   "ETA_dEpsilon_A": 0.22905569007263898,
++   "ETA_dEpsilon_B": 0.0948328267477202,
++   "ETA_dEpsilon_C": -0.13422286332491878,
++   "ETA_dEpsilon_D": 0.11904761904761885,
++   "ETA_dBeta": 0.75,
++   "AETA_dBeta": 0.03571428571428571,
++   "ETA_psi_1": 0.49222797927461165,
++   "ETA_dPsi_A": 0.22177202072538832,
++   "ETA_dPsi_B": 0.0
++  },
++  "Limonene": {
++   "ETA_alpha": 5.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.3,
++   "ETA_shape_y": 0.3,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 7.0,
++   "AETA_beta": 0.7,
++   "ETA_beta_s": 5.0,
++   "AETA_beta_s": 0.5,
++   "ETA_beta_ns": 2.0,
++   "AETA_beta_ns": 0.2,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 9.305239335224726,
++   "AETA_eta": 0.9305239335224726,
++   "ETA_eta_L": 3.620709505782055,
++   "AETA_eta_L": 0.3620709505782055,
++   "ETA_eta_R": 11.952923934983268,
++   "AETA_eta_R": 1.1952923934983268,
++   "ETA_eta_RL": 4.698377302757662,
++   "AETA_eta_RL": 0.46983773027576625,
++   "ETA_eta_F": 2.6476845997585414,
++   "AETA_eta_F": 0.26476845997585413,
++   "ETA_eta_FL": 1.0776677969756072,
++   "AETA_eta_FL": 0.10776677969756072,
++   "ETA_eta_B": 0.21583625961543262,
++   "AETA_eta_B": 0.021583625961543264,
++   "ETA_eta_BR": 0.3018362596154326,
++   "AETA_eta_BR": 0.03018362596154326,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.45384615384615423,
++   "ETA_epsilon_2": 0.7000000000000001,
++   "ETA_epsilon_3": 0.43333333333333374,
++   "ETA_epsilon_4": 0.43333333333333374,
++   "ETA_epsilon_5": 0.7000000000000001,
++   "ETA_dEpsilon_A": 0.020512820512820495,
++   "ETA_dEpsilon_B": 0.020512820512820495,
++   "ETA_dEpsilon_C": 0.0,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -3.0,
++   "AETA_dBeta": -0.3,
++   "ETA_psi_1": 0.7142857142857142,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.0002857142857142225
++  },
++  "Allicin": {
++   "ETA_alpha": 5.0,
++   "AETA_alpha": 0.5555555555555556,
++   "ETA_shape_p": 0.26666666666666666,
++   "ETA_shape_y": 0.16666666666666669,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 7.75,
++   "AETA_beta": 0.8611111111111112,
++   "ETA_beta_s": 4.25,
++   "AETA_beta_s": 0.4722222222222222,
++   "ETA_beta_ns": 3.5,
++   "AETA_beta_ns": 0.3888888888888889,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 6.23985827554457,
++   "AETA_eta": 0.6933175861716189,
++   "ETA_eta_L": 2.9451636573530457,
++   "AETA_eta_L": 0.32724040637256063,
++   "ETA_eta_R": 9.958788306683074,
++   "AETA_eta_R": 1.106532034075897,
++   "ETA_eta_RL": 4.308060412490447,
++   "AETA_eta_RL": 0.47867337916560526,
++   "ETA_eta_F": 3.7189300311385036,
++   "AETA_eta_F": 0.4132144479042782,
++   "ETA_eta_FL": 1.3628967551374016,
++   "AETA_eta_FL": 0.15143297279304463,
++   "ETA_eta_B": 0.10615314988264757,
++   "AETA_eta_B": 0.011794794431405286,
++   "ETA_eta_BR": 0.10615314988264757,
++   "AETA_eta_BR": 0.011794794431405286,
++   "ETA_dAlpha_A": 0.05555555555555555,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.5578947368421056,
++   "ETA_epsilon_2": 0.8444444444444444,
++   "ETA_epsilon_3": 0.4241379310344831,
++   "ETA_epsilon_4": 0.5130434782608699,
++   "ETA_epsilon_5": 0.8444444444444444,
++   "ETA_dEpsilon_A": 0.13375680580762245,
++   "ETA_dEpsilon_B": 0.04485125858123562,
++   "ETA_dEpsilon_C": -0.08890554722638683,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -0.75,
++   "AETA_dBeta": -0.08333333333333333,
++   "ETA_psi_1": 0.6578947368421053,
++   "ETA_dPsi_A": 0.05610526315789466,
++   "ETA_dPsi_B": 0.0
++  },
++  "Glutathione": {
++   "ETA_alpha": 9.033333333333333,
++   "AETA_alpha": 0.45166666666666666,
++   "ETA_shape_p": 0.3579335793357934,
++   "ETA_shape_y": 0.33210332103321033,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 18.25,
++   "AETA_beta": 0.9125,
++   "ETA_beta_s": 12.25,
++   "AETA_beta_s": 0.6125,
++   "ETA_beta_ns": 6.0,
++   "AETA_beta_ns": 0.3,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 18.145360020626452,
++   "AETA_eta": 0.9072680010313225,
++   "ETA_eta_L": 5.548379775902394,
++   "AETA_eta_L": 0.27741898879511967,
++   "ETA_eta_R": 33.6495015562958,
++   "AETA_eta_R": 1.68247507781479,
++   "ETA_eta_RL": 9.272963365427636,
++   "AETA_eta_RL": 0.4636481682713818,
++   "ETA_eta_F": 15.504141535669351,
++   "AETA_eta_F": 0.7752070767834676,
++   "ETA_eta_FL": 3.724583589525242,
++   "AETA_eta_FL": 0.1862291794762621,
++   "ETA_eta_B": 0.6412501969454603,
++   "AETA_eta_B": 0.03206250984727301,
++   "ETA_eta_BR": 0.6412501969454603,
++   "AETA_eta_BR": 0.03206250984727301,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.04833333333333334,
++   "ETA_epsilon_1": 0.6801801801801804,
++   "ETA_epsilon_2": 1.0033333333333332,
++   "ETA_epsilon_3": 0.4290322580645165,
++   "ETA_epsilon_4": 0.6801801801801804,
++   "ETA_epsilon_5": 0.8209876543209877,
++   "ETA_dEpsilon_A": 0.25114792211566395,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.25114792211566395,
++   "ETA_dEpsilon_D": 0.18234567901234544,
++   "ETA_dBeta": -6.25,
++   "AETA_dBeta": -0.3125,
++   "ETA_psi_1": 0.4501661129568107,
++   "ETA_dPsi_A": 0.2638338870431893,
++   "ETA_dPsi_B": 0.0
++  },
++  "Digoxin": {
++   "ETA_alpha": 25.16666666666666,
++   "AETA_alpha": 0.45757575757575747,
++   "ETA_shape_p": 0.19205298013245034,
++   "ETA_shape_y": 0.39735099337748353,
++   "ETA_shape_x": 0.05960264900662253,
++   "ETA_beta": 38.75,
++   "AETA_beta": 0.7045454545454546,
++   "ETA_beta_s": 36.25,
++   "AETA_beta_s": 0.6590909090909091,
++   "ETA_beta_ns": 2.5,
++   "AETA_beta_ns": 0.045454545454545456,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 103.73264935225208,
++   "AETA_eta": 1.886048170040947,
++   "ETA_eta_L": 20.446424654171796,
++   "AETA_eta_L": 0.3717531755303963,
++   "ETA_eta_R": 136.94998058221583,
++   "AETA_eta_R": 2.4899996469493786,
++   "ETA_eta_RL": 26.0107502574498,
++   "AETA_eta_RL": 0.4729227319536327,
++   "ETA_eta_F": 33.21733122996375,
++   "AETA_eta_F": 0.6039514769084318,
++   "ETA_eta_FL": 5.564325603278004,
++   "AETA_eta_FL": 0.10116955642323643,
++   "ETA_eta_B": 1.4034633049232959,
++   "AETA_eta_B": 0.025517514634969016,
++   "ETA_eta_BR": 2.0914633049232956,
++   "AETA_eta_BR": 0.03802660554405992,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.04242424242424253,
++   "ETA_epsilon_1": 0.5750700280112032,
++   "ETA_epsilon_2": 0.8951515151515157,
++   "ETA_epsilon_3": 0.4456953642384089,
++   "ETA_epsilon_4": 0.5705234159779601,
++   "ETA_epsilon_5": 0.8366120218579237,
++   "ETA_dEpsilon_A": 0.12937466377279433,
++   "ETA_dEpsilon_B": 0.004546612033243136,
++   "ETA_dEpsilon_C": -0.1248280517395512,
++   "ETA_dEpsilon_D": 0.05853949329359198,
++   "ETA_dBeta": -33.75,
++   "AETA_dBeta": -0.6136363636363636,
++   "ETA_psi_1": 0.5111712931618141,
++   "ETA_dPsi_A": 0.20282870683818588,
++   "ETA_dPsi_B": 0.0
++  },
++  "Capsaicin": {
++   "ETA_alpha": 10.400000000000002,
++   "AETA_alpha": 0.47272727272727283,
++   "ETA_shape_p": 0.2083333333333333,
++   "ETA_shape_y": 0.24038461538461534,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 22.0,
++   "AETA_beta": 1.0,
++   "ETA_beta_s": 12.5,
++   "AETA_beta_s": 0.5681818181818182,
++   "ETA_beta_ns": 9.5,
++   "AETA_beta_ns": 0.4318181818181818,
++   "ETA_beta_ns_d": 1.0,
++   "AETA_beta_ns_d": 0.045454545454545456,
++   "ETA_eta": 20.005675534751497,
++   "AETA_eta": 0.9093488879432499,
++   "ETA_eta_L": 6.298208704871986,
++   "AETA_eta_L": 0.28628221385781755,
++   "ETA_eta_R": 34.93250841154303,
++   "AETA_eta_R": 1.5878412914337743,
++   "ETA_eta_RL": 10.524075805453153,
++   "AETA_eta_RL": 0.4783670820660524,
++   "ETA_eta_F": 14.926832876791536,
++   "AETA_eta_F": 0.6784924034905244,
++   "ETA_eta_FL": 4.2258671005811665,
++   "AETA_eta_FL": 0.19208486820823484,
++   "ETA_eta_B": 0.3901377569199429,
++   "AETA_eta_B": 0.01773353440545195,
++   "ETA_eta_BR": 0.47613775691994287,
++   "AETA_eta_BR": 0.02164262531454286,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.027272727272727174,
++   "ETA_epsilon_1": 0.5346938775510207,
++   "ETA_epsilon_2": 0.8227272727272724,
++   "ETA_epsilon_3": 0.4333333333333337,
++   "ETA_epsilon_4": 0.5017543859649126,
++   "ETA_epsilon_5": 0.7791666666666665,
++   "ETA_dEpsilon_A": 0.10136054421768703,
++   "ETA_dEpsilon_B": 0.032939491586108094,
++   "ETA_dEpsilon_C": -0.06842105263157894,
++   "ETA_dEpsilon_D": 0.043560606060605966,
++   "ETA_dBeta": -3.0,
++   "AETA_dBeta": -0.13636363636363635,
++   "ETA_psi_1": 0.5745856353591163,
++   "ETA_dPsi_A": 0.13941436464088364,
++   "ETA_dPsi_B": 0.0
++  },
++  "EllagicAcid": {
++   "ETA_alpha": 9.666666666666668,
++   "AETA_alpha": 0.43939393939393945,
++   "ETA_shape_p": 0.20689655172413787,
++   "ETA_shape_y": 0.6206896551724137,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 33.0,
++   "AETA_beta": 1.5,
++   "ETA_beta_s": 15.0,
++   "AETA_beta_s": 0.6818181818181818,
++   "ETA_beta_ns": 18.0,
++   "AETA_beta_ns": 0.8181818181818182,
++   "ETA_beta_ns_d": 3.0,
++   "AETA_beta_ns_d": 0.13636363636363635,
++   "ETA_eta": 13.767316725831167,
++   "AETA_eta": 0.6257871239014167,
++   "ETA_eta_L": 3.8484357884091507,
++   "AETA_eta_L": 0.17492889947314322,
++   "ETA_eta_R": 40.222916953228086,
++   "AETA_eta_R": 1.828314406964913,
++   "ETA_eta_RL": 10.396754605515326,
++   "AETA_eta_RL": 0.4725797547961512,
++   "ETA_eta_F": 26.45560022739692,
++   "AETA_eta_F": 1.2025272830634963,
++   "ETA_eta_FL": 6.548318817106176,
++   "AETA_eta_FL": 0.297650855323008,
++   "ETA_eta_B": 0.5174589568577694,
++   "AETA_eta_B": 0.023520861675353156,
++   "ETA_eta_BR": 0.8614589568577694,
++   "AETA_eta_BR": 0.03915722531171679,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.06060606060606055,
++   "ETA_epsilon_1": 0.833333333333333,
++   "ETA_epsilon_2": 0.9787878787878782,
++   "ETA_epsilon_3": 0.446666666666667,
++   "ETA_epsilon_4": 0.6733333333333333,
++   "ETA_epsilon_5": 0.874358974358974,
++   "ETA_dEpsilon_A": 0.38666666666666605,
++   "ETA_dEpsilon_B": 0.1599999999999997,
++   "ETA_dEpsilon_C": -0.22666666666666635,
++   "ETA_dEpsilon_D": 0.10442890442890418,
++   "ETA_dBeta": 3.0,
++   "AETA_dBeta": 0.13636363636363635,
++   "ETA_psi_1": 0.44891640866873095,
++   "ETA_dPsi_A": 0.265083591331269,
++   "ETA_dPsi_B": 0.0
++  },
++  "Astaxanthin": {
++   "ETA_alpha": 21.333333333333332,
++   "AETA_alpha": 0.4848484848484848,
++   "ETA_shape_p": 0.29687500000000006,
++   "ETA_shape_y": 0.28125,
++   "ETA_shape_x": 0.046875,
++   "ETA_beta": 37.5,
++   "AETA_beta": 0.8522727272727273,
++   "ETA_beta_s": 23.5,
++   "AETA_beta_s": 0.5340909090909091,
++   "ETA_beta_ns": 14.0,
++   "AETA_beta_ns": 0.3181818181818182,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 63.37821335070327,
++   "AETA_eta": 1.4404139397887106,
++   "ETA_eta_L": 13.264373203154431,
++   "AETA_eta_L": 0.3014630273444189,
++   "ETA_eta_R": 97.06042910368247,
++   "AETA_eta_R": 2.205918843265511,
++   "ETA_eta_RL": 20.456939227838788,
++   "AETA_eta_RL": 0.46493043699633607,
++   "ETA_eta_F": 33.6822157529792,
++   "AETA_eta_F": 0.7655049034767999,
++   "ETA_eta_FL": 7.192566024684357,
++   "AETA_eta_FL": 0.1634674096519172,
++   "ETA_eta_B": 1.4572743345343078,
++   "AETA_eta_B": 0.033119871239416086,
++   "ETA_eta_BR": 1.6292743345343077,
++   "AETA_eta_BR": 0.03702896214850699,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.015151515151515178,
++   "ETA_epsilon_1": 0.5152777777777761,
++   "ETA_epsilon_2": 0.7696969696969694,
++   "ETA_epsilon_3": 0.4353846153846135,
++   "ETA_epsilon_4": 0.4751412429378512,
++   "ETA_epsilon_5": 0.7492753623188402,
++   "ETA_dEpsilon_A": 0.07989316239316258,
++   "ETA_dEpsilon_B": 0.04013653483992485,
++   "ETA_dEpsilon_C": -0.03975662755323772,
++   "ETA_dEpsilon_D": 0.02042160737812926,
++   "ETA_dBeta": -9.5,
++   "AETA_dBeta": -0.2159090909090909,
++   "ETA_psi_1": 0.6299212598425199,
++   "ETA_dPsi_A": 0.08407874015748007,
++   "ETA_dPsi_B": 0.0
++  },
++  "DMSO": {
++   "ETA_alpha": 2.166666666666667,
++   "AETA_alpha": 0.5416666666666667,
++   "ETA_shape_p": 0.6153846153846153,
++   "ETA_shape_y": 0.3846153846153846,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 3.25,
++   "AETA_beta": 0.8125,
++   "ETA_beta_s": 1.75,
++   "AETA_beta_s": 0.4375,
++   "ETA_beta_ns": 1.5,
++   "AETA_beta_ns": 0.375,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 2.0925413286116457,
++   "AETA_eta": 0.5231353321529114,
++   "ETA_eta_L": 1.2076411491518955,
++   "AETA_eta_L": 0.30191028728797387,
++   "ETA_eta_R": 3.232050807568877,
++   "AETA_eta_R": 0.8080127018922193,
++   "ETA_eta_RL": 1.7320508075688772,
++   "AETA_eta_RL": 0.4330127018922193,
++   "ETA_eta_F": 1.1395094789572315,
++   "AETA_eta_F": 0.2848773697393079,
++   "ETA_eta_FL": 0.5244096584169817,
++   "AETA_eta_FL": 0.13110241460424543,
++   "ETA_eta_B": 0.18216275480421795,
++   "AETA_eta_B": 0.04554068870105449,
++   "ETA_eta_BR": 0.18216275480421795,
++   "AETA_eta_BR": 0.04554068870105449,
++   "ETA_dAlpha_A": 0.04166666666666674,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.5633333333333332,
++   "ETA_epsilon_2": 0.9583333333333333,
++   "ETA_epsilon_3": 0.41428571428571415,
++   "ETA_epsilon_4": 0.5633333333333332,
++   "ETA_epsilon_5": 0.9583333333333333,
++   "ETA_dEpsilon_A": 0.1490476190476191,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.1490476190476191,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -0.25,
++   "AETA_dBeta": -0.0625,
++   "ETA_psi_1": 0.5652173913043479,
++   "ETA_dPsi_A": 0.14878260869565207,
++   "ETA_dPsi_B": 0.0
++  },
++  "DiethylThioketone": {
++   "ETA_alpha": 3.3333333333333335,
++   "AETA_alpha": 0.5555555555555556,
++   "ETA_shape_p": 0.55,
++   "ETA_shape_y": 0.15,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 3.5,
++   "AETA_beta": 0.5833333333333334,
++   "ETA_beta_s": 2.5,
++   "AETA_beta_s": 0.4166666666666667,
++   "ETA_beta_ns": 1.0,
++   "AETA_beta_ns": 0.16666666666666666,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 4.822570815725777,
++   "AETA_eta": 0.8037618026209629,
++   "ETA_eta_L": 2.3800024277401044,
++   "AETA_eta_L": 0.3966670712900174,
++   "ETA_eta_R": 5.730588650324319,
++   "AETA_eta_R": 0.9550981083873865,
++   "ETA_eta_RL": 2.808060412490447,
++   "AETA_eta_RL": 0.46801006874840784,
++   "ETA_eta_F": 0.9080178345985415,
++   "AETA_eta_F": 0.15133630576642357,
++   "ETA_eta_FL": 0.4280579847503425,
++   "AETA_eta_FL": 0.07134299745839041,
++   "ETA_eta_B": 0.10615314988264801,
++   "AETA_eta_B": 0.017692191647108002,
++   "ETA_eta_BR": 0.10615314988264801,
++   "AETA_eta_BR": 0.017692191647108002,
++   "ETA_dAlpha_A": 0.05555555555555558,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.4666666666666665,
++   "ETA_epsilon_2": 0.7444444444444444,
++   "ETA_epsilon_3": 0.41999999999999993,
++   "ETA_epsilon_4": 0.4666666666666665,
++   "ETA_epsilon_5": 0.7444444444444444,
++   "ETA_dEpsilon_A": 0.04666666666666658,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.04666666666666658,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -1.5,
++   "AETA_dBeta": -0.25,
++   "ETA_psi_1": 0.7462686567164181,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.0322686567164181
++  },
++  "VinylsulfonicAcid": {
++   "ETA_alpha": 2.833333333333334,
++   "AETA_alpha": 0.4722222222222223,
++   "ETA_shape_p": 0.5294117647058821,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.2941176470588235,
++   "ETA_beta": 7.25,
++   "AETA_beta": 1.2083333333333333,
++   "ETA_beta_s": 3.25,
++   "AETA_beta_s": 0.5416666666666666,
++   "ETA_beta_ns": 4.0,
++   "AETA_beta_ns": 0.6666666666666666,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 2.102011435864211,
++   "AETA_eta": 0.3503352393107018,
++   "ETA_eta_L": 1.025875532219732,
++   "AETA_eta_L": 0.1709792553699553,
++   "ETA_eta_R": 6.371320343559643,
++   "AETA_eta_R": 1.0618867239266072,
++   "ETA_eta_RL": 2.5606601717798214,
++   "AETA_eta_RL": 0.4267766952966369,
++   "ETA_eta_F": 4.269308907695432,
++   "AETA_eta_F": 0.7115514846159053,
++   "ETA_eta_FL": 1.5347846395600895,
++   "AETA_eta_FL": 0.2557974399266816,
++   "ETA_eta_B": 0.3535533905932735,
++   "AETA_eta_B": 0.05892556509887892,
++   "ETA_eta_BR": 0.3535533905932735,
++   "AETA_eta_BR": 0.05892556509887892,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.02777777777777768,
++   "ETA_epsilon_1": 0.7966666666666666,
++   "ETA_epsilon_2": 1.1277777777777778,
++   "ETA_epsilon_3": 0.41999999999999993,
++   "ETA_epsilon_4": 0.7138888888888889,
++   "ETA_epsilon_5": 1.0095238095238095,
++   "ETA_dEpsilon_A": 0.3766666666666667,
++   "ETA_dEpsilon_B": 0.08277777777777773,
++   "ETA_dEpsilon_C": -0.293888888888889,
++   "ETA_dEpsilon_D": 0.11825396825396828,
++   "ETA_dBeta": 0.75,
++   "AETA_dBeta": 0.125,
++   "ETA_psi_1": 0.4187192118226602,
++   "ETA_dPsi_A": 0.29528078817733977,
++   "ETA_dPsi_B": 0.0
++  },
++  "Thiophene": {
++   "ETA_alpha": 2.8333333333333335,
++   "AETA_alpha": 0.5666666666666667,
++   "ETA_shape_p": 0.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 6.5,
++   "AETA_beta": 1.3,
++   "ETA_beta_s": 2.5,
++   "AETA_beta_s": 0.5,
++   "ETA_beta_ns": 4.0,
++   "AETA_beta_ns": 0.8,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 1.868033988749895,
++   "AETA_eta": 0.37360679774997896,
++   "ETA_eta_L": 1.24535599249993,
++   "AETA_eta_L": 0.249071198499986,
++   "ETA_eta_R": 3.75,
++   "AETA_eta_R": 0.75,
++   "ETA_eta_RL": 2.5,
++   "AETA_eta_RL": 0.5,
++   "ETA_eta_F": 1.881966011250105,
++   "AETA_eta_F": 0.37639320225002104,
++   "ETA_eta_FL": 1.25464400750007,
++   "AETA_eta_FL": 0.250928801500014,
++   "ETA_eta_B": -0.08578643762690508,
++   "AETA_eta_B": -0.017157287525381017,
++   "ETA_eta_BR": 0.00021356237309491655,
++   "AETA_eta_BR": 4.271247461898331e-05,
++   "ETA_dAlpha_A": 0.0666666666666667,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.5518518518518518,
++   "ETA_epsilon_2": 0.7533333333333333,
++   "ETA_epsilon_3": 0.43333333333333324,
++   "ETA_epsilon_4": 0.47435897435897423,
++   "ETA_epsilon_5": 0.7533333333333333,
++   "ETA_dEpsilon_A": 0.11851851851851858,
++   "ETA_dEpsilon_B": 0.07749287749287759,
++   "ETA_dEpsilon_C": -0.04102564102564099,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": 1.5,
++   "AETA_dBeta": 0.3,
++   "ETA_psi_1": 0.752212389380531,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.038212389380531064
++  },
++  "Triethoxyphosphine": {
++   "ETA_alpha": 5.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.3,
++   "ETA_shape_y": 0.2,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 6.0,
++   "AETA_beta": 0.6,
++   "ETA_beta_s": 6.0,
++   "AETA_beta_s": 0.6,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 8.936503355530133,
++   "AETA_eta": 0.8936503355530133,
++   "ETA_eta_L": 3.734602828683007,
++   "AETA_eta_L": 0.3734602828683007,
++   "ETA_eta_R": 11.630636400820151,
++   "AETA_eta_R": 1.1630636400820151,
++   "ETA_eta_RL": 4.846065214951231,
++   "AETA_eta_RL": 0.4846065214951231,
++   "ETA_eta_F": 2.694133045290018,
++   "AETA_eta_F": 0.2694133045290018,
++   "ETA_eta_FL": 1.1114623862682245,
++   "AETA_eta_FL": 0.11114623862682245,
++   "ETA_eta_B": 0.0681483474218636,
++   "AETA_eta_B": 0.00681483474218636,
++   "ETA_eta_BR": 0.0681483474218636,
++   "AETA_eta_BR": 0.00681483474218636,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.5440000000000004,
++   "ETA_epsilon_2": 0.9099999999999999,
++   "ETA_epsilon_3": 0.42500000000000043,
++   "ETA_epsilon_4": 0.5440000000000004,
++   "ETA_epsilon_5": 0.9099999999999999,
++   "ETA_dEpsilon_A": 0.11899999999999994,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.11899999999999994,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -6.0,
++   "AETA_dBeta": -0.6,
++   "ETA_psi_1": 0.5494505494505495,
++   "ETA_dPsi_A": 0.16454945054945047,
++   "ETA_dPsi_B": 0.0
++  },
++  "MethylphosphonicAcid": {
++   "ETA_alpha": 2.5,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.5999999999999999,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.4,
++   "ETA_beta": 4.25,
++   "AETA_beta": 0.85,
++   "ETA_beta_s": 2.75,
++   "AETA_beta_s": 0.55,
++   "ETA_beta_ns": 1.5,
++   "AETA_beta_ns": 0.3,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 2.656476026298553,
++   "AETA_eta": 0.5312952052597106,
++   "ETA_eta_L": 1.318536928039955,
++   "AETA_eta_L": 0.263707385607991,
++   "ETA_eta_R": 5.0,
++   "AETA_eta_R": 1.0,
++   "ETA_eta_RL": 2.0,
++   "AETA_eta_RL": 0.4,
++   "ETA_eta_F": 2.343523973701447,
++   "AETA_eta_F": 0.46870479474028937,
++   "ETA_eta_FL": 0.681463071960045,
++   "AETA_eta_FL": 0.136292614392009,
++   "ETA_eta_B": 0.4142135623730949,
++   "AETA_eta_B": 0.08284271247461898,
++   "ETA_eta_BR": 0.4142135623730949,
++   "AETA_eta_BR": 0.08284271247461898,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.7099999999999999,
++   "ETA_epsilon_2": 1.1199999999999999,
++   "ETA_epsilon_3": 0.41764705882352926,
++   "ETA_epsilon_4": 0.7099999999999999,
++   "ETA_epsilon_5": 0.8857142857142856,
++   "ETA_dEpsilon_A": 0.2923529411764706,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.2923529411764706,
++   "ETA_dEpsilon_D": 0.23428571428571432,
++   "ETA_dBeta": -1.25,
++   "AETA_dBeta": -0.25,
++   "ETA_psi_1": 0.44642857142857145,
++   "ETA_dPsi_A": 0.2675714285714285,
++   "ETA_dPsi_B": 0.0
++  },
++  "MethylCyclopropane": {
++   "ETA_alpha": 2.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 0.25,
++   "ETA_shape_y": 0.25,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 2.0,
++   "AETA_beta": 0.5,
++   "ETA_beta_s": 2.0,
++   "AETA_beta_s": 0.5,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 2.6009536313038994,
++   "AETA_eta": 0.6502384078259749,
++   "ETA_eta_L": 1.8938468501173518,
++   "AETA_eta_L": 0.47346171252933794,
++   "ETA_eta_R": 2.6009536313038994,
++   "AETA_eta_R": 0.6502384078259749,
++   "ETA_eta_RL": 1.8938468501173518,
++   "AETA_eta_RL": 0.47346171252933794,
++   "ETA_eta_F": 0.0,
++   "AETA_eta_F": 0.0,
++   "ETA_eta_FL": 0.0,
++   "AETA_eta_FL": 0.0,
++   "ETA_eta_B": 0.02036671225574338,
++   "AETA_eta_B": 0.005091678063935845,
++   "ETA_eta_BR": 0.10636671225574337,
++   "AETA_eta_BR": 0.026591678063935843,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.4333333333333332,
++   "ETA_epsilon_2": 0.7,
++   "ETA_epsilon_3": 0.4333333333333332,
++   "ETA_epsilon_4": 0.4333333333333332,
++   "ETA_epsilon_5": 0.7,
++   "ETA_dEpsilon_A": 0.0,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": 0.0,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -2.0,
++   "AETA_dBeta": -0.5,
++   "ETA_psi_1": 0.7142857142857143,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.00028571428571433355
++  },
++  "Acetonitrile": {
++   "ETA_alpha": 1.4,
++   "AETA_alpha": 0.4666666666666666,
++   "ETA_shape_p": 0.6428571428571429,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 4.25,
++   "AETA_beta": 1.4166666666666667,
++   "ETA_beta_s": 1.25,
++   "AETA_beta_s": 0.4166666666666667,
++   "ETA_beta_ns": 3.0,
++   "AETA_beta_ns": 1.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 0.6183188931928036,
++   "AETA_eta": 0.20610629773093456,
++   "ETA_eta_L": 0.4550195770072585,
++   "AETA_eta_L": 0.15167319233575283,
++   "ETA_eta_R": 1.914213562373095,
++   "AETA_eta_R": 0.6380711874576983,
++   "ETA_eta_RL": 1.4142135623730951,
++   "AETA_eta_RL": 0.47140452079103173,
++   "ETA_eta_F": 1.2958946691802913,
++   "AETA_eta_F": 0.4319648897267638,
++   "ETA_eta_FL": 0.9591939853658367,
++   "AETA_eta_FL": 0.3197313284552789,
++   "ETA_eta_B": 0.0,
++   "AETA_eta_B": 0.0,
++   "ETA_eta_BR": 0.0,
++   "AETA_eta_BR": 0.0,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.03333333333333336,
++   "ETA_epsilon_1": 0.5666666666666665,
++   "ETA_epsilon_2": 0.8333333333333334,
++   "ETA_epsilon_3": 0.40909090909090895,
++   "ETA_epsilon_4": 0.5666666666666665,
++   "ETA_epsilon_5": 0.8333333333333334,
++   "ETA_dEpsilon_A": 0.1575757575757576,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.1575757575757576,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": 1.75,
++   "AETA_dBeta": 0.5833333333333334,
++   "ETA_psi_1": 0.5599999999999999,
++   "ETA_dPsi_A": 0.15400000000000003,
++   "ETA_dPsi_B": 0.0
++  },
++  "Histidine": {
++   "ETA_alpha": 4.866666666666666,
++   "AETA_alpha": 0.4424242424242424,
++   "ETA_shape_p": 0.21917808219178084,
++   "ETA_shape_y": 0.3082191780821918,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 12.75,
++   "AETA_beta": 1.1590909090909092,
++   "ETA_beta_s": 7.25,
++   "AETA_beta_s": 0.6590909090909091,
++   "ETA_beta_ns": 5.5,
++   "AETA_beta_ns": 0.5,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 6.052909926804307,
++   "AETA_eta": 0.5502645388003915,
++   "ETA_eta_L": 2.413347629216743,
++   "AETA_eta_L": 0.21939523901970392,
++   "ETA_eta_R": 13.527835238158147,
++   "AETA_eta_R": 1.2298032034689224,
++   "ETA_eta_RL": 5.198377302757662,
++   "AETA_eta_RL": 0.4725797547961511,
++   "ETA_eta_F": 7.47492531135384,
++   "AETA_eta_F": 0.679538664668531,
++   "ETA_eta_FL": 2.7850296735409192,
++   "AETA_eta_FL": 0.2531845157764472,
++   "ETA_eta_B": 0.21583625961543262,
++   "AETA_eta_B": 0.01962147814685751,
++   "ETA_eta_BR": 0.3018362596154326,
++   "AETA_eta_BR": 0.027439659965039328,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.05757575757575761,
++   "ETA_epsilon_1": 0.656666666666667,
++   "ETA_epsilon_2": 0.9484848484848485,
++   "ETA_epsilon_3": 0.43333333333333385,
++   "ETA_epsilon_4": 0.6242424242424246,
++   "ETA_epsilon_5": 0.7755555555555558,
++   "ETA_dEpsilon_A": 0.2233333333333331,
++   "ETA_dEpsilon_B": 0.032424242424242355,
++   "ETA_dEpsilon_C": -0.19090909090909075,
++   "ETA_dEpsilon_D": 0.1729292929292927,
++   "ETA_dBeta": -1.75,
++   "AETA_dBeta": -0.1590909090909091,
++   "ETA_psi_1": 0.4664536741214057,
++   "ETA_dPsi_A": 0.24754632587859426,
++   "ETA_dPsi_B": 0.0
++  },
++  "Ammonia": {
++   "ETA_alpha": 0.4,
++   "AETA_alpha": 0.4,
++   "ETA_shape_p": 0.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 0.0,
++   "AETA_beta": 0.0,
++   "ETA_beta_s": 0.0,
++   "AETA_beta_s": 0.0,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 0.0,
++   "AETA_eta": 0.0,
++   "ETA_eta_L": 0.0,
++   "AETA_eta_L": 0.0,
++   "ETA_eta_R": 0.0,
++   "AETA_eta_R": 0.0,
++   "ETA_eta_RL": 0.0,
++   "AETA_eta_RL": 0.0,
++   "ETA_eta_F": 0.0,
++   "AETA_eta_F": 0.0,
++   "ETA_eta_FL": 0.0,
++   "AETA_eta_FL": 0.0,
++   "ETA_eta_B": null,
++   "AETA_eta_B": null,
++   "ETA_eta_BR": null,
++   "AETA_eta_BR": null,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.09999999999999998,
++   "ETA_epsilon_1": 0.5,
++   "ETA_epsilon_2": 1.1,
++   "ETA_epsilon_3": 0.38,
++   "ETA_epsilon_4": 0.5,
++   "ETA_epsilon_5": 0.5,
++   "ETA_dEpsilon_A": 0.12,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.12,
++   "ETA_dEpsilon_D": 0.6000000000000001,
++   "ETA_dBeta": 0.0,
++   "AETA_dBeta": 0.0,
++   "ETA_psi_1": 0.36363636363636365,
++   "ETA_dPsi_A": 0.3503636363636363,
++   "ETA_dPsi_B": 0.0
++  },
++  "PentachloroLambda5Phosphane": {
++   "ETA_alpha": 4.571428571428572,
++   "AETA_alpha": 0.761904761904762,
++   "ETA_shape_p": 0.7812499999999999,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 3.75,
++   "AETA_beta": 0.625,
++   "ETA_beta_s": 3.75,
++   "AETA_beta_s": 0.625,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 7.281667915299611,
++   "AETA_eta": 1.2136113192166018,
++   "ETA_eta_L": 2.519763153394848,
++   "AETA_eta_L": 0.41996052556580804,
++   "ETA_eta_R": null,
++   "AETA_eta_R": null,
++   "ETA_eta_RL": null,
++   "AETA_eta_RL": null,
++   "ETA_eta_F": null,
++   "AETA_eta_F": null,
++   "ETA_eta_FL": null,
++   "AETA_eta_FL": null,
++   "ETA_eta_B": null,
++   "AETA_eta_B": null,
++   "ETA_eta_BR": null,
++   "AETA_eta_BR": null,
++   "ETA_dAlpha_A": null,
++   "ETA_dAlpha_B": null,
++   "ETA_epsilon_1": 1.2380952380952381,
++   "ETA_epsilon_2": 1.2380952380952381,
++   "ETA_epsilon_3": null,
++   "ETA_epsilon_4": 1.2380952380952381,
++   "ETA_epsilon_5": 1.2380952380952381,
++   "ETA_dEpsilon_A": null,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": null,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -3.75,
++   "AETA_dBeta": -0.625,
++   "ETA_psi_1": 0.6153846153846154,
++   "ETA_dPsi_A": 0.09861538461538455,
++   "ETA_dPsi_B": 0.0
++  },
++  "SodiumChloride": {
++   "ETA_alpha": null,
++   "AETA_alpha": null,
++   "ETA_shape_p": null,
++   "ETA_shape_y": null,
++   "ETA_shape_x": null,
++   "ETA_beta": null,
++   "AETA_beta": null,
++   "ETA_beta_s": null,
++   "AETA_beta_s": null,
++   "ETA_beta_ns": null,
++   "AETA_beta_ns": null,
++   "ETA_beta_ns_d": null,
++   "AETA_beta_ns_d": null,
++   "ETA_eta": null,
++   "AETA_eta": null,
++   "ETA_eta_L": null,
++   "AETA_eta_L": null,
++   "ETA_eta_R": null,
++   "AETA_eta_R": null,
++   "ETA_eta_RL": null,
++   "AETA_eta_RL": null,
++   "ETA_eta_F": null,
++   "AETA_eta_F": null,
++   "ETA_eta_FL": null,
++   "AETA_eta_FL": null,
++   "ETA_eta_B": null,
++   "AETA_eta_B": null,
++   "ETA_eta_BR": null,
++   "AETA_eta_BR": null,
++   "ETA_dAlpha_A": null,
++   "ETA_dAlpha_B": null,
++   "ETA_epsilon_1": null,
++   "ETA_epsilon_2": null,
++   "ETA_epsilon_3": null,
++   "ETA_epsilon_4": null,
++   "ETA_epsilon_5": null,
++   "ETA_dEpsilon_A": null,
++   "ETA_dEpsilon_B": null,
++   "ETA_dEpsilon_C": null,
++   "ETA_dEpsilon_D": null,
++   "ETA_dBeta": null,
++   "AETA_dBeta": null,
++   "ETA_psi_1": null,
++   "ETA_dPsi_A": null,
++   "ETA_dPsi_B": null
++  },
++  "TrichloroYtterbium": {
++   "ETA_alpha": 2.942857142857143,
++   "AETA_alpha": 0.7357142857142858,
++   "ETA_shape_p": 0.7281553398058251,
++   "ETA_shape_y": 0.27184466019417475,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 2.25,
++   "AETA_beta": 0.5625,
++   "ETA_beta_s": 2.25,
++   "AETA_beta_s": 0.5625,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 3.1743145504593677,
++   "AETA_eta": 0.7935786376148419,
++   "ETA_eta_L": 1.745743121887939,
++   "AETA_eta_L": 0.4364357804719847,
++   "ETA_eta_R": 3.232050807568877,
++   "AETA_eta_R": 0.8080127018922193,
++   "ETA_eta_RL": 1.7320508075688772,
++   "AETA_eta_RL": 0.4330127018922193,
++   "ETA_eta_F": 0.05773625710950947,
++   "AETA_eta_F": 0.014434064277377368,
++   "ETA_eta_FL": -0.013692314319061705,
++   "AETA_eta_FL": -0.003423078579765426,
++   "ETA_eta_B": 0.18216275480421795,
++   "AETA_eta_B": 0.04554068870105449,
++   "ETA_eta_BR": 0.18216275480421795,
++   "AETA_eta_BR": 0.04554068870105449,
++   "ETA_dAlpha_A": 0.23571428571428577,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 1.8892857142857147,
++   "ETA_epsilon_2": 1.8892857142857147,
++   "ETA_epsilon_3": 0.41428571428571415,
++   "ETA_epsilon_4": 1.8892857142857147,
++   "ETA_epsilon_5": 1.8892857142857147,
++   "ETA_dEpsilon_A": 1.4750000000000005,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -1.4750000000000005,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -2.25,
++   "AETA_dBeta": -0.5625,
++   "ETA_psi_1": 0.38941398865784493,
++   "ETA_dPsi_A": 0.32458601134215503,
++   "ETA_dPsi_B": 0.0
++  },
++  "Acetylene": {
++   "ETA_alpha": 1.0,
++   "AETA_alpha": 0.5,
++   "ETA_shape_p": 1.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 2.5,
++   "AETA_beta": 1.25,
++   "ETA_beta_s": 0.5,
++   "AETA_beta_s": 0.25,
++   "ETA_beta_ns": 2.0,
++   "AETA_beta_ns": 1.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 0.2,
++   "AETA_eta": 0.1,
++   "ETA_eta_L": 0.2,
++   "AETA_eta_L": 0.1,
++   "ETA_eta_R": 1.0,
++   "AETA_eta_R": 0.5,
++   "ETA_eta_RL": 1.0,
++   "AETA_eta_RL": 0.5,
++   "ETA_eta_F": 0.8,
++   "AETA_eta_F": 0.4,
++   "ETA_eta_FL": 0.8,
++   "AETA_eta_FL": 0.4,
++   "ETA_eta_B": 0.0,
++   "AETA_eta_B": 0.0,
++   "ETA_eta_BR": 0.0,
++   "AETA_eta_BR": 0.0,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.5,
++   "ETA_epsilon_2": 0.7,
++   "ETA_epsilon_3": 0.3999999999999999,
++   "ETA_epsilon_4": 0.3999999999999999,
++   "ETA_epsilon_5": 0.7,
++   "ETA_dEpsilon_A": 0.10000000000000009,
++   "ETA_dEpsilon_B": 0.10000000000000009,
++   "ETA_dEpsilon_C": 0.0,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": 1.5,
++   "AETA_dBeta": 0.75,
++   "ETA_psi_1": 0.7142857142857143,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 0.00028571428571433355
++  },
++  "Carbonate": {
++   "ETA_alpha": 1.4999999999999998,
++   "AETA_alpha": 0.37499999999999994,
++   "ETA_shape_p": 0.6666666666666667,
++   "ETA_shape_y": 0.33333333333333337,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 3.75,
++   "AETA_beta": 0.9375,
++   "ETA_beta_s": 2.25,
++   "AETA_beta_s": 0.5625,
++   "ETA_beta_ns": 1.5,
++   "AETA_beta_ns": 0.375,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 1.1062325112074647,
++   "AETA_eta": 0.27655812780186617,
++   "ETA_eta_L": 0.6274101693454089,
++   "AETA_eta_L": 0.15685254233635224,
++   "ETA_eta_R": 3.232050807568877,
++   "AETA_eta_R": 0.8080127018922193,
++   "ETA_eta_RL": 1.7320508075688772,
++   "AETA_eta_RL": 0.4330127018922193,
++   "ETA_eta_F": 2.1258182963614125,
++   "AETA_eta_F": 0.5314545740903531,
++   "ETA_eta_FL": 1.1046406382234681,
++   "AETA_eta_FL": 0.27616015955586704,
++   "ETA_eta_B": 0.18216275480421795,
++   "AETA_eta_B": 0.04554068870105449,
++   "ETA_eta_BR": 0.18216275480421795,
++   "AETA_eta_BR": 0.04554068870105449,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.12500000000000006,
++   "ETA_epsilon_1": 1.275,
++   "ETA_epsilon_2": 1.275,
++   "ETA_epsilon_3": 0.41428571428571415,
++   "ETA_epsilon_4": 1.275,
++   "ETA_epsilon_5": 1.275,
++   "ETA_dEpsilon_A": 0.8607142857142858,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.8607142857142858,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -0.75,
++   "AETA_dBeta": -0.1875,
++   "ETA_psi_1": 0.2941176470588235,
++   "ETA_dPsi_A": 0.4198823529411765,
++   "ETA_dPsi_B": 0.0
++  },
++  "PotassiumIon": {
++   "ETA_alpha": 6.0,
++   "AETA_alpha": 6.0,
++   "ETA_shape_p": 0.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 0.0,
++   "AETA_beta": 0.0,
++   "ETA_beta_s": 0.0,
++   "AETA_beta_s": 0.0,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 0.0,
++   "AETA_eta": 0.0,
++   "ETA_eta_L": 0.0,
++   "AETA_eta_L": 0.0,
++   "ETA_eta_R": 0.0,
++   "AETA_eta_R": 0.0,
++   "ETA_eta_RL": 0.0,
++   "AETA_eta_RL": 0.0,
++   "ETA_eta_F": 0.0,
++   "AETA_eta_F": 0.0,
++   "ETA_eta_FL": 0.0,
++   "AETA_eta_FL": 0.0,
++   "ETA_eta_B": null,
++   "AETA_eta_B": null,
++   "ETA_eta_BR": null,
++   "AETA_eta_BR": null,
++   "ETA_dAlpha_A": 5.5,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": -5.7,
++   "ETA_epsilon_2": -5.7,
++   "ETA_epsilon_3": 0.38,
++   "ETA_epsilon_4": -5.7,
++   "ETA_epsilon_5": -5.7,
++   "ETA_dEpsilon_A": -6.08,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": 6.08,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": 0.0,
++   "AETA_dBeta": 0.0,
++   "ETA_psi_1": -1.0526315789473684,
++   "ETA_dPsi_A": 1.7666315789473683,
++   "ETA_dPsi_B": 0.0
++  },
++  "Oxygen": {
++   "ETA_alpha": 0.6666666666666666,
++   "AETA_alpha": 0.3333333333333333,
++   "ETA_shape_p": 1.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 1.5,
++   "AETA_beta": 0.75,
++   "ETA_beta_s": 0.5,
++   "AETA_beta_s": 0.25,
++   "ETA_beta_ns": 1.0,
++   "AETA_beta_ns": 0.5,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 0.2222222222222222,
++   "AETA_eta": 0.1111111111111111,
++   "ETA_eta_L": 0.2222222222222222,
++   "AETA_eta_L": 0.1111111111111111,
++   "ETA_eta_R": 1.0,
++   "AETA_eta_R": 0.5,
++   "ETA_eta_RL": 1.0,
++   "AETA_eta_RL": 0.5,
++   "ETA_eta_F": 0.7777777777777778,
++   "AETA_eta_F": 0.3888888888888889,
++   "ETA_eta_FL": 0.7777777777777778,
++   "AETA_eta_FL": 0.3888888888888889,
++   "ETA_eta_B": 0.0,
++   "AETA_eta_B": 0.0,
++   "ETA_eta_BR": 0.0,
++   "AETA_eta_BR": 0.0,
++   "ETA_dAlpha_A": 0.0,
++   "ETA_dAlpha_B": 0.16666666666666669,
++   "ETA_epsilon_1": 1.4666666666666666,
++   "ETA_epsilon_2": 1.4666666666666666,
++   "ETA_epsilon_3": 0.3999999999999999,
++   "ETA_epsilon_4": 1.4666666666666666,
++   "ETA_epsilon_5": 1.4666666666666666,
++   "ETA_dEpsilon_A": 1.0666666666666667,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -1.0666666666666667,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": 0.5,
++   "AETA_dBeta": 0.25,
++   "ETA_psi_1": 0.22727272727272727,
++   "ETA_dPsi_A": 0.4867272727272727,
++   "ETA_dPsi_B": 0.0
++  },
++  "Iodine": {
++   "ETA_alpha": 3.2857142857142856,
++   "AETA_alpha": 1.6428571428571428,
++   "ETA_shape_p": 1.0,
++   "ETA_shape_y": 0.0,
++   "ETA_shape_x": 0.0,
++   "ETA_beta": 0.5,
++   "AETA_beta": 0.25,
++   "ETA_beta_s": 0.5,
++   "AETA_beta_s": 0.25,
++   "ETA_beta_ns": 0.0,
++   "AETA_beta_ns": 0.0,
++   "ETA_beta_ns_d": 0.0,
++   "AETA_beta_ns_d": 0.0,
++   "ETA_eta": 3.2857142857142856,
++   "AETA_eta": 1.6428571428571428,
++   "ETA_eta_L": 3.2857142857142856,
++   "AETA_eta_L": 1.6428571428571428,
++   "ETA_eta_R": 1.0,
++   "AETA_eta_R": 0.5,
++   "ETA_eta_RL": 1.0,
++   "AETA_eta_RL": 0.5,
++   "ETA_eta_F": -2.2857142857142856,
++   "AETA_eta_F": -1.1428571428571428,
++   "ETA_eta_FL": -2.2857142857142856,
++   "AETA_eta_FL": -1.1428571428571428,
++   "ETA_eta_B": 0.0,
++   "AETA_eta_B": 0.0,
++   "ETA_eta_BR": 0.0,
++   "AETA_eta_BR": 0.0,
++   "ETA_dAlpha_A": 1.1428571428571428,
++   "ETA_dAlpha_B": 0.0,
++   "ETA_epsilon_1": 0.4571428571428573,
++   "ETA_epsilon_2": 0.4571428571428573,
++   "ETA_epsilon_3": 0.3999999999999999,
++   "ETA_epsilon_4": 0.4571428571428573,
++   "ETA_epsilon_5": 0.4571428571428573,
++   "ETA_dEpsilon_A": 0.057142857142857384,
++   "ETA_dEpsilon_B": 0.0,
++   "ETA_dEpsilon_C": -0.057142857142857384,
++   "ETA_dEpsilon_D": 0.0,
++   "ETA_dBeta": -0.5,
++   "AETA_dBeta": -0.25,
++   "ETA_psi_1": 3.5937499999999987,
++   "ETA_dPsi_A": 0.0,
++   "ETA_dPsi_B": 2.8797499999999987
++  }
++ }
++}
+\ No newline at end of file

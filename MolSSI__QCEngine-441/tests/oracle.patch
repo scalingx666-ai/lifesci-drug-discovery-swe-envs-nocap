@@ -1,0 +1,314 @@
+diff --git a/.github/workflows/CI.yml b/.github/workflows/CI.yml
+index 25b331cf5..f028fd89d 100644
+--- a/.github/workflows/CI.yml
++++ b/.github/workflows/CI.yml
+@@ -98,6 +98,12 @@ jobs:
+             runs-on: windows-latest
+             pytest: "-k 'not (hes2 or qchem)'"
+ 
++          - conda-env: mace
++            python-version: "3.10"
++            label: MACE
++            runs-on: ubuntu-latest
++            pytest: ""
++
+     name: "🐍 ${{ matrix.cfg.python-version }} • ${{ matrix.cfg.label }} • ${{ matrix.cfg.runs-on }}"
+     runs-on: ${{ matrix.cfg.runs-on }}
+ 
+diff --git a/devtools/conda-envs/mace.yaml b/devtools/conda-envs/mace.yaml
+new file mode 100644
+index 000000000..aeb7061d3
+--- /dev/null
++++ b/devtools/conda-envs/mace.yaml
+@@ -0,0 +1,19 @@
++name: mace
++channels:
++  - conda-forge
++dependencies:
++    # Core
++  - python
++  - pyyaml
++  - py-cpuinfo
++  - psutil
++  - qcelemental >=0.12.0
++  - pydantic>=1.0.0
++
++  # mace deps
++  - pymace
++
++    # Testing
++  - pytest
++  - pytest-cov
++  - codecov
+\ No newline at end of file
+diff --git a/qcengine/programs/base.py b/qcengine/programs/base.py
+index 8d9cfc9ff..bf2fb1556 100644
+--- a/qcengine/programs/base.py
++++ b/qcengine/programs/base.py
+@@ -28,6 +28,7 @@
+ from .torchani import TorchANIHarness
+ from .turbomole import TurbomoleHarness
+ from .xtb import XTBHarness
++from .mace import MACEHarness
+ 
+ __all__ = ["register_program", "get_program", "list_all_programs", "list_available_programs"]
+ 
+@@ -125,6 +126,7 @@ def list_available_programs() -> Set[str]:
+ 
+ # AI
+ register_program(TorchANIHarness())
++register_program(MACEHarness())
+ 
+ # Molecular Mechanics
+ register_program(RDKitHarness())
+diff --git a/qcengine/programs/mace.py b/qcengine/programs/mace.py
+new file mode 100644
+index 000000000..8ef5400df
+--- /dev/null
++++ b/qcengine/programs/mace.py
+@@ -0,0 +1,139 @@
++from typing import TYPE_CHECKING, Dict, Union
++from qcelemental.models import AtomicResult, Provenance, FailedOperation
++from qcelemental.util import safe_version, which_import
++from qcengine.exceptions import InputError
++from qcengine.programs.model import ProgramHarness
++from qcengine.units import ureg
++
++if TYPE_CHECKING:
++    from qcelemental.models import AtomicInput, FailedOperation
++    from qcengine.config import TaskConfig
++
++
++class MACEHarness(ProgramHarness):
++    """Can be used to execute a published MACE-OFF23 model or local mace model.
++    For more info on the MACE-OFF23 models see <https://doi.org/10.48550/arXiv.2312.15211>.
++    The models can be found at <https://github.com/ACEsuit/mace-off>
++    """
++
++    _CACHE = {}
++
++    _defaults = {
++        "name": "MACE",
++        "scratch": False,
++        "thread_safe": True,
++        "thread_parallel": False,
++        "node_parallel": False,
++        "managed_memory": False,
++    }
++    version_cache: Dict[str, str] = {}
++
++    def found(self, raise_error: bool = False) -> bool:
++        return which_import(
++            "mace",
++            return_bool=True,
++            raise_error=raise_error,
++            raise_msg="Please install via `mamba install pymace -c conda-forge`",
++        )
++
++    def get_version(self) -> str:
++        self.found(raise_error=True)
++
++        which_prog = which_import("mace")
++        if which_prog not in self.version_cache:
++            import mace
++
++            self.version_cache[which_prog] = safe_version(mace.__version__)
++
++        return self.version_cache[which_prog]
++
++    def load_model(self, name: str):
++        """Compile and cache the model to make it faster when calling many times in serial"""
++        model_name = name.lower()
++        if model_name in self._CACHE:
++            return self._CACHE[model_name]
++
++        import torch
++        from e3nn.util import jit
++
++        if model_name in ["small", "medium", "large"]:
++            from mace.calculators.foundations_models import mace_off
++
++            model = mace_off(model=model_name, return_raw_model=True)
++        else:
++            try:
++                model = torch.load(name, map_location=torch.device("cpu"))
++            except FileNotFoundError:
++                raise InputError(
++                    "The mace harness can only run local models or a MACE-OFF23 model (`small`, `medium`, `large`)"
++                )
++        comp_mod = jit.compile(model)
++        self._CACHE[model_name] = (comp_mod, float(model.r_max), model.atomic_numbers)
++        return self._CACHE[model_name]
++
++    def compute(self, input_data: "AtomicInput", config: "TaskConfig") -> Union["AtomicResult", "FailedOperation"]:
++
++        self.found(raise_error=True)
++
++        import mace
++        import numpy as np
++        import torch
++        from mace.data import AtomicData
++        from mace.data.utils import AtomicNumberTable, Configuration
++        from mace.tools.torch_geometric import DataLoader
++
++        torch.set_default_dtype(torch.float64)
++
++        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        # Failure flag
++        ret_data = {"success": False}
++
++        # Build model
++        method = input_data.model.method
++
++        # load the torch model which can be a MACE-OFF23 or local model
++        model, r_max, atomic_numbers = self.load_model(name=method)
++
++        z_table = AtomicNumberTable([int(z) for z in atomic_numbers])
++        atomic_numbers = input_data.molecule.atomic_numbers
++        pbc = (False, False, False)
++        # set the cell as None and mace will automatically create a cell big enough to include all atoms
++        cell = None
++
++        config = Configuration(
++            atomic_numbers=atomic_numbers,
++            positions=input_data.molecule.geometry * ureg.conversion_factor("bohr", "angstrom"),
++            pbc=pbc,
++            cell=cell,
++        )
++
++        data_loader = DataLoader(
++            dataset=[AtomicData.from_config(config, z_table=z_table, cutoff=r_max)],
++            batch_size=1,
++            shuffle=False,
++            drop_last=False,
++        )
++        input_dict = next(iter(data_loader)).to_dict()
++        model.to(device)
++        mace_data = model(input_dict, compute_force=True)
++        ret_data["properties"] = {"return_energy": mace_data["energy"] * ureg.conversion_factor("eV", "hartree")}
++
++        if input_data.driver == "energy":
++            ret_data["return_result"] = ret_data["properties"]["return_energy"]
++        elif input_data.driver == "gradient":
++            ret_data["return_result"] = (
++                np.asarray(-1.0 * mace_data["forces"] * ureg.conversion_factor("eV / angstrom", "hartree / bohr"))
++                .ravel()
++                .tolist()
++            )
++
++        else:
++            raise InputError("MACE only supports the energy and gradient driver methods.")
++
++        ret_data["extras"] = input_data.extras.copy()
++        ret_data["provenance"] = Provenance(creator="mace", version=mace.__version__, routine="mace")
++        ret_data["schema_name"] = "qcschema_output"
++        ret_data["success"] = True
++
++        # Form up a dict first, then sent to BaseModel to avoid repeat kwargs which don't override each other
++        return AtomicResult(**{**input_data.dict(), **ret_data})
+diff --git a/qcengine/programs/tests/test_programs.py b/qcengine/programs/tests/test_programs.py
+index e5249302b..f5ae4abce 100644
+--- a/qcengine/programs/tests/test_programs.py
++++ b/qcengine/programs/tests/test_programs.py
+@@ -94,7 +94,6 @@ def test_psi4_wavefunction_task():
+ 
+ @using("psi4")
+ def test_psi4_internal_failure():
+-
+     mol = Molecule.from_data(
+         """0 3
+      O    0.000000000000     0.000000000000    -0.068516245955
+@@ -206,7 +205,6 @@ def test_mopac_task():
+ 
+ 
+ def test_random_failure_no_retries(failure_engine):
+-
+     failure_engine.iter_modes = ["input_error"]
+     ret = qcng.compute(failure_engine.get_job(), failure_engine.name, raise_error=False)
+     assert ret.error.error_type == "input_error"
+@@ -219,7 +217,6 @@ def test_random_failure_no_retries(failure_engine):
+ 
+ 
+ def test_random_failure_with_retries(failure_engine):
+-
+     failure_engine.iter_modes = ["random_error", "random_error", "random_error"]
+     ret = qcng.compute(failure_engine.get_job(), failure_engine.name, raise_error=False, task_config={"retries": 2})
+     assert ret.input_data["provenance"]["retries"] == 2
+@@ -232,7 +229,6 @@ def test_random_failure_with_retries(failure_engine):
+ 
+ 
+ def test_random_failure_with_success(failure_engine):
+-
+     failure_engine.iter_modes = ["random_error", "pass"]
+     failure_engine.ncalls = 0
+     ret = qcng.compute(failure_engine.get_job(), failure_engine.name, raise_error=False, task_config={"retries": 1})
+@@ -383,3 +379,37 @@ def test_openmm_gaff_keywords(gaff_settings):
+         ret = qcng.compute(inp, program, raise_error=False)
+         assert ret.success is True
+         assert ret.return_result == pytest.approx(expected_result, rel=1e-6)
++
++
++@using("mace")
++def test_mace_energy():
++    """
++    Test calculating the energy with mace
++    """
++    water = qcng.get_molecule("water")
++    atomic_input = AtomicInput(molecule=water, model={"method": "small", "basis": None}, driver="energy")
++
++    result = qcng.compute(atomic_input, "mace")
++    assert result.success
++    assert pytest.approx(result.return_result) == -76.47683956098838
++
++
++@using("mace")
++def test_mace_gradient():
++    """
++    Test calculating the gradient with mace
++    """
++    water = qcng.get_molecule("water")
++    expected_result = np.array(
++        [
++            [0.0, -2.1590400539385646e-18, -0.04178551770271103],
++            [0.0, -0.029712483642769006, 0.020892758851355515],
++            [0.0, 0.029712483642769006, 0.020892758851355518],
++        ]
++    )
++
++    atomic_input = AtomicInput(molecule=water, model={"method": "small", "basis": None}, driver="gradient")
++
++    result = qcng.compute(atomic_input, "mace")
++    assert result.success
++    assert pytest.approx(result.return_result) == expected_result
+diff --git a/qcengine/testing.py b/qcengine/testing.py
+index d16755855..f20aaff2f 100644
+--- a/qcengine/testing.py
++++ b/qcengine/testing.py
+@@ -185,6 +185,7 @@ def get_job(self):
+     "turbomole": which("define", return_bool=True),
+     "xtb": which_import("xtb", return_bool=True),
+     "mrchem": is_program_new_enough("mrchem", "1.0.0"),
++    "mace": is_program_new_enough("mace", "0.3.2"),
+ }
+ _programs["openmm"] = _programs["rdkit"] and which_import(".openmm", package="simtk", return_bool=True)
+ 
+diff --git a/qcengine/tests/test_harness_canonical.py b/qcengine/tests/test_harness_canonical.py
+index ed482ceb4..a0aecba80 100644
+--- a/qcengine/tests/test_harness_canonical.py
++++ b/qcengine/tests/test_harness_canonical.py
+@@ -33,6 +33,7 @@
+     ("cfour", {"method": "hf", "basis": "6-31G"}, {}),
+     ("gamess", {"method": "hf", "basis": "n31"}, {"basis__NGAUSS": 6}),
+     ("mctc-gcp", {"method": "dft/sv"}, {}),
++    ("mace", {"method": "small"}, {})
+     # add as programs available
+     # ("terachem", {"method": "bad"}),
+ ]
+@@ -133,6 +134,7 @@ def test_compute_energy_qcsk_basis(program, model, keywords):
+         ("gcp", {"method": "bad"}),
+         ("mrchem", {"method": "bad"}),
+         ("mctc-gcp", {"method": "bad"}),
++        ("mace", {"method": "bad"})
+         # add as programs available
+         # ("molpro", {"method": "bad"}),
+         # ("terachem", {"method": "bad"}),

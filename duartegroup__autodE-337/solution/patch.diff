@@ -1,0 +1,406 @@
+diff --git a/.github/workflows/pytest.yml b/.github/workflows/pytest.yml
+index a431a66a3..eff13511e 100644
+--- a/.github/workflows/pytest.yml
++++ b/.github/workflows/pytest.yml
+@@ -31,7 +31,7 @@ jobs:
+     steps:
+     - uses: actions/checkout@v3
+ 
+-    - uses: conda-incubator/setup-miniconda@v2
++    - uses: conda-incubator/setup-miniconda@v3
+       with:
+         python-version: ${{ matrix.python-version }}
+         activate-environment: test
+diff --git a/.github/workflows/pytest_cov.yml b/.github/workflows/pytest_cov.yml
+index 81e43c699..88d9ca084 100644
+--- a/.github/workflows/pytest_cov.yml
++++ b/.github/workflows/pytest_cov.yml
+@@ -32,7 +32,7 @@ jobs:
+     steps:
+     - uses: actions/checkout@v3
+ 
+-    - uses: conda-incubator/setup-miniconda@v2
++    - uses: conda-incubator/setup-miniconda@v3
+       with:
+         python-version: ${{ matrix.python-version }}
+         activate-environment: test
+diff --git a/autode/bracket/dhs.py b/autode/bracket/dhs.py
+index d6d97a6e7..6deac4002 100644
+--- a/autode/bracket/dhs.py
++++ b/autode/bracket/dhs.py
+@@ -132,18 +132,12 @@ def _initialise_run(self) -> None:
+         self._target_dist = np.linalg.norm(self.dist_vec)
+         self._update_gradient_and_energy()
+ 
+-        # Hack to get the Hessian update from old coordinates
++        # Update the Hessian from old coordinates, if exists
+         if self._old_coords is not None and self._old_coords.h is not None:
+             assert isinstance(self._old_coords, CartesianCoordinates)
+-            sub_opt = DistanceConstrainedOptimiser(
+-                pivot_point=self._coords,  # any dummy coordinate will work
+-                maxiter=20,
+-                gtol=1.0e-4,
+-                etol=1.0e-4,
++            self._coords.update_h_from_old_h(
++                self._old_coords, self._hessian_update_types
+             )
+-            sub_opt._coords = self._old_coords
+-            sub_opt._coords = self._coords
+-            self._coords.h = np.array(sub_opt._updated_h())
+         else:
+             # no hessian available, use low level method
+             self._coords.update_h_from_cart_h(self._low_level_cart_hessian)
+@@ -191,7 +185,9 @@ def _update_gradient_and_energy(self) -> None:
+         super()._update_gradient_and_energy()
+         if self.iteration != 0:
+             assert self._coords is not None, "Must have set coordinates"
+-            self._coords.h = self._updated_h()
++            self._coords.update_h_from_old_h(
++                self._history.penultimate, self._hessian_update_types
++            )
+ 
+     def _step(self) -> None:
+         """
+@@ -536,8 +532,9 @@ def __init__(
+             initial_species, final_species
+         )
+ 
+-        # DHS needs to keep an extra reference to the calculation method
++        # DHS needs to keep an extra reference method and n_cores
+         self._method: Optional[Method] = None
++        self._n_cores: Optional[int] = None
+ 
+         self._step_size = Distance(abs(step_size), "ang")
+         if self._step_size > self.imgpair.dist:
+@@ -595,7 +592,7 @@ def _step(self) -> None:
+         )
+         tmp_spc = self._species.copy()
+         tmp_spc.coordinates = new_coord
+-        opt.run(tmp_spc, self._method)
++        opt.run(tmp_spc, self._method, self._n_cores)
+         self._micro_iter = self._micro_iter + opt.iteration
+ 
+         # not converged can only happen if exceeded maxiter of optimiser
+@@ -623,6 +620,7 @@ def _calculate(
+             n_cores (int): Number of cores to use for calculation
+         """
+         self._method = method
++        self._n_cores = n_cores
+         super()._calculate(method, n_cores)
+ 
+     @property
+diff --git a/autode/bracket/imagepair.py b/autode/bracket/imagepair.py
+index adcd2f5da..6a1ad0077 100644
+--- a/autode/bracket/imagepair.py
++++ b/autode/bracket/imagepair.py
+@@ -3,9 +3,7 @@
+ that require a pair of images
+ """
+ import itertools
+-
+ import numpy as np
+-
+ from abc import ABC, abstractmethod
+ from typing import Optional, Tuple, TYPE_CHECKING, List, Iterator
+ from enum import Enum
+@@ -25,9 +23,6 @@
+     from autode.species import Species
+     from autode.wrappers.methods import Method
+     from autode.hessians import Hessian
+-    from autode.values import Energy
+-
+-_flush_old_hessians = True
+ 
+ 
+ def _calculate_engrad_for_species(
+@@ -125,7 +120,7 @@ def __init__(
+         self._method = None
+         self._hess_method = None
+         self._n_cores = None
+-        self._hessian_update_type = BofillUpdate
++        self._hessian_update_types = [BofillUpdate]
+ 
+         self._left_history = OptimiserHistory()
+         self._right_history = OptimiserHistory()
+@@ -407,18 +402,10 @@ def update_both_img_hessian_by_formula(self):
+         Update the molecular hessian for both images by update formula
+         """
+         for history in [self._left_history, self._right_history]:
+-            coords_l, coords_k = history.final, history.penultimate
+-            assert coords_l.g is not None, "Gradient is not set!"
+-            assert coords_l.h is None, "Hessian already exists!"
+-
+-            updater = self._hessian_update_type(
+-                h=coords_k.h,
+-                s=coords_l.raw - coords_k.raw,
+-                y=coords_l.g - coords_k.g,
++            history.final.update_h_from_old_h(
++                history.penultimate, self._hessian_update_types
+             )
+ 
+-            coords_l.h = np.array(updater.updated_h)
+-
+         return None
+ 
+ 
+diff --git a/autode/opt/coordinates/base.py b/autode/opt/coordinates/base.py
+index 747680e99..af2843311 100644
+--- a/autode/opt/coordinates/base.py
++++ b/autode/opt/coordinates/base.py
+@@ -12,6 +12,8 @@
+     from autode.units import Unit
+     from autode.values import Gradient
+     from autode.hessians import Hessian
++    from typing import Type
++    from autode.opt.optimisers.hessian_update import HessianUpdater
+ 
+ 
+ class OptCoordinates(ValueArray, ABC):
+@@ -205,6 +207,49 @@ def update_h_from_cart_h(
+         N atoms, zeroing the second derivatives if required"""
+         return self._update_h_from_cart_h(arr)
+ 
++    def update_h_from_old_h(
++        self,
++        old_coords: "OptCoordinates",
++        hessian_update_types: List["Type[HessianUpdater]"],
++    ) -> None:
++        r"""
++        Update the Hessian :math:`H` from an old Hessian using an update
++        scheme. Requires the gradient to be set, and the old set of
++        coordinates with gradient to be available
++
++        Args:
++            old_coords (OptCoordinates): Old set of coordinates with
++                        gradient and hessian defined
++            hessian_update_types (list[type[HessianUpdater]]): A list of
++                        hessian updater classes - the first updater that
++                        meets the mathematical conditions will be used
++        """
++        assert self._g is not None
++        assert isinstance(old_coords, OptCoordinates), "Wrong type!"
++        assert old_coords._h is not None
++        assert old_coords._g is not None
++
++        for update_type in hessian_update_types:
++            updater = update_type(
++                h=old_coords._h,
++                s=self.raw - old_coords.raw,
++                y=self._g - old_coords._g,
++                subspace_idxs=old_coords.indexes,
++            )
++
++            if not updater.conditions_met:
++                logger.info(f"Conditions for {update_type} not met")
++                continue
++
++            new_h = updater.updated_h
++            assert self.h_or_h_inv_has_correct_shape(new_h)
++            self._h = new_h
++            return None
++
++        raise RuntimeError(
++            "Could not update the Hessian - no suitable update strategies"
++        )
++
+     def make_hessian_positive_definite(self) -> None:
+         """
+         Make the Hessian matrix positive definite by shifting eigenvalues
+diff --git a/autode/opt/optimisers/base.py b/autode/opt/optimisers/base.py
+index 174987f8f..0e3468c64 100644
+--- a/autode/opt/optimisers/base.py
++++ b/autode/opt/optimisers/base.py
+@@ -708,82 +708,6 @@ def _log_convergence(self) -> None:
+         logger.info(log_string)
+         return None
+ 
+-    def _updated_h_inv(self) -> np.ndarray:
+-        r"""
+-        Update the inverse of the Hessian matrix :math:`H^{-1}` for the
+-        current set of coordinates. If the first iteration then use the true
+-        inverse of the (estimated) Hessian, otherwise update the inverse
+-        using a viable update strategy.
+-
+-
+-        .. math::
+-
+-            H_{l - 1}^{-1} \rightarrow H_{l}^{-1}
+-
+-        """
+-        assert self._coords is not None, "Must have coordinates to get H"
+-
+-        if self.iteration == 0:
+-            logger.info("First iteration so using exact inverse, H^-1")
+-            return np.linalg.inv(self._coords.h)
+-
+-        return self._best_hessian_updater.updated_h_inv
+-
+-    def _updated_h(self) -> np.ndarray:
+-        r"""
+-        Update the Hessian matrix :math:`H` for the current set of
+-        coordinates. If the first iteration then use the initial Hessian
+-
+-        .. math::
+-
+-            H_{l - 1} \rightarrow H_{l}
+-
+-        """
+-        assert self._coords is not None, "Must have coordinates to get H"
+-
+-        if self.iteration == 0:
+-            logger.info("First iteration so not updating the Hessian")
+-            return self._coords.h
+-
+-        return self._best_hessian_updater.updated_h
+-
+-    @property
+-    def _best_hessian_updater(self) -> "HessianUpdater":
+-        """
+-        Find the best Hessian update strategy by enumerating all the possible
+-        Hessian update types implemented for this optimiser and returning the
+-        first that meets the criteria to be used.
+-
+-        -----------------------------------------------------------------------
+-        Returns:
+-            (autode.opt.optimisers.hessian_update.HessianUpdater):
+-
+-        Raises:
+-            (RuntimeError): If no suitable strategies are found
+-        """
+-        coords_l, coords_k = self._history.final, self._history.penultimate
+-        assert coords_k.g is not None and coords_l.g is not None
+-
+-        for update_type in self._hessian_update_types:
+-            updater = update_type(
+-                h=coords_k.h,
+-                h_inv=coords_k.h_inv,
+-                s=coords_l.raw - coords_k.raw,
+-                y=coords_l.g - coords_k.g,
+-                subspace_idxs=coords_l.indexes,
+-            )
+-
+-            if not updater.conditions_met:
+-                logger.info(f"Conditions for {update_type} not met")
+-                continue
+-
+-            return updater
+-
+-        raise RuntimeError(
+-            "Could not update the inverse Hessian - no "
+-            "suitable update strategies"
+-        )
+-
+     def plot_optimisation(
+         self,
+         filename: Optional[str] = None,
+diff --git a/autode/opt/optimisers/crfo.py b/autode/opt/optimisers/crfo.py
+index 038f99666..a28aa8565 100644
+--- a/autode/opt/optimisers/crfo.py
++++ b/autode/opt/optimisers/crfo.py
+@@ -44,7 +44,11 @@ def _step(self) -> None:
+         """Partitioned rational function step"""
+         assert self._coords is not None, "Must have coords to take a step"
+         assert self._coords.g is not None, "Must have a gradient"
+-        self._coords.h = self._updated_h()
++        if self.iteration != 0:
++            self._coords.update_h_from_old_h(
++                self._history.penultimate, self._hessian_update_types
++            )
++        assert self._coords.h is not None
+ 
+         n, m = len(self._coords), self._coords.n_constraints
+         logger.info(f"Optimising {n} coordinates and {m} lagrange multipliers")
+diff --git a/autode/opt/optimisers/prfo.py b/autode/opt/optimisers/prfo.py
+index c2e0e4de1..4b8ae4100 100644
+--- a/autode/opt/optimisers/prfo.py
++++ b/autode/opt/optimisers/prfo.py
+@@ -47,8 +47,10 @@ def _step(self) -> None:
+ 
+         if self.should_calculate_hessian:
+             self._update_hessian()
+-        else:
+-            self._coords.h = self._updated_h()
++        elif self.iteration != 0:
++            self._coords.update_h_from_old_h(
++                self._history.penultimate, self._hessian_update_types
++            )
+ 
+         assert self._coords.h is not None  # _update_hessian must set .h
+         idxs = list(range(len(self._coords)))
+diff --git a/autode/opt/optimisers/rfo.py b/autode/opt/optimisers/rfo.py
+index f0304a479..dbb053309 100644
+--- a/autode/opt/optimisers/rfo.py
++++ b/autode/opt/optimisers/rfo.py
+@@ -44,8 +44,11 @@ def _step(self) -> None:
+         assert self._coords is not None and self._coords.g is not None
+         logger.info("Taking a RFO step")
+ 
+-        self._coords.h = self._updated_h()
+-
++        if self.iteration != 0:
++            self._coords.update_h_from_old_h(
++                self._history.penultimate, self._hessian_update_types
++            )
++        assert self._coords.h is not None
+         h_n, _ = self._coords.h.shape
+ 
+         # Form the augmented Hessian, structure from ref [1], eqn. (56)
+diff --git a/doc/changelog.rst b/doc/changelog.rst
+index 56039d147..6e7c2e4df 100644
+--- a/doc/changelog.rst
++++ b/doc/changelog.rst
+@@ -13,11 +13,13 @@ Bug Fixes
+ *********
+ - Fixes no solvent being added in QRC calculations
+ - Fixes cases where .xyz files are printed with no space between coordinates when the coordinate value is large.
++- Fixes DHS and DHS-GS methods ignoring number of cores
+ 
+ Usability improvements/Changes
+ ******************************
+ - Added consistent aliases for double dagger across all energies in :code:`autode.reaction.delta`
+ - Optimiser trajectories are saved on disk instead of keeping completely in memory
++- Hessian updates the refactored into :code:`OptCoordinates` class
+ 
+ 1.4.2
+ ------
+diff --git a/tests/test_bracket/test_imagepair.py b/tests/test_bracket/test_imagepair.py
+index ecf0ff6c4..1f9bcdb5d 100644
+--- a/tests/test_bracket/test_imagepair.py
++++ b/tests/test_bracket/test_imagepair.py
+@@ -300,7 +300,3 @@ def test_hessian_update():
+     imgpair.update_both_img_hessian_by_formula()
+     assert imgpair.left_coords.h is not None
+     assert imgpair.right_coords.h is not None
+-
+-    # calling Hessian update again will raise exception
+-    with pytest.raises(AssertionError):
+-        imgpair.update_both_img_hessian_by_formula()
+diff --git a/tests/test_opt/test_hessian_update.py b/tests/test_opt/test_hessian_update.py
+index 9594c4c45..be6952a19 100644
+--- a/tests/test_opt/test_hessian_update.py
++++ b/tests/test_opt/test_hessian_update.py
+@@ -2,6 +2,7 @@
+ import pytest
+ import numpy as np
+ from ..testutils import work_in_zipped_dir
++from autode.opt.coordinates import CartesianCoordinates
+ from autode.opt.optimisers.hessian_update import (
+     BFGSUpdate,
+     BFGSPDUpdate,
+@@ -184,6 +185,16 @@ def test_bfgs_pd_update(eigval, expected):
+     assert updater.conditions_met == expected
+ 
+ 
++def test_update_fails_if_no_suited_scheme():
++    coords1 = CartesianCoordinates(np.array([0.1, 0.1]))
++    coords1.g = np.array([0.1, 0.1])
++    coords1.h = np.array([[1.0, 0.0], [0.0, -1]])
++    coords2 = CartesianCoordinates(np.array([0.2, 0.2]))
++    coords2.g = np.array([0.2, 0.2])
++    with pytest.raises(RuntimeError):
++        coords2.update_h_from_old_h(coords1, [BFGSPDUpdateNoUpdate])
++
++
+ @work_in_zipped_dir(os.path.join(here, "data", "hessians.zip"))
+ def test_bfgs_and_bfgssr1_update_water():
+     h = np.loadtxt("water_cart_hessian0.txt")

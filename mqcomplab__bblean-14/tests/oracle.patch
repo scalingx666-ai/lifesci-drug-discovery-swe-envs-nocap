@@ -1,0 +1,1056 @@
+diff --git a/bbtools/bb_lean.py b/bbtools/bb_lean.py
+index 05510a6f..6e4a10b8 100644
+--- a/bbtools/bb_lean.py
++++ b/bbtools/bb_lean.py
+@@ -30,6 +30,8 @@
+ #     Kenneth Lopez Perez <klopezperez@chem.ufl.edu>
+ #     Kate Huddleston <kdavis2@chem.ufl.edu>
+ 
++import typing as tp
++import itertools
+ from collections import defaultdict
+ from weakref import WeakSet
+ 
+@@ -211,7 +213,16 @@ def _get_merge_accept_fn(
+ def popcount(a):
+     # a is packed uint8 array with last axis = bytes
+     # Sum bit-counts across bytes to get per-object totals
+-    return np.bitwise_count(a).sum(axis=-1, dtype=np.uint32)
++
++    # If the array has columns that are a multiple of 8, doing a bitwise count
++    # over the buffer reinterpreted as uint64 is slightly faster.
++    # This is zero cost if the exception is not triggered. Not having a be a multiple of
++    # 8 is a very unlikely scenario, since fps are typically 1024 or 2048
++    try:
++        b = a.view(np.uint64)
++    except ValueError:
++        b = a
++    return np.bitwise_count(b).sum(axis=-1, dtype=np.uint32)
+ 
+ 
+ def pack_fingerprints(a):
+@@ -233,13 +244,10 @@ def tanimoto_sim_packed(arr, vec, cardinalities=None):
+     If "cardinalities" is passed, it must be the result of calling popcount(arr).
+     """
+     intersection = popcount(np.bitwise_and(arr, vec))
+-    if cardinalities is not None:
+-        cardinalities = cardinalities.copy()
+-    else:
++    if cardinalities is None:
+         cardinalities = popcount(arr)
+-    cardinalities += popcount(vec)  # In-place operation prevents extra mem allocation
+     # Return value requires an out-of-place operation since it casts uints to f64
+-    return intersection / (cardinalities - intersection)
++    return intersection / (cardinalities + popcount(vec) - intersection)
+ 
+ 
+ def jt_isim(c_total, n_objects: int):
+@@ -298,7 +306,6 @@ def max_separation(Y, n_features: int):
+     centroid_packed = calc_centroid(linear_sum, n_samples, pack=True)
+ 
+     cardinalities = popcount(Y)
+-
+     # Get the similarity of each molecule to the centroid
+     sims_med = tanimoto_sim_packed(Y, centroid_packed, cardinalities)
+ 
+@@ -363,7 +370,7 @@ def _iterate_sparse_X(X):
+         yield row
+ 
+ 
+-def _split_node(node, threshold: float, branching_factor: int):
++def _split_node(node):
+     """The node has to be split if there is no place for a new subcluster
+     in the node.
+     1. Two empty nodes and two empty subclusters are initialized.
+@@ -373,26 +380,17 @@ def _split_node(node, threshold: float, branching_factor: int):
+        pair of distant subclusters.
+     4. The two nodes are set as children to the two subclusters.
+     """
+-    new_subcluster1 = _BFSubcluster(n_features=node.n_features)
+-    new_subcluster2 = _BFSubcluster(n_features=node.n_features)
+-    new_node1 = _BFNode(
+-        threshold=threshold,
+-        branching_factor=branching_factor,
+-        is_leaf=node.is_leaf,
+-        n_features=node.n_features,
+-    )
+-    new_node2 = _BFNode(
+-        threshold=threshold,
+-        branching_factor=branching_factor,
+-        is_leaf=node.is_leaf,
+-        n_features=node.n_features,
+-    )
++    n_features = node.n_features
++    branching_factor = node.branching_factor
++    new_subcluster1 = _BFSubcluster(n_features=n_features)
++    new_subcluster2 = _BFSubcluster(n_features=n_features)
++    new_node1 = _BFNode(branching_factor, n_features)
++    new_node2 = _BFNode(branching_factor, n_features)
+     new_subcluster1.child_ = new_node1
+     new_subcluster2.child_ = new_node2
+ 
+     if node.is_leaf:
+-        if node.prev_leaf_ is not None:
+-            node.prev_leaf_.next_leaf_ = new_node1
++        node.prev_leaf_.next_leaf_ = new_node1
+         new_node1.prev_leaf_ = node.prev_leaf_
+         new_node1.next_leaf_ = new_node2
+         new_node2.prev_leaf_ = new_node1
+@@ -401,15 +399,13 @@ def _split_node(node, threshold: float, branching_factor: int):
+             node.next_leaf_.prev_leaf_ = new_node2
+ 
+     # O(N) implementation of max separation
+-    farthest_idx, node1_dist, node2_dist = max_separation(
+-        node.centroids_, node.n_features
+-    )
++    separated_idxs, node1_dist, node2_dist = max_separation(node.centroids_, n_features)
+     # Notice that max_separation is returning similarities and not distances
+     node1_closer = node1_dist > node2_dist
+     # Make sure node1 is closest to itself even if all distances are equal.
+     # This can only happen when all node.centroids_ are duplicates leading to all
+     # distances between centroids being zero.
+-    node1_closer[farthest_idx[0]] = True
++    node1_closer[separated_idxs[0]] = True
+ 
+     for idx, subcluster in enumerate(node.subclusters_):
+         if node1_closer[idx]:
+@@ -432,16 +428,9 @@ class _BFNode:
+ 
+     Parameters
+     ----------
+-    threshold : float
+-        Threshold needed for a new subcluster to enter a BFSubcluster.
+-
+     branching_factor : int
+         Maximum number of BF subclusters in each node.
+ 
+-    is_leaf : bool
+-        We need to know if the BFNode is a leaf or not, in order to
+-        retrieve the final subclusters.
+-
+     n_features : int
+         The number of features.
+ 
+@@ -451,26 +440,24 @@ class _BFNode:
+         List of subclusters for a particular BFNode.
+ 
+     prev_leaf_ : _BFNode
+-        Useful only if is_leaf is True.
++        Only useful for leaf nodes, otherwise None
+ 
+     next_leaf_ : _BFNode
+-        next_leaf. Useful only if is_leaf is True.
+-        the final subclusters.
++        Only useful for leaf nodes, otherwise None
+ 
+     init_centroids_ : ndarray of shape (branching_factor + 1, n_features)
+         Manipulate ``init_centroids_`` throughout rather than centroids_ since
+         the centroids are just a view of the ``init_centroids_`` .
+ 
+-    centroids_ : ndarray of shape (branching_factor + 1, n_features)
++    centroids_ : ndarray of shape (branching_factor, n_features)
+         View of ``init_centroids_``.
+ 
++    is_leaf : bool
++        True if next_leaf_ is present
+     """
+ 
+     # NOTE: Slots deactivates __dict__, and thus reduces memory usage of python objects
+     __slots__ = (
+-        "threshold",
+-        "branching_factor",
+-        "is_leaf",
+         "n_features",
+         "subclusters_",
+         "init_centroids_",
+@@ -479,12 +466,7 @@ class _BFNode:
+         "next_leaf_",
+     )
+ 
+-    def __init__(
+-        self, *, threshold: float, branching_factor: int, is_leaf: bool, n_features: int
+-    ):
+-        self.threshold = threshold
+-        self.branching_factor = branching_factor
+-        self.is_leaf = is_leaf
++    def __init__(self, branching_factor: int, n_features: int):
+         self.n_features = n_features
+ 
+         # The list of subclusters, centroids and squared norms
+@@ -501,6 +483,14 @@ def __init__(
+         self.prev_leaf_ = None
+         self.next_leaf_ = None
+ 
++    @property
++    def is_leaf(self) -> bool:
++        return self.prev_leaf_ is not None
++
++    @property
++    def branching_factor(self) -> int:
++        return self.init_centroids_.shape[0] - 1
++
+     def append_subcluster(self, subcluster):
+         n_samples = len(self.subclusters_)
+         self.subclusters_.append(subcluster)
+@@ -521,20 +511,13 @@ def update_split_subclusters(self, subcluster, new_subcluster1, new_subcluster2)
+         # Append new_subcluster2
+         self.append_subcluster(new_subcluster2)
+ 
+-    def insert_bf_subcluster(self, subcluster, merge_accept_fn):
++    def insert_bf_subcluster(self, subcluster, merge_accept_fn, threshold):
+         """Insert a new subcluster into the node."""
+-        # Fix for shape mismatch when reusing tree with different n_features
+-        if subcluster.n_features != self.n_features:
+-            raise NotImplementedError(
+-                "Different n_features in the same tree not implemented"
+-            )
+-
++        # Reusing tree with different features is forbidden
+         if not self.subclusters_:
+             self.append_subcluster(subcluster)
+             return False
+ 
+-        threshold = self.threshold
+-        branching_factor = self.branching_factor
+         # We need to find the closest subcluster among all the
+         # subclusters so that we can insert our new subcluster.
+         sim_matrix = tanimoto_sim_packed(self.centroids_, subcluster.centroid_)
+@@ -545,7 +528,7 @@ def insert_bf_subcluster(self, subcluster, merge_accept_fn):
+         if closest_subcluster.child_ is not None:
+ 
+             split_child = closest_subcluster.child_.insert_bf_subcluster(
+-                subcluster, merge_accept_fn
++                subcluster, merge_accept_fn, threshold
+             )
+ 
+             if not split_child:
+@@ -562,7 +545,7 @@ def insert_bf_subcluster(self, subcluster, merge_accept_fn):
+             # subcluster to accommodate the new child.
+             else:
+                 new_subcluster1, new_subcluster2 = _split_node(
+-                    closest_subcluster.child_, threshold, branching_factor
++                    closest_subcluster.child_
+                 )
+                 self.update_split_subclusters(
+                     closest_subcluster, new_subcluster1, new_subcluster2
+@@ -575,7 +558,7 @@ def insert_bf_subcluster(self, subcluster, merge_accept_fn):
+         # good to go!
+         else:
+             merged = closest_subcluster.merge_subcluster(
+-                subcluster, self.threshold, merge_accept_fn
++                subcluster, threshold, merge_accept_fn
+             )
+             if merged:
+                 self.init_centroids_[closest_index] = closest_subcluster.centroid_
+@@ -595,7 +578,7 @@ def insert_bf_subcluster(self, subcluster, merge_accept_fn):
+ 
+ 
+ class _BFSubcluster:
+-    """Each subcluster in a BFNode is called a BFSubcluster.
++    r"""Each subcluster in a BFNode is called a BFSubcluster.
+ 
+     A BFSubcluster can have a BFNode has its child.
+ 
+@@ -656,7 +639,7 @@ def __init__(
+             if linear_sum is not None:
+                 if len(mol_indices) != 1:
+                     raise ValueError("Expected len(mol_indices) == 1")
+-                buffer = np.empty((n_features + 1,), dtype=np.uint8)
++                buffer = np.empty((len(linear_sum) + 1,), dtype=np.uint8)
+                 buffer[:-1] = linear_sum
+                 buffer[-1] = 1
+                 self._buffer = buffer
+@@ -740,7 +723,7 @@ def merge_subcluster(self, nominee_cluster, threshold, merge_accept_fn):
+ 
+ 
+ class BitBirch:
+-    """Implements the BitBIRCH clustering algorithm.
++    r"""Implements the BitBIRCH clustering algorithm.
+ 
+     BitBIRCH paper:
+ 
+@@ -847,15 +830,26 @@ def set_merge(
+             )
+         self._merge_accept_fn = _get_merge_accept_fn(merge_criterion, tolerance)
+ 
++    def _initialize_tree(self, n_features: int) -> None:
++        # Initialize the root (and a dummy node to get back the subclusters
++        self.root_ = _BFNode(self.branching_factor, n_features)
++        self.dummy_leaf_ = _BFNode(self.branching_factor, n_features)
++        self.dummy_leaf_.next_leaf_ = self.root_
++        self.root_.prev_leaf_ = self.dummy_leaf_
++
+     def fit(
+         self,
+         X,
++        reinsert_indices: tp.Iterator[int] | None = None,
+         store_centroids: bool = True,
+         input_is_packed: bool = True,
+         n_features: int | None = None,
+     ):
+-        """
+-        Build a BF Tree for the input data.
++        r"""Build a BF Tree for the input data.
++
++        if `reinsert_indices` is passed, X corresponds only to the molecules that will
++        be reinserted into the tree, and `reinsert_indices` are the indices associated
++        with these molecules.
+ 
+         Parameters
+         ----------
+@@ -867,61 +861,42 @@ def fit(
+         self
+             Fitted estimator.
+         """
+-        threshold = self.threshold
+-        branching_factor = self.branching_factor
+         n_features = _validate_n_features(X, input_is_packed, n_features)
+-
+-        # If partial_fit is called for the first time or fit is called, we
+-        # start a new tree.
++        # Start a new tree the first time this function is called
+         if self.first_call:
+-            # The first root is the leaf. Manipulate this object throughout.
+-            self.root_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
+-            )
++            self._initialize_tree(n_features)
+ 
+-            # To enable getting back subclusters.
+-            self.dummy_leaf_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
+-            )
+-            self.dummy_leaf_.next_leaf_ = self.root_
+-            self.root_.prev_leaf_ = self.dummy_leaf_
+-
+-        # Cannot vectorize. Enough to convince to use cython.
+         if not sparse.issparse(X):
+             iter_func = iter
+         else:
+             iter_func = _iterate_sparse_X
+ 
+-        merge_accept_fn = self._merge_accept_fn
++        if reinsert_indices is None:
++            idx_provider = itertools.count(self.index_tracker)
++        else:
++            idx_provider = reinsert_indices
+ 
+-        for sample in iter_func(X):
++        threshold = self.threshold
++        branching_factor = self.branching_factor
++        merge_accept_fn = self._merge_accept_fn
++        for idx, sample in zip(idx_provider, iter_func(X)):
+             subcluster = _BFSubcluster(
+                 linear_sum=_copy_or_unpack(sample, n_features, input_is_packed),
+-                mol_indices=[self.index_tracker],
++                mol_indices=[idx],
+                 n_features=n_features,
+             )
+-            split = self.root_.insert_bf_subcluster(subcluster, merge_accept_fn)
++            split = self.root_.insert_bf_subcluster(
++                subcluster, merge_accept_fn, threshold
++            )
+ 
+             if split:
+-                new_subcluster1, new_subcluster2 = _split_node(
+-                    self.root_, threshold, branching_factor
+-                )
+-                self.root_ = _BFNode(
+-                    threshold=threshold,
+-                    branching_factor=branching_factor,
+-                    is_leaf=False,
+-                    n_features=n_features,
+-                )
++                new_subcluster1, new_subcluster2 = _split_node(self.root_)
++                self.root_ = _BFNode(branching_factor, n_features)
+                 self.root_.append_subcluster(new_subcluster1)
+                 self.root_.append_subcluster(new_subcluster2)
+ 
+-            self.index_tracker += 1
++            if reinsert_indices is not None:
++                self.index_tracker += 1
+ 
+         if store_centroids:
+             centroids = np.concatenate([leaf.centroids_ for leaf in self._get_leaves()])
+@@ -931,44 +906,38 @@ def fit(
+         self.first_call = False
+         return self
+ 
++    # Provided for backwards compatibility
++    def fit_reinsert(
++        self,
++        X,
++        reinsert_indices: tp.Iterator[int],
++        store_centroids: bool = True,
++        input_is_packed: bool = True,
++        n_features: int | None = None,
++    ):
++        return self.fit(
++            X, reinsert_indices, store_centroids, input_is_packed, n_features
++        )
++
+     def fit_np(self, X):
+-        threshold = self.threshold
+-        branching_factor = self.branching_factor
+         # NOTE: X can be a numpy array or a list
+         if isinstance(X, list):
+             n_features = len(X[0]) - 1
+         else:
+             n_features = X.shape[1] - 1
+ 
+-        # If partial_fit is called for the first time or fit is called, we
+-        # start a new tree.
++        # Start a new tree the first time this function is called
+         if self.first_call:
+-            # The first root is the leaf. Manipulate this object throughout.
+-            self.root_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
+-            )
++            self._initialize_tree(n_features)
+ 
+-            # To enable getting back subclusters.
+-            self.dummy_leaf_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
+-            )
+-            self.dummy_leaf_.next_leaf_ = self.root_
+-            self.root_.prev_leaf_ = self.dummy_leaf_
+-
+-        # Cannot vectorize. Enough to convince to use cython.
+         if not sparse.issparse(X):
+             iter_func = iter
+         else:
+             iter_func = _iterate_sparse_X
+ 
+         merge_accept_fn = self._merge_accept_fn
+-
++        threshold = self.threshold
++        branching_factor = self.branching_factor
+         # A copy is only required when iterating over a numpy array
+         copy_if_arr = (lambda x: x) if isinstance(X, list) else (lambda x: x.copy())
+         for sample in iter_func(X):
+@@ -977,18 +946,13 @@ def fit_np(self, X):
+                 mol_indices=[self.index_tracker],
+                 n_features=n_features,
+             )
+-            split = self.root_.insert_bf_subcluster(subcluster, merge_accept_fn)
++            split = self.root_.insert_bf_subcluster(
++                subcluster, merge_accept_fn, threshold
++            )
+ 
+             if split:
+-                new_subcluster1, new_subcluster2 = _split_node(
+-                    self.root_, threshold, branching_factor
+-                )
+-                self.root_ = _BFNode(
+-                    threshold=threshold,
+-                    branching_factor=branching_factor,
+-                    is_leaf=False,
+-                    n_features=n_features,
+-                )
++                new_subcluster1, new_subcluster2 = _split_node(self.root_)
++                self.root_ = _BFNode(branching_factor, n_features)
+                 self.root_.append_subcluster(new_subcluster1)
+                 self.root_.append_subcluster(new_subcluster2)
+ 
+@@ -998,36 +962,16 @@ def fit_np(self, X):
+         return self
+ 
+     def fit_np_reinsert(self, X, reinsert_indices, store_centroids: bool = True):
+-        threshold = self.threshold
+-        branching_factor = self.branching_factor
+-        # NOTE: X can be a numpy array or a list, in both cases it *must be unpacked*
++        # NOTE: X can be a numpy array or a list
+         if isinstance(X, list):
+             n_features = len(X[0]) - 1
+         else:
+             n_features = X.shape[1] - 1
+ 
+-        # If partial_fit is called for the first time or fit is called, we
+-        # start a new tree.
++        # Start a new tree the first time this function is called
+         if self.first_call:
+-            # The first root is the leaf. Manipulate this object throughout.
+-            self.root_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
+-            )
++            self._initialize_tree(n_features)
+ 
+-            # To enable getting back subclusters.
+-            self.dummy_leaf_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
+-            )
+-            self.dummy_leaf_.next_leaf_ = self.root_
+-            self.root_.prev_leaf_ = self.dummy_leaf_
+-
+-        # Cannot vectorize. Enough to convince to use cython.
+         if not sparse.issparse(X):
+             iter_func = iter
+         else:
+@@ -1035,100 +979,23 @@ def fit_np_reinsert(self, X, reinsert_indices, store_centroids: bool = True):
+ 
+         merge_accept_fn = self._merge_accept_fn
+ 
++        threshold = self.threshold
++        branching_factor = self.branching_factor
+         # A copy is only required when iterating over a numpy array
+         copy_if_arr = (lambda x: x) if isinstance(X, list) else (lambda x: x.copy())
+-        for sample, mol_inds in zip(iter_func(X), reinsert_indices):
++        for sample, mol_indices in zip(iter_func(X), reinsert_indices):
+             subcluster = _BFSubcluster(
+                 buffer=copy_if_arr(sample),
+-                mol_indices=mol_inds,
+-                n_features=n_features,
+-            )
+-            split = self.root_.insert_bf_subcluster(subcluster, merge_accept_fn)
+-
+-            if split:
+-                new_subcluster1, new_subcluster2 = _split_node(
+-                    self.root_, threshold, branching_factor
+-                )
+-                self.root_ = _BFNode(
+-                    threshold=threshold,
+-                    branching_factor=branching_factor,
+-                    is_leaf=False,
+-                    n_features=n_features,
+-                )
+-                self.root_.append_subcluster(new_subcluster1)
+-                self.root_.append_subcluster(new_subcluster2)
+-
+-        if store_centroids:
+-            centroids = np.concatenate([leaf.centroids_ for leaf in self._get_leaves()])
+-            self.subcluster_centers_ = centroids
+-            self._n_features_out = self.subcluster_centers_.shape[0]
+-
+-        self.first_call = False
+-        return self
+-
+-    def fit_reinsert(
+-        self,
+-        X,
+-        reinsert_indices,
+-        store_centroids: bool = True,
+-        input_is_packed: bool = True,
+-        n_features: int | None = None,
+-    ):
+-        """X corresponds to only the molecules that will be reinserted into the tree
+-        reinsert indices are the indices of the molecules that will be reinserted into
+-        the tree
+-        """
+-        threshold = self.threshold
+-        branching_factor = self.branching_factor
+-        n_features = _validate_n_features(X, input_is_packed, n_features)
+-
+-        # If partial_fit is called for the first time or fit is called, we
+-        # start a new tree.
+-        if self.first_call:
+-            # The first root is the leaf. Manipulate this object throughout.
+-            self.root_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
++                mol_indices=mol_indices,
+                 n_features=n_features,
+             )
+-
+-            # To enable getting back subclusters.
+-            self.dummy_leaf_ = _BFNode(
+-                threshold=threshold,
+-                branching_factor=branching_factor,
+-                is_leaf=True,
+-                n_features=n_features,
++            split = self.root_.insert_bf_subcluster(
++                subcluster, merge_accept_fn, threshold
+             )
+-            self.dummy_leaf_.next_leaf_ = self.root_
+-            self.root_.prev_leaf_ = self.dummy_leaf_
+-
+-        # Cannot vectorize. Enough to convince to use cython.
+-        if not sparse.issparse(X):
+-            iter_func = iter
+-        else:
+-            iter_func = _iterate_sparse_X
+-
+-        merge_accept_fn = self._merge_accept_fn
+-
+-        for sample, mol_ind in zip(iter_func(X), reinsert_indices):
+-            subcluster = _BFSubcluster(
+-                linear_sum=_copy_or_unpack(sample, n_features, input_is_packed),
+-                mol_indices=[mol_ind],
+-                n_features=n_features,
+-            )
+-            split = self.root_.insert_bf_subcluster(subcluster, merge_accept_fn)
+ 
+             if split:
+-                new_subcluster1, new_subcluster2 = _split_node(
+-                    self.root_, threshold, branching_factor
+-                )
+-                self.root_ = _BFNode(
+-                    threshold=threshold,
+-                    branching_factor=branching_factor,
+-                    is_leaf=False,
+-                    n_features=n_features,
+-                )
++                new_subcluster1, new_subcluster2 = _split_node(self.root_)
++                self.root_ = _BFNode(branching_factor, n_features)
+                 self.root_.append_subcluster(new_subcluster1)
+                 self.root_.append_subcluster(new_subcluster2)
+ 
+@@ -1167,10 +1034,7 @@ def get_centroids_mol_ids(self):
+             for subcluster in leaf.subclusters_:
+                 centroids.append(subcluster.centroid_)
+                 mol_ids.append(subcluster.mol_indices)
+-
+-        dict_centroids_mol_ids = {"centroids": centroids, "mol_ids": mol_ids}
+-
+-        return dict_centroids_mol_ids
++        return {"centroids": centroids, "mol_ids": mol_ids}
+ 
+     def get_centroids(self):
+         """Get a list of Numpy arrays containing the centroids' fingerprints"""
+@@ -1181,7 +1045,6 @@ def get_centroids(self):
+         for leaf in self._get_leaves():
+             for subcluster in leaf.subclusters_:
+                 centroids.append(subcluster.centroid_)
+-
+         return centroids
+ 
+     def get_cluster_mol_ids(self):
+@@ -1193,10 +1056,8 @@ def get_cluster_mol_ids(self):
+         for leaf in self._get_leaves():
+             for subcluster in leaf.subclusters_:
+                 clusters_mol_id.append(subcluster.mol_indices)
+-
+         # Sort the clusters by the number of samples in the cluster
+         clusters_mol_id = sorted(clusters_mol_id, key=lambda x: len(x), reverse=True)
+-
+         return clusters_mol_id
+ 
+     def _get_BFs(self):
+@@ -1208,17 +1069,14 @@ def _get_BFs(self):
+         for leaf in self._get_leaves():
+             for subcluster in leaf.subclusters_:
+                 BFs.append(subcluster)
+-
+         # Sort the BitFeatures by the number of samples in the cluster
+         BFs = sorted(BFs, key=lambda x: x.n_samples_, reverse=True)
+-
+         return BFs
+ 
+     def bf_to_np_refine(
+         self,
+         fps,
+         initial_mol=0,
+-        return_fp_lists: bool = False,
+         input_is_packed: bool = True,
+     ):
+         """Prepare BitFeatures of the largest cluster and the rest of the clusters
+@@ -1230,51 +1088,29 @@ def bf_to_np_refine(
+ 
+         BFs = self._get_BFs()
+         big, rest = BFs[0], BFs[1:]
+-
+-        n_features = self.root_.n_features
+-        if return_fp_lists:
+-            dtypes_to_fp, dtypes_to_mols = self._prepare_bf_to_np_lists(rest)
+-            # Add fps and mol indices of the "big" cluster
+-            for mol_idx in big.mol_indices:
+-                unpacked_fp = _copy_or_unpack(
+-                    fps[mol_idx - initial_mol], n_features, input_is_packed
+-                )
+-                buffer = np.empty(unpacked_fp.shape[0] + 1, dtype=np.uint8)
+-                buffer[:-1] = unpacked_fp
+-                buffer[-1] = 1
+-                dtypes_to_fp["uint8"].append(buffer)
+-                dtypes_to_mols["uint8"].append([mol_idx])
+-        else:
+-            # Extra uint8 slack needed to add the "big" cluster
+-            dtypes_to_fp, dtypes_to_mols, running_idxs = self._prepare_bf_to_np(
+-                rest, n_features, reserve_extra_uint8_slack=len(big.mol_indices)
++        n_features = big.n_features
++        dtypes_to_fp, dtypes_to_mols = self._prepare_bf_to_buffer_dicts(rest)
++        # Add fps and mol indices of the "big" cluster
++        for mol_idx in big.mol_indices:
++            unpacked_fp = _copy_or_unpack(
++                fps[mol_idx - initial_mol], n_features, input_is_packed
+             )
+-            # Add fps and mol indices of the "big" cluster
+-            for mol_idx in big.mol_indices:
+-                unpacked_fp = _copy_or_unpack(
+-                    fps[mol_idx - initial_mol], n_features, input_is_packed
+-                )
+-                dtypes_to_fp["uint8"][running_idxs["uint8"], -1] = 1
+-                dtypes_to_fp["uint8"][running_idxs["uint8"], :-1] = unpacked_fp
+-                dtypes_to_mols["uint8"].append([mol_idx])
+-                running_idxs["uint8"] += 1
+-        return list(dtypes_to_fp.values()), list(dtypes_to_mols.values())
++            buffer = np.empty(unpacked_fp.shape[0] + 1, dtype=np.uint8)
++            buffer[:-1] = unpacked_fp
++            buffer[-1] = 1
++            dtypes_to_fp["uint8"].append(buffer)
++            dtypes_to_mols["uint8"].append([mol_idx])
++        return dtypes_to_fp, dtypes_to_mols
+ 
+-    def bf_to_np(self, return_fp_lists: bool = False):
++    def bf_to_np(self):
+         """Prepare BitFeatures of the largest cluster and the rest of the clusters"""
+         if self.first_call:
+             raise ValueError("The model has not been fitted yet.")
+ 
+-        BFs = self._get_BFs()
+-        if return_fp_lists:
+-            dtypes_to_fp, dtypes_to_mols = self._prepare_bf_to_np_lists(BFs)
+-        else:
+-            n_features = self.root_.n_features
+-            dtypes_to_fp, dtypes_to_mols, _ = self._prepare_bf_to_np(BFs, n_features)
+-        return list(dtypes_to_fp.values()), list(dtypes_to_mols.values())
++        return self._prepare_bf_to_buffer_dicts(self._get_BFs())
+ 
+     @staticmethod
+-    def _prepare_bf_to_np_lists(BFs):
++    def _prepare_bf_to_buffer_dicts(BFs):
+         # Helper function used when returning lists of subclusters
+         dtypes_to_fp = defaultdict(list)
+         dtypes_to_mols = defaultdict(list)
+@@ -1283,49 +1119,14 @@ def _prepare_bf_to_np_lists(BFs):
+             dtypes_to_mols[BF.dtype_name].append(BF.mol_indices)
+         return dtypes_to_fp, dtypes_to_mols
+ 
+-    @staticmethod
+-    def _prepare_bf_to_np(BFs, n_features, reserve_extra_uint8_slack=None):
+-        # 1st pass: find buffer sizes and assign idxs to dtypes_to_mols
+-        buffer_sizes = defaultdict(int)
+-        dtypes_to_mols = defaultdict(list)
+-        for BF in BFs:
+-            buffer_sizes[BF.dtype_name] += 1
+-            dtypes_to_mols[BF.dtype_name].append(BF.mol_indices)
+-
+-        # Extra slack may be required to save the "big" cluster fingerprints
+-        if reserve_extra_uint8_slack is not None:
+-            buffer_sizes["uint8"] += reserve_extra_uint8_slack
+-
+-        # NOTE: In order to return arrays it is unavoidable to allocate potentially huge
+-        # buffers to copy the data located in the subclusters. This can be bypassed,
+-        # while keeping the option to save arrays to single *.npy files by using
+-        # hand-coded numpy streaming saves. This is achieved with the *return_fp_lists*
+-        # option. Here, just allocate the big buffers.
+-        #
+-        # This already gets rid of almost all the memory bottleneck
+-        dtypes_to_fp = {}
+-        n_features = next(iter(BFs)).n_features
+-        for dtype, size in buffer_sizes.items():
+-            dtypes_to_fp[dtype] = np.empty((size, n_features + 1), dtype=dtype)
+-
+-        # 2nd pass: assign to buffers and to dtypes_to_mols, keep running idxs since
+-        # they will be needed to keep track of where to start adding the "big" cluster
+-        running_idxs = defaultdict(int)
+-        for BF in BFs:
+-            dtypes_to_fp[BF.dtype_name][running_idxs[BF.dtype_name]] = BF._buffer
+-            running_idxs[BF.dtype_name] += 1
+-        return dtypes_to_fp, dtypes_to_mols, running_idxs
+-
+     def get_assignments(self, n_mols):
+         clustered_ids = self.get_cluster_mol_ids()
+ 
+         assignments = np.full(n_mols, -1, dtype=int)
+         for i, cluster in enumerate(clustered_ids):
+             assignments[cluster] = i + 1
+-
+         # Check that there are no unassigned molecules
+         assert np.all(assignments != -1)
+-
+         return assignments
+ 
+     def __repr__(self) -> str:
+diff --git a/bbtools/cli.py b/bbtools/cli.py
+index 47fca46a..3f96464d 100644
+--- a/bbtools/cli.py
++++ b/bbtools/cli.py
+@@ -6,6 +6,7 @@
+ import json
+ import time
+ import sys
++import pickle
+ import uuid
+ import re
+ import multiprocessing as mp
+@@ -309,17 +310,9 @@ def _run(
+     start_time = time.perf_counter()
+     set_merge(merge_criterion, tolerance)
+     tree = BitBirch(branching_factor=branching_factor, threshold=threshold)
+-    idx = 0
+     for file in input_files:
+         fps = np.load(file, mmap_mode="r" if use_mmap else None)[:max_fps]
+-        fps_num = len(fps)
+-        tree.fit_reinsert(
+-            fps,
+-            list(range(idx, idx + fps_num)),
+-            store_centroids=False,
+-            n_features=n_features,
+-        )
+-        idx += fps_num
++        tree.fit(fps, store_centroids=False, n_features=n_features)
+     cluster_mol_ids = tree.get_cluster_mol_ids()
+     total_time_s = time.perf_counter() - start_time
+     console.print(f"Time elapsed: {total_time_s:.5f} s")
+@@ -330,9 +323,8 @@ def _run(
+         console.print_peak_mem_raw(stats)
+ 
+     # Dump outputs (peak memory, timings, config, cluster ids)
+-    cluster_ids_fpath = out_dir / "cluster-mol-ids.json"
+-    with open(cluster_ids_fpath, mode="wt", encoding="utf-8") as f:
+-        json.dump({i: v for i, v in enumerate(cluster_mol_ids)}, f, indent=4)
++    with open(out_dir / "clusters.pkl", mode="wb") as f:
++        pickle.dump(cluster_mol_ids, f)
+ 
+     collect_system_specs_and_dump_config(ctx.params)
+     timings_fpath = out_dir / "timings.json"
+diff --git a/bbtools/multiround.py b/bbtools/multiround.py
+index a3148125..e233fd84 100644
+--- a/bbtools/multiround.py
++++ b/bbtools/multiround.py
+@@ -28,9 +28,9 @@ def _load_fp_data_and_mol_idxs(
+     out_dir: Path,
+     fp_filepath: Path,
+     round: int,
+-    mmap: bool = True,
++    use_mmap: bool = True,
+ ) -> tuple[NDArray[tp.Any], tp.Any]:
+-    fp_data = np.load(fp_filepath, mmap_mode="r" if mmap else None)
++    fp_data = np.load(fp_filepath, mmap_mode="r" if use_mmap else None)
+     # Infer the mol_idxs filename from the fp_np filename, and fetch the mol_idxs
+     count, dtype = fp_filepath.name.split(".")[0].split("_")[-2:]
+     idxs_file = out_dir / f"mol_idxs_round{round}_{count}_{dtype}.pkl"
+@@ -49,20 +49,21 @@ def first_round(
+     out_dir: Path | str,
+     filename_idxs_are_slices: bool = False,
+     max_fps: int | None = None,
+-    mmap: bool = True,
++    use_mmap: bool = True,
+     bitbirch_variant: str = "lean",
+     merge_criterion: str = "diameter",
+ ) -> None:
+ 
+     BitBirch, set_merge = _import_bitbirch_variant(bitbirch_variant)
+     out_dir = Path(out_dir)
+-    fps = np.load(fp_file, mmap_mode="r" if mmap else None)[:max_fps]
++    fps = np.load(fp_file, mmap_mode="r" if use_mmap else None)[:max_fps]
+ 
+-    # Fit the fps. fit_reinsert is necessary to keep track of proper molecule indices
+-    # Use indices of molecules in the current batch, according to the total set
++    # Fit the fps. `reinsert_indices` is necessary to keep track of proper molecule
++    # indices. Use indices of molecules in the current batch, according to the total set
+     idx0, idx1 = map(int, fp_file.name.split(".")[0].split("_")[-2:])
+     set_merge(merge_criterion)  # Initial batch uses diameter BitBIRCH
+     brc_diameter = BitBirch(branching_factor=branching_factor, threshold=threshold)
++    # TODO: Check this
+     if filename_idxs_are_slices:
+         # idxs are <start_mol_idx>_<end_mol_idx>
+         range_ = range(idx0, idx1)
+@@ -72,18 +73,12 @@ def first_round(
+         range_ = range(idx1, idx1 + len(fps))
+         start_mol_idx = idx1
+ 
+-    brc_diameter.fit_reinsert(
+-        fps, list(range_), store_centroids=False, n_features=n_features
++    brc_diameter.fit(
++        fps, reinsert_indices=range_, store_centroids=False, n_features=n_features
+     )
+ 
+     # Extract the BitFeatures info of the leaves to refine the top cluster
+-    # Use an if-statement since only bb_lean has this argument
+-    if bitbirch_variant != "lean":
+-        fps_bfs, mols_bfs = brc_diameter.bf_to_np_refine(fps, initial_mol=start_mol_idx)
+-    else:
+-        fps_bfs, mols_bfs = brc_diameter.bf_to_np_refine(
+-            fps, initial_mol=start_mol_idx, return_fp_lists=True
+-        )
++    fps_bfs, mols_bfs = brc_diameter.bf_to_np_refine(fps, initial_mol=start_mol_idx)
+     del fps
+     del brc_diameter
+     gc.collect()
+@@ -93,27 +88,29 @@ def first_round(
+         # passed at the end
+         set_merge("tolerance", tolerance)  # 'tolerance' used to refine the tree
+         brc_tolerance = BitBirch(branching_factor=branching_factor, threshold=threshold)
+-        for fp_type, mol_idxs in zip(fps_bfs, mols_bfs):
+-            brc_tolerance.fit_np_reinsert(fp_type, mol_idxs, store_centroids=False)
+-
+-        # Get the info from the fitted BFs in compact list format
+-        if bitbirch_variant != "lean":
+-            fps_bfs, mols_bfs = brc_tolerance.bf_to_np()
++        if bitbirch_variant == "lean":
++            # For the "lean" variant, these are dicts
++            iterable = zip(fps_bfs.values(), mols_bfs.values())
+         else:
+-            fps_bfs, mols_bfs = brc_tolerance.bf_to_np(return_fp_lists=True)
++            iterable = zip(fps_bfs, mols_bfs)
++        for buf, mol_idxs in iterable:
++            brc_tolerance.fit_np_reinsert(buf, mol_idxs, store_centroids=False)
++        fps_bfs, mols_bfs = brc_tolerance.bf_to_np()
+         del brc_tolerance
+         gc.collect()
+ 
+-    if bitbirch_variant != "lean":
+-        for fp_type, mol_idxs in zip(fps_bfs, mols_bfs):
+-            suffix = f"round1_{idx0}_{str(fp_type.dtype)}"
+-            np.save(out_dir / f"fp_{suffix}", fp_type)
++    if bitbirch_variant in ["lean", "lean_dense"]:
++        # In this case the fps_bfs and mols_idxs are *dicts*
++        for dtype, buf_list in fps_bfs.items():
++            suffix = f"round1_{idx0}_{dtype}"
++            numpy_streaming_save(buf_list, out_dir / f"bufs_{suffix}")
+             with open(out_dir / f"mol_idxs_{suffix}.pkl", mode="wb") as f:
+-                pickle.dump(mol_idxs, f)
++                pickle.dump(mols_bfs[dtype], f)
+     else:
+-        numpy_streaming_save(fps_bfs, out_dir / f"round1_{idx0}")
+-        for fp_type, mol_idxs in zip(fps_bfs, mols_bfs):
+-            suffix = f"round1_{idx0}_{str(fp_type[0].dtype)}"
++        # In this case fps_bfs is *list of arrays*, and mols_bfs is *list of lists*
++        for buf, mol_idxs in zip(fps_bfs, mols_bfs):
++            suffix = f"round1_{idx0}_{str(buf.dtype)}"
++            np.save(out_dir / f"bufs_{suffix}", buf)
+             with open(out_dir / f"mol_idxs_{suffix}.pkl", mode="wb") as f:
+                 pickle.dump(mol_idxs, f)
+ 
+@@ -124,7 +121,7 @@ def second_round(
+     threshold: float,
+     tolerance: float,
+     out_dir: Path | str,
+-    mmap: bool = True,
++    use_mmap: bool = True,
+     bitbirch_variant: str = "lean",
+ ) -> None:
+     BitBirch, set_merge = _import_bitbirch_variant(bitbirch_variant)
+@@ -134,29 +131,30 @@ def second_round(
+     set_merge("tolerance", tolerance)
+     brc_chunk = BitBirch(branching_factor=branching_factor, threshold=threshold)
+     for fp_filename in chunk_filenames:
+-        fp_data, mol_idxs = _load_fp_data_and_mol_idxs(out_dir, fp_filename, 1, mmap)
++        fp_data, mol_idxs = _load_fp_data_and_mol_idxs(
++            out_dir, fp_filename, 1, use_mmap
++        )
+         brc_chunk.fit_np_reinsert(fp_data, mol_idxs, store_centroids=False)
+         del mol_idxs
+         del fp_data
+         gc.collect()
+ 
+-    if bitbirch_variant != "lean":
+-        fps_bfs, mols_bfs = brc_chunk.bf_to_np()
+-    else:
+-        fps_bfs, mols_bfs = brc_chunk.bf_to_np(return_fp_lists=True)
++    fps_bfs, mols_bfs = brc_chunk.bf_to_np()
+     del brc_chunk
+     gc.collect()
+ 
+-    if bitbirch_variant != "lean":
+-        for fp_type, mol_idxs in zip(fps_bfs, mols_bfs):
+-            suffix = f"round2_{chunk_idx}_{str(fp_type.dtype)}"
+-            np.save(out_dir / f"fp_{suffix}", fp_type)
++    if bitbirch_variant in ["lean", "lean_dense"]:
++        # In this case the fps_bfs and mols_idxs are *dicts*
++        for dtype, buf_list in fps_bfs.items():
++            suffix = f"round2_{chunk_idx}_{dtype}"
++            numpy_streaming_save(buf_list, out_dir / f"bufs_{suffix}")
+             with open(out_dir / f"mol_idxs_{suffix}.pkl", mode="wb") as f:
+-                pickle.dump(mol_idxs, f)
++                pickle.dump(mols_bfs[dtype], f)
+     else:
+-        numpy_streaming_save(fps_bfs, out_dir / f"round2_{chunk_idx}")
+-        for fp_type, mol_idxs in zip(fps_bfs, mols_bfs):
+-            suffix = f"round2_{chunk_idx}_{str(fp_type[0].dtype)}"
++        # In this case fps_bfs is *list of arrays*, and mols_bfs is *list of lists*
++        for buf, mol_idxs in zip(fps_bfs, mols_bfs):
++            suffix = f"round2_{chunk_idx}_{str(buf.dtype)}"
++            np.save(out_dir / f"bufs_{suffix}", buf)
+             with open(out_dir / f"mol_idxs_{suffix}.pkl", mode="wb") as f:
+                 pickle.dump(mol_idxs, f)
+ 
+@@ -166,7 +164,7 @@ def third_round(
+     threshold: float,
+     tolerance: float,
+     out_dir: Path | str,
+-    mmap: bool = True,
++    use_mmap: bool = True,
+     bitbirch_variant: str = "lean",
+ ) -> None:
+ 
+@@ -178,18 +176,20 @@ def third_round(
+ 
+     sorted_files2 = _glob_and_sort_by_uint_bits(out_dir, "*round2*.npy")
+     for fp_filename in sorted_files2:
+-        fp_data, mol_idxs = _load_fp_data_and_mol_idxs(out_dir, fp_filename, 2, mmap)
++        fp_data, mol_idxs = _load_fp_data_and_mol_idxs(
++            out_dir, fp_filename, 2, use_mmap
++        )
+         brc_final.fit_np_reinsert(fp_data, mol_idxs, store_centroids=False)
+         del fp_data
+         del mol_idxs
+         gc.collect()
+ 
+-    mol_ids = brc_final.get_cluster_mol_ids().copy()
++    cluster_mol_ids = brc_final.get_cluster_mol_ids()
+     del brc_final
+     gc.collect()
+ 
+     with open(out_dir / "clusters.pkl", mode="wb") as f:
+-        pickle.dump(mol_ids, f)
++        pickle.dump(cluster_mol_ids, f)
+ 
+ 
+ # NOTE:
+@@ -237,7 +237,7 @@ def run_multiround_bitbirch(
+         branching_factor=branching_factor,
+         threshold=threshold,
+         tolerance=tolerance,
+-        mmap=use_mmap,
++        use_mmap=use_mmap,
+         bitbirch_variant=bitbirch_variant,
+         out_dir=out_dir,
+     )
+diff --git a/bbtools/utils.py b/bbtools/utils.py
+index 15db048f..757b4e29 100644
+--- a/bbtools/utils.py
++++ b/bbtools/utils.py
+@@ -76,15 +76,11 @@ def cpu_name() -> str:
+ 
+ # Save a list of numpy arrays into a single array in a streaming fashion, avoiding
+ # stacking them in memory
+-def numpy_streaming_save(
+-    fps_bfs: list[list[NDArray[tp.Any]]], path: Path | str
+-) -> None:
+-    path = Path(path)
+-    for fp_list in fps_bfs:
+-        first_arr = np.ascontiguousarray(fp_list[0])
+-        header = np.lib.format.header_data_from_array_1_0(first_arr)
+-        header["shape"] = (len(fp_list), len(first_arr))
+-        with open(path.with_name(f"{path.name}_{first_arr.dtype.name}.npy"), "wb") as f:
+-            np.lib.format.write_array_header_1_0(f, header)
+-            for arr in fp_list:
+-                np.ascontiguousarray(arr).tofile(f)
++def numpy_streaming_save(fp_list: list[NDArray[np.integer]], path: Path | str) -> None:
++    first_arr = np.ascontiguousarray(fp_list[0])
++    header = np.lib.format.header_data_from_array_1_0(first_arr)
++    header["shape"] = (len(fp_list), len(first_arr))
++    with open(Path(path).with_suffix(".npy"), "wb") as f:
++        np.lib.format.write_array_header_1_0(f, header)
++        for arr in fp_list:
++            np.ascontiguousarray(arr).tofile(f)

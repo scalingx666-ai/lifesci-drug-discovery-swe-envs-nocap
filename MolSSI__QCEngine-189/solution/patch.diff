@@ -1,0 +1,461 @@
+diff --git a/docs/source/environment.rst b/docs/source/environment.rst
+index b2405293c..8ab1daea4 100644
+--- a/docs/source/environment.rst
++++ b/docs/source/environment.rst
+@@ -81,3 +81,12 @@ An example ``qcengine.yaml`` file that sets the scratch directory for all nodes
+     all:
+       hostname_pattern: "*"
+       scratch_directory: ./scratch
++
++Cluster Configuration
++---------------------
++
++A node configuration file is required when using node-parallel tasks on a compute cluster.
++The configuration file must contain a description of the command used to launch MPI tasks and,
++in some cases, the designation that a certain node is a compute node.
++See the descriptions for ``mpiexec_command`` and ``is_batch_node`` in the ``NodeDescriptor``
++documentation for further details.
+diff --git a/qcengine/config.py b/qcengine/config.py
+index 6e7591071..081cc8401 100644
+--- a/qcengine/config.py
++++ b/qcengine/config.py
+@@ -27,6 +27,9 @@ def get_global(key: Optional[str] = None) -> Union[str, Dict[str, Any]]:
+     import cpuinfo
+     import psutil
+ 
++    # TODO (wardlt): Implement a means of getting CPU information from compute nodes on clusters for MPI tasks
++    #  The QC code runs on a different node than the node running this Python function, which may have different info
++
+     global _global_values
+     if _global_values is None:
+         _global_values = {}
+@@ -68,27 +71,77 @@ class NodeDescriptor(pydantic.BaseModel):
+     memory_safety_factor: int = 10  # Percentage of memory as a safety factor
+ 
+     # Specifications
+-    ncores: Optional[int] = None
++    ncores: Optional[int] = pydantic.Field(None, description="""Number of cores accessible to each task on this node
++    
++    The default value, ``None``, will allow QCEngine to autodetect the number of cores.""")
+     jobs_per_node: int = 2
+     retries: int = 0
+ 
+-    def __init__(self, **data: Dict[str, Any]) -> "BaseModel":
+-
++    # Cluster options
++    is_batch_node: bool = pydantic.Field(False, help="""Whether the node running QCEngine is a batch node
++    
++    Some clusters are configured such that tasks are launched from a special "batch" or "MOM" onto the compute nodes.
++    The compute nodes on such clusters often have a different CPU architecture than the batch nodes and 
++    often are unable to launch MPI tasks, which has two implications:
++        1) QCEngine must make *all* calls to an executable via ``mpirun`` because the executables might not
++        be able to run on the batch node. 
++        2) QCEngine must run on the batch node to be able to launch tasks on the more than one compute nodes  
++    
++    ``is_batch_node`` is used when creating the task configuration as a means of determining whether
++    ``mpiexec_command`` must always be used even for serial jobs (e.g., getting the version number)
++    """)
++    mpiexec_command: Optional[str] = pydantic.Field(
++        None, description="""Invocation for launching node-parallel tasks with MPI
++        
++        The invocation need not specify the number of nodes, tasks, or cores per node.
++        Information about the task configuration will be added to the command by use of
++        Python's string formatting. The configuration will be supplied as the following variables:
++        
++            {nnodes} - Number of nodes
++            {ranks_per_node} - Number of MPI ranks per node
++            {cores_per_rank} - Number of cores to use for each MPI rank
++            {total_ranks} - Total number of MPI ranks
++            
++        As examples, the ``aprun`` command on Cray systems should be similar to 
++        ``aprun -n {total_ranks} -N {ranks_per_node}`` and ``mpirun`` from OpenMPI should
++        be similar to ``mpirun -np {total_ranks} -N {ranks_per_node}``.
++        
++        Programs where each MPI rank can use multiple threads (e.g., QC programs with MPI+OpenMP) can 
++        use the {cores_per_rank} option to control the hybrid parallelism. 
++        As an example, the Cray ``aprun`` command using this figure could be:
++        ``aprun -n {total_ranks} -N {ranks_per_node} -d {cores_per_rank} -j 1``.
++        The appropriate number of ranks per node will be determined based on the number of
++        cores per node and the number of cores per rank.
++        """
++    )
++
++    def __init__(self, **data: Dict[str, Any]):
+         data = parse_environment(data)
+         super().__init__(**data)
+ 
++        if self.mpiexec_command is not None:
++            # Ensure that the mpiexec_command contains necessary information
++            if not ('{total_ranks}' in self.mpiexec_command or '{nnodes}' in self.mpiexec_command):
++                raise ValueError('mpiexec_command must contain either {total_ranks} or {nnodes}')
++            if '{ranks_per_node}' not in self.mpiexec_command:
++                raise ValueError('mpiexec_command must explicitly state the number of ranks per node')
++
+     class Config:
+         extra = "forbid"
+ 
+ 
+ class TaskConfig(pydantic.BaseModel):
++    """Description of the configuration used to launch a task."""
+ 
+     # Specifications
+-    ncores: int  # Number of ncores per task
++    ncores: int = pydantic.Field(None, description="Number cores per task on each node")
+     nnodes: int  # Number of nodes per task
+     memory: float  # Amount of memory in GiB per node
+     scratch_directory: Optional[str]  # What location to use as scratch
+     retries: int  # Number of retries on random failures
++    mpiexec_command: Optional[str]  # Command used to launch MPI tasks, see NodeDescriptor
++    use_mpiexec: bool = False  # Whether it is necessary to use MPI to run an executable
++    cores_per_rank: int = pydantic.Field(1, description="Number of cores per MPI rank")
+ 
+     class Config:
+         extra = "forbid"
+@@ -229,7 +282,7 @@ def get_config(*, hostname: Optional[str] = None, local_options: Dict[str, Any]
+ 
+     config["memory"] = memory
+ 
+-    # Handle ncores
++    # Get the number of cores available to each task
+     ncores = local_options.pop("ncores", int(ncores / jobs_per_node))
+     if ncores < 1:
+         raise KeyError("Number of jobs per node exceeds the number of available cores.")
+@@ -237,9 +290,20 @@ def get_config(*, hostname: Optional[str] = None, local_options: Dict[str, Any]
+     config["ncores"] = ncores
+     config["nnodes"] = local_options.pop("nnodes", 1)
+ 
++    # Add in the MPI launch command template
++    config["mpiexec_command"] = node.mpiexec_command
++    config["use_mpiexec"] = node.is_batch_node or config["nnodes"] > 1
++    config["cores_per_rank"] = local_options.get("cores_per_rank", 1)
++
++    # Override any settings
+     if local_options is not None:
+         config.update(local_options)
+ 
++    # Make sure mpirun command is defined if needed
++    if config["use_mpiexec"] and config["mpiexec_command"] is None:
++        raise ValueError("You need to define the mpiexec command for this node. "
++                         "See: https://qcengine.readthedocs.io/en/stable/environment.html")
++
+     return TaskConfig(**config)
+ 
+ 
+diff --git a/qcengine/programs/nwchem/runner.py b/qcengine/programs/nwchem/runner.py
+index 7e3e83eca..feb0ea43d 100644
+--- a/qcengine/programs/nwchem/runner.py
++++ b/qcengine/programs/nwchem/runner.py
+@@ -16,7 +16,7 @@
+ from qcengine.exceptions import UnknownError
+ 
+ from ...exceptions import InputError
+-from ...util import execute
++from ...util import execute, create_mpi_invocation
+ from ..model import ProgramHarness
+ from .germinate import muster_modelchem
+ from .harvester import extract_formatted_properties, harvest
+@@ -66,8 +66,15 @@ def get_version(self) -> str:
+ 
+         # Run NWChem
+         which_prog = which("nwchem")
++        if config.use_mpiexec:
++            command = create_mpi_invocation(which_prog, config)
++        else:
++            command = [which_prog]
++        command.append("v.nw")
++
+         if which_prog not in self.version_cache:
+-            success, output = execute([which_prog, "v.nw"], {"v.nw": ""}, scratch_directory=config.scratch_directory)
++            success, output = execute(command, {"v.nw": ""},
++                                      scratch_directory=config.scratch_directory)
+ 
+             if success:
+                 for line in output["stdout"].splitlines():
+@@ -104,7 +111,7 @@ def compute(self, input_model: "AtomicInput", config: "TaskConfig") -> "AtomicRe
+             raise UnknownError(dexe["stderr"])
+ 
+     def build_input(
+-        self, input_model: "AtomicInput", config: "TaskConfig", template: Optional[str] = None
++        self, input_model: "AtomicInput", config: TaskConfig, template: Optional[str] = None
+     ) -> Dict[str, Any]:
+         nwchemrec = {"infiles": {}, "scratch_directory": config.scratch_directory}
+ 
+@@ -114,7 +121,10 @@ def build_input(
+         # Handle memory
+         # for nwchem, [GiB] --> [B]
+         # someday, replace with this: opts['memory'] = str(int(config.memory * (1024**3) / 1e6)) + ' mb'
+-        opts["memory"] = int(config.memory * (1024 ** 3))
++        memory_size = int(config.memory * (1024 ** 3))
++        if config.use_mpiexec:  # It is the memory per MPI rank
++            memory_size //= config.nnodes * config.ncores
++        opts["memory"] = memory_size
+ 
+         # Handle molecule
+         molcmd, moldata = input_model.molecule.to_string(dtype="nwchem", units="Bohr", return_data=True)
+@@ -139,7 +149,12 @@ def build_input(
+         optcmd = format_keywords(opts)
+ 
+         nwchemrec["infiles"]["nwchem.nw"] = "echo\n" + molcmd + optcmd + mdccmd
+-        nwchemrec["command"] = [which("nwchem")]
++
++        # Determine the command
++        if config.nnodes > 1:
++            nwchemrec["command"] = create_mpi_invocation(which("nwchem"), config)
++        else:
++            nwchemrec["command"] = [which("nwchem")]
+ 
+         return nwchemrec
+ 
+diff --git a/qcengine/tests/test_config.py b/qcengine/tests/test_config.py
+index 42af9bd55..7db766592 100644
+--- a/qcengine/tests/test_config.py
++++ b/qcengine/tests/test_config.py
+@@ -1,14 +1,15 @@
+ """
+-Tests the DQM compute module configuration
++Tests the QCEngine compute module configuration
+ """
+ 
+ import copy
+ 
+ import pydantic
+ import pytest
++from qcengine.config import NodeDescriptor
+ 
+ import qcengine as qcng
+-from qcengine.util import environ_context
++from qcengine.util import environ_context, create_mpi_invocation
+ 
+ 
+ def test_node_blank():
+@@ -77,6 +78,15 @@ def opt_state_basic():
+                 "scratch_directory": "$NOVAR_RANDOM_ABC123",
+             },
+             {"name": "newriver", "hostname_pattern": "nr*", "jobs_per_node": 2, "ncores": 24, "memory": 240},
++            {
++                "name": "batchnode",
++                "hostname_pattern": "bn*",
++                "is_batch_node": True,
++                "jobs_per_node": 1,
++                "mpiexec_command": "mpirun -n {total_ranks} -N {ranks_per_node}",
++                "ncores": 24,
++                "memory": 240
++            },
+             {
+                 "name": "default",
+                 "hostname_pattern": "*",
+@@ -155,8 +165,27 @@ def test_config_local_njob_ncore_plus_memory(opt_state_basic):
+ 
+ 
+ def test_config_local_nnodes(opt_state_basic):
+-    config = qcng.config.get_config(hostname="something", local_options={"nnodes": 4})
+-    assert config.nnodes == 4
++    # Give a warning that mentions that mpirun is needed if you define a multi-node task
++    with pytest.raises(ValueError) as exc:
++        qcng.config.get_config(hostname="something", local_options={"nnodes": 10})
++    assert 'https://qcengine.readthedocs.io/en/stable/environment.html' in str(exc.value)
++
++    # Test with an MPI run command
++    local_options = {"nnodes": 4,
++                     "mpiexec_command": "mpirun -n {total_ranks} -N {ranks_per_node} --cpus-per-slot {cores_per_rank}"}
++    config = qcng.config.get_config(hostname="something", local_options=local_options)
++    assert config.use_mpiexec
++    assert config.mpiexec_command.startswith('mpirun')
++    assert create_mpi_invocation('hello_world', config) == ['mpirun', '-n', '20', '-N', '5', '--cpus-per-slot', '1',
++                                                            'hello_world']
++
++    # Change the number of cores per rank
++    local_options["cores_per_rank"] = 2
++    config = qcng.config.get_config(hostname='something', local_options=local_options)
++    assert config.use_mpiexec
++    assert config.mpiexec_command.startswith('mpirun')
++    assert create_mpi_invocation('hello_world', config) == ['mpirun', '-n', '20', '-N', '2', '--cpus-per-slot', '2',
++                                                            'hello_world']
+ 
+ 
+ def test_config_validation(opt_state_basic):
+@@ -166,3 +195,28 @@ def test_config_validation(opt_state_basic):
+ 
+ def test_global_repr():
+     assert isinstance(qcng.config.global_repr(), str)
++
++
++def test_batch_node(opt_state_basic):
++    # Should always use mpirun
++    config = qcng.config.get_config(hostname="bn1")
++    assert config.use_mpiexec
++    assert config.ncores == 24
++    assert config.nnodes == 1
++
++    config = qcng.config.get_config(hostname="bn1", local_options={'nnodes': 2})
++    assert config.use_mpiexec
++    assert config.ncores == 24
++    assert config.nnodes == 2
++
++
++def test_mpirun_command_errors():
++    # Checks for ranks_per_node
++    with pytest.raises(ValueError) as exc:
++        NodeDescriptor(name="something", hostname_pattern="*", mpiexec_command="mpirun -n {total_ranks}")
++    assert 'must explicitly state' in str(exc.value)
++
++    with pytest.raises(ValueError) as exc:
++        NodeDescriptor(name="something", hostname_pattern="*", mpiexec_command="mpirun -N {ranks_per_node}")
++    assert 'must contain either' in str(exc.value)
++
+diff --git a/qcengine/util.py b/qcengine/util.py
+index af5e29643..5282b53d5 100644
+--- a/qcengine/util.py
++++ b/qcengine/util.py
+@@ -14,15 +14,43 @@
+ import traceback
+ from contextlib import contextmanager
+ from pathlib import Path
+-from typing import Any, Dict, List, Optional, Tuple, Union
++from functools import partial
++from threading import Thread
++from typing import Any, Dict, List, Optional, Tuple, Union, BinaryIO
+ 
+ from pydantic import ValidationError
+ from qcelemental.models import FailedOperation
++from qcengine.config import TaskConfig
+ 
+ from .config import LOGGER, get_provenance_augments
+ from .exceptions import InputError, QCEngineException
+ 
+-__all__ = ["compute_wrapper", "model_wrapper", "handle_output_metadata"]
++__all__ = ["compute_wrapper", "model_wrapper", "handle_output_metadata", "create_mpi_invocation", "execute"]
++
++
++def create_mpi_invocation(executable: str, task_config: TaskConfig) -> List[str]:
++    """Create the launch command for an MPI-parallel task
++
++     Parameters
++     ----------
++        executable: str
++            Path to executable
++        task_config: TaskConfig
++            Specification for number of nodes, cores per node, etc.
++    """
++
++    # Make the mpirun invocation
++    mpirun_str = task_config.mpiexec_command.format(
++        nnodes=task_config.nnodes,
++        ranks_per_node=task_config.ncores // task_config.cores_per_rank,
++        total_ranks=task_config.nnodes * task_config.ncores,
++        cores_per_rank=task_config.cores_per_rank
++    )
++    command = mpirun_str.split()
++
++    # Add in the desired executable
++    command.append(executable)
++    return command
+ 
+ 
+ def model_wrapper(input_data: Dict[str, Any], model: "BaseModel") -> "BaseModel":
+@@ -198,6 +226,25 @@ def popen(
+ 
+     Code and idea from dask.distributed's testing suite
+     https://github.com/dask/distributed
++
++    Parameters
++    ----------
++        args: List[str]
++            Input arguments for the command
++        append_prefix: bool
++            Whether to prepend the Python path prefix to the command being executed
++        popen_kwargs: Dict[str, Any]
++            Any keyword arguments to use when launching the process
++
++    Returns
++    -------
++        exe: dict
++            Dictionary with the following keys:
++            <ul>
++                <li>proc: Popen object describing the background task</li>
++                <li>stdout: String value of the standard output of the task</li>
++                <li>stdeer: String value of the standard error of the task</li>
++            </ul>
+     """
+     args = list(args)
+     if popen_kwargs is None:
+@@ -219,22 +266,52 @@ def popen(
+         # Allow using CTRL_C_EVENT / CTRL_BREAK_EVENT
+         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+ 
++    # Route the standard error and output
+     popen_kwargs["stdout"] = subprocess.PIPE
+     popen_kwargs["stderr"] = subprocess.PIPE
++
++    # Prepare StringIO objects to store the stdout and stderr
++    stdout = io.BytesIO()
++    stderr = io.BytesIO()
++
++    # Launch the process
+     LOGGER.info("Popen", args, popen_kwargs)
++
++    # Ready the output
+     ret = {"proc": subprocess.Popen(args, **popen_kwargs)}
++
++    # Spawn threads that will read from the stderr/stdout
++    #  The PIPE uses a buffer with finite capacity. The underlying
++    #  process will stall if it is unable to write to the buffer
++    #  because the buffer is full. These threads continuously read
++    #  from the buffers to ensure that they do not fill.
++    #
++    def read_from_buffer(buffer: BinaryIO, storage: io.BytesIO):
++        for r in iter(partial(buffer.read, 1024), b''):
++            storage.write(r)
++    stdout_reader = Thread(target=read_from_buffer, args=(ret["proc"].stdout, stdout))
++    stdout_reader.start()
++    stderr_reader = Thread(target=read_from_buffer, args=(ret["proc"].stderr, stderr))
++    stderr_reader.start()
++
++    # Yield control back to the main thread
+     try:
+         yield ret
+     except Exception:
+         raise
+ 
+     finally:
++        # Executes on an exception or once the context manager closes
+         try:
+             terminate_process(ret["proc"])
+         finally:
+-            output, error = ret["proc"].communicate()
+-            ret["stdout"] = output.decode()
+-            ret["stderr"] = error.decode()
++            # Wait for the reader threads to finish
++            stdout_reader.join()
++            stderr_reader.join()
++
++            # Retrieve the standard output for the process
++            ret["stdout"] = stdout.getvalue().decode()
++            ret["stderr"] = stderr.getvalue().decode()
+ 
+ 
+ @contextmanager
+@@ -373,22 +450,12 @@ def execute(
+         popen_kwargs["shell"] = shell
+         with disk_files(infiles, outfiles, cwd=scrdir, as_binary=as_binary) as extrafiles:
+             with popen(command, popen_kwargs=popen_kwargs) as proc:
+-
+-                realtime_stdout = ""
+-                while True:
+-                    output = proc["proc"].stdout.readline()
+-                    if output == b"" and proc["proc"].poll() is not None:
+-                        break
+-                    if output:
+-                        realtime_stdout += output.decode("utf-8")
+-
++                # Wait for the subprocess to complete or the timeout to expire
+                 if interupt_after is None:
+                     proc["proc"].wait(timeout=timeout)
+                 else:
+                     time.sleep(interupt_after)
+                     terminate_process(proc["proc"])
+-
+-            proc["stdout"] = realtime_stdout
+             retcode = proc["proc"].poll()
+         proc["outfiles"] = extrafiles
+     proc["scratch_directory"] = scrdir

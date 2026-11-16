@@ -1,0 +1,264 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9a73a1e9e..237a57603 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -88,6 +88,7 @@ and this project adheres to [Pragmatic Versioning](https://github.com/experiment
+ - LLM field descriptions report descriptor data uniformly for every feature type: a prefix stating what the feature is and its range or options, then the data — `Categorical, allowed: [...] — descriptors per category: {...} — structure: [...]`, `Continuous, bounds [...] — descriptors: {...} — structure: CCO`. Previously the kind was announced in the prefix (`Categorical with descriptors`, `Continuous molecular (SMILES: CCO)`) and only the two descriptor-carrying classes emitted anything.
+ 
+ ### Fixed
++- `QparegoStrategy` draws independent Chebyshev scalarization weights for each candidate in a batch, instead of reusing one trade-off direction for the whole batch (#849). Baseline predictions and output constraints are shared across candidates.
+ - Sigmoid and target-window objectives use stable sigmoid evaluations, preventing NaN acquisition gradients in saturated regions and preserving small rewards in decreasing tails. ([#853](https://github.com/experimental-design/bofire/issues/853))
+ - Surrogates now reject output types they can't model. Every surrogate's output check was always true (`isinstance(my_type, type(ContinuousOutput))`), so e.g. a `SingleTaskGPSurrogate` or `RandomForestSurrogate` accepted a categorical output, and a `ClassificationMLPEnsemble` a continuous one.
+ - Predictions of a model with both continuous and categorical outputs are labelled correctly. The prediction columns listed every categorical output before the continuous ones, while the models are stacked in output order (continuous first), so the values landed under the wrong column names.
+diff --git a/bofire/strategies/predictives/qparego.py b/bofire/strategies/predictives/qparego.py
+index 16e8c6487..2f06ffcab 100644
+--- a/bofire/strategies/predictives/qparego.py
++++ b/bofire/strategies/predictives/qparego.py
+@@ -15,12 +15,7 @@
+     qNEI,
+ )
+ from bofire.data_models.api import Domain
+-from bofire.data_models.objectives.api import (
+-    CloseToTargetObjective,
+-    MaximizeObjective,
+-    MinimizeObjective,
+-    Objective,
+-)
++from bofire.data_models.objectives.api import Objective
+ from bofire.data_models.strategies.api import QparegoStrategy as DataModel
+ from bofire.data_models.strategies.convergence_criteria.api import (
+     AnyConvergenceCriterion,
+@@ -37,10 +32,9 @@
+ )
+ 
+ 
+-# this implementation follows this tutorial: https://github.com/pytorch/botorch/blob/main/tutorials/multi_objective_bo.ipynb
+-# main difference to the multiobjective strategies is that we have a randomized list of acqfs, this has to be bring into accordance
+-# with the other strategies
+ class QparegoStrategy(BotorchStrategy):
++    """Generate candidates sequentially with an independent scalarization per point."""
++
+     def __init__(
+         self,
+         data_model: DataModel,
+@@ -50,41 +44,23 @@ def __init__(
+         self.acquisition_function = data_model.acquisition_function
+         self.constraint_callables, self.etas = None, 1e-3
+ 
+-    def _get_objective_and_constraints(
++    def _get_objectives_and_constraints(
+         self,
++        n: int,
+     ) -> Tuple[
+-        GenericMCObjective,
++        List[GenericMCObjective],
+         Union[List[Callable[[torch.Tensor], torch.Tensor]], None],
+         Union[List, float],
+     ]:
+-        """Returns the scalarized objective.
+-
+-        Returns:
+-            GenericMCObjective: the botorch objective.
+-            Union[ConstrainedObjective, None]: the botorch constraints.
+-            Union[List, float]: etas used in the botorch constraints.
++        """Draw independent scalarizations using shared baseline predictions.
+ 
++        Each candidate gets its own weights and callable. Output transformations,
++        posterior-mean predictions, and output constraints are computed once.
+         """
+         assert self.experiments is not None, "No experiments available."
+         ref_point_mask = torch.from_numpy(get_ref_point_mask(domain=self.domain)).to(
+             **tkwargs,
+         )
+-        weights = (
+-            sample_simplex(
+-                len(
+-                    self.domain.outputs.get_keys_by_objective(
+-                        includes=[
+-                            MaximizeObjective,
+-                            MinimizeObjective,
+-                            CloseToTargetObjective,
+-                        ],
+-                    ),
+-                ),
+-                **tkwargs,
+-            ).squeeze()
+-            * ref_point_mask
+-        )
+-
+         obj_callable = get_multiobjective_objective(
+             outputs=self.domain.outputs,
+             experiments=self.experiments,
+@@ -100,15 +76,21 @@ def _get_objective_and_constraints(
+             df_preds[[f"{key}_pred" for key in self.domain.outputs.get_keys()]].values,
+         ).to(**tkwargs)
+ 
+-        scalarization = get_chebyshev_scalarization(
+-            weights=weights,
+-            Y=obj_callable(preds, None) * ref_point_mask,
+-        )
++        Y = obj_callable(preds, None) * ref_point_mask
++
++        def make_objective() -> GenericMCObjective:
++            weights = (
++                sample_simplex(len(ref_point_mask), **tkwargs).squeeze()
++                * ref_point_mask
++            )
++            scalarization = get_chebyshev_scalarization(weights=weights, Y=Y)
++
++            def objective_callable(Z, X=None):
++                return scalarization(obj_callable(Z, None) * ref_point_mask, X)
+ 
+-        def objective_callable(Z, X=None):
+-            return scalarization(obj_callable(Z, None) * ref_point_mask, X)
++            return GenericMCObjective(objective=objective_callable)
+ 
+-        if len(weights) != len(self.domain.outputs.get_by_objective(Objective)):
++        if len(ref_point_mask) != len(self.domain.outputs.get_by_objective(Objective)):
+             constraint_callables, etas = get_output_constraints(
+                 self.domain.outputs,
+                 experiments=self.experiments,
+@@ -117,7 +99,7 @@ def objective_callable(Z, X=None):
+             constraint_callables, etas = None, 1e-3
+ 
+         return (
+-            GenericMCObjective(objective=objective_callable),
++            [make_objective() for _ in range(n)],
+             constraint_callables,
+             etas,
+         )
+@@ -130,17 +112,17 @@ def _get_acqfs(self, n: int) -> List[AcquisitionFunction]:
+         X_train, X_pending = self.get_acqf_input_tensors()
+ 
+         (
+-            objective_callable,
++            objectives,
+             constraint_callables,
+             etas,
+-        ) = self._get_objective_and_constraints()
++        ) = self._get_objectives_and_constraints(n)
+ 
+         assert self.model is not None
+-        for i in range(n):
++        for i, objective in enumerate(objectives):
+             acqf = get_acquisition_function(
+                 acquisition_function_name=self.acquisition_function.__class__.__name__,
+                 model=self.model,
+-                objective=objective_callable,
++                objective=objective,
+                 X_observed=X_train,
+                 X_pending=X_pending if i == 0 else None,
+                 constraints=constraint_callables,
+diff --git a/tests/bofire/strategies/test_qparego.py b/tests/bofire/strategies/test_qparego.py
+index aac9038fc..24860f8d8 100644
+--- a/tests/bofire/strategies/test_qparego.py
++++ b/tests/bofire/strategies/test_qparego.py
+@@ -1,5 +1,6 @@
+ import random
+ from itertools import chain
++from unittest.mock import patch
+ 
+ import pytest
+ import torch
+@@ -21,6 +22,83 @@
+ from tests.bofire.utils.test_multiobjective import invalid_domains
+ 
+ 
++@pytest.mark.parametrize("acquisition", [qEI, qLogEI, qNEI, qLogNEI])
++@pytest.mark.parametrize("n", [1, 3])
++def test_qparego_independent_scalarizations(acquisition, n):
++    benchmark = DTLZ2(dim=6, num_objectives=3)
++    experiments = benchmark.f(
++        benchmark.domain.inputs.sample(12, seed=123), return_complete=True
++    )
++    strategy = QparegoStrategy(
++        data_model=data_models.QparegoStrategy(
++            domain=benchmark.domain,
++            acquisition_function=acquisition(n_mc_samples=32),
++            seed=123,
++        )
++    )
++    strategy.tell(experiments)
++    predictions = strategy.predict(experiments)
++    Y = torch.tensor(
++        predictions[
++            [f"{key}_pred" for key in benchmark.domain.outputs.get_keys()]
++        ].to_numpy(copy=True),
++        dtype=torch.double,
++    )
++    # Each prescribed weight vector should favor a different minimization
++    # trade-off, regardless of the predicted scale of each output.
++    low, high = Y.min(dim=0).values, Y.max(dim=0).values
++    normalized_probes = 0.8 - 0.6 * torch.eye(3, dtype=torch.double)
++    probes = (low + normalized_probes * (high - low)).unsqueeze(0)
++    weights = 0.1 + 0.7 * torch.eye(3, dtype=torch.double)
++    with (
++        patch(
++            "bofire.strategies.predictives.qparego.sample_simplex",
++            side_effect=list(weights[:n]),
++        ) as draw_weights,
++        patch.object(strategy, "predict", wraps=strategy.predict) as predict,
++    ):
++        acqfs = strategy._get_acqfs(n)
++
++    assert draw_weights.call_count == n
++    predict.assert_called_once()
++    assert len(acqfs) == n
++    assert len({id(acqf.objective) for acqf in acqfs}) == n
++    assert [acqf.objective(probes).argmax().item() for acqf in acqfs] == list(range(n))
++
++
++def test_qparego_batch_conditions_on_pending_candidates():
++    benchmark = DTLZ2(dim=6, num_objectives=3)
++    experiments = benchmark.f(
++        benchmark.domain.inputs.sample(12, seed=123), return_complete=True
++    )
++    strategy = QparegoStrategy(
++        data_model=data_models.QparegoStrategy(
++            domain=benchmark.domain,
++            acquisition_function=qLogEI(n_mc_samples=32),
++            seed=123,
++        )
++    )
++    strategy.tell(experiments)
++    pending = experiments[benchmark.domain.inputs.get_keys()].iloc[[0]].copy()
++    strategy.set_candidates(pending)
++    selected = []
++
++    def optimize_one(acq_function, q, **kwargs):
++        assert q == 1
++        expected_pending = torch.cat(
++            [torch.tensor(pending.to_numpy(copy=True), dtype=torch.double), *selected]
++        )
++        torch.testing.assert_close(acq_function.X_pending, expected_pending)
++        candidate = torch.full((1, 6), 0.2 * (len(selected) + 1), dtype=torch.double)
++        selected.append(candidate)
++        return candidate, torch.tensor(0.0, dtype=torch.double)
++
++    with patch("botorch.optim.optimize.optimize_acqf", side_effect=optimize_one):
++        candidates = strategy.ask(3)
++    assert len(candidates) == 3
++    assert len(selected) == 3
++
++
+ @pytest.mark.parametrize(
+     "domain",
+     [
+@@ -63,7 +141,7 @@ def test_qparego(num_test_candidates):
+     preds = my_strategy.predict(experiments)
+     assert len(preds) == len(experiments)
+     # test get objective
+-    objective, _, _ = my_strategy._get_objective_and_constraints()
++    [objective], _, _ = my_strategy._get_objectives_and_constraints(1)
+     assert isinstance(objective, GenericMCObjective)
+     acqfs = my_strategy._get_acqfs(2)
+     assert len(acqfs) == 2
+@@ -94,7 +172,7 @@ def test(benchmark_factory):
+         my_strategy = QparegoStrategy(data_model=data_model)
+         my_strategy.tell(experiments)
+         # test get objective
+-        objective, _, _ = my_strategy._get_objective_and_constraints()
++        [objective], _, _ = my_strategy._get_objectives_and_constraints(1)
+         assert isinstance(objective, GenericMCObjective)
+         # ask
+         candidates = my_strategy.ask(num_test_candidates)

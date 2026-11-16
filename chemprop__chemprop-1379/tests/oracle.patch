@@ -1,0 +1,217 @@
+diff --git a/chemprop/nn/message_passing/base.py b/chemprop/nn/message_passing/base.py
+index 623f35b46..42f756c6a 100644
+--- a/chemprop/nn/message_passing/base.py
++++ b/chemprop/nn/message_passing/base.py
+@@ -206,7 +206,7 @@ def forward(self, bmg: BatchMolGraph, V_d: Tensor | None = None) -> Tensor:
+             H = self.update(M, H_0)
+ 
+         index_torch = bmg.edge_index[1].unsqueeze(1).repeat(1, H.shape[1])
+-        M = torch.zeros(len(bmg.V), H.shape[1], dtype=H.dtype, device=H.device).scatter_reduce_(
++        M = torch.zeros(bmg.V.shape[0], H.shape[1], dtype=H.dtype, device=H.device).scatter_reduce_(
+             0, index_torch, H, reduce="sum", include_self=False
+         )
+         return self.finalize(M, bmg.V, V_d)
+diff --git a/chemprop/nn/message_passing/mixins.py b/chemprop/nn/message_passing/mixins.py
+index 14c315fee..ca2d46f77 100644
+--- a/chemprop/nn/message_passing/mixins.py
++++ b/chemprop/nn/message_passing/mixins.py
+@@ -10,9 +10,9 @@ def initialize(self, bmg: BatchMolGraph) -> Tensor:
+ 
+     def message(self, H: Tensor, bmg: BatchMolGraph) -> Tensor:
+         index_torch = bmg.edge_index[1].unsqueeze(1).repeat(1, H.shape[1])
+-        M_all = torch.zeros(len(bmg.V), H.shape[1], dtype=H.dtype, device=H.device).scatter_reduce_(
+-            0, index_torch, H, reduce="sum", include_self=False
+-        )[bmg.edge_index[0]]
++        M_all = torch.zeros(
++            bmg.V.shape[0], H.shape[1], dtype=H.dtype, device=H.device
++        ).scatter_reduce_(0, index_torch, H, reduce="sum", include_self=False)[bmg.edge_index[0]]
+         M_rev = H[bmg.rev_edge_index]
+ 
+         return M_all - M_rev
+@@ -25,6 +25,6 @@ def initialize(self, bmg: BatchMolGraph) -> Tensor:
+     def message(self, H: Tensor, bmg: BatchMolGraph):
+         H = torch.cat((H, bmg.E), dim=1)
+         index_torch = bmg.edge_index[1].unsqueeze(1).repeat(1, H.shape[1])
+-        return torch.zeros(len(bmg.V), H.shape[1], dtype=H.dtype, device=H.device).scatter_reduce_(
+-            0, index_torch, H, reduce="sum", include_self=False
+-        )[bmg.edge_index[0]]
++        return torch.zeros(
++            bmg.V.shape[0], H.shape[1], dtype=H.dtype, device=H.device
++        ).scatter_reduce_(0, index_torch, H, reduce="sum", include_self=False)[bmg.edge_index[0]]
+diff --git a/chemprop/nn/message_passing/mol_atom_bond.py b/chemprop/nn/message_passing/mol_atom_bond.py
+index 83f74f29d..089af1052 100644
+--- a/chemprop/nn/message_passing/mol_atom_bond.py
++++ b/chemprop/nn/message_passing/mol_atom_bond.py
+@@ -296,7 +296,7 @@ def forward(
+             H = self.update(M, H_0)
+ 
+         index_torch = bmg.edge_index[1].unsqueeze(1).repeat(1, H.shape[1])
+-        M = torch.zeros(len(bmg.V), H.shape[1], dtype=H.dtype, device=H.device).scatter_reduce_(
++        M = torch.zeros(bmg.V.shape[0], H.shape[1], dtype=H.dtype, device=H.device).scatter_reduce_(
+             0, index_torch, H, reduce="sum", include_self=False
+         )
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 585e57142..dcf69911e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -5,6 +5,9 @@
+ import pandas as pd
+ import pytest
+ from rdkit import Chem
++from torch.utils._pytree import GetAttrKey, register_pytree_node
++
++from chemprop.data import BatchMolGraph
+ 
+ _DATA_DIR = Path(__file__).parent / "data"
+ _DF = pd.read_csv(_DATA_DIR / "smis.csv")
+@@ -14,6 +17,42 @@
+ _DF["mol"] = _DF["smi"].map(Chem.MolFromSmiles)
+ 
+ 
++@pytest.fixture(scope="session")
++def batch_mol_graph_pytree():
++    def flatten(bmg: BatchMolGraph):
++        return [bmg.V, bmg.E, bmg.edge_index, bmg.rev_edge_index, bmg.batch], len(bmg)
++
++    def unflatten(children, size):
++        V, E, edge_index, rev_edge_index, batch = children
++        bmg = object.__new__(BatchMolGraph)
++        bmg.V = V
++        bmg.E = E
++        bmg.edge_index = edge_index
++        bmg.rev_edge_index = rev_edge_index
++        bmg.batch = batch
++        bmg._BatchMolGraph__size = size
++        return bmg
++
++    def flatten_with_keys(bmg: BatchMolGraph):
++        children, context = flatten(bmg)
++        keys = [
++            GetAttrKey("V"),
++            GetAttrKey("E"),
++            GetAttrKey("edge_index"),
++            GetAttrKey("rev_edge_index"),
++            GetAttrKey("batch"),
++        ]
++        return list(zip(keys, children)), context
++
++    register_pytree_node(
++        BatchMolGraph,
++        flatten,
++        unflatten,
++        flatten_with_keys_fn=flatten_with_keys,
++        serialized_type_name="chemprop.data.collate.BatchMolGraph",
++    )
++
++
+ @pytest.fixture
+ def data_dir():
+     return _DATA_DIR
+diff --git a/tests/integration/test_export.py b/tests/integration/test_export.py
+new file mode 100644
+index 000000000..d60e3d278
+--- /dev/null
++++ b/tests/integration/test_export.py
+@@ -0,0 +1,46 @@
++import pytest
++import torch
++
++from chemprop.data import BatchMolGraph, MoleculeDatapoint, MoleculeDataset, collate_batch
++from chemprop.models import MPNN
++from chemprop.nn import BondMessagePassing, RegressionFFN, SumAggregation
++
++
++def make_batch(smiles: list[str]) -> BatchMolGraph:
++    dataset = MoleculeDataset([MoleculeDatapoint.from_smi(smi) for smi in smiles])
++    return collate_batch(dataset)[0]
++
++
++@pytest.mark.usefixtures("batch_mol_graph_pytree")
++def test_mpnn_export_dynamic_graph_sizes():
++    export_graph = make_batch(["C", "CC", "CCC", "CCCC"])
++    inference_graph = make_batch(["C", "S", "N", "O"])
++    assert export_graph.V.shape[0] != inference_graph.V.shape[0]
++    assert inference_graph.E.shape[0] == 0
++
++    message_passing = BondMessagePassing()
++    model = MPNN(
++        message_passing, SumAggregation(), RegressionFFN(input_dim=message_passing.output_dim)
++    ).eval()
++    num_atoms = torch.export.Dim("num_atoms")
++    num_edges = torch.export.Dim("num_edges")
++    dynamic_shapes = {
++        "bmg": [{0: num_atoms}, {0: num_edges}, {1: num_edges}, {0: num_edges}, {0: num_atoms}],
++        "V_d": None,
++        "X_d": None,
++    }
++
++    with torch.inference_mode():
++        expected = model(inference_graph)
++
++    exported = torch.export.export(
++        model,
++        (export_graph,),
++        kwargs={"V_d": None, "X_d": None},
++        dynamic_shapes=dynamic_shapes,
++        strict=False,
++    )
++
++    with torch.inference_mode():
++        actual = exported.module()(inference_graph, V_d=None, X_d=None)
++    torch.testing.assert_close(actual, expected)
+diff --git a/tests/unit/nn/test_message_passing.py b/tests/unit/nn/test_message_passing.py
+new file mode 100644
+index 000000000..49ed8022d
+--- /dev/null
++++ b/tests/unit/nn/test_message_passing.py
+@@ -0,0 +1,49 @@
++import numpy as np
++import pytest
++import torch
++
++from chemprop.data import BatchMolGraph
++from chemprop.data.molgraph import MolGraph
++from chemprop.nn import (
++    AtomMessagePassing,
++    BondMessagePassing,
++    MABAtomMessagePassing,
++    MABBondMessagePassing,
++)
++
++
++def make_chain_graph(num_atoms: int) -> BatchMolGraph:
++    src = np.arange(num_atoms - 1)
++    dst = src + 1
++    edge_index = np.stack((np.concatenate((src, dst)), np.concatenate((dst, src))))
++    num_edges = edge_index.shape[1]
++    mol_graph = MolGraph(
++        V=np.ones((num_atoms, 72), dtype=np.float32),
++        E=np.ones((num_edges, 14), dtype=np.float32),
++        edge_index=edge_index,
++        rev_edge_index=np.concatenate((np.arange(num_atoms - 1, num_edges), src)),
++    )
++    return BatchMolGraph([mol_graph])
++
++
++@pytest.mark.parametrize(
++    "message_passing",
++    [AtomMessagePassing(), BondMessagePassing(), MABAtomMessagePassing(), MABBondMessagePassing()],
++)
++@pytest.mark.usefixtures("batch_mol_graph_pytree")
++def test_message_passing_export_dynamic_graph_sizes(message_passing):
++    export_graph = make_chain_graph(3)
++    inference_graph = make_chain_graph(5)
++    num_atoms = torch.export.Dim("num_atoms", min=2)
++    num_edges = torch.export.Dim("num_edges", min=2)
++    dynamic_shapes = {
++        "bmg": [{0: num_atoms}, {0: num_edges}, {1: num_edges}, {0: num_edges}, {0: num_atoms}]
++    }
++
++    exported = torch.export.export(
++        message_passing, (export_graph,), dynamic_shapes=dynamic_shapes, strict=False
++    )
++
++    expected = message_passing(inference_graph)
++    actual = exported.module()(inference_graph)
++    torch.testing.assert_close(actual, expected)

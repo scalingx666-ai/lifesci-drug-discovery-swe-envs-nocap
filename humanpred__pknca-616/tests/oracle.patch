@@ -1,0 +1,3665 @@
+diff --git a/NEWS.md b/NEWS.md
+index 2ba22ed61..dce4795e7 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -73,6 +73,23 @@ the dosing including dose amount and route.
+   extrapolation before the first is not; both are controlled by the
+   `extrapolate_later` and `extrapolate_earlier` arguments (#342).
+ 
++* IV bolus AUC and AUMC parameters (`aucivlast`, `aucivinf.obs`, `aumcivlast`,
++  and the rest of the `auciv`/`aumciv` family) no longer require a measured
++  concentration at time 0.  When the profile starts after the dose, `c0`
++  supplies the concentration at time 0 and the AU(M)C is calculated from it
++  (#352).
++
++* Breaking change: `pk.calc.auciv_pbext()` gains `conc` and `time` arguments.
++  The percent back-extrapolated (`aucivpbextlast`, `aucivpbextint.last`, and
++  the rest) is now `NA` unless a concentration was measured at time 0.  Without
++  one, the AUC it compares against either cannot be calculated or, for the
++  `aucint` family, already extrapolates back to time 0 with `conc.origin`, so
++  it does not describe the observed part of the IV AUC (#352).
++
++* `add.interval.col()` accepts an `I()`-wrapped value in `formalsmap` to pass a
++  constant to the calculation function instead of naming a data source or
++  another parameter.  See `vignette("v80-writing-parameter-functions")`.
++
+ * Bug fix: `superposition()` drops missing concentrations before calculating.
+   They previously reached the half-life fit and stopped the calculation with
+   `NA/NaN/Inf in 'x'` (#308).
+diff --git a/R/001-add.interval.col.R b/R/001-add.interval.col.R
+index 6f8bd3c73..e1c2d0ebb 100644
+--- a/R/001-add.interval.col.R
++++ b/R/001-add.interval.col.R
+@@ -281,6 +281,13 @@ assert_selection <- function(selection, name) {
+ #'     \item{"duration.dose.group"}{Duration of dose (typically infusion duration) for doses in the current group.}
+ #'     \item{"route.group"}{Route of dosing for the current group.}
+ #'   }
++#'   \item{Constants:}
++#'   \describe{
++#'     \item{a value wrapped in [base::I()]}{The value itself, passed to the
++#'     function unchanged.  Use this for an argument that selects a variant of
++#'     a shared calculation function (for example, `auc.type = I("AUCall")`)
++#'     rather than naming a data source or another parameter.}
++#'   }
+ #' }
+ #' @examples
+ #' \dontrun{
+diff --git a/R/auciv.R b/R/auciv.R
+index c90d45b01..0a752cbcc 100644
+--- a/R/auciv.R
++++ b/R/auciv.R
+@@ -8,13 +8,21 @@
+ #' measurement to time 0 using `c0` and the AUXC calculated by another method
+ #' (e.g., auclast or aumclast).
+ #'
+-#' The calculation method takes the following steps:
+-#' \enumerate{
+-#'   \item `time = 0` must be present in the data with a measured concentration.
+-#'   \item The AUXC between `time = 0` and the next time point is calculated (`auxc_first`).
+-#'   \item The AUXC between `time = 0` with `c0` and the next time point is calculated (`auxc_second`).
+-#'   \item The final AUXC is the initial AUXC plus the difference between the two
+-#'         AUXCs (`auxc_final <- auxc + auxc_second - auxc_first`).
++#' How the calculation proceeds depends on what is measured at `time = 0`:
++#'
++#' \describe{
++#'   \item{A concentration is measured at `time = 0`}{The AUXC between `time = 0`
++#'     and the next time point is calculated with the measured concentration
++#'     (`auxc_first`) and with `c0` (`auxc_second`).  The final AUXC is
++#'     `auxc + auxc_second - auxc_first`.}
++#'   \item{No concentration at `time = 0` and `auxc` was calculated}{`auxc` comes
++#'     from a method that extrapolates back to `time = 0` with `conc.origin`
++#'     (zero; the `aucint` family), so that segment is replaced by the one using
++#'     `c0` in the same way.}
++#'   \item{No concentration at `time = 0` and `auxc` is `NA`}{`auxc` is `NA`
++#'     because an AUXC may not start before the first measurement.  `c0` supplies
++#'     that measurement, so the AUXC is calculated here from `c0` and the
++#'     measured data using `fun_auxc` and `auc.type`.}
+ #' }
+ #'
+ #' @inheritParams pk.calc.auxc
+@@ -24,13 +32,23 @@
+ #'   (it may be calculated using any method)
+ #' @param fun_auxc_last Function to calculate the AUXC for the last interval
+ #'   (e.g., `pk.calc.auc.last` or `pk.calc.aumc.last`)
++#' @param fun_auxc Function to calculate the AUXC over the full interval when
++#'   `auxc` could not be calculated (e.g., `pk.calc.auc` or `pk.calc.aumc`)
++#' @param auc.type The type of AUXC for `fun_auxc` to calculate.  `NULL` (the
++#'   default) means that the AUXC will not be calculated from `c0` and the
++#'   measured data, so `NA` is returned when `auxc` is `NA`.
++#' @param clast The last concentration above the limit of quantification, used
++#'   by `fun_auxc` when `auc.type` is `"AUCinf"` (`clast.obs` gives AUCinf,obs
++#'   and `clast.pred` gives AUCinf,pred)
+ #'
+ #' @return The AUXC calculated using `c0`
+ #'
+ #' @family AUC calculations
+ #' @family AUMC calculations
+ #' @export
+-pk.calc.auxciv <- function(conc, time, c0, auxc, fun_auxc_last, ..., options = list(), check = TRUE) {
++pk.calc.auxciv <- function(conc, time, c0, auxc, fun_auxc_last, fun_auxc,
++                           auc.type = NULL, lambda.z = NA, clast = NA,
++                           ..., options = list(), check = TRUE) {
+   if (check) {
+     assert_conc_time(conc = conc, time = time)
+     data <-
+@@ -42,26 +60,62 @@ pk.calc.auxciv <- function(conc, time, c0, auxc, fun_auxc_last, ..., options = l
+   } else {
+     data <- data.frame(conc = conc, time = time)
+   }
+-  if (!(0 %in% time)) {
+-    return(structure(NA_real_, exclude = "No time 0 in data"))
++  if (nrow(data) == 0) {
++    return(structure(NA_real_, exclude = "No data for AUC calculation"))
+   } else if (is.na(c0)) {
+     return(structure(NA_real_, exclude = "c0 is not calculated"))
+   }
+-  auxc_first <- fun_auxc_last(conc = data$conc[1:2], time = data$time[1:2], ..., check = FALSE)
+-  auxc_second <- fun_auxc_last(conc = c(c0, data$conc[2]), time = data$time[1:2], ..., check = FALSE)
+-  auxc_final <- auxc + auxc_second - auxc_first
+-  auxc_final
++  if (0 %in% data$time) {
++    auxc_first <- fun_auxc_last(conc = data$conc[1:2], time = data$time[1:2], ..., check = FALSE)
++    auxc_second <- fun_auxc_last(conc = c(c0, data$conc[2]), time = data$time[1:2], ..., check = FALSE)
++    auxc + auxc_second - auxc_first
++  } else if (data$time[1] < 0) {
++    structure(NA_real_, exclude = "No time 0 in data")
++  } else if (!is.na(auxc)) {
++    # auxc extrapolated back to time 0 with conc.origin (zero); replace that
++    # segment with the one starting from c0.
++    auxc_first <- fun_auxc_last(conc = c(0, data$conc[1]), time = c(0, data$time[1]), ..., check = FALSE)
++    auxc_second <- fun_auxc_last(conc = c(c0, data$conc[1]), time = c(0, data$time[1]), ..., check = FALSE)
++    auxc + auxc_second - auxc_first
++  } else if (is.null(auc.type)) {
++    structure(NA_real_, exclude = "No time 0 in data")
++  } else {
++    auxc_args <-
++      list(
++        conc = c(c0, data$conc), time = c(0, data$time),
++        auc.type = auc.type,
++        ...,
++        options = options, check = FALSE
++      )
++    if (identical(auc.type, "AUCinf")) {
++      auxc_args$clast <- clast
++      auxc_args$lambda.z <- lambda.z
++    }
++    ret <- do.call(fun_auxc, auxc_args)
++    if (!is.na(ret)) {
++      # auxc is NA here, and its reason for exclusion does not apply to a value
++      # that was calculated from c0.
++      attr(ret, "exclude") <- "DO NOT EXCLUDE"
++    }
++    ret
++  }
+ }
+ 
+ 
+ #' @describeIn pk.calc.auxciv Calculate AUC for intravenous dosing with C0 back-extrapolation
+ #' @param auc The AUC calculated using `conc` and `time` without `c0`
+ #' @export
+-pk.calc.auciv <- function(conc, time, c0, auc, ..., options = list(), check = TRUE) {
++pk.calc.auciv <- function(conc, time, c0, auc, auc.type = NULL,
++                          lambda.z = NA, clast = NA, ..., options = list(),
++                          check = TRUE) {
+   pk.calc.auxciv(
+     conc = conc, time = time,
+     c0 = c0, auxc = auc,
+     fun_auxc_last = pk.calc.auc.last,
++    fun_auxc = pk.calc.auc,
++    auc.type = auc.type,
++    lambda.z = lambda.z,
++    clast = clast,
+     ...,
+     options = options,
+     check = check
+@@ -79,7 +133,7 @@ add.interval.col(
+   depends = c("auclast", "c0"),
+   desc = "AUClast, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(auc="auclast"),
++  formalsmap = list(auc="auclast", auc.type=I("AUClast"), lambda.z=NULL, clast=NULL),
+   pptestcd_cdisc="AUCIVLST",
+   pptest_cdisc="AUClast (IV dosing)",
+   formula = "$AUC_{\\text{iv,last}} = AUC_{\\text{last}} + AUC(C_0, t_1) - AUC(C(0), t_1)$")
+@@ -92,7 +146,7 @@ add.interval.col(
+   depends = c("aucall", "c0"),
+   desc = "AUCall, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(auc="aucall"),
++  formalsmap = list(auc="aucall", auc.type=I("AUCall"), lambda.z=NULL, clast=NULL),
+   pptestcd_cdisc="AUCIVA",
+   pptest_cdisc="AUCall (IV dosing)",
+   formula = "$AUC_{\\text{iv,all}} = AUC_{\\text{all}} + AUC(C_0, t_1) - AUC(C(0), t_1)$")
+@@ -105,7 +159,7 @@ add.interval.col(
+   depends = c("aucint.last", "c0"),
+   desc = "AUCint.last, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(auc="aucint.last"),
++  formalsmap = list(auc="aucint.last", auc.type=NULL, lambda.z=NULL, clast=NULL),
+   pptestcd_cdisc="AUCIVILT",
+   pptest_cdisc="AUCint,last (IV dosing)",
+   formula = "$AUC_{\\text{iv,int,last}} = AUC_{\\text{int,last}} + AUC(C_0, t_1) - AUC(C(0), t_1)$")
+@@ -118,7 +172,7 @@ add.interval.col(
+   depends = c("aucint.all", "c0"),
+   desc = "AUCint.all, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(auc="aucint.all"),
++  formalsmap = list(auc="aucint.all", auc.type=NULL, lambda.z=NULL, clast=NULL),
+   pptestcd_cdisc="AUCIVINA",
+   pptest_cdisc="AUCint,all (IV dosing)",
+   formula = "$AUC_{\\text{iv,int,all}} = AUC_{\\text{int,all}} + AUC(C_0, t_1) - AUC(C(0), t_1)$")
+@@ -128,10 +182,10 @@ add.interval.col(
+   FUN = "pk.calc.auciv",
+   unit_type = "auc",
+   pretty_name = "AUCinf,obs (IV dosing)",
+-  depends = c("aucinf.obs", "c0"),
++  depends = c("aucinf.obs", "c0", "lambda.z", "clast.obs"),
+   desc = "AUCinf.obs, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(auc="aucinf.obs"),
++  formalsmap = list(auc="aucinf.obs", auc.type=I("AUCinf"), clast="clast.obs"),
+   pptestcd_cdisc="AUCIVIS",
+   pptest_cdisc="AUCinf,obs (IV dosing)",
+   formula = "$AUC_{\\text{iv,}\\infty\\text{,obs}} = AUC_{\\infty,\\text{obs}} + AUC(C_0, t_1) - AUC(C(0), t_1)$")
+@@ -141,10 +195,10 @@ add.interval.col(
+   FUN = "pk.calc.auciv",
+   unit_type = "auc",
+   pretty_name = "AUCinf,pred (IV dosing)",
+-  depends = c("aucinf.pred", "c0"),
++  depends = c("aucinf.pred", "c0", "lambda.z", "clast.pred"),
+   desc = "AUCinf.pred, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(auc="aucinf.pred"),
++  formalsmap = list(auc="aucinf.pred", auc.type=I("AUCinf"), clast="clast.pred"),
+   pptestcd_cdisc="AUCIVIP",
+   pptest_cdisc="AUCinf,pred (IV dosing)",
+   formula = "$AUC_{\\text{iv,}\\infty\\text{,pred}} = AUC_{\\infty,\\text{pred}} + AUC(C_0, t_1) - AUC(C(0), t_1)$")
+@@ -152,12 +206,35 @@ add.interval.col(
+ 
+ #' @describeIn pk.calc.auxciv Calculate the percent back-extrapolated AUC for IV
+ #'   administration
+-#' @details The calculation for back-extrapolation is `100*(1 - auc/auciv)`.
++#' @details The calculation for back-extrapolation is `100*(1 - auc/auciv)`.  It
++#'   requires a measured concentration at time 0; without one, `auc` does not
++#'   describe the observed part of `auciv` (it either cannot be calculated or,
++#'   for the `aucint` family, already extrapolates back to time 0 with
++#'   `conc.origin`), so `NA` is returned.
+ #' @param auc The AUC calculated without C0 back-extrapolation 
+ #' @param auciv The AUC calculated using `c0`
+ #' @returns `pk.calc.auciv_pctbackextrap`: The AUC percent back-extrapolated
+ #' @export
+-pk.calc.auciv_pbext <- function(auc, auciv) {
++pk.calc.auciv_pbext <- function(conc, time, auc, auciv, ..., options = list(), check = TRUE) {
++  if (check) {
++    assert_conc_time(conc = conc, time = time)
++    data <-
++      clean.conc.blq(
++        conc, time,
++        options = options,
++        check = FALSE
++      )
++  } else {
++    data <- data.frame(conc = conc, time = time)
++  }
++  if (!(0 %in% data$time)) {
++    return(
++      structure(
++        NA_real_,
++        exclude = "Percent back-extrapolated requires a measured concentration at time 0"
++      )
++    )
++  }
+   if (!is.na(auciv) && !is.na(auc) && auciv < auc){rlang::abort("auciv must be >= auc; back-extrapolation cannot be negative.")}
+   100*(1 - auc/auciv)
+ }
+@@ -246,11 +323,17 @@ add.interval.col(
+ #' @describeIn pk.calc.auxciv Calculate AUMC for intravenous dosing with C0 back-extrapolation
+ #' @param aumc The AUMC calculated using `conc` and `time` without `c0`
+ #' @export
+-pk.calc.aumciv <- function(conc, time, c0, aumc, ..., options = list(), check = TRUE) {
++pk.calc.aumciv <- function(conc, time, c0, aumc, auc.type = NULL,
++                           lambda.z = NA, clast = NA, ..., options = list(),
++                           check = TRUE) {
+   pk.calc.auxciv(
+     conc = conc, time = time,
+     c0 = c0, auxc = aumc,
+     fun_auxc_last = pk.calc.aumc.last,
++    fun_auxc = pk.calc.aumc,
++    auc.type = auc.type,
++    lambda.z = lambda.z,
++    clast = clast,
+     ...,
+     options = options,
+     check = check
+@@ -267,7 +350,7 @@ add.interval.col(
+   depends = c("aumclast", "c0"),
+   desc = "AUMClast, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(aumc = "aumclast")
++  formalsmap = list(aumc = "aumclast", auc.type = I("AUClast"), lambda.z = NULL, clast = NULL)
+ )
+ 
+ add.interval.col(
+@@ -278,7 +361,7 @@ add.interval.col(
+   depends = c("aumcall", "c0"),
+   desc = "AUMCall, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(aumc = "aumcall")
++  formalsmap = list(aumc = "aumcall", auc.type = I("AUCall"), lambda.z = NULL, clast = NULL)
+ )
+ 
+ add.interval.col(
+@@ -289,7 +372,7 @@ add.interval.col(
+   depends = c("aumcint.last", "c0"),
+   desc = "AUMCint.last, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(aumc = "aumcint.last")
++  formalsmap = list(aumc = "aumcint.last", auc.type = NULL, lambda.z = NULL, clast = NULL)
+ )
+ 
+ add.interval.col(
+@@ -300,7 +383,7 @@ add.interval.col(
+   depends = c("aumcint.all", "c0"),
+   desc = "AUMCint.all, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(aumc = "aumcint.all")
++  formalsmap = list(aumc = "aumcint.all", auc.type = NULL, lambda.z = NULL, clast = NULL)
+ )
+ 
+ add.interval.col(
+@@ -308,10 +391,10 @@ add.interval.col(
+   FUN = "pk.calc.aumciv",
+   unit_type = "aumc",
+   pretty_name = "AUMCinf,obs (IV dosing)",
+-  depends = c("aumcinf.obs", "c0"),
++  depends = c("aumcinf.obs", "c0", "lambda.z", "clast.obs"),
+   desc = "AUMCinf.obs, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(aumc = "aumcinf.obs")
++  formalsmap = list(aumc = "aumcinf.obs", auc.type = I("AUCinf"), clast = "clast.obs")
+ )
+ 
+ add.interval.col(
+@@ -319,10 +402,10 @@ add.interval.col(
+   FUN = "pk.calc.aumciv",
+   unit_type = "aumc",
+   pretty_name = "AUMCinf,pred (IV dosing)",
+-  depends = c("aumcinf.pred", "c0"),
++  depends = c("aumcinf.pred", "c0", "lambda.z", "clast.pred"),
+   desc = "AUMCinf.pred, IV back-extrap C0",
+   sparse = FALSE,
+-  formalsmap = list(aumc = "aumcinf.pred")
++  formalsmap = list(aumc = "aumcinf.pred", auc.type = I("AUCinf"), clast = "clast.pred")
+ )
+ 
+ 
+diff --git a/R/check.intervals.R b/R/check.intervals.R
+index e0f2ce415..32847d3e0 100644
+--- a/R/check.intervals.R
++++ b/R/check.intervals.R
+@@ -342,6 +342,9 @@ parameter_direct_refs <- function(x, all_intervals, optional_dose) {
+     args[names(spec$formalsmap)] <- spec$formalsmap
+   }
+   args <- args[!vapply(X = args, FUN = is.null, FUN.VALUE = TRUE)]
++  # I()-wrapped formalsmap values are constants, not references to a data source
++  # or another parameter.
++  args <- args[!vapply(X = args, FUN = inherits, FUN.VALUE = TRUE, what = "AsIs")]
+   if (!optional_dose) {
+     drop_args <- pknca_optional_dose_args[[spec$FUN]]
+     if (!is.null(drop_args)) {
+diff --git a/R/pk.calc.all.R b/R/pk.calc.all.R
+index 089f0627a..c0d31959b 100644
+--- a/R/pk.calc.all.R
++++ b/R/pk.calc.all.R
+@@ -509,7 +509,11 @@ pk.nca.interval <- function(conc, time, volume, duration.conc,
+       arglist <- arglist[!vapply(X = arglist, FUN = is.null, FUN.VALUE = TRUE)]
+       for (arg_formal in names(arglist)) {
+         arg_mapped <- arglist[[arg_formal]]
+-        if (arg_mapped == "conc") {
++        if (inherits(arg_mapped, "AsIs")) {
++          # An I()-wrapped formalsmap value is the argument itself rather than
++          # the name of a data source or another parameter.
++          call_args[[arg_formal]] <- unclass(arg_mapped)
++        } else if (arg_mapped == "conc") {
+           call_args[[arg_formal]] <- conc
+         } else if (arg_mapped == "time") {
+           # Realign the time to be relative to the start of the
+diff --git a/man/add.interval.col.Rd b/man/add.interval.col.Rd
+index 94bd3c591..2fd09ad1d 100644
+--- a/man/add.interval.col.Rd
++++ b/man/add.interval.col.Rd
+@@ -140,6 +140,13 @@ and the values should be one of the following:
+ \item{"duration.dose.group"}{Duration of dose (typically infusion duration) for doses in the current group.}
+ \item{"route.group"}{Route of dosing for the current group.}
+ }
++\item{Constants:}
++\describe{
++\item{a value wrapped in \code{\link[base:I]{base::I()}}}{The value itself, passed to the
++function unchanged.  Use this for an argument that selects a variant of
++a shared calculation function (for example, \code{auc.type = I("AUCall")})
++rather than naming a data source or another parameter.}
++}
+ }
+ }
+ \examples{
+diff --git a/man/pk.calc.auxciv.Rd b/man/pk.calc.auxciv.Rd
+index 13e3aa710..f7664ff4b 100644
+--- a/man/pk.calc.auxciv.Rd
++++ b/man/pk.calc.auxciv.Rd
+@@ -13,16 +13,50 @@ pk.calc.auxciv(
+   c0,
+   auxc,
+   fun_auxc_last,
++  fun_auxc,
++  auc.type = NULL,
++  lambda.z = NA,
++  clast = NA,
+   ...,
+   options = list(),
+   check = TRUE
+ )
+ 
+-pk.calc.auciv(conc, time, c0, auc, ..., options = list(), check = TRUE)
++pk.calc.auciv(
++  conc,
++  time,
++  c0,
++  auc,
++  auc.type = NULL,
++  lambda.z = NA,
++  clast = NA,
++  ...,
++  options = list(),
++  check = TRUE
++)
+ 
+-pk.calc.auciv_pbext(auc, auciv)
++pk.calc.auciv_pbext(
++  conc,
++  time,
++  auc,
++  auciv,
++  ...,
++  options = list(),
++  check = TRUE
++)
+ 
+-pk.calc.aumciv(conc, time, c0, aumc, ..., options = list(), check = TRUE)
++pk.calc.aumciv(
++  conc,
++  time,
++  c0,
++  aumc,
++  auc.type = NULL,
++  lambda.z = NA,
++  clast = NA,
++  ...,
++  options = list(),
++  check = TRUE
++)
+ }
+ \arguments{
+ \item{conc}{Measured concentrations}
+@@ -37,6 +71,20 @@ pk.calc.aumciv(conc, time, c0, aumc, ..., options = list(), check = TRUE)
+ \item{fun_auxc_last}{Function to calculate the AUXC for the last interval
+ (e.g., \code{pk.calc.auc.last} or \code{pk.calc.aumc.last})}
+ 
++\item{fun_auxc}{Function to calculate the AUXC over the full interval when
++\code{auxc} could not be calculated (e.g., \code{pk.calc.auc} or \code{pk.calc.aumc})}
++
++\item{auc.type}{The type of AUXC for \code{fun_auxc} to calculate.  \code{NULL} (the
++default) means that the AUXC will not be calculated from \code{c0} and the
++measured data, so \code{NA} is returned when \code{auxc} is \code{NA}.}
++
++\item{lambda.z}{The elimination rate (in units of inverse time) for
++extrapolation}
++
++\item{clast}{The last concentration above the limit of quantification, used
++by \code{fun_auxc} when \code{auc.type} is \code{"AUCinf"} (\code{clast.obs} gives AUCinf,obs
++and \code{clast.pred} gives AUCinf,pred)}
++
+ \item{...}{For functions other than \code{pk.calc.auxc}, these values are passed
+ to \code{pk.calc.auxc}}
+ 
+@@ -65,16 +113,28 @@ The AUXC for intravenous (IV) dosing extrapolates the AUXC back from the first
+ measurement to time 0 using \code{c0} and the AUXC calculated by another method
+ (e.g., auclast or aumclast).
+ 
+-The calculation method takes the following steps:
+-\enumerate{
+-\item \code{time = 0} must be present in the data with a measured concentration.
+-\item The AUXC between \code{time = 0} and the next time point is calculated (\code{auxc_first}).
+-\item The AUXC between \code{time = 0} with \code{c0} and the next time point is calculated (\code{auxc_second}).
+-\item The final AUXC is the initial AUXC plus the difference between the two
+-AUXCs (\code{auxc_final <- auxc + auxc_second - auxc_first}).
++How the calculation proceeds depends on what is measured at \code{time = 0}:
++
++\describe{
++\item{A concentration is measured at \code{time = 0}}{The AUXC between \code{time = 0}
++and the next time point is calculated with the measured concentration
++(\code{auxc_first}) and with \code{c0} (\code{auxc_second}).  The final AUXC is
++\code{auxc + auxc_second - auxc_first}.}
++\item{No concentration at \code{time = 0} and \code{auxc} was calculated}{\code{auxc} comes
++from a method that extrapolates back to \code{time = 0} with \code{conc.origin}
++(zero; the \code{aucint} family), so that segment is replaced by the one using
++\code{c0} in the same way.}
++\item{No concentration at \code{time = 0} and \code{auxc} is \code{NA}}{\code{auxc} is \code{NA}
++because an AUXC may not start before the first measurement.  \code{c0} supplies
++that measurement, so the AUXC is calculated here from \code{c0} and the
++measured data using \code{fun_auxc} and \code{auc.type}.}
+ }
+ 
+-The calculation for back-extrapolation is \code{100*(1 - auc/auciv)}.
++The calculation for back-extrapolation is \code{100*(1 - auc/auciv)}.  It
++requires a measured concentration at time 0; without one, \code{auc} does not
++describe the observed part of \code{auciv} (it either cannot be calculated or,
++for the \code{aucint} family, already extrapolates back to time 0 with
++\code{conc.origin}), so \code{NA} is returned.
+ }
+ \section{Functions}{
+ \itemize{
+diff --git a/tests/testthat/test-auciv.R b/tests/testthat/test-auciv.R
+index 112524c1c..8847eb606 100644
+--- a/tests/testthat/test-auciv.R
++++ b/tests/testthat/test-auciv.R
+@@ -3,9 +3,9 @@
+ # Basic pk.calc.auciv Tests
+ # ============================================================================
+ test_that("pk.calc.auciv works correctly", {
+-  # No time 0 in data
++  # No time 0 in data and no auc.type to calculate the AUC from c0
+   expect_equal(
+-    pk.calc.auciv(conc = 1:2, time = 1:2),
++    pk.calc.auciv(conc = 1:2, time = 1:2, c0 = 3, auc = NA_real_),
+     structure(NA_real_, exclude = "No time 0 in data")
+   )
+   
+@@ -37,19 +37,19 @@ test_that("pk.calc.auciv works correctly", {
+ # ============================================================================
+ test_that("pk.calc.auciv_pbext calculates percent back-extrapolation correctly", {
+   expect_equal(
+-    pk.calc.auciv_pbext(auc = 1, auciv = 2.1),
++    pk.calc.auciv_pbext(conc = c(0, 1), time = c(0, 1), auc = 1, auciv = 2.1),
+     100 * (1 - 1/2.1)
+   )
+   
+   # Zero back-extrapolation (auc = auciv)
+   expect_equal(
+-    pk.calc.auciv_pbext(auc = 2.5, auciv = 2.5),
++    pk.calc.auciv_pbext(conc = c(0, 1), time = c(0, 1), auc = 2.5, auciv = 2.5),
+     0
+   )
+   
+   # 50% back-extrapolation
+   expect_equal(
+-    pk.calc.auciv_pbext(auc = 1, auciv = 2),
++    pk.calc.auciv_pbext(conc = c(0, 1), time = c(0, 1), auc = 1, auciv = 2),
+     50
+   )
+ })
+@@ -58,9 +58,9 @@ test_that("pk.calc.auciv_pbext calculates percent back-extrapolation correctly",
+ # pk.calc.aumciv Tests
+ # ============================================================================
+ test_that("pk.calc.aumciv works correctly", {
+-  # No time 0 in data
++  # No time 0 in data and no auc.type to calculate the AUMC from c0
+   expect_equal(
+-    pk.calc.aumciv(conc = 1:2, time = 1:2, c0 = NA, aumc = 5),
++    pk.calc.aumciv(conc = 1:2, time = 1:2, c0 = 3, aumc = NA_real_),
+     structure(NA_real_, exclude = "No time 0 in data")
+   )
+   
+@@ -87,17 +87,21 @@ test_that("NA data are removed from concentrations for calculation of AUCiv (#35
+   o_conc_353alt <- PKNCAconc(data = d_iv_353alt, conc~time)
+   o_dose <- PKNCAdose(data = data.frame(time = 0), ~time)
+   o_data_353alt <- PKNCAdata(o_conc_353alt, o_dose, intervals = d_intervals)
+-  # The same warning is expected three times
+-  expect_warning(expect_warning(expect_warning(
++  # aucinf.obs cannot start before the first measurement and warns once.  The NA
++  # concentration at time 0 is dropped, so aucivinf.obs is calculated from c0
++  # rather than from aucinf.obs.
++  expect_warning(
+     o_nca <- pk.nca(o_data_353alt),
+     regexp = "Requesting an AUC range starting (0) before the first measurement (5) is not allowed",
+-    fixed = TRUE),
+-    regexp = "Requesting an AUC range starting (0) before the first measurement (5) is not allowed",
+-    fixed = TRUE),
+-    regexp = "Requesting an AUC range starting (0) before the first measurement (5) is not allowed",
+     fixed = TRUE
+   )
+   expect_s3_class(o_nca, "PKNCAresults")
++  result <- as.data.frame(o_nca)
++  expect_equal(
++    result$PPORRES[result$PPTESTCD == "aucivinf.obs"], 109.02992,
++    tolerance = 1e-6
++  )
++  expect_true(is.na(result$PPORRES[result$PPTESTCD == "aucinf.obs"]))
+ })
+ 
+ test_that("missing dose information does not cause NA time (#353)", {
+@@ -236,14 +240,14 @@ test_that("IV calculations handle edge cases correctly", {
+ # ============================================================================
+ test_that("pk.calc.auciv_pbext handles edge cases correctly", {
+   # Zero back-extrapolation (auciv = auc)
+-  expect_equal(pk.calc.auciv_pbext(auc = 5, auciv = 5), 0)
++  expect_equal(pk.calc.auciv_pbext(conc = c(0, 1), time = c(0, 1), auc = 5, auciv = 5), 0)
+   
+   # 100% back-extrapolation (auc = 0, auciv > 0)
+-  expect_equal(pk.calc.auciv_pbext(auc = 0, auciv = 5), 100)
++  expect_equal(pk.calc.auciv_pbext(conc = c(0, 1), time = c(0, 1), auc = 0, auciv = 5), 100)
+   
+   # auciv < auc must raise an error — not a valid physical scenario
+   expect_error(
+-    pk.calc.auciv_pbext(auc = 5, auciv = 3),
++    pk.calc.auciv_pbext(conc = c(0, 1), time = c(0, 1), auc = 5, auciv = 3),
+     regexp = "(?i)auciv must be >= auc"
+   )
+ })
+@@ -278,3 +282,203 @@ test_that("AUCiv and AUMCiv calculations are consistent", {
+   # AUMC should be larger than AUC (for positive concentrations and times)
+   expect_true(aumciv_result > auciv_result)
+ })
++
++
++# ============================================================================
++# Back-extrapolation without a measured time 0 concentration (#352)
++# ============================================================================
++
++# The profile without a time 0 measurement and the same profile with a measured
++# BLQ (zero) concentration at time 0.  c0 replaces the time 0 concentration in
++# both, so every IV parameter must agree between them.
++d_iv_352 <- data.frame(conc = c(4, 2, 1, 0.45), time = c(5, 15, 30, 60))
++d_iv_352_t0 <- data.frame(conc = c(0, 4, 2, 1, 0.45), time = c(0, 5, 15, 30, 60))
++d_dose_352 <- data.frame(dose = 100, time = 0)
++params_352 <-
++  c(
++    "aucivlast", "aucivall", "aucivint.last", "aucivint.all",
++    "aucivinf.obs", "aucivinf.pred",
++    "aumcivlast", "aumcivall", "aumcivint.last", "aumcivint.all",
++    "aumcivinf.obs", "aumcivinf.pred",
++    "aucivpbextlast", "aucivpbextall", "aucivpbextint.last",
++    "aucivpbextint.all", "aucivpbextinf.obs", "aucivpbextinf.pred"
++  )
++
++nca_352 <- function(d_conc) {
++  d_intervals <- data.frame(start = 0, end = Inf)
++  d_intervals[params_352] <- TRUE
++  o_data <-
++    PKNCAdata(
++      PKNCAconc(d_conc, conc~time),
++      PKNCAdose(d_dose_352, dose~time, route = "intravascular"),
++      intervals = d_intervals
++    )
++  as.data.frame(suppressWarnings(pk.nca(o_data)))
++}
++
++test_that("IV AUC is calculated without a time 0 concentration (#352)", {
++  r <- nca_352(d_iv_352)
++  value <- stats::setNames(r$PPORRES, r$PPTESTCD)
++  # c0 back-extrapolates to 5.656854, so the AUC starts at time 0 even though
++  # the first measurement is at time 5.
++  expect_equal(unname(value["c0"]), 5.656854, tolerance = 1e-6)
++  expect_equal(unname(value["aucivlast"]), 95.06123, tolerance = 1e-6)
++  expect_equal(unname(value["aucivall"]), 95.06123, tolerance = 1e-6)
++  expect_equal(unname(value["aucivint.last"]), 95.06123, tolerance = 1e-6)
++  expect_equal(unname(value["aucivint.all"]), 95.06123, tolerance = 1e-6)
++  expect_equal(unname(value["aucivinf.obs"]), 109.02992, tolerance = 1e-6)
++  expect_equal(unname(value["aucivinf.pred"]), 108.45559, tolerance = 1e-6)
++  expect_equal(unname(value["aumcivlast"]), 1685.66716, tolerance = 1e-6)
++  expect_equal(unname(value["aumcivall"]), 1685.66716, tolerance = 1e-6)
++  expect_equal(unname(value["aumcivint.last"]), 1685.66716, tolerance = 1e-6)
++  expect_equal(unname(value["aumcivint.all"]), 1685.66716, tolerance = 1e-6)
++  expect_equal(unname(value["aumcivinf.obs"]), 2957.39875, tolerance = 1e-6)
++  expect_equal(unname(value["aumcivinf.pred"]), 2905.11073, tolerance = 1e-6)
++})
++
++test_that("the percent back-extrapolated is NA without a time 0 concentration (#352)", {
++  r <- nca_352(d_iv_352)
++  value <- stats::setNames(r$PPORRES, r$PPTESTCD)
++  exclude <- stats::setNames(r$exclude, r$PPTESTCD)
++  pbext <- grep("^aucivpbext", params_352, value = TRUE)
++  # Without a measured concentration at time 0, no AUC describes the observed
++  # part of the IV AUC, so the percent back-extrapolated is not calculable.
++  expect_true(all(is.na(value[pbext])))
++  expect_true(
++    all(grepl(
++      "Percent back-extrapolated requires a measured concentration at time 0",
++      exclude[pbext],
++      fixed = TRUE
++    ))
++  )
++  # AUClast, AUCall, AUCinf,obs, and AUCinf,pred also carry the reason they
++  # could not be calculated; the aucint family calculates and does not.
++  expect_equal(
++    unname(exclude[c("aucivpbextlast", "aucivpbextall", "aucivpbextinf.obs", "aucivpbextinf.pred")]),
++    rep(
++      paste(
++        "Requesting an AUC range starting (0) before the first measurement (5) is not allowed",
++        "Percent back-extrapolated requires a measured concentration at time 0",
++        sep = "; "
++      ),
++      4
++    )
++  )
++  expect_equal(
++    unname(exclude[c("aucivpbextint.last", "aucivpbextint.all")]),
++    rep("Percent back-extrapolated requires a measured concentration at time 0", 2)
++  )
++  # The AUCs that c0 makes calculable are not excluded.
++  expect_true(all(is.na(exclude[setdiff(params_352, pbext)])))
++})
++
++test_that("a measured zero at time 0 gives the same IV parameters (#352)", {
++  no_t0 <- nca_352(d_iv_352)
++  with_t0 <- nca_352(d_iv_352_t0)
++  ivparams <- setdiff(params_352, grep("^aucivpbext", params_352, value = TRUE))
++  expect_equal(
++    stats::setNames(no_t0$PPORRES, no_t0$PPTESTCD)[ivparams],
++    stats::setNames(with_t0$PPORRES, with_t0$PPTESTCD)[ivparams]
++  )
++  # The percent back-extrapolated is calculable only when the AUC without
++  # back-extrapolation is.
++  with_t0_value <- stats::setNames(with_t0$PPORRES, with_t0$PPTESTCD)
++  expect_equal(unname(with_t0_value["aucivpbextlast"]), 14.62568, tolerance = 1e-6)
++  expect_equal(unname(with_t0_value["aucivpbextall"]), 14.62568, tolerance = 1e-6)
++  expect_equal(unname(with_t0_value["aucivpbextint.last"]), 14.62568, tolerance = 1e-6)
++  expect_equal(unname(with_t0_value["aucivpbextint.all"]), 14.62568, tolerance = 1e-6)
++  expect_equal(unname(with_t0_value["aucivpbextinf.obs"]), 12.75187, tolerance = 1e-6)
++  expect_equal(unname(with_t0_value["aucivpbextinf.pred"]), 12.81940, tolerance = 1e-6)
++})
++
++test_that("pk.calc.auxciv calculates the AUXC from c0 when auxc is NA", {
++  conc <- c(4, 2, 1, 0.45)
++  time <- c(5, 15, 30, 60)
++  c0 <- 5.656854
++  # Identical to calculating on the profile with c0 measured at time 0
++  expect_equal(
++    pk.calc.auciv(conc = conc, time = time, c0 = c0, auc = NA_real_, auc.type = "AUClast"),
++    structure(
++      pk.calc.auc.last(conc = c(c0, conc), time = c(0, time)),
++      exclude = "DO NOT EXCLUDE"
++    ),
++    ignore_attr = "method"
++  )
++  expect_equal(
++    pk.calc.aumciv(conc = conc, time = time, c0 = c0, aumc = NA_real_, auc.type = "AUClast"),
++    structure(
++      pk.calc.aumc.last(conc = c(c0, conc), time = c(0, time)),
++      exclude = "DO NOT EXCLUDE"
++    ),
++    ignore_attr = "method"
++  )
++  lambda.z <- 0.03221489
++  expect_equal(
++    pk.calc.auciv(
++      conc = conc, time = time, c0 = c0, auc = NA_real_,
++      auc.type = "AUCinf", lambda.z = lambda.z, clast = 0.45
++    ),
++    structure(
++      pk.calc.auc.inf.obs(
++        conc = c(c0, conc), time = c(0, time),
++        clast.obs = 0.45, lambda.z = lambda.z
++      ),
++      exclude = "DO NOT EXCLUDE"
++    ),
++    ignore_attr = "method"
++  )
++})
++
++test_that("pk.calc.auxciv replaces the conc.origin segment when auxc is calculated", {
++  conc <- c(4, 2, 1, 0.45)
++  time <- c(5, 15, 30, 60)
++  c0 <- 5.656854
++  # aucint.last extrapolates back to time 0 with conc.origin = 0
++  auc_origin0 <- pk.calc.aucint.last(conc = conc, time = time, start = 0, end = Inf, time.dose = NULL)
++  expect_equal(
++    pk.calc.auciv(conc = conc, time = time, c0 = c0, auc = auc_origin0),
++    pk.calc.auc.last(conc = c(c0, conc), time = c(0, time)),
++    ignore_attr = TRUE
++  )
++})
++
++test_that("pk.calc.auxciv reports why it could not calculate", {
++  expect_warning(
++    expect_warning(
++      expect_equal(
++        pk.calc.auciv(conc = numeric(), time = numeric(), c0 = 1, auc = 1),
++        structure(NA_real_, exclude = "No data for AUC calculation")
++      ),
++      regexp = "No concentration data given"
++    ),
++    regexp = "No time data given"
++  )
++  expect_equal(
++    pk.calc.auciv(conc = c(4, 2), time = c(5, 15), c0 = NA, auc = 1, auc.type = "AUClast"),
++    structure(NA_real_, exclude = "c0 is not calculated")
++  )
++})
++
++
++test_that("pk.calc.auciv_pbext requires a measured concentration at time 0", {
++  expect_equal(
++    pk.calc.auciv_pbext(conc = c(4, 2), time = c(5, 15), auc = 81, auciv = 95),
++    structure(
++      NA_real_,
++      exclude = "Percent back-extrapolated requires a measured concentration at time 0"
++    )
++  )
++  # An NA at time 0 is not a measurement
++  expect_equal(
++    pk.calc.auciv_pbext(conc = c(NA, 4, 2), time = c(0, 5, 15), auc = 81, auciv = 95),
++    structure(
++      NA_real_,
++      exclude = "Percent back-extrapolated requires a measured concentration at time 0"
++    )
++  )
++  # A BLQ (zero) at time 0 is a measurement
++  expect_equal(
++    pk.calc.auciv_pbext(conc = c(0, 4, 2), time = c(0, 5, 15), auc = 81, auciv = 95),
++    100 * (1 - 81/95)
++  )
++})
+diff --git a/tests/testthat/test-pk.calc.all.R b/tests/testthat/test-pk.calc.all.R
+index 4f94da877..7eb40596c 100644
+--- a/tests/testthat/test-pk.calc.all.R
++++ b/tests/testthat/test-pk.calc.all.R
+@@ -1,1376 +1,1426 @@
+-test_that("pk.nca", {
+-  # Note that generate.conc sets the random seed, so it doesn't have to happen
+-  # here.
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose)
+-  myresult <- pk.nca(mydata)
+-
+-  expect_equal(names(myresult),
+-               c("result", "data", "columns"),
+-               info="Make sure that the result has the expected names (and only the expected names) in it.")
+-  expect_true(checkProvenance(myresult),
+-              info="Provenance works on results")
+-
+-  mydata.failure <- mydata
+-  # There's no way to automatically make a PKNCAdata object with no intervals,
+-  # but we want to ensure that users cannot cause this error by playing in the
+-  # internals.
+-  mydata.failure$intervals <- data.frame()
+-  expect_warning(myresult.failure <- pk.nca(mydata.failure),
+-                 regexp="No intervals given; no calculations will be done.",
+-                 info="An empty result is returned if there are no intervals")
+-
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose.nodose <- PKNCAdose(tmpdose, formula=~time|treatment+ID)
+-  mydata.nodose <- PKNCAdata(myconc, mydose.nodose)
+-  expect_equal(
+-    pk.nca(mydata.nodose)$result,
+-    myresult$result,
+-    info="missing dose information is handled without an issue"
+-  )
+-
+-  # Test each of the pieces for myresult for accuracy
+-
+-  expect_equal(myresult$data, {
+-    tmp <- mydata
+-    # The options should be the default options after the calculations are done.
+-    tmp$options <- PKNCA.options()
+-    tmp
+-  }, info="The data is just a copy of the input data plus an instantiation of the PKNCA.options")
+-
+-  verify.result <-
+-    tibble::tibble(
+-      treatment="Trt 1",
+-      ID=rep(c(1, 2), each=16),
+-      start=0,
+-      end=c(24, rep(Inf, 15),
+-            24, rep(Inf, 15)),
+-      PPTESTCD=rep(c("auclast", "cmax", "tmax", "tlast", "clast.obs",
+-                     "lambda.z", "r.squared", "adj.r.squared", "lambda.z.corrxy",
+-                     "lambda.z.time.first", "lambda.z.time.last",
+-                     "lambda.z.n.points", "clast.pred", "half.life",
+-                     "span.ratio", "aucinf.obs"),
+-                   times=2),
+-      PPORRES=c(13.54, 0.9998, 4.000, 24.00, 0.3441,
+-                0.04297, 0.9072, 0.9021, -0.952, 5.000, 24.00,
+-                20.00, 0.3356, 16.13, 1.178,
+-                21.55, 14.03, 0.9410, 2.000,
+-                24.00, 0.3148, 0.05689, 0.9000, 0.8944, -0.952,
+-                5.000, 24.00, 20.00, 0.3011, 12.18,
+-                1.560, 19.56),
+-      PPANMETH = c(
+-        "AUC: lin up/log down",
+-        rep("", 4),
+-        rep("", 10),
+-        "AUC: lin up/log down",
+-        "AUC: lin up/log down",
+-        rep("", 4),
+-        rep("", 10),
+-        "AUC: lin up/log down"
+-      ),
+-      exclude=NA_character_
+-    )
+-  expect_equal(
+-    myresult$result,
+-    verify.result,
+-    tolerance=0.001,
+-    info=paste("The specific order of the levels isn't important--",
+-               "the fact that they are factors and that the set",
+-               "doesn't change is important.")
+-  )
+-
+-  # Specifying new intervals
+-  mydata.newinterval <-
+-      PKNCAdata(myconc, mydose,
+-                intervals=data.frame(start=0, end=c(24, Inf),
+-                                     auclast=c(TRUE, FALSE),
+-                                     aucinf.obs=c(FALSE, TRUE),
+-                                     cmax=c(FALSE, TRUE),
+-                                     tmax=c(FALSE, TRUE),
+-                                     half.life=c(FALSE, TRUE)))
+-  myresult.newinterval <- pk.nca(mydata)
+-  expect_equal(myresult.newinterval$result,
+-               myresult$result,
+-               info="Intervals can be specified manually, and will apply across appropriate parts of the grouping variables.")
+-
+-
+-  # Dosing not at time 0
+-  tmpconc.multi <- generate.conc(2, 1, 0:24)
+-  tmpdose.multi <- generate.dose(tmpconc.multi)
+-  tmpconc.multi$time <- tmpconc.multi$time + 2
+-  tmpdose.multi$time <- tmpdose.multi$time + 2
+-  myconc.multi <- PKNCAconc(tmpconc.multi, conc~time|treatment+ID)
+-  mydose.multi <- PKNCAdose(tmpdose.multi, dose~time|treatment+ID)
+-  mydata.multi <- PKNCAdata(myconc.multi, mydose.multi)
+-  myresult.multi <- pk.nca(mydata.multi)
+-
+-  verify.result.multi <- verify.result
+-  verify.result.multi$start <- verify.result.multi$start + 2
+-  verify.result.multi$end <- verify.result.multi$end + 2
+-  expect_equal(myresult.multi$result, verify.result.multi,
+-               tolerance=0.001,
+-               info="Shifted dosing works the same as un-shifted where time parameters like tmax and tlast are reported relative to the start of the interval")
+-
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=Inf, cmax=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(myresult$result$PPORRES,
+-               c(0.99981, 0.94097), tolerance=0.00001,
+-               info="Calculations work with a single row of intervals and a single parameter requested")
+-
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=Inf, cl.obs=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(subset(myresult$result, PPTESTCD %in% "cl.obs")$PPORRES,
+-               c(0.04640, 0.05111), tolerance=0.0001,
+-               info="PK intervals work with passing in dose as a parameter")
+-
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=24, cmax=TRUE, cav=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(subset(myresult$result, PPTESTCD %in% "cav")$PPORRES,
+-               c(0.5642, 0.5846), tolerance=0.0001,
+-               info="PK intervals work with passing in start and end as parameters")
+-
+-  # Ensure that the correct number of doses are included in parameters that use dosing.
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  tmpdose$time <- NULL
+-  tmpdose <- merge(tmpdose, data.frame(time=c(0, 6, 12, 18, 24)))
+-  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=24, cl.obs=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.obs"],
+-               4/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "aucinf.obs"],
+-               tolerance=0.0001,
+-               info="The correct number of doses is selected for an interval (>=start and <end), 4 doses and not 5")
+-
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=6, cl.last=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.last"],
+-               1/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "auclast"],
+-               tolerance=0.0001,
+-               info="The correct number of doses is selected for an interval (>=start and <end), 1 dose and not 5")
+-
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=1, end=6, cl.last=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.last"],
+-               NA/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "auclast"],
+-               tolerance=0.0001,
+-               info="The correct number of doses is selected for an interval (>=start and <end), no doses selected")
+-
+-})
+-
+-test_that("verbose pk.nca", {
+-  tmpconc <- generate.conc(nsub=1, ntreat=1, 0:4)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time)
+-  mydata <- PKNCAdata(myconc, mydose)
+-  expect_message(expect_message(expect_message(
+-    suppressWarnings(pk.nca(mydata, verbose=TRUE)),
+-    regexp = "Setting up options"),
+-    regexp = "Starting dense PK NCA calculations"),
+-    regexp = "Combining completed dense PK calculation results"
+-  )
+-  expect_message(
+-    suppressWarnings(pk.nca(mydata, verbose=FALSE)),
+-    NA
+-  )
+-})
+-
+-test_that("pk.nca warnings", {
+-  tmpconc <- generate.conc(nsub=1, ntreat=1, 0:4)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time)
+-  mydata <- PKNCAdata(myconc, mydose, intervals=data.frame(start=24, end=48, cmax=TRUE))
+-  expect_warning(
+-    pk.nca(mydata),
+-    regexp="No data for interval"
+-  )
+-})
+-
+-test_that("pk.nca.interval errors", {
+-  expect_error(
+-    pk.nca.interval(interval="A"),
+-    regexp="Please report a bug.  Interval must be a one-row data.frame",
+-    class = "pknca_error_internal_interval_not_one_row_df"
+-  )
+-  expect_error(
+-    pk.nca.interval(interval=data.frame()),
+-    regexp="Please report a bug.  Interval must be a one-row data.frame",
+-    class = "pknca_error_internal_interval_not_one_row_df"
+-  )
+-})
+-
+-test_that("a parameter needing an interval column says so instead of asking for a bug report", {
+-  d_conc <- data.frame(conc = 2^(0:-5), time = 0:5)
+-  o_conc <- PKNCAconc(d_conc, conc~time)
+-  # `conc_above` for time_above and `dose1` for f have to be given by the user
+-  # as interval columns.  `tau` does not belong here: it is detected from the
+-  # dose times when it is not given, and is NA with a warning when it can be
+-  # neither given nor detected.
+-  needs_interval_col <-
+-    list(
+-      time_above = "Cannot find argument 'conc_above' for NCA parameter 'time_above' (calculated by 'pk.calc.time_above'); give it as a column in the interval specification",
+-      f = "Cannot find argument 'dose1' for NCA parameter 'f' (calculated by 'pk.calc.f'); give it as a column in the interval specification"
+-    )
+-  for (current_param in names(needs_interval_col)) {
+-    d_interval <- data.frame(start = 0, end = Inf)
+-    d_interval[[current_param]] <- TRUE
+-    o_data <- PKNCAdata(o_conc, intervals = d_interval)
+-    # purrr wraps the error it gets from pk.nca(), so the text is checked in the
+-    # whole chain rather than in the top condition
+-    current_message <-
+-      conditionMessage(tryCatch(
+-        suppressMessages(suppressWarnings(pk.nca(o_data))),
+-        error = function(e) e
+-      ))
+-    expect_true(grepl(needs_interval_col[[current_param]], current_message, fixed = TRUE))
+-    expect_false(grepl("report a bug", current_message, fixed = TRUE))
+-  }
+-  # Supplying the column makes the parameter calculable
+-  o_data <- PKNCAdata(o_conc, intervals = data.frame(start = 0, end = Inf, time_above = TRUE, conc_above = 0.2))
+-  suppressMessages(suppressWarnings(o_nca <- pk.nca(o_data)))
+-  expect_equal(as.data.frame(o_nca)$PPTESTCD, "time_above")
+-})
+-
+-test_that("interval_calculation_error asks for a bug report only when PKNCA did not diagnose the error", {
+-  preamble <- "Error with interval start=0, end=Inf"
+-  # Diagnosed by PKNCA: the message already says what to change
+-  err_diagnosed <-
+-    tryCatch(
+-      interval_calculation_error(
+-        rlang::catch_cnd(rlang::abort("say what to change", class = "pknca_error_invalid_route")),
+-        error_preamble = preamble
+-      ),
+-      error = function(e) e
+-    )
+-  expect_s3_class(err_diagnosed, "pknca_error_interval_calculation")
+-  expect_equal(err_diagnosed$message, paste0(preamble, ": say what to change"))
+-  # Internal: PKNCA did not expect this
+-  err_internal <-
+-    tryCatch(
+-      interval_calculation_error(
+-        rlang::catch_cnd(rlang::abort("should not happen", class = "pknca_error_internal_tlast")),
+-        error_preamble = preamble
+-      ),
+-      error = function(e) e
+-    )
+-  expect_equal(
+-    err_internal$message,
+-    paste0("Please report a bug.\n", preamble, ": should not happen")
+-  )
+-  # Unclassed errors from outside PKNCA are also unexpected
+-  err_unclassed <-
+-    tryCatch(
+-      interval_calculation_error(
+-        rlang::catch_cnd(stop("from somewhere else")),
+-        error_preamble = preamble
+-      ),
+-      error = function(e) e
+-    )
+-  expect_equal(
+-    err_unclassed$message,
+-    paste0("Please report a bug.\n", preamble, ": from somewhere else")
+-  )
+-})
+-
+-test_that("Calculations when dose time is missing", {
+-  # Ensure that the correct number of doses are included in parameters that use dosing.
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, dose~.|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=24, cl.obs=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(
+-    myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.obs"],
+-    1/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "aucinf.obs"],
+-    info="The correct number of doses is selected for an interval (>=start and <end), 4 doses and not 5"
+-  )
+-})
+-
+-test_that("Calculations when no dose info is given", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, intervals=data.frame(start=0, end=24, cmax=TRUE, cl.last=TRUE))
+-  # cmax needs no dosing information, cl.last needs the dose amount (#538)
+-  expect_message(
+-    myresult <- pk.nca(mydata),
+-    regexp="these parameters will not be calculated: cl.last",
+-    fixed=TRUE
+-  )
+-  expect_equal(
+-    myresult$result,
+-    tibble::tibble(
+-      treatment="Trt 1",
+-      ID=rep(1:2, each=3),
+-      start=0,
+-      end=24,
+-      PPTESTCD=rep(c("auclast", "cmax", "cl.last"), 2),
+-      PPORRES=c(13.5417297156528, 0.999812606062292, NA,
+-                14.0305397438242, 0.94097296083447, NA),
+-      PPANMETH = c(
+-        "AUC: lin up/log down",
+-        rep("", 2),
+-        "AUC: lin up/log down",
+-        rep("", 2)
+-      ),
+-      exclude=NA_character_
+-    )
+-  )
+-})
+-
+-test_that("pk.nca with exclusions", {
+-  # Note that generate.conc sets the random seed, so it doesn't have to happen
+-  # here.
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose)
+-  myresult <- pk.nca(mydata)
+-  tmpconc.excl <- tmpconc
+-  tmpconc.excl$excl <- NA_character_
+-  tmpconc.excl$excl[5] <- "test exclusion"
+-  myconc.excl <- PKNCAconc(tmpconc.excl,
+-                           formula=conc~time|treatment+ID,
+-                           exclude="excl")
+-  mydata.excl <- PKNCAdata(myconc.excl, mydose)
+-  myresult.excl <- pk.nca(mydata.excl)
+-  expect_true(identical(myresult$result[myresult$result$ID %in% 2,],
+-                        myresult.excl$result[myresult.excl$result$ID %in% 2,]),
+-               info="Results are unchanged for the subject who has the same data")
+-  expect_false(identical(myresult$result[myresult$result$ID %in% 1,],
+-                         myresult.excl$result[myresult.excl$result$ID %in% 1,]),
+-               info="Results are changed for the subject who has the same data")
+-  expect_equal(myresult.excl$result$PPORRES[myresult.excl$result$ID %in% 1 & myresult.excl$result$PPTESTCD %in% "cmax"],
+-               max(tmpconc.excl$conc[tmpconc.excl$ID %in% 1 & is.na(tmpconc.excl$excl)]),
+-               info="Cmax is affected by the exclusion")
+-})
+-
+-test_that("pk.calc.all with duration.dose required", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  tmpdose$duration_dose <- 0.1
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID, duration="duration_dose", route="intravascular")
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=24,
+-                                           mrt.iv.last=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "mrt.iv.last"],
+-               c(10.36263, 10.12515),
+-               tolerance=1e-5,
+-               info="duration.dose is used when requested")
+-})
+-
+-test_that("pk.calc.all with duration.conc required", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  tmpconc$duration_conc <- 0.1
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, duration="duration_conc")
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID, route="intravascular")
+-  mydata <- PKNCAdata(myconc, mydose,
+-                      intervals=data.frame(start=0, end=24,
+-                                           mrt.iv.last=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "mrt.iv.last"],
+-               c(10.41263, 10.17515),
+-               tolerance=1e-5,
+-               info="duration.conc is used when requested")
+-})
+-
+-test_that("half life inclusion and exclusion", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  tmpconc$include_hl <- tmpconc$time <= 22
+-  tmpconc$exclude_hl <- tmpconc$time == 22
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  myconc_incl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID,
+-                           include_half.life="include_hl")
+-  myconc_excl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID,
+-                           exclude_half.life="exclude_hl")
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <-  PKNCAdata(myconc, mydose,
+-                       intervals=data.frame(start=0, end=24, half.life=TRUE))
+-  mydata_incl <- PKNCAdata(myconc_incl, mydose,
+-                           intervals=data.frame(start=0, end=24, half.life=TRUE))
+-  mydata_excl <- PKNCAdata(myconc_excl, mydose,
+-                           intervals=data.frame(start=0, end=24, half.life=TRUE))
+-  myresult <- pk.nca(mydata)
+-  myresult_incl <- pk.nca(mydata_incl)
+-  myresult_excl <- pk.nca(mydata_excl)
+-  expect_false(identical(myresult$result, myresult_excl$result))
+-  expect_false(identical(myresult$result, myresult_incl$result))
+-})
+-
+-test_that("include_half.life and exclude_half.life work with NAs treated as missing for all NA and as FALSE for partial NA (#372)", {
+-  # Partial NA include_hl is used
+-  d_conc_incl <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, include_hl = c(FALSE, NA, TRUE, TRUE, TRUE, TRUE))
+-  o_conc_incl <- PKNCAconc(d_conc_incl, conc~time, include_half.life = "include_hl")
+-  o_data_incl <- PKNCAdata(o_conc_incl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  suppressMessages(o_nca_incl <- pk.nca(o_data_incl))
+-  expect_equal(as.data.frame(o_nca_incl, out_format = "wide")$half.life, 1.820879, tolerance = 0.00001)
+-
+-  # All FALSE include_hl is used
+-  d_conc_false <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, include_hl = FALSE)
+-  o_conc_false <- PKNCAconc(d_conc_false, conc~time, include_half.life = "include_hl")
+-  o_data_false <- PKNCAdata(o_conc_false, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  suppressWarnings(suppressMessages(o_nca_false <- pk.nca(o_data_false)))
+-  d_nca_false <- as.data.frame(o_nca_false)
+-  expect_equal(d_nca_false$PPORRES[d_nca_false$PPTESTCD %in% "half.life"], NA_real_)
+-
+-  # All NA include_hl is ignored
+-  d_conc <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, include_hl = NA)
+-  o_conc <- PKNCAconc(d_conc, conc~time, include_half.life = "include_hl")
+-  o_data <- PKNCAdata(o_conc, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  suppressMessages(o_nca <- pk.nca(o_data))
+-  expect_equal(as.data.frame(o_nca, out_format = "wide")$half.life, 1.512942, tolerance = 0.00001)
+-
+-  # Partial NA include_hl is used
+-  d_conc_excl <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, exclude_hl = c(FALSE, NA, TRUE, TRUE, TRUE, TRUE))
+-  o_conc_excl <- PKNCAconc(d_conc_excl, conc~time, exclude_half.life = "exclude_hl")
+-  o_data_excl <- PKNCAdata(o_conc_excl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  suppressWarnings(suppressMessages(o_nca_excl <- pk.nca(o_data_excl)))
+-  d_nca_excl <- as.data.frame(o_nca_excl)
+-  expect_equal(d_nca_excl$PPORRES[d_nca_excl$PPTESTCD %in% "half.life"], NA_real_)
+-
+-  # All NA exclude_hl is ignored
+-  d_conc <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, exclude_hl = NA)
+-  o_conc <- PKNCAconc(d_conc, conc~time, exclude_half.life = "exclude_hl")
+-  o_data <- PKNCAdata(o_conc, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  suppressMessages(o_nca <- pk.nca(o_data))
+-  expect_equal(as.data.frame(o_nca, out_format = "wide")$half.life, 1.512942, tolerance = 0.00001)
+-
+-  # All FALSE exclude_hl is used
+-  d_conc_false <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, exclude_hl = FALSE)
+-  o_conc_false <- PKNCAconc(d_conc_false, conc~time, exclude_half.life = "exclude_hl")
+-  o_data_false <- PKNCAdata(o_conc_false, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  suppressWarnings(suppressMessages(o_nca_false <- pk.nca(o_data_false)))
+-  d_nca_false <- as.data.frame(o_nca_false)
+-  expect_equal(d_nca_false$PPORRES[d_nca_false$PPTESTCD %in% "half.life"], 1.512942, tolerance = 0.00001)
+-})
+-
+-test_that("non-logical half-life point columns fail loud at calculation time (#583)", {
+-  # PKNCAconc() validates at construction, so replace the column afterward to
+-  # reach the check in pk.nca()
+-  d_conc <-
+-    data.frame(
+-      conc = c(1, 0.5, 0.25, 0.125, 0.06),
+-      time = 0:4,
+-      excl = c(NA, NA, NA, TRUE, NA),
+-      incl = c(NA, TRUE, TRUE, TRUE, NA),
+-      subject = 1
+-    )
+-  o_conc_excl <- PKNCAconc(d_conc, conc ~ time | subject, exclude_half.life = "excl")
+-  o_data_excl <- PKNCAdata(o_conc_excl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  o_data_excl$conc$data$excl <- ifelse(is.na(d_conc$excl), NA_character_, "yes")
+-  expect_error(
+-    suppressMessages(pk.nca(o_data_excl)),
+-    regexp = "The exclude_half.life column ('excl') must be a logical (TRUE/FALSE/NA) column, not character",
+-    fixed = TRUE
+-  )
+-
+-  o_conc_incl <- PKNCAconc(d_conc, conc ~ time | subject, include_half.life = "incl")
+-  o_data_incl <- PKNCAdata(o_conc_incl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
+-  o_data_incl$conc$data$incl <- ifelse(is.na(d_conc$incl), NA_character_, "yes")
+-  expect_error(
+-    suppressMessages(pk.nca(o_data_incl)),
+-    regexp = "The include_half.life column ('incl') must be a logical (TRUE/FALSE/NA) column, not character",
+-    fixed = TRUE
+-  )
+-})
+-
+-test_that("No interval requested (e.g. for placebo)", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <-
+-    PKNCAdata(
+-      myconc, mydose,
+-      intervals=
+-        data.frame(
+-          treatment="Trt 3", start=0, end=24, cmax=TRUE,
+-          stringsAsFactors=FALSE
+-        )
+-    )
+-  expect_warning(expect_warning(expect_warning(expect_warning(
+-    myresult <- pk.nca(mydata),
+-    class = "pknca_warning_no_intervals"),
+-    class = "pknca_warning_no_intervals"),
+-    class = "pknca_warning_no_conc_data"),
+-    class = "pknca_warning_no_results"
+-  )
+-  expect_equal(
+-    nrow(as.data.frame(myresult)),
+-    0,
+-    info="No rows were generated when no intervals applied"
+-  )
+-})
+-
+-test_that("Volume-related calculations", {
+-  tmpconc <- generate.conc(2, 1, c(4, 12, 24))
+-  tmpconc$conc <- seq_len(nrow(tmpconc))
+-  tmpconc$vol <- 2
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, volume="vol")
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <-  PKNCAdata(myconc, mydose,
+-                       intervals=data.frame(treatment="Trt 1", start=0, end=24,
+-                                            ae=TRUE, fe=TRUE,
+-                                            stringsAsFactors=FALSE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(as.data.frame(myresult)[["PPORRES"]], c(12, 12, 30, 30),
+-              info="ae and fe are correctly calculated")
+-  tmpdose2 <- tmpdose
+-  tmpdose2$dose <- 2
+-  mydose2 <- PKNCAdose(tmpdose2, formula=dose~time|treatment+ID)
+-  mydata2 <-  PKNCAdata(myconc, mydose2,
+-                       intervals=data.frame(treatment="Trt 1", start=0, end=24,
+-                                            ae=TRUE, fe=TRUE,
+-                                            stringsAsFactors=FALSE))
+-  myresult2 <- pk.nca(mydata2)
+-  expect_equal(as.data.frame(myresult2)[["PPORRES"]], c(12, 6, 30, 15),
+-               info="fe respects dose")
+-})
+-
+-test_that("pk.nca can calculate values with group-level data", {
+-  tmpconc_impute <- generate.conc(2, 1, 0:24)
+-  # This is what will happen in the imputation
+-  tmpconc_observe_05 <- tmpconc_impute[tmpconc_impute$time %in% 0,]
+-  tmpconc_observe_05$time <- 0.5
+-  tmpconc_observe <- rbind(tmpconc_impute, tmpconc_observe_05)
+-  tmpconc_observe <- tmpconc_observe[order(tmpconc_observe$treatment, tmpconc_observe$ID, tmpconc_observe$time),]
+-  tmpdose <- generate.dose(tmpconc_impute)
+-  tmpdose$time <- 0.5
+-
+-  myconc_impute <- PKNCAconc(tmpconc_impute, formula=conc~time|treatment+ID)
+-  myconc_observe <- PKNCAconc(tmpconc_observe, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata_impute <-
+-    PKNCAdata(myconc_impute, mydose,
+-              intervals=data.frame(treatment="Trt 1", start=0, end=24,
+-                                   aucint.last.dose=TRUE,
+-                                   stringsAsFactors=FALSE))
+-  mydata_observe <-
+-    PKNCAdata(myconc_observe, mydose,
+-              intervals=data.frame(treatment="Trt 1", start=0, end=24,
+-                                   auclast=TRUE,
+-                                   stringsAsFactors=FALSE))
+-  myres_impute <- pk.nca(mydata_impute)
+-  myres_observe <- pk.nca(mydata_observe)
+-  expect_equal(as.data.frame(myres_impute)$PPORRES,
+-               as.data.frame(myres_observe)$PPORRES,
+-               info="Manually imputing values gives the same result as aucint")
+-})
+-
+-test_that("Missing dose info for some subjects gives a warning, not a difficult-to-interpret error", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)[1,]
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <-  PKNCAdata(myconc, mydose,
+-                       intervals=data.frame(start=0, end=24,
+-                                            cl.last=TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_true(all(is.na(myresult$result[["PPORRES"]]) == c(FALSE, FALSE, FALSE, TRUE)) &
+-                all(myresult$result[["PPTESTCD"]] == rep(c("auclast", "cl.last"), 2)),
+-              info="cl.last is not calculated when dose information is missing, but only for the subject where dose info is missing.")
+-})
+-
+-# Fix issue #68
+-test_that("Ensure that options are respected during pk.nca call", {
+-  doses <- data.frame(ID=1:2, Time=0, Dose=0.5)
+-
+-  conc.data <- c(0, 1, 2, 1.3, 0.4, 0.35, 0.125)
+-  time.data <- c(0, 1, 2, 4,   8,   24,   48)
+-  concs <- merge(doses["ID"], data.frame(Conc=conc.data, Time=time.data))
+-
+-  myconc <- PKNCA::PKNCAconc(concs, formula=Conc~Time|ID)
+-  mydose <- PKNCA::PKNCAdose(doses, formula=Dose~Time|ID)
+-
+-  myintervals <- data.frame(start=c(0,0,0),
+-                            end=c(24,48,Inf),
+-                            auclast=TRUE,
+-                            aucinf.obs=TRUE,
+-                            aucinf.pred=TRUE,
+-                            aumclast=TRUE,
+-                            aumcall=TRUE,
+-                            half.life=TRUE)
+-
+-  linear.mydata <- PKNCA::PKNCAdata(myconc, mydose, intervals = myintervals,
+-                                    options = list(auc.method = "linear"))
+-  linear.results <- PKNCA::pk.nca(linear.mydata)
+-
+-  linlog.mydata <- PKNCA::PKNCAdata(myconc, mydose, intervals = myintervals,
+-                                    options = list(auc.method = "lin up/log down"))
+-  linlog.results <- PKNCA::pk.nca(linlog.mydata)
+-  expect_true(
+-    all.equal(
+-      linear.results$result$PPORRES[linear.results$result$PPTESTCD %in% "aucinf.obs" &
+-                                      linear.results$result$ID %in% 1 &
+-                                      linear.results$result$end %in% Inf],
+-      24.54319,
+-      tolerance=0.0001) &
+-      all.equal(
+-        linlog.results$result$PPORRES[linlog.results$result$PPTESTCD %in% "aucinf.obs" &
+-                                        linlog.results$result$ID %in% 1 &
+-                                        linlog.results$result$end %in% Inf],
+-        23.68317,
+-        tolerance=0.0001),
+-    info="linear and loglinear effects are calculated differently."
+-  )
+-})
+-
+-test_that("Can calculate parameters requiring extra arguments", {
+-  o_conc <- PKNCAconc(conc~time, data=data.frame(conc=c(1:3, 2:1), time=0:4))
+-  d_intervals <- data.frame(start=0, end=4, time_above=TRUE, conc_above=2)
+-  o_data <- PKNCAdata(o_conc, intervals=d_intervals, options=list(auc.method="linear"))
+-  o_nca <- suppressMessages(pk.nca(o_data))
+-  expect_equal(as.data.frame(o_nca)$PPORRES, 2)
+-})
+-
+-test_that("calculate with sparse data", {
+-  d_sparse <-
+-    data.frame(
+-      id = c(1L, 2L, 3L, 1L, 2L, 3L, 1L, 2L, 3L, 4L, 5L, 6L, 4L, 5L, 6L, 7L, 8L, 9L, 7L, 8L, 9L),
+-      conc = c(0, 0, 0,  1.75, 2.2, 1.58, 4.63, 2.99, 1.52, 3.03, 1.98, 2.22, 3.34, 1.3, 1.22, 3.54, 2.84, 2.55, 0.3, 0.0421, 0.231),
+-      time = c(0, 0, 0, 1, 1, 1, 6, 6, 6, 2, 2, 2, 10, 10, 10, 4, 4, 4, 24, 24, 24),
+-      dose = c(100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
+-    )
+-  o_conc_sparse <- PKNCAconc(d_sparse, conc~time|id, sparse=TRUE)
+-
+-  d_intervals <-
+-    data.frame(
+-      start=0,
+-      end=24,
+-      aucinf.obs=TRUE,
+-      cmax=TRUE,
+-      sparse_auclast=TRUE
+-    )
+-  o_data_sparse <- PKNCAdata(o_conc_sparse, intervals=d_intervals)
+-  suppressMessages(
+-    expect_warning(expect_warning(
+-      o_nca <- pk.nca(o_data_sparse),
+-      class = "pknca_warning_sparse_df_multi"),
+-      class = "pknca_warning_halflife_too_few_points"
+-    )
+-  )
+-  df_result <- as.data.frame(o_nca)
+-  expect_true("sparse_auclast" %in% df_result$PPTESTCD)
+-  expect_equal(df_result$PPORRES[df_result$PPTESTCD %in% "sparse_auclast"], 39.4689)
+-  sum_o_nca <- summary(o_nca)
+-  expect_s3_class(sum_o_nca, "summary_PKNCAresults")
+-
+-  # Mixed sparse and dense calculations when only one type is requested in an
+-  # interval works The example below has dense-only; sparse and dense; and and
+-  # sparse-only.
+-  d_intervals_mixed <-
+-    data.frame(
+-      start=0,
+-      end=c(23, 24, 25),
+-      cmax=c(TRUE, TRUE, FALSE),
+-      sparse_auclast=c(FALSE, TRUE, TRUE)
+-    )
+-  o_data_sparse_mixed <- PKNCAdata(o_conc_sparse, intervals=d_intervals_mixed)
+-  suppressMessages(
+-    expect_warning(expect_warning(
+-      o_nca_sparse_mixed <- pk.nca(o_data_sparse_mixed),
+-      class = "pknca_warning_sparse_df_multi"),
+-      class = "pknca_warning_sparse_df_multi"
+-    )
+-  )
+-  df_result_sparse_mixed <- as.data.frame(o_nca_sparse_mixed)
+-  expect_true("sparse_auclast" %in% df_result_sparse_mixed$PPTESTCD)
+-  expect_equal(df_result_sparse_mixed$PPORRES[df_result_sparse_mixed$PPTESTCD %in% "sparse_auclast"], rep(39.4689, 2))
+-  suppressMessages(
+-    expect_message(
+-      expect_warning(expect_warning(
+-        o_nca_sparse_mixed <- pk.nca(o_data_sparse_mixed, verbose=TRUE),
+-        class = "pknca_warning_sparse_df_multi"),
+-        class = "pknca_warning_sparse_df_multi"
+-      ),
+-      regexp="No sparse calculations requested for an interval"
+-    )
+-  )
+-
+-  # Sparse data with multiple treatments, confirm the correct number of rows of
+-  # outputs are created.
+-  d_sparse_200 <- d_sparse
+-  d_sparse_200$dose <- 200
+-  d_sparse_multi_trt <- rbind(d_sparse, d_sparse_200)
+-  d_sparse_multi_trt$dose_grp <- d_sparse_multi_trt$dose
+-  o_conc_sparse_multi_trt <- PKNCAconc(d_sparse_multi_trt, conc~time|dose_grp+id, sparse=TRUE)
+-  d_intervals_mixed <-
+-    data.frame(
+-      start=0,
+-      end=c(23, 24, 25),
+-      cmax=c(TRUE, TRUE, FALSE),
+-      sparse_auclast=c(FALSE, TRUE, TRUE)
+-    )
+-  d_dose_sparse_multi_trt <- unique(d_sparse_multi_trt[, c("id", "dose")])
+-  d_dose_sparse_multi_trt$time <- 0
+-  d_dose_sparse_multi_trt$dose_grp <- d_dose_sparse_multi_trt$dose
+-  o_dose_sparse_multi_trt <- PKNCAdose(d_dose_sparse_multi_trt, dose~time|dose_grp+id)
+-  o_data_sparse_multi_trt <- PKNCAdata(o_conc_sparse_multi_trt, o_dose_sparse_multi_trt, intervals=d_intervals_mixed)
+-  suppressMessages(
+-    expect_warning(expect_warning(expect_warning(expect_warning(
+-      o_nca_sparse_multi_trt <- pk.nca(o_data_sparse_multi_trt),
+-      class = "pknca_warning_sparse_df_multi"),
+-      class = "pknca_warning_sparse_df_multi"),
+-      class = "pknca_warning_sparse_df_multi"),
+-      class = "pknca_warning_sparse_df_multi"
+-    )
+-  )
+-  expect_equal(nrow(as.data.frame(o_nca_sparse_multi_trt)), 16)
+-
+-  # Correct detection of mixed doses within a sparse dose group when there are
+-  # no grouping columns other than subject
+-  d_sparse_multi_trt_bad_dose_single <- d_sparse_multi_trt[d_sparse_multi_trt$dose == 100, ]
+-  d_dose_sparse_multi_trt_bad_dose_single <- unique(d_sparse_multi_trt_bad_dose_single[, c("id", "dose")])
+-  d_dose_sparse_multi_trt_bad_dose_single$time <- 0
+-  d_dose_sparse_multi_trt_bad_dose_single$dose[1] <- d_dose_sparse_multi_trt_bad_dose_single$dose[1] + 1
+-  o_conc_sparse_multi_trt_bad_dose_single <- PKNCAconc(d_sparse_multi_trt_bad_dose_single, conc~time|id, sparse=TRUE)
+-  o_dose_sparse_multi_trt_bad_dose_single <- PKNCAdose(d_dose_sparse_multi_trt_bad_dose_single, dose~time|id)
+-  o_data_sparse_multi_trt_bad_dose_single <- PKNCAdata(o_conc_sparse_multi_trt_bad_dose_single, o_dose_sparse_multi_trt_bad_dose_single, intervals=d_intervals_mixed)
+-  expect_error(
+-    pk.nca(o_data_sparse_multi_trt_bad_dose_single),
+-    regexp="With sparse PK, all subjects in a group must have the same dosing information.*Not all subjects have the same dosing information"
+-  )
+-
+-  # Correct detection of mixed doses within a sparse dose group
+-  d_dose_sparse_multi_trt_bad_dose <- d_dose_sparse_multi_trt
+-  d_dose_sparse_multi_trt_bad_dose$dose[1] <- d_dose_sparse_multi_trt$dose[1] + 1
+-  o_dose_sparse_multi_trt_bad_dose <- PKNCAdose(d_dose_sparse_multi_trt_bad_dose, dose~time|dose_grp+id)
+-  o_data_sparse_multi_trt_bad_dose <- PKNCAdata(o_conc_sparse_multi_trt, o_dose_sparse_multi_trt_bad_dose, intervals=d_intervals_mixed)
+-  expect_error(
+-    pk.nca(o_data_sparse_multi_trt_bad_dose),
+-    regexp="With sparse PK, all subjects in a group must have the same dosing information.*Not all subjects have the same dosing information for this group: +dose_grp=100"
+-  )
+-  # Correct detection of mixed doses within a sparse dose group when there are no groups
+-})
+-
+-test_that("Unexpected interval columns now not cause an error (#238)", {
+-  d_conc <-
+-    data.frame(
+-      ID = 1L,
+-      time = 0:6,
+-      conc = c(0, 0.7, 0.71, 0.85, 1, 0.76, 0.74)
+-    )
+-  d_dose <- data.frame(dose = 1)
+-  d_intervals <- data.frame(start = 0, end = 6, cmax = TRUE, aucinf = TRUE)
+-  o_conc <- PKNCAconc(d_conc, formula = conc~time|ID)
+-  o_dose <- PKNCAdose(d_dose, formula = dose~.)
+-  expect_error(PKNCAdata(o_conc, o_dose, intervals = d_intervals),
+-               "The following columns in 'intervals' are not allowed:"
+-  )
+-})
+-
+-test_that("aucint works within pk.calc.all for all zero concentrations with interpolated or extrapolated concentrations", {
+-  # AUCint.inf.obs
+-  d_interval <- data.frame(start = 0, end = 4, aucint.inf.obs = TRUE)
+-  d_conctime <- data.frame(conc = c(0, 0, 0, 0), time = 0:3)
+-  o_conc <- PKNCAconc(d_conctime, conc~time)
+-  o_data <- PKNCAdata(o_conc, intervals = d_interval)
+-  suppressWarnings(suppressMessages(
+-    o_nca <- pk.nca(o_data)
+-  ))
+-  results <- setNames(as.data.frame(o_nca)$PPORRES, nm = as.data.frame(o_nca)$PPTESTCD)
+-  zero_names <- c("clast.obs", "aucint.inf.obs")
+-  na_names <- setdiff(names(results), zero_names)
+-  expect_equal(
+-    results[zero_names],
+-    setNames(rep(0, length(zero_names)), zero_names)
+-  )
+-  expect_equal(
+-    results[na_names],
+-    setNames(rep(NA_real_, length(na_names)), na_names)
+-  )
+-
+-  # AUCint.inf.pred
+-  d_interval <- data.frame(start = 0, end = 4, aucint.inf.pred = TRUE)
+-  d_conctime <- data.frame(conc = c(0, 0, 0, 0), time = 0:3)
+-  o_conc <- PKNCAconc(d_conctime, conc~time)
+-  o_data <- PKNCAdata(o_conc, intervals = d_interval)
+-  suppressWarnings(suppressMessages(
+-    o_nca <- pk.nca(o_data)
+-  ))
+-  expect_equal(
+-    as.data.frame(o_nca)$PPORRES,
+-    c(rep(NA_real_, 12), 0)
+-  )
+-})
+-
+-test_that("The option keep_interval_cols is respected", {
+-  d_interval <- data.frame(start = 0, end = 4, cmax = TRUE, foo = "A")
+-  d_conctime <- data.frame(conc = c(0, 0, 0, 0), time = 0:3)
+-  o_conc <- PKNCAconc(d_conctime, conc~time)
+- expect_error(PKNCAdata(o_conc, intervals = d_interval),
+-              "The following columns in 'intervals' are not allowed:")
+-
+-  o_data <- PKNCAdata(o_conc, intervals = d_interval, options = list(keep_interval_cols = "foo"))
+-  suppressWarnings(suppressMessages(
+-    o_nca <- pk.nca(o_data)
+-  ))
+-  expect_equal(o_nca$result$foo, "A")
+-  expect_true("foo" %in% names(summary(o_nca)))
+-})
+-
+-test_that("dose is calculable", {
+-  tmpconc <- generate.conc(2, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose, intervals = data.frame(start = 0, end = Inf, totdose = TRUE))
+-  myresult <- pk.nca(mydata)
+-
+-  # One dose in the interval
+-  expect_equal(as.data.frame(myresult)$PPORRES, rep(1, 2))
+-  expect_equal(as.data.frame(myresult)$PPTESTCD, rep("totdose", 2))
+-
+-  # Don't give dose data
+-  mydata <- PKNCAdata(myconc, intervals = data.frame(start = 0, end = Inf, totdose = TRUE))
+-  suppressMessages(myresult <- pk.nca(mydata))
+-  expect_equal(as.data.frame(myresult)$PPORRES, rep(NA_real_, 2))
+-  expect_equal(as.data.frame(myresult)$PPTESTCD, rep("totdose", 2))
+-
+-  # Multiple doses in the interval
+-  tmpdose_second <- tmpdose
+-  tmpdose_second$time <- 1
+-  mydose <- PKNCAdose(rbind(tmpdose, tmpdose_second), formula=dose~time|treatment+ID)
+-  mydata <- PKNCAdata(myconc, mydose, intervals = data.frame(start = 0, end = Inf, totdose = TRUE))
+-  myresult <- pk.nca(mydata)
+-  expect_equal(as.data.frame(myresult)$PPORRES, rep(2, 2))
+-  expect_equal(as.data.frame(myresult)$PPTESTCD, rep("totdose", 2))
+-})
+-
+-test_that("do not give rbind error when interval columns have attributes (#381)", {
+-  o_conc <- PKNCAconc(data = data.frame(conc = 1, time = 0), conc~time)
+-  d_interval <- data.frame(start = 0, end = Inf, cmax = TRUE, tmax = TRUE)
+-  attr(d_interval$start, "label") <- "start"
+-  o_data <- PKNCAdata(o_conc, intervals = d_interval)
+-  suppressMessages(o_nca <- pk.nca(o_data))
+-  # interval attributes are preserved
+-  expect_equal(
+-    attributes(as.data.frame(o_nca)$start),
+-    list(label = "start")
+-  )
+-})
+-
+-test_that("pk.nca produces the PPANMETH column", {
+-  # --- Setup shared concentration and dose data ---
+-  tmpconc <- generate.conc(1, 1, 0:24)
+-  tmpdose <- generate.dose(tmpconc)
+-  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
+-
+-  # --- PPANMETH differentiates based on the AUC method used ---
+-  mydata_linear <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, auclast=TRUE), options=list(auc.method="linear"))
+-  mydata_linlog <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, auclast=TRUE), options=list(auc.method="lin up/log down"))
+-  res_linear <- pk.nca(mydata_linear)
+-  res_linlog <- pk.nca(mydata_linlog)
+-  expect_true("PPANMETH" %in% names(res_linear$result))
+-  expect_true("PPANMETH" %in% names(res_linlog$result))
+-  expect_true(any(grepl("AUC: linear", res_linear$result$PPANMETH, fixed=TRUE)))
+-  expect_true(any(grepl("AUC: lin up/log down", res_linlog$result$PPANMETH, fixed=TRUE)))
+-
+-  # --- PPANMETH distinguishes how the half.life was adjusted ---
+-  tmpconc$include_hl <- tmpconc$time <= 22
+-  tmpconc$exclude_hl <- tmpconc$time == 22
+-  myconc_base <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
+-  myconc_incl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, include_half.life="include_hl")
+-  myconc_excl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, exclude_half.life="exclude_hl")
+-  mydata_base <- PKNCAdata(myconc_base, mydose, intervals=data.frame(start=0, end=24, lambda.z=TRUE))
+-  mydata_incl <- PKNCAdata(myconc_incl, mydose, intervals=data.frame(start=0, end=24, lambda.z=TRUE))
+-  mydata_excl <- PKNCAdata(myconc_excl, mydose, intervals=data.frame(start=0, end=24, lambda.z=TRUE))
+-  res_base <- pk.nca(mydata_base)
+-  res_incl <- pk.nca(mydata_incl)
+-  res_excl <- pk.nca(mydata_excl)
+-  expect_true("PPANMETH" %in% names(res_base$result))
+-  expect_true("PPANMETH" %in% names(res_incl$result))
+-  expect_true("PPANMETH" %in% names(res_excl$result))
+-  expect_equal(
+-    unique(res_base$result$PPANMETH[res_base$result$PPTESTCD %in% c("lambda.z", "half.life", "r.squared")]),
+-    ""
+-  )
+-  expect_equal(
+-    unique(res_incl$result$PPANMETH[res_incl$result$PPTESTCD %in% c("lambda.z", "half.life", "r.squared")]),
+-    "Lambda Z: Manual selection"
+-  )
+-  expect_equal(
+-    unique(res_excl$result$PPANMETH[res_excl$result$PPTESTCD %in% c("lambda.z", "half.life", "r.squared")]),
+-    ""
+-  )
+-  expect_equal(
+-    unique(res_base$result$PPANMETH[res_base$result$PPTESTCD %in% c("tmax", "cmax")]),
+-    ""
+-  )
+-  expect_equal(
+-    unique(res_incl$result$PPANMETH[res_incl$result$PPTESTCD %in% c("tmax", "cmax")]),
+-    ""
+-  )
+-  expect_equal(
+-    unique(res_excl$result$PPANMETH[res_excl$result$PPTESTCD %in% c("tmax", "cmax")]),
+-    ""
+-  )
+-
+-  # --- PPANMETH specifies if an imputation method was used in the interval ---
+-  o_data <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, c0=TRUE))
+-  o_data_impute <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, c0=TRUE), impute="start_conc0")
+-  res <- pk.nca(o_data)
+-  res_impute <- pk.nca(o_data_impute)
+-  expect_equal(res$result$PPANMETH, "")
+-  expect_true("PPANMETH" %in% names(res$result))
+-  expect_equal(res$result$PPANMETH, "")
+-  expect_equal(res_impute$result$PPANMETH, "Imputation: start_conc0")
+-
+-  # --- PPANMETH reports based on the parameter dependencies ---
+-  mydata <- PKNCAdata(
+-    myconc_incl, mydose,
+-    intervals=data.frame(start=0, end=24, c0 = TRUE, half.life = TRUE, aucinf.pred=TRUE),
+-    impute = "start_conc0"
+-  )
+-  res <- pk.nca(mydata)
+-  expect_equal(
+-    res$result$PPANMETH[res$result$PPTESTCD == "c0"],
+-    "Imputation: start_conc0"
+-  )
+-  expect_equal(
+-    res$result$PPANMETH[res$result$PPTESTCD == "half.life"],
+-    "Imputation: start_conc0. Lambda Z: Manual selection"
+-  )
+-  expect_equal(
+-    res$result$PPANMETH[res$result$PPTESTCD == "aucinf.pred"],
+-    "Imputation: start_conc0. AUC: lin up/log down"
+-  )
+-})
+-
+-test_that("pk.nca can be run for each parameter independently (#473)", {
+-  
+-  # ── Dense data setup ──────────────────────────────────────────────────────
+-  d_conc <- Theoph[Theoph$Subject %in% "1", ]
+-  d_conc <- rbind(d_conc, mutate(d_conc, Time = Time + 25))
+-  d_conc$volume   <- 1
+-  d_conc$duration <- 1
+-  d_dose <- data.frame(
+-    Subject  = "1",
+-    Time     = c(0, 25),
+-    Dose     = 5,
+-    duration = 1
+-  )
+-  o_conc_dense <- PKNCAconc(
+-    d_conc,
+-    formula  = conc~Time|Subject,
+-    volume   = "volume",
+-    duration = "duration"
+-  )
+-  o_dose_dense <- PKNCAdose(
+-    d_dose,
+-    formula  = Dose~Time|Subject,
+-    route    = "intravascular",
+-    duration = "duration"
+-  )
+-  
+-  # ── Sparse data setup ─────────────────────────────────────────────────────
+-  # Each subject measured at DIFFERENT time points
+-  # → no shared times → off-diagonal covariance = 0
+-  # → no warning fires → df calculable (NA only when n=1, silently)
+-  d_sparse <- data.frame(
+-    conc = c(
+-      1.0, 3.0, 2.0, 0.5,    # Subject A
+-      2.0, 2.5, 1.5, 0.8,    # Subject B
+-      1.5, 3.5, 1.8, 0.6     # Subject C
+-    ),
+-    time = c(
+-      0,  3,  7, 11,          # Subject A — unique times
+-      1,  4,  8, 12,          # Subject B — unique times
+-      2,  5,  9, 10           # Subject C — unique times
+-    ),
+-    Subject = c(rep("A", 4), rep("B", 4), rep("C", 4))
+-  )
+-  d_dose_sparse <- data.frame(
+-    Subject  = c("A", "B", "C"),
+-    time     = c(0, 0, 0),
+-    Dose     = c(5, 5, 5),
+-    duration = c(1, 1, 1)
+-  )
+-  
+-  o_conc_sparse <- PKNCAconc(
+-    d_sparse,
+-    formula = conc~time|Subject,
+-    sparse  = TRUE
+-  )
+-  o_dose_sparse <- PKNCAdose(
+-    d_dose_sparse,
+-    formula  = Dose~time|Subject,
+-    route    = "extravascular",
+-    duration = "duration"
+-  )
+-  
+-  # ── Params that cannot be tested independently ────────────────────────────
+-  # These require special data structures or multi-dose designs
+-  # and are tested in dedicated tests elsewhere
+-  non_pknca_covered_params <- c(
+-    "f", "time_above",
+-    "sparse_auc_se", "sparse_auc_df",
+-    "sparse_aumc_se", "sparse_aumc_df",
+-    "ceoi"
+-  )
+-  
+-  all_params <- setdiff(
+-    names(get.interval.cols()),
+-    c("start", "end", non_pknca_covered_params)
+-  )
+-  
+-  # ── Classify params as sparse or dense ───────────────────────────────────
+-  all_interval_cols <- get.interval.cols()
+-  sparse_params <- Filter(
+-    function(p) isTRUE(all_interval_cols[[p]]$sparse),
+-    all_params
+-  )
+-  dense_params <- setdiff(all_params, sparse_params)
+-  
+-  # ── Intervals ─────────────────────────────────────────────────────────────
+-  intervals_dense  <- data.frame(start = c(0, 25), end = c(25, Inf))
+-  
+-  # sparse_auclast and sparse_aumclast must be TRUE so that
+-  # dependent params (cl.sparse.last, mrt.sparse.last etc.)
+-  # have their dependencies available in the pipeline
+-  intervals_sparse <- data.frame(
+-    start           = 0,
+-    end             = 12,
+-    sparse_auclast  = TRUE,
+-    sparse_aumclast = TRUE
+-  )
+-  
+-  # ── Test dense params with dense data ────────────────────────────────────
+-  for (param in dense_params) {
+-    intervals_with_param <- intervals_dense
+-    intervals_with_param[[param]] <- TRUE
+-    o_data <- PKNCAdata(o_conc_dense, o_dose_dense,
+-                        intervals = intervals_with_param)
+-    expect_no_error(
+-      param_res <- pk.nca(o_data)
+-    )
+-    expect_false(
+-      all(is.na(param_res$result$PPORRES)),
+-      info = paste0("Parameter ", param, " can be calculated independently")
+-    )
+-  }
+-  
+-  # ── Test sparse params with sparse data ──────────────────────────────────
+-  for (param in sparse_params) {
+-    intervals_with_param <- intervals_sparse
+-    intervals_with_param[[param]] <- TRUE
+-    o_data <- PKNCAdata(o_conc_sparse, o_dose_sparse,
+-                        intervals = intervals_with_param)
+-    expect_no_error(
+-      param_res <- pk.nca(o_data)
+-    )
+-    expect_false(
+-      all(is.na(param_res$result$PPORRES)),
+-      info = paste0("Parameter ", param, " can be calculated independently")
+-    )
+-  }
+-})
+-
+-
+-test_that("Cannot include and exclude half-life points at the same time (#406)", {
+-  o_conc <- PKNCAconc(data = data.frame(conc = 1, time = 0, inex = TRUE), conc~time, include_half.life = "inex", exclude_half.life = "inex")
+-  d_interval <- data.frame(start = 0, end = Inf, half.life = TRUE)
+-  o_data <- PKNCAdata(o_conc, intervals = d_interval)
+-  expect_error(
+-    suppressMessages(pk.nca(o_data)),
+-    regexp = "Cannot both include and exclude half-life points for the same interval"
+-  )
+-})
+-
+-test_that("pk.nca.interval covers route, volume.group, duration.conc.group, dose.group, duration.dose.group, route.group branches", {
+-  # Lines 449, 457, 459, 461, 467, 469 in pk.calc.all.R are only reached when a
+-  # registered NCA function has one of these names as a formal argument.
+-  # Register a temporary test function that accepts all six, save and restore state.
+-  fn_name <- "pknca_test_grp_args_cov_fn_"
+-  assign(
+-    fn_name,
+-    function(conc, time, route, volume.group, duration.conc.group,
+-             dose.group, duration.dose.group, route.group) {
+-      sum(conc, na.rm = TRUE)
+-    },
+-    envir = .GlobalEnv
+-  )
+-  old_cols <- get("interval.cols", envir = PKNCA:::.PKNCAEnv)
+-  old_sorted <- get0("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv)
+-  on.exit({
+-    assign("interval.cols", old_cols, envir = PKNCA:::.PKNCAEnv)
+-    if (!is.null(old_sorted)) {
+-      assign("interval.cols_sorted", old_sorted, envir = PKNCA:::.PKNCAEnv)
+-    } else if (exists("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv, inherits = FALSE)) {
+-      rm("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv)
+-    }
+-    rm(list = fn_name, envir = .GlobalEnv)
+-  }, add = TRUE)
+-
+-  add.interval.col(
+-    "pknca_test_grp_args_cov_col_",
+-    FUN = fn_name,
+-    unit_type = "conc",
+-    pretty_name = "Test: group arg branches",
+-    desc = "Coverage test for group arg branches"
+-  )
+-
+-  d <- as.data.frame(datasets::Theoph[datasets::Theoph$Subject == "1", ])
+-  d$volume <- 1
+-  d$duration <- 1
+-  d_dose <- d[d$Time == 0, , drop = FALSE]
+-
+-  o_conc <- PKNCAconc(d, formula = conc~Time|Subject, volume = "volume", duration = "duration")
+-  o_dose <- PKNCAdose(d_dose, formula = Dose~Time|Subject, route = "intravascular", duration = "duration")
+-  o_data <- PKNCAdata(
+-    o_conc, o_dose,
+-    intervals = data.frame(start = 0, end = 24, pknca_test_grp_args_cov_col_ = TRUE)
+-  )
+-  result <- pk.nca(o_data)
+-  expect_true("pknca_test_grp_args_cov_col_" %in% as.data.frame(result)$PPTESTCD)
+-})
+-
+-test_that("pk.nca sorts group data by time so unsorted input works (#568)", {
+-  conc_data <-
+-    data.frame(
+-      MRRLT = c(16, -0.8, 3, 6, 8, 12, 20, 25),
+-      AVAL = c(120, 260, 340, 300, 210, 150, 110, 90)
+-    )
+-  conc_sorted <- conc_data[order(conc_data$MRRLT), ]
+-  dose_data <- data.frame(EXDOSE = 1)
+-
+-  run_nca <- function(cdat) {
+-    o_conc <- PKNCAconc(cdat, AVAL ~ MRRLT)
+-    o_dose <- PKNCAdose(dose_data, EXDOSE ~ .)
+-    intervals <-
+-      data.frame(
+-        start = 0, end = 24,
+-        aucint.all = TRUE, aucint.last = TRUE, aucint.inf.obs = TRUE,
+-        cmax = TRUE, half.life = TRUE
+-      )
+-    o_data <-
+-      PKNCAdata(
+-        o_conc, o_dose, intervals = intervals,
+-        options = list(auc.method = "linear")
+-      )
+-    as.data.frame(suppressWarnings(pk.nca(o_data)))
+-  }
+-
+-  # Previously errored with "Assertion on 'time' failed: Must be sorted."
+-  res_unsorted <- expect_no_error(run_nca(conc_data))
+-  res_sorted <- run_nca(conc_sorted)
+-
+-  # aucint* parameters (which use the group-level time/conc) are calculable and
+-  # identical regardless of the input ordering.
+-  expect_equal(
+-    res_unsorted$PPORRES[res_unsorted$PPTESTCD == "aucint.all"],
+-    4523.263157894737
+-  )
+-  # Every parameter matches the pre-sorted calculation.
+-  merged <-
+-    merge(
+-      res_unsorted[, c("PPTESTCD", "PPORRES")],
+-      res_sorted[, c("PPTESTCD", "PPORRES")],
+-      by = "PPTESTCD", suffixes = c(".uns", ".srt")
+-    )
+-  expect_equal(merged$PPORRES.uns, merged$PPORRES.srt)
+-})
+-
+-test_that("mrt.md and vss.md get tau from the intervals or the dose times (#151)", {
+-  # Steady-state profile for a one-compartment IV bolus with CL=0.5, V=10
+-  # (k=0.05) dosed 100 every 24 hours, so the true MRT is 1/k = 20 and the true
+-  # Vss is V = 10.
+-  tau <- 24
+-  d_time <- c(0, 0.5, 1, 2, 4, 6, 8, 12, 18, 24)
+-  d_conc <- 10/(1 - exp(-0.05*tau))*exp(-0.05*d_time)
+-
+-  # A single dose in the dosing data (the common steady-state design): tau
+-  # cannot be detected, so it comes from the interval specification.
+-  o_conc_1 <- PKNCAconc(data.frame(subj=1, time=d_time, conc=d_conc), conc~time|subj)
+-  o_dose_1 <- PKNCAdose(data.frame(subj=1, time=0, dose=100), dose~time|subj, route="intravascular")
+-  interval_tau <-
+-    data.frame(
+-      start=0, end=tau, tau=tau,
+-      auclast=TRUE, aumclast=TRUE, aucinf.obs=TRUE, cl.last=TRUE,
+-      mrt.md.obs=TRUE, vss.md.obs=TRUE
+-    )
+-  res_1 <- as.data.frame(pk.nca(PKNCAdata(o_conc_1, o_dose_1, intervals=interval_tau)))
+-  value_1 <- stats::setNames(res_1$PPORRES, res_1$PPTESTCD)
+-
+-  # The multiple-dose equation recovers the model's true MRT and Vss exactly
+-  # here; the single-dose parameters over the same interval do not (mrt.last is
+-  # AUMClast/AUClast = 9.66).
+-  expect_equal(value_1[["mrt.md.obs"]], 20, tolerance=1e-8)
+-  expect_equal(value_1[["vss.md.obs"]], 10, tolerance=1e-8)
+-  # The wiring is what is under test: confirm the reported value is the
+-  # multiple-dose equation applied to this interval's own AUC and AUMC.
+-  expect_equal(
+-    value_1[["mrt.md.obs"]],
+-    value_1[["aumclast"]]/value_1[["auclast"]] +
+-      tau*(value_1[["aucinf.obs"]] - value_1[["auclast"]])/value_1[["auclast"]]
+-  )
+-  expect_equal(value_1[["vss.md.obs"]], value_1[["cl.last"]]*value_1[["mrt.md.obs"]])
+-
+-  # The same profile as the last of four q24h doses: tau is detected from the
+-  # dose times, so no tau column is needed.
+-  o_conc_4 <-
+-    PKNCAconc(data.frame(subj=1, time=3*tau + d_time, conc=d_conc), conc~time|subj)
+-  o_dose_4 <-
+-    PKNCAdose(
+-      data.frame(subj=1, time=(0:3)*tau, dose=100),
+-      dose~time|subj, route="intravascular"
+-    )
+-  interval_detect <-
+-    data.frame(
+-      start=3*tau, end=4*tau,
+-      auclast=TRUE, aumclast=TRUE, aucinf.obs=TRUE, cl.last=TRUE,
+-      mrt.md.obs=TRUE, vss.md.obs=TRUE
+-    )
+-  res_4 <- as.data.frame(pk.nca(PKNCAdata(o_conc_4, o_dose_4, intervals=interval_detect)))
+-  value_4 <- stats::setNames(res_4$PPORRES, res_4$PPTESTCD)
+-  expect_equal(value_4[["mrt.md.obs"]], value_1[["mrt.md.obs"]])
+-  expect_equal(value_4[["vss.md.obs"]], value_1[["vss.md.obs"]])
+-
+-  # A tau column overrides detection
+-  interval_override <- interval_detect
+-  interval_override$tau <- 12
+-  res_override <-
+-    as.data.frame(pk.nca(PKNCAdata(o_conc_4, o_dose_4, intervals=interval_override)))
+-  value_override <- stats::setNames(res_override$PPORRES, res_override$PPTESTCD)
+-  expect_equal(
+-    value_override[["mrt.md.obs"]],
+-    value_1[["aumclast"]]/value_1[["auclast"]] +
+-      12*(value_1[["aucinf.obs"]] - value_1[["auclast"]])/value_1[["auclast"]]
+-  )
+-
+-  # Without a tau column and without repeating doses, the parameter is NA
+-  # rather than silently falling back to the single-dose equation.
+-  interval_no_tau <- interval_tau
+-  interval_no_tau$tau <- NULL
+-  expect_warning(
+-    res_na <- as.data.frame(pk.nca(PKNCAdata(o_conc_1, o_dose_1, intervals=interval_no_tau))),
+-    class="pknca_warning_tau_undetermined"
+-  )
+-  value_na <- stats::setNames(res_na$PPORRES, res_na$PPTESTCD)
+-  expect_equal(value_na[["mrt.md.obs"]], NA_real_)
+-  expect_equal(value_na[["vss.md.obs"]], NA_real_)
+-  # The single-dose parameters in the same interval are unaffected
+-  expect_equal(value_na[["auclast"]], value_1[["auclast"]])
+-})
+-
+-test_that("mrt.md.pred and vss.md.pred get tau the same way (#151)", {
+-  tau <- 12
+-  d_time <- c(0, 0.5, 1, 2, 4, 6, 9, 12)
+-  d_conc <- 10/(1 - exp(-0.1*tau))*exp(-0.1*d_time)
+-  o_conc <- PKNCAconc(data.frame(subj=1, time=d_time, conc=d_conc), conc~time|subj)
+-  o_dose <- PKNCAdose(data.frame(subj=1, time=0, dose=50), dose~time|subj, route="intravascular")
+-  interval <-
+-    data.frame(
+-      start=0, end=tau, tau=tau,
+-      auclast=TRUE, aumclast=TRUE, aucinf.pred=TRUE, cl.last=TRUE,
+-      mrt.md.pred=TRUE, vss.md.pred=TRUE
+-    )
+-  res <- as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals=interval)))
+-  value <- stats::setNames(res$PPORRES, res$PPTESTCD)
+-  expect_equal(
+-    value[["mrt.md.pred"]],
+-    value[["aumclast"]]/value[["auclast"]] +
+-      tau*(value[["aucinf.pred"]] - value[["auclast"]])/value[["auclast"]]
+-  )
+-  expect_equal(value[["vss.md.pred"]], value[["cl.last"]]*value[["mrt.md.pred"]])
+-  expect_false(is.na(value[["mrt.md.pred"]]))
+-})
+-
+-test_that("mrt.ivmd and vss.ivmd correct the multiple-dose MRT for the infusion duration (#151)", {
+-  # The same steady-state one-compartment profile as above (CL=0.5, V=10,
+-  # k=0.05, 100 q24h) given as a 4 hour infusion instead of a bolus.  The true
+-  # MRT is still 1/k = 20 and the true Vss is still V = 10.
+-  tau <- 24
+-  duration <- 4
+-  d_time <- c(0, 1, 2, 3, 4, 5, 6, 8, 12, 18, 24)
+-  # Superposition of the single-dose infusion profile over many prior doses
+-  conc_single <- function(t) {
+-    rate <- 100/duration
+-    ifelse(
+-      t <= duration,
+-      rate/0.5*(1 - exp(-0.05*t)),
+-      rate/0.5*(1 - exp(-0.05*duration))*exp(-0.05*(t - duration))
+-    )
+-  }
+-  d_conc <- rowSums(sapply(0:400, function(i) conc_single(d_time + i*tau)))
+-
+-  o_conc <- PKNCAconc(data.frame(subj=1, time=d_time, conc=d_conc), conc~time|subj)
+-  o_dose <-
+-    PKNCAdose(
+-      data.frame(subj=1, time=0, dose=100, duration=duration),
+-      dose~time|subj, route="intravascular", duration="duration"
+-    )
+-  interval <-
+-    data.frame(
+-      start=0, end=tau, tau=tau, cl.last=TRUE,
+-      mrt.md.obs=TRUE, vss.md.obs=TRUE,
+-      mrt.ivmd.obs=TRUE, vss.ivmd.obs=TRUE,
+-      mrt.ivmd.pred=TRUE, vss.ivmd.pred=TRUE
+-    )
+-  res <- as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals=interval)))
+-  value <- stats::setNames(res$PPORRES, res$PPTESTCD)
+-
+-  # The IV form hits the true MRT and Vss; the non-IV form is high by
+-  # duration/2 and by cl.last*duration/2 respectively.
+-  expect_equal(value[["mrt.ivmd.obs"]], 20, tolerance=1e-3)
+-  expect_equal(value[["vss.ivmd.obs"]], 10, tolerance=1e-3)
+-  expect_equal(value[["mrt.ivmd.obs"]], value[["mrt.md.obs"]] - duration/2)
+-  expect_equal(
+-    value[["vss.md.obs"]] - value[["vss.ivmd.obs"]],
+-    value[["cl.last"]]*duration/2
+-  )
+-  expect_equal(value[["vss.ivmd.obs"]], value[["cl.last"]]*value[["mrt.ivmd.obs"]])
+-  expect_equal(value[["vss.ivmd.pred"]], value[["cl.last"]]*value[["mrt.ivmd.pred"]])
+-
+-  # tau reaches the IV form the same way it reaches the non-IV form.  One
+-  # warning is raised per requested parameter that takes tau, so collect them
+-  # all rather than letting the ones expect_warning() does not take escape.
+-  interval_no_tau <- interval
+-  interval_no_tau$tau <- NULL
+-  warn_class <- character()
+-  res_na <-
+-    withCallingHandlers(
+-      as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals=interval_no_tau))),
+-      warning = function(w) {
+-        warn_class <<- c(warn_class, class(w)[1])
+-        invokeRestart("muffleWarning")
+-      }
+-    )
+-  expect_equal(warn_class, rep("pknca_warning_tau_undetermined", 3),
+-               info="one warning per requested parameter taking tau")
+-  value_na <- stats::setNames(res_na$PPORRES, res_na$PPTESTCD)
+-  expect_equal(value_na[["mrt.ivmd.obs"]], NA_real_)
+-  expect_equal(value_na[["vss.ivmd.obs"]], NA_real_)
+-  expect_equal(value_na[["mrt.ivmd.pred"]], NA_real_)
+-  expect_equal(value_na[["vss.ivmd.pred"]], NA_real_)
+-})
++test_that("pk.nca", {
++  # Note that generate.conc sets the random seed, so it doesn't have to happen
++  # here.
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose)
++  myresult <- pk.nca(mydata)
++
++  expect_equal(names(myresult),
++               c("result", "data", "columns"),
++               info="Make sure that the result has the expected names (and only the expected names) in it.")
++  expect_true(checkProvenance(myresult),
++              info="Provenance works on results")
++
++  mydata.failure <- mydata
++  # There's no way to automatically make a PKNCAdata object with no intervals,
++  # but we want to ensure that users cannot cause this error by playing in the
++  # internals.
++  mydata.failure$intervals <- data.frame()
++  expect_warning(myresult.failure <- pk.nca(mydata.failure),
++                 regexp="No intervals given; no calculations will be done.",
++                 info="An empty result is returned if there are no intervals")
++
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose.nodose <- PKNCAdose(tmpdose, formula=~time|treatment+ID)
++  mydata.nodose <- PKNCAdata(myconc, mydose.nodose)
++  expect_equal(
++    pk.nca(mydata.nodose)$result,
++    myresult$result,
++    info="missing dose information is handled without an issue"
++  )
++
++  # Test each of the pieces for myresult for accuracy
++
++  expect_equal(myresult$data, {
++    tmp <- mydata
++    # The options should be the default options after the calculations are done.
++    tmp$options <- PKNCA.options()
++    tmp
++  }, info="The data is just a copy of the input data plus an instantiation of the PKNCA.options")
++
++  verify.result <-
++    tibble::tibble(
++      treatment="Trt 1",
++      ID=rep(c(1, 2), each=16),
++      start=0,
++      end=c(24, rep(Inf, 15),
++            24, rep(Inf, 15)),
++      PPTESTCD=rep(c("auclast", "cmax", "tmax", "tlast", "clast.obs",
++                     "lambda.z", "r.squared", "adj.r.squared", "lambda.z.corrxy",
++                     "lambda.z.time.first", "lambda.z.time.last",
++                     "lambda.z.n.points", "clast.pred", "half.life",
++                     "span.ratio", "aucinf.obs"),
++                   times=2),
++      PPORRES=c(13.54, 0.9998, 4.000, 24.00, 0.3441,
++                0.04297, 0.9072, 0.9021, -0.952, 5.000, 24.00,
++                20.00, 0.3356, 16.13, 1.178,
++                21.55, 14.03, 0.9410, 2.000,
++                24.00, 0.3148, 0.05689, 0.9000, 0.8944, -0.952,
++                5.000, 24.00, 20.00, 0.3011, 12.18,
++                1.560, 19.56),
++      PPANMETH = c(
++        "AUC: lin up/log down",
++        rep("", 4),
++        rep("", 10),
++        "AUC: lin up/log down",
++        "AUC: lin up/log down",
++        rep("", 4),
++        rep("", 10),
++        "AUC: lin up/log down"
++      ),
++      exclude=NA_character_
++    )
++  expect_equal(
++    myresult$result,
++    verify.result,
++    tolerance=0.001,
++    info=paste("The specific order of the levels isn't important--",
++               "the fact that they are factors and that the set",
++               "doesn't change is important.")
++  )
++
++  # Specifying new intervals
++  mydata.newinterval <-
++      PKNCAdata(myconc, mydose,
++                intervals=data.frame(start=0, end=c(24, Inf),
++                                     auclast=c(TRUE, FALSE),
++                                     aucinf.obs=c(FALSE, TRUE),
++                                     cmax=c(FALSE, TRUE),
++                                     tmax=c(FALSE, TRUE),
++                                     half.life=c(FALSE, TRUE)))
++  myresult.newinterval <- pk.nca(mydata)
++  expect_equal(myresult.newinterval$result,
++               myresult$result,
++               info="Intervals can be specified manually, and will apply across appropriate parts of the grouping variables.")
++
++
++  # Dosing not at time 0
++  tmpconc.multi <- generate.conc(2, 1, 0:24)
++  tmpdose.multi <- generate.dose(tmpconc.multi)
++  tmpconc.multi$time <- tmpconc.multi$time + 2
++  tmpdose.multi$time <- tmpdose.multi$time + 2
++  myconc.multi <- PKNCAconc(tmpconc.multi, conc~time|treatment+ID)
++  mydose.multi <- PKNCAdose(tmpdose.multi, dose~time|treatment+ID)
++  mydata.multi <- PKNCAdata(myconc.multi, mydose.multi)
++  myresult.multi <- pk.nca(mydata.multi)
++
++  verify.result.multi <- verify.result
++  verify.result.multi$start <- verify.result.multi$start + 2
++  verify.result.multi$end <- verify.result.multi$end + 2
++  expect_equal(myresult.multi$result, verify.result.multi,
++               tolerance=0.001,
++               info="Shifted dosing works the same as un-shifted where time parameters like tmax and tlast are reported relative to the start of the interval")
++
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=Inf, cmax=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(myresult$result$PPORRES,
++               c(0.99981, 0.94097), tolerance=0.00001,
++               info="Calculations work with a single row of intervals and a single parameter requested")
++
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=Inf, cl.obs=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(subset(myresult$result, PPTESTCD %in% "cl.obs")$PPORRES,
++               c(0.04640, 0.05111), tolerance=0.0001,
++               info="PK intervals work with passing in dose as a parameter")
++
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=24, cmax=TRUE, cav=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(subset(myresult$result, PPTESTCD %in% "cav")$PPORRES,
++               c(0.5642, 0.5846), tolerance=0.0001,
++               info="PK intervals work with passing in start and end as parameters")
++
++  # Ensure that the correct number of doses are included in parameters that use dosing.
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  tmpdose$time <- NULL
++  tmpdose <- merge(tmpdose, data.frame(time=c(0, 6, 12, 18, 24)))
++  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=24, cl.obs=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.obs"],
++               4/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "aucinf.obs"],
++               tolerance=0.0001,
++               info="The correct number of doses is selected for an interval (>=start and <end), 4 doses and not 5")
++
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=6, cl.last=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.last"],
++               1/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "auclast"],
++               tolerance=0.0001,
++               info="The correct number of doses is selected for an interval (>=start and <end), 1 dose and not 5")
++
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=1, end=6, cl.last=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.last"],
++               NA/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "auclast"],
++               tolerance=0.0001,
++               info="The correct number of doses is selected for an interval (>=start and <end), no doses selected")
++
++})
++
++test_that("verbose pk.nca", {
++  tmpconc <- generate.conc(nsub=1, ntreat=1, 0:4)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time)
++  mydata <- PKNCAdata(myconc, mydose)
++  expect_message(expect_message(expect_message(
++    suppressWarnings(pk.nca(mydata, verbose=TRUE)),
++    regexp = "Setting up options"),
++    regexp = "Starting dense PK NCA calculations"),
++    regexp = "Combining completed dense PK calculation results"
++  )
++  expect_message(
++    suppressWarnings(pk.nca(mydata, verbose=FALSE)),
++    NA
++  )
++})
++
++test_that("pk.nca warnings", {
++  tmpconc <- generate.conc(nsub=1, ntreat=1, 0:4)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time)
++  mydata <- PKNCAdata(myconc, mydose, intervals=data.frame(start=24, end=48, cmax=TRUE))
++  expect_warning(
++    pk.nca(mydata),
++    regexp="No data for interval"
++  )
++})
++
++test_that("pk.nca.interval errors", {
++  expect_error(
++    pk.nca.interval(interval="A"),
++    regexp="Please report a bug.  Interval must be a one-row data.frame",
++    class = "pknca_error_internal_interval_not_one_row_df"
++  )
++  expect_error(
++    pk.nca.interval(interval=data.frame()),
++    regexp="Please report a bug.  Interval must be a one-row data.frame",
++    class = "pknca_error_internal_interval_not_one_row_df"
++  )
++})
++
++test_that("a parameter needing an interval column says so instead of asking for a bug report", {
++  d_conc <- data.frame(conc = 2^(0:-5), time = 0:5)
++  o_conc <- PKNCAconc(d_conc, conc~time)
++  # `conc_above` for time_above and `dose1` for f have to be given by the user
++  # as interval columns.  `tau` does not belong here: it is detected from the
++  # dose times when it is not given, and is NA with a warning when it can be
++  # neither given nor detected.
++  needs_interval_col <-
++    list(
++      time_above = "Cannot find argument 'conc_above' for NCA parameter 'time_above' (calculated by 'pk.calc.time_above'); give it as a column in the interval specification",
++      f = "Cannot find argument 'dose1' for NCA parameter 'f' (calculated by 'pk.calc.f'); give it as a column in the interval specification"
++    )
++  for (current_param in names(needs_interval_col)) {
++    d_interval <- data.frame(start = 0, end = Inf)
++    d_interval[[current_param]] <- TRUE
++    o_data <- PKNCAdata(o_conc, intervals = d_interval)
++    # purrr wraps the error it gets from pk.nca(), so the text is checked in the
++    # whole chain rather than in the top condition
++    current_message <-
++      conditionMessage(tryCatch(
++        suppressMessages(suppressWarnings(pk.nca(o_data))),
++        error = function(e) e
++      ))
++    expect_true(grepl(needs_interval_col[[current_param]], current_message, fixed = TRUE))
++    expect_false(grepl("report a bug", current_message, fixed = TRUE))
++  }
++  # Supplying the column makes the parameter calculable
++  o_data <- PKNCAdata(o_conc, intervals = data.frame(start = 0, end = Inf, time_above = TRUE, conc_above = 0.2))
++  suppressMessages(suppressWarnings(o_nca <- pk.nca(o_data)))
++  expect_equal(as.data.frame(o_nca)$PPTESTCD, "time_above")
++})
++
++test_that("interval_calculation_error asks for a bug report only when PKNCA did not diagnose the error", {
++  preamble <- "Error with interval start=0, end=Inf"
++  # Diagnosed by PKNCA: the message already says what to change
++  err_diagnosed <-
++    tryCatch(
++      interval_calculation_error(
++        rlang::catch_cnd(rlang::abort("say what to change", class = "pknca_error_invalid_route")),
++        error_preamble = preamble
++      ),
++      error = function(e) e
++    )
++  expect_s3_class(err_diagnosed, "pknca_error_interval_calculation")
++  expect_equal(err_diagnosed$message, paste0(preamble, ": say what to change"))
++  # Internal: PKNCA did not expect this
++  err_internal <-
++    tryCatch(
++      interval_calculation_error(
++        rlang::catch_cnd(rlang::abort("should not happen", class = "pknca_error_internal_tlast")),
++        error_preamble = preamble
++      ),
++      error = function(e) e
++    )
++  expect_equal(
++    err_internal$message,
++    paste0("Please report a bug.\n", preamble, ": should not happen")
++  )
++  # Unclassed errors from outside PKNCA are also unexpected
++  err_unclassed <-
++    tryCatch(
++      interval_calculation_error(
++        rlang::catch_cnd(stop("from somewhere else")),
++        error_preamble = preamble
++      ),
++      error = function(e) e
++    )
++  expect_equal(
++    err_unclassed$message,
++    paste0("Please report a bug.\n", preamble, ": from somewhere else")
++  )
++})
++
++test_that("Calculations when dose time is missing", {
++  # Ensure that the correct number of doses are included in parameters that use dosing.
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, dose~.|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=24, cl.obs=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(
++    myresult$result$PPORRES[myresult$result$PPTESTCD %in% "cl.obs"],
++    1/myresult$result$PPORRES[myresult$result$PPTESTCD %in% "aucinf.obs"],
++    info="The correct number of doses is selected for an interval (>=start and <end), 4 doses and not 5"
++  )
++})
++
++test_that("Calculations when no dose info is given", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, intervals=data.frame(start=0, end=24, cmax=TRUE, cl.last=TRUE))
++  # cmax needs no dosing information, cl.last needs the dose amount (#538)
++  expect_message(
++    myresult <- pk.nca(mydata),
++    regexp="these parameters will not be calculated: cl.last",
++    fixed=TRUE
++  )
++  expect_equal(
++    myresult$result,
++    tibble::tibble(
++      treatment="Trt 1",
++      ID=rep(1:2, each=3),
++      start=0,
++      end=24,
++      PPTESTCD=rep(c("auclast", "cmax", "cl.last"), 2),
++      PPORRES=c(13.5417297156528, 0.999812606062292, NA,
++                14.0305397438242, 0.94097296083447, NA),
++      PPANMETH = c(
++        "AUC: lin up/log down",
++        rep("", 2),
++        "AUC: lin up/log down",
++        rep("", 2)
++      ),
++      exclude=NA_character_
++    )
++  )
++})
++
++test_that("pk.nca with exclusions", {
++  # Note that generate.conc sets the random seed, so it doesn't have to happen
++  # here.
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose)
++  myresult <- pk.nca(mydata)
++  tmpconc.excl <- tmpconc
++  tmpconc.excl$excl <- NA_character_
++  tmpconc.excl$excl[5] <- "test exclusion"
++  myconc.excl <- PKNCAconc(tmpconc.excl,
++                           formula=conc~time|treatment+ID,
++                           exclude="excl")
++  mydata.excl <- PKNCAdata(myconc.excl, mydose)
++  myresult.excl <- pk.nca(mydata.excl)
++  expect_true(identical(myresult$result[myresult$result$ID %in% 2,],
++                        myresult.excl$result[myresult.excl$result$ID %in% 2,]),
++               info="Results are unchanged for the subject who has the same data")
++  expect_false(identical(myresult$result[myresult$result$ID %in% 1,],
++                         myresult.excl$result[myresult.excl$result$ID %in% 1,]),
++               info="Results are changed for the subject who has the same data")
++  expect_equal(myresult.excl$result$PPORRES[myresult.excl$result$ID %in% 1 & myresult.excl$result$PPTESTCD %in% "cmax"],
++               max(tmpconc.excl$conc[tmpconc.excl$ID %in% 1 & is.na(tmpconc.excl$excl)]),
++               info="Cmax is affected by the exclusion")
++})
++
++test_that("pk.calc.all with duration.dose required", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  tmpdose$duration_dose <- 0.1
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID, duration="duration_dose", route="intravascular")
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=24,
++                                           mrt.iv.last=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "mrt.iv.last"],
++               c(10.36263, 10.12515),
++               tolerance=1e-5,
++               info="duration.dose is used when requested")
++})
++
++test_that("pk.calc.all with duration.conc required", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  tmpconc$duration_conc <- 0.1
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, duration="duration_conc")
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID, route="intravascular")
++  mydata <- PKNCAdata(myconc, mydose,
++                      intervals=data.frame(start=0, end=24,
++                                           mrt.iv.last=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(myresult$result$PPORRES[myresult$result$PPTESTCD %in% "mrt.iv.last"],
++               c(10.41263, 10.17515),
++               tolerance=1e-5,
++               info="duration.conc is used when requested")
++})
++
++test_that("half life inclusion and exclusion", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  tmpconc$include_hl <- tmpconc$time <= 22
++  tmpconc$exclude_hl <- tmpconc$time == 22
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  myconc_incl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID,
++                           include_half.life="include_hl")
++  myconc_excl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID,
++                           exclude_half.life="exclude_hl")
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <-  PKNCAdata(myconc, mydose,
++                       intervals=data.frame(start=0, end=24, half.life=TRUE))
++  mydata_incl <- PKNCAdata(myconc_incl, mydose,
++                           intervals=data.frame(start=0, end=24, half.life=TRUE))
++  mydata_excl <- PKNCAdata(myconc_excl, mydose,
++                           intervals=data.frame(start=0, end=24, half.life=TRUE))
++  myresult <- pk.nca(mydata)
++  myresult_incl <- pk.nca(mydata_incl)
++  myresult_excl <- pk.nca(mydata_excl)
++  expect_false(identical(myresult$result, myresult_excl$result))
++  expect_false(identical(myresult$result, myresult_incl$result))
++})
++
++test_that("include_half.life and exclude_half.life work with NAs treated as missing for all NA and as FALSE for partial NA (#372)", {
++  # Partial NA include_hl is used
++  d_conc_incl <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, include_hl = c(FALSE, NA, TRUE, TRUE, TRUE, TRUE))
++  o_conc_incl <- PKNCAconc(d_conc_incl, conc~time, include_half.life = "include_hl")
++  o_data_incl <- PKNCAdata(o_conc_incl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  suppressMessages(o_nca_incl <- pk.nca(o_data_incl))
++  expect_equal(as.data.frame(o_nca_incl, out_format = "wide")$half.life, 1.820879, tolerance = 0.00001)
++
++  # All FALSE include_hl is used
++  d_conc_false <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, include_hl = FALSE)
++  o_conc_false <- PKNCAconc(d_conc_false, conc~time, include_half.life = "include_hl")
++  o_data_false <- PKNCAdata(o_conc_false, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  suppressWarnings(suppressMessages(o_nca_false <- pk.nca(o_data_false)))
++  d_nca_false <- as.data.frame(o_nca_false)
++  expect_equal(d_nca_false$PPORRES[d_nca_false$PPTESTCD %in% "half.life"], NA_real_)
++
++  # All NA include_hl is ignored
++  d_conc <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, include_hl = NA)
++  o_conc <- PKNCAconc(d_conc, conc~time, include_half.life = "include_hl")
++  o_data <- PKNCAdata(o_conc, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  suppressMessages(o_nca <- pk.nca(o_data))
++  expect_equal(as.data.frame(o_nca, out_format = "wide")$half.life, 1.512942, tolerance = 0.00001)
++
++  # Partial NA include_hl is used
++  d_conc_excl <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, exclude_hl = c(FALSE, NA, TRUE, TRUE, TRUE, TRUE))
++  o_conc_excl <- PKNCAconc(d_conc_excl, conc~time, exclude_half.life = "exclude_hl")
++  o_data_excl <- PKNCAdata(o_conc_excl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  suppressWarnings(suppressMessages(o_nca_excl <- pk.nca(o_data_excl)))
++  d_nca_excl <- as.data.frame(o_nca_excl)
++  expect_equal(d_nca_excl$PPORRES[d_nca_excl$PPTESTCD %in% "half.life"], NA_real_)
++
++  # All NA exclude_hl is ignored
++  d_conc <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, exclude_hl = NA)
++  o_conc <- PKNCAconc(d_conc, conc~time, exclude_half.life = "exclude_hl")
++  o_data <- PKNCAdata(o_conc, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  suppressMessages(o_nca <- pk.nca(o_data))
++  expect_equal(as.data.frame(o_nca, out_format = "wide")$half.life, 1.512942, tolerance = 0.00001)
++
++  # All FALSE exclude_hl is used
++  d_conc_false <- data.frame(conc = c(1, 0.6, 0.3, 0.25, 0.15, 0.1), time = 0:5, exclude_hl = FALSE)
++  o_conc_false <- PKNCAconc(d_conc_false, conc~time, exclude_half.life = "exclude_hl")
++  o_data_false <- PKNCAdata(o_conc_false, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  suppressWarnings(suppressMessages(o_nca_false <- pk.nca(o_data_false)))
++  d_nca_false <- as.data.frame(o_nca_false)
++  expect_equal(d_nca_false$PPORRES[d_nca_false$PPTESTCD %in% "half.life"], 1.512942, tolerance = 0.00001)
++})
++
++test_that("non-logical half-life point columns fail loud at calculation time (#583)", {
++  # PKNCAconc() validates at construction, so replace the column afterward to
++  # reach the check in pk.nca()
++  d_conc <-
++    data.frame(
++      conc = c(1, 0.5, 0.25, 0.125, 0.06),
++      time = 0:4,
++      excl = c(NA, NA, NA, TRUE, NA),
++      incl = c(NA, TRUE, TRUE, TRUE, NA),
++      subject = 1
++    )
++  o_conc_excl <- PKNCAconc(d_conc, conc ~ time | subject, exclude_half.life = "excl")
++  o_data_excl <- PKNCAdata(o_conc_excl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  o_data_excl$conc$data$excl <- ifelse(is.na(d_conc$excl), NA_character_, "yes")
++  expect_error(
++    suppressMessages(pk.nca(o_data_excl)),
++    regexp = "The exclude_half.life column ('excl') must be a logical (TRUE/FALSE/NA) column, not character",
++    fixed = TRUE
++  )
++
++  o_conc_incl <- PKNCAconc(d_conc, conc ~ time | subject, include_half.life = "incl")
++  o_data_incl <- PKNCAdata(o_conc_incl, intervals = data.frame(start = 0, end = Inf, half.life = TRUE))
++  o_data_incl$conc$data$incl <- ifelse(is.na(d_conc$incl), NA_character_, "yes")
++  expect_error(
++    suppressMessages(pk.nca(o_data_incl)),
++    regexp = "The include_half.life column ('incl') must be a logical (TRUE/FALSE/NA) column, not character",
++    fixed = TRUE
++  )
++})
++
++test_that("No interval requested (e.g. for placebo)", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <-
++    PKNCAdata(
++      myconc, mydose,
++      intervals=
++        data.frame(
++          treatment="Trt 3", start=0, end=24, cmax=TRUE,
++          stringsAsFactors=FALSE
++        )
++    )
++  expect_warning(expect_warning(expect_warning(expect_warning(
++    myresult <- pk.nca(mydata),
++    class = "pknca_warning_no_intervals"),
++    class = "pknca_warning_no_intervals"),
++    class = "pknca_warning_no_conc_data"),
++    class = "pknca_warning_no_results"
++  )
++  expect_equal(
++    nrow(as.data.frame(myresult)),
++    0,
++    info="No rows were generated when no intervals applied"
++  )
++})
++
++test_that("Volume-related calculations", {
++  tmpconc <- generate.conc(2, 1, c(4, 12, 24))
++  tmpconc$conc <- seq_len(nrow(tmpconc))
++  tmpconc$vol <- 2
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, volume="vol")
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <-  PKNCAdata(myconc, mydose,
++                       intervals=data.frame(treatment="Trt 1", start=0, end=24,
++                                            ae=TRUE, fe=TRUE,
++                                            stringsAsFactors=FALSE))
++  myresult <- pk.nca(mydata)
++  expect_equal(as.data.frame(myresult)[["PPORRES"]], c(12, 12, 30, 30),
++              info="ae and fe are correctly calculated")
++  tmpdose2 <- tmpdose
++  tmpdose2$dose <- 2
++  mydose2 <- PKNCAdose(tmpdose2, formula=dose~time|treatment+ID)
++  mydata2 <-  PKNCAdata(myconc, mydose2,
++                       intervals=data.frame(treatment="Trt 1", start=0, end=24,
++                                            ae=TRUE, fe=TRUE,
++                                            stringsAsFactors=FALSE))
++  myresult2 <- pk.nca(mydata2)
++  expect_equal(as.data.frame(myresult2)[["PPORRES"]], c(12, 6, 30, 15),
++               info="fe respects dose")
++})
++
++test_that("pk.nca can calculate values with group-level data", {
++  tmpconc_impute <- generate.conc(2, 1, 0:24)
++  # This is what will happen in the imputation
++  tmpconc_observe_05 <- tmpconc_impute[tmpconc_impute$time %in% 0,]
++  tmpconc_observe_05$time <- 0.5
++  tmpconc_observe <- rbind(tmpconc_impute, tmpconc_observe_05)
++  tmpconc_observe <- tmpconc_observe[order(tmpconc_observe$treatment, tmpconc_observe$ID, tmpconc_observe$time),]
++  tmpdose <- generate.dose(tmpconc_impute)
++  tmpdose$time <- 0.5
++
++  myconc_impute <- PKNCAconc(tmpconc_impute, formula=conc~time|treatment+ID)
++  myconc_observe <- PKNCAconc(tmpconc_observe, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata_impute <-
++    PKNCAdata(myconc_impute, mydose,
++              intervals=data.frame(treatment="Trt 1", start=0, end=24,
++                                   aucint.last.dose=TRUE,
++                                   stringsAsFactors=FALSE))
++  mydata_observe <-
++    PKNCAdata(myconc_observe, mydose,
++              intervals=data.frame(treatment="Trt 1", start=0, end=24,
++                                   auclast=TRUE,
++                                   stringsAsFactors=FALSE))
++  myres_impute <- pk.nca(mydata_impute)
++  myres_observe <- pk.nca(mydata_observe)
++  expect_equal(as.data.frame(myres_impute)$PPORRES,
++               as.data.frame(myres_observe)$PPORRES,
++               info="Manually imputing values gives the same result as aucint")
++})
++
++test_that("Missing dose info for some subjects gives a warning, not a difficult-to-interpret error", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)[1,]
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <-  PKNCAdata(myconc, mydose,
++                       intervals=data.frame(start=0, end=24,
++                                            cl.last=TRUE))
++  myresult <- pk.nca(mydata)
++  expect_true(all(is.na(myresult$result[["PPORRES"]]) == c(FALSE, FALSE, FALSE, TRUE)) &
++                all(myresult$result[["PPTESTCD"]] == rep(c("auclast", "cl.last"), 2)),
++              info="cl.last is not calculated when dose information is missing, but only for the subject where dose info is missing.")
++})
++
++# Fix issue #68
++test_that("Ensure that options are respected during pk.nca call", {
++  doses <- data.frame(ID=1:2, Time=0, Dose=0.5)
++
++  conc.data <- c(0, 1, 2, 1.3, 0.4, 0.35, 0.125)
++  time.data <- c(0, 1, 2, 4,   8,   24,   48)
++  concs <- merge(doses["ID"], data.frame(Conc=conc.data, Time=time.data))
++
++  myconc <- PKNCA::PKNCAconc(concs, formula=Conc~Time|ID)
++  mydose <- PKNCA::PKNCAdose(doses, formula=Dose~Time|ID)
++
++  myintervals <- data.frame(start=c(0,0,0),
++                            end=c(24,48,Inf),
++                            auclast=TRUE,
++                            aucinf.obs=TRUE,
++                            aucinf.pred=TRUE,
++                            aumclast=TRUE,
++                            aumcall=TRUE,
++                            half.life=TRUE)
++
++  linear.mydata <- PKNCA::PKNCAdata(myconc, mydose, intervals = myintervals,
++                                    options = list(auc.method = "linear"))
++  linear.results <- PKNCA::pk.nca(linear.mydata)
++
++  linlog.mydata <- PKNCA::PKNCAdata(myconc, mydose, intervals = myintervals,
++                                    options = list(auc.method = "lin up/log down"))
++  linlog.results <- PKNCA::pk.nca(linlog.mydata)
++  expect_true(
++    all.equal(
++      linear.results$result$PPORRES[linear.results$result$PPTESTCD %in% "aucinf.obs" &
++                                      linear.results$result$ID %in% 1 &
++                                      linear.results$result$end %in% Inf],
++      24.54319,
++      tolerance=0.0001) &
++      all.equal(
++        linlog.results$result$PPORRES[linlog.results$result$PPTESTCD %in% "aucinf.obs" &
++                                        linlog.results$result$ID %in% 1 &
++                                        linlog.results$result$end %in% Inf],
++        23.68317,
++        tolerance=0.0001),
++    info="linear and loglinear effects are calculated differently."
++  )
++})
++
++test_that("Can calculate parameters requiring extra arguments", {
++  o_conc <- PKNCAconc(conc~time, data=data.frame(conc=c(1:3, 2:1), time=0:4))
++  d_intervals <- data.frame(start=0, end=4, time_above=TRUE, conc_above=2)
++  o_data <- PKNCAdata(o_conc, intervals=d_intervals, options=list(auc.method="linear"))
++  o_nca <- suppressMessages(pk.nca(o_data))
++  expect_equal(as.data.frame(o_nca)$PPORRES, 2)
++})
++
++test_that("calculate with sparse data", {
++  d_sparse <-
++    data.frame(
++      id = c(1L, 2L, 3L, 1L, 2L, 3L, 1L, 2L, 3L, 4L, 5L, 6L, 4L, 5L, 6L, 7L, 8L, 9L, 7L, 8L, 9L),
++      conc = c(0, 0, 0,  1.75, 2.2, 1.58, 4.63, 2.99, 1.52, 3.03, 1.98, 2.22, 3.34, 1.3, 1.22, 3.54, 2.84, 2.55, 0.3, 0.0421, 0.231),
++      time = c(0, 0, 0, 1, 1, 1, 6, 6, 6, 2, 2, 2, 10, 10, 10, 4, 4, 4, 24, 24, 24),
++      dose = c(100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
++    )
++  o_conc_sparse <- PKNCAconc(d_sparse, conc~time|id, sparse=TRUE)
++
++  d_intervals <-
++    data.frame(
++      start=0,
++      end=24,
++      aucinf.obs=TRUE,
++      cmax=TRUE,
++      sparse_auclast=TRUE
++    )
++  o_data_sparse <- PKNCAdata(o_conc_sparse, intervals=d_intervals)
++  suppressMessages(
++    expect_warning(expect_warning(
++      o_nca <- pk.nca(o_data_sparse),
++      class = "pknca_warning_sparse_df_multi"),
++      class = "pknca_warning_halflife_too_few_points"
++    )
++  )
++  df_result <- as.data.frame(o_nca)
++  expect_true("sparse_auclast" %in% df_result$PPTESTCD)
++  expect_equal(df_result$PPORRES[df_result$PPTESTCD %in% "sparse_auclast"], 39.4689)
++  sum_o_nca <- summary(o_nca)
++  expect_s3_class(sum_o_nca, "summary_PKNCAresults")
++
++  # Mixed sparse and dense calculations when only one type is requested in an
++  # interval works The example below has dense-only; sparse and dense; and and
++  # sparse-only.
++  d_intervals_mixed <-
++    data.frame(
++      start=0,
++      end=c(23, 24, 25),
++      cmax=c(TRUE, TRUE, FALSE),
++      sparse_auclast=c(FALSE, TRUE, TRUE)
++    )
++  o_data_sparse_mixed <- PKNCAdata(o_conc_sparse, intervals=d_intervals_mixed)
++  suppressMessages(
++    expect_warning(expect_warning(
++      o_nca_sparse_mixed <- pk.nca(o_data_sparse_mixed),
++      class = "pknca_warning_sparse_df_multi"),
++      class = "pknca_warning_sparse_df_multi"
++    )
++  )
++  df_result_sparse_mixed <- as.data.frame(o_nca_sparse_mixed)
++  expect_true("sparse_auclast" %in% df_result_sparse_mixed$PPTESTCD)
++  expect_equal(df_result_sparse_mixed$PPORRES[df_result_sparse_mixed$PPTESTCD %in% "sparse_auclast"], rep(39.4689, 2))
++  suppressMessages(
++    expect_message(
++      expect_warning(expect_warning(
++        o_nca_sparse_mixed <- pk.nca(o_data_sparse_mixed, verbose=TRUE),
++        class = "pknca_warning_sparse_df_multi"),
++        class = "pknca_warning_sparse_df_multi"
++      ),
++      regexp="No sparse calculations requested for an interval"
++    )
++  )
++
++  # Sparse data with multiple treatments, confirm the correct number of rows of
++  # outputs are created.
++  d_sparse_200 <- d_sparse
++  d_sparse_200$dose <- 200
++  d_sparse_multi_trt <- rbind(d_sparse, d_sparse_200)
++  d_sparse_multi_trt$dose_grp <- d_sparse_multi_trt$dose
++  o_conc_sparse_multi_trt <- PKNCAconc(d_sparse_multi_trt, conc~time|dose_grp+id, sparse=TRUE)
++  d_intervals_mixed <-
++    data.frame(
++      start=0,
++      end=c(23, 24, 25),
++      cmax=c(TRUE, TRUE, FALSE),
++      sparse_auclast=c(FALSE, TRUE, TRUE)
++    )
++  d_dose_sparse_multi_trt <- unique(d_sparse_multi_trt[, c("id", "dose")])
++  d_dose_sparse_multi_trt$time <- 0
++  d_dose_sparse_multi_trt$dose_grp <- d_dose_sparse_multi_trt$dose
++  o_dose_sparse_multi_trt <- PKNCAdose(d_dose_sparse_multi_trt, dose~time|dose_grp+id)
++  o_data_sparse_multi_trt <- PKNCAdata(o_conc_sparse_multi_trt, o_dose_sparse_multi_trt, intervals=d_intervals_mixed)
++  suppressMessages(
++    expect_warning(expect_warning(expect_warning(expect_warning(
++      o_nca_sparse_multi_trt <- pk.nca(o_data_sparse_multi_trt),
++      class = "pknca_warning_sparse_df_multi"),
++      class = "pknca_warning_sparse_df_multi"),
++      class = "pknca_warning_sparse_df_multi"),
++      class = "pknca_warning_sparse_df_multi"
++    )
++  )
++  expect_equal(nrow(as.data.frame(o_nca_sparse_multi_trt)), 16)
++
++  # Correct detection of mixed doses within a sparse dose group when there are
++  # no grouping columns other than subject
++  d_sparse_multi_trt_bad_dose_single <- d_sparse_multi_trt[d_sparse_multi_trt$dose == 100, ]
++  d_dose_sparse_multi_trt_bad_dose_single <- unique(d_sparse_multi_trt_bad_dose_single[, c("id", "dose")])
++  d_dose_sparse_multi_trt_bad_dose_single$time <- 0
++  d_dose_sparse_multi_trt_bad_dose_single$dose[1] <- d_dose_sparse_multi_trt_bad_dose_single$dose[1] + 1
++  o_conc_sparse_multi_trt_bad_dose_single <- PKNCAconc(d_sparse_multi_trt_bad_dose_single, conc~time|id, sparse=TRUE)
++  o_dose_sparse_multi_trt_bad_dose_single <- PKNCAdose(d_dose_sparse_multi_trt_bad_dose_single, dose~time|id)
++  o_data_sparse_multi_trt_bad_dose_single <- PKNCAdata(o_conc_sparse_multi_trt_bad_dose_single, o_dose_sparse_multi_trt_bad_dose_single, intervals=d_intervals_mixed)
++  expect_error(
++    pk.nca(o_data_sparse_multi_trt_bad_dose_single),
++    regexp="With sparse PK, all subjects in a group must have the same dosing information.*Not all subjects have the same dosing information"
++  )
++
++  # Correct detection of mixed doses within a sparse dose group
++  d_dose_sparse_multi_trt_bad_dose <- d_dose_sparse_multi_trt
++  d_dose_sparse_multi_trt_bad_dose$dose[1] <- d_dose_sparse_multi_trt$dose[1] + 1
++  o_dose_sparse_multi_trt_bad_dose <- PKNCAdose(d_dose_sparse_multi_trt_bad_dose, dose~time|dose_grp+id)
++  o_data_sparse_multi_trt_bad_dose <- PKNCAdata(o_conc_sparse_multi_trt, o_dose_sparse_multi_trt_bad_dose, intervals=d_intervals_mixed)
++  expect_error(
++    pk.nca(o_data_sparse_multi_trt_bad_dose),
++    regexp="With sparse PK, all subjects in a group must have the same dosing information.*Not all subjects have the same dosing information for this group: +dose_grp=100"
++  )
++  # Correct detection of mixed doses within a sparse dose group when there are no groups
++})
++
++test_that("Unexpected interval columns now not cause an error (#238)", {
++  d_conc <-
++    data.frame(
++      ID = 1L,
++      time = 0:6,
++      conc = c(0, 0.7, 0.71, 0.85, 1, 0.76, 0.74)
++    )
++  d_dose <- data.frame(dose = 1)
++  d_intervals <- data.frame(start = 0, end = 6, cmax = TRUE, aucinf = TRUE)
++  o_conc <- PKNCAconc(d_conc, formula = conc~time|ID)
++  o_dose <- PKNCAdose(d_dose, formula = dose~.)
++  expect_error(PKNCAdata(o_conc, o_dose, intervals = d_intervals),
++               "The following columns in 'intervals' are not allowed:"
++  )
++})
++
++test_that("aucint works within pk.calc.all for all zero concentrations with interpolated or extrapolated concentrations", {
++  # AUCint.inf.obs
++  d_interval <- data.frame(start = 0, end = 4, aucint.inf.obs = TRUE)
++  d_conctime <- data.frame(conc = c(0, 0, 0, 0), time = 0:3)
++  o_conc <- PKNCAconc(d_conctime, conc~time)
++  o_data <- PKNCAdata(o_conc, intervals = d_interval)
++  suppressWarnings(suppressMessages(
++    o_nca <- pk.nca(o_data)
++  ))
++  results <- setNames(as.data.frame(o_nca)$PPORRES, nm = as.data.frame(o_nca)$PPTESTCD)
++  zero_names <- c("clast.obs", "aucint.inf.obs")
++  na_names <- setdiff(names(results), zero_names)
++  expect_equal(
++    results[zero_names],
++    setNames(rep(0, length(zero_names)), zero_names)
++  )
++  expect_equal(
++    results[na_names],
++    setNames(rep(NA_real_, length(na_names)), na_names)
++  )
++
++  # AUCint.inf.pred
++  d_interval <- data.frame(start = 0, end = 4, aucint.inf.pred = TRUE)
++  d_conctime <- data.frame(conc = c(0, 0, 0, 0), time = 0:3)
++  o_conc <- PKNCAconc(d_conctime, conc~time)
++  o_data <- PKNCAdata(o_conc, intervals = d_interval)
++  suppressWarnings(suppressMessages(
++    o_nca <- pk.nca(o_data)
++  ))
++  expect_equal(
++    as.data.frame(o_nca)$PPORRES,
++    c(rep(NA_real_, 12), 0)
++  )
++})
++
++test_that("The option keep_interval_cols is respected", {
++  d_interval <- data.frame(start = 0, end = 4, cmax = TRUE, foo = "A")
++  d_conctime <- data.frame(conc = c(0, 0, 0, 0), time = 0:3)
++  o_conc <- PKNCAconc(d_conctime, conc~time)
++ expect_error(PKNCAdata(o_conc, intervals = d_interval),
++              "The following columns in 'intervals' are not allowed:")
++
++  o_data <- PKNCAdata(o_conc, intervals = d_interval, options = list(keep_interval_cols = "foo"))
++  suppressWarnings(suppressMessages(
++    o_nca <- pk.nca(o_data)
++  ))
++  expect_equal(o_nca$result$foo, "A")
++  expect_true("foo" %in% names(summary(o_nca)))
++})
++
++test_that("dose is calculable", {
++  tmpconc <- generate.conc(2, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose, intervals = data.frame(start = 0, end = Inf, totdose = TRUE))
++  myresult <- pk.nca(mydata)
++
++  # One dose in the interval
++  expect_equal(as.data.frame(myresult)$PPORRES, rep(1, 2))
++  expect_equal(as.data.frame(myresult)$PPTESTCD, rep("totdose", 2))
++
++  # Don't give dose data
++  mydata <- PKNCAdata(myconc, intervals = data.frame(start = 0, end = Inf, totdose = TRUE))
++  suppressMessages(myresult <- pk.nca(mydata))
++  expect_equal(as.data.frame(myresult)$PPORRES, rep(NA_real_, 2))
++  expect_equal(as.data.frame(myresult)$PPTESTCD, rep("totdose", 2))
++
++  # Multiple doses in the interval
++  tmpdose_second <- tmpdose
++  tmpdose_second$time <- 1
++  mydose <- PKNCAdose(rbind(tmpdose, tmpdose_second), formula=dose~time|treatment+ID)
++  mydata <- PKNCAdata(myconc, mydose, intervals = data.frame(start = 0, end = Inf, totdose = TRUE))
++  myresult <- pk.nca(mydata)
++  expect_equal(as.data.frame(myresult)$PPORRES, rep(2, 2))
++  expect_equal(as.data.frame(myresult)$PPTESTCD, rep("totdose", 2))
++})
++
++test_that("do not give rbind error when interval columns have attributes (#381)", {
++  o_conc <- PKNCAconc(data = data.frame(conc = 1, time = 0), conc~time)
++  d_interval <- data.frame(start = 0, end = Inf, cmax = TRUE, tmax = TRUE)
++  attr(d_interval$start, "label") <- "start"
++  o_data <- PKNCAdata(o_conc, intervals = d_interval)
++  suppressMessages(o_nca <- pk.nca(o_data))
++  # interval attributes are preserved
++  expect_equal(
++    attributes(as.data.frame(o_nca)$start),
++    list(label = "start")
++  )
++})
++
++test_that("pk.nca produces the PPANMETH column", {
++  # --- Setup shared concentration and dose data ---
++  tmpconc <- generate.conc(1, 1, 0:24)
++  tmpdose <- generate.dose(tmpconc)
++  myconc <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  mydose <- PKNCAdose(tmpdose, formula=dose~time|treatment+ID)
++
++  # --- PPANMETH differentiates based on the AUC method used ---
++  mydata_linear <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, auclast=TRUE), options=list(auc.method="linear"))
++  mydata_linlog <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, auclast=TRUE), options=list(auc.method="lin up/log down"))
++  res_linear <- pk.nca(mydata_linear)
++  res_linlog <- pk.nca(mydata_linlog)
++  expect_true("PPANMETH" %in% names(res_linear$result))
++  expect_true("PPANMETH" %in% names(res_linlog$result))
++  expect_true(any(grepl("AUC: linear", res_linear$result$PPANMETH, fixed=TRUE)))
++  expect_true(any(grepl("AUC: lin up/log down", res_linlog$result$PPANMETH, fixed=TRUE)))
++
++  # --- PPANMETH distinguishes how the half.life was adjusted ---
++  tmpconc$include_hl <- tmpconc$time <= 22
++  tmpconc$exclude_hl <- tmpconc$time == 22
++  myconc_base <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID)
++  myconc_incl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, include_half.life="include_hl")
++  myconc_excl <- PKNCAconc(tmpconc, formula=conc~time|treatment+ID, exclude_half.life="exclude_hl")
++  mydata_base <- PKNCAdata(myconc_base, mydose, intervals=data.frame(start=0, end=24, lambda.z=TRUE))
++  mydata_incl <- PKNCAdata(myconc_incl, mydose, intervals=data.frame(start=0, end=24, lambda.z=TRUE))
++  mydata_excl <- PKNCAdata(myconc_excl, mydose, intervals=data.frame(start=0, end=24, lambda.z=TRUE))
++  res_base <- pk.nca(mydata_base)
++  res_incl <- pk.nca(mydata_incl)
++  res_excl <- pk.nca(mydata_excl)
++  expect_true("PPANMETH" %in% names(res_base$result))
++  expect_true("PPANMETH" %in% names(res_incl$result))
++  expect_true("PPANMETH" %in% names(res_excl$result))
++  expect_equal(
++    unique(res_base$result$PPANMETH[res_base$result$PPTESTCD %in% c("lambda.z", "half.life", "r.squared")]),
++    ""
++  )
++  expect_equal(
++    unique(res_incl$result$PPANMETH[res_incl$result$PPTESTCD %in% c("lambda.z", "half.life", "r.squared")]),
++    "Lambda Z: Manual selection"
++  )
++  expect_equal(
++    unique(res_excl$result$PPANMETH[res_excl$result$PPTESTCD %in% c("lambda.z", "half.life", "r.squared")]),
++    ""
++  )
++  expect_equal(
++    unique(res_base$result$PPANMETH[res_base$result$PPTESTCD %in% c("tmax", "cmax")]),
++    ""
++  )
++  expect_equal(
++    unique(res_incl$result$PPANMETH[res_incl$result$PPTESTCD %in% c("tmax", "cmax")]),
++    ""
++  )
++  expect_equal(
++    unique(res_excl$result$PPANMETH[res_excl$result$PPTESTCD %in% c("tmax", "cmax")]),
++    ""
++  )
++
++  # --- PPANMETH specifies if an imputation method was used in the interval ---
++  o_data <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, c0=TRUE))
++  o_data_impute <- PKNCAdata(myconc, mydose, intervals=data.frame(start=0, end=24, c0=TRUE), impute="start_conc0")
++  res <- pk.nca(o_data)
++  res_impute <- pk.nca(o_data_impute)
++  expect_equal(res$result$PPANMETH, "")
++  expect_true("PPANMETH" %in% names(res$result))
++  expect_equal(res$result$PPANMETH, "")
++  expect_equal(res_impute$result$PPANMETH, "Imputation: start_conc0")
++
++  # --- PPANMETH reports based on the parameter dependencies ---
++  mydata <- PKNCAdata(
++    myconc_incl, mydose,
++    intervals=data.frame(start=0, end=24, c0 = TRUE, half.life = TRUE, aucinf.pred=TRUE),
++    impute = "start_conc0"
++  )
++  res <- pk.nca(mydata)
++  expect_equal(
++    res$result$PPANMETH[res$result$PPTESTCD == "c0"],
++    "Imputation: start_conc0"
++  )
++  expect_equal(
++    res$result$PPANMETH[res$result$PPTESTCD == "half.life"],
++    "Imputation: start_conc0. Lambda Z: Manual selection"
++  )
++  expect_equal(
++    res$result$PPANMETH[res$result$PPTESTCD == "aucinf.pred"],
++    "Imputation: start_conc0. AUC: lin up/log down"
++  )
++})
++
++test_that("pk.nca can be run for each parameter independently (#473)", {
++  
++  # ── Dense data setup ──────────────────────────────────────────────────────
++  d_conc <- Theoph[Theoph$Subject %in% "1", ]
++  d_conc <- rbind(d_conc, mutate(d_conc, Time = Time + 25))
++  d_conc$volume   <- 1
++  d_conc$duration <- 1
++  d_dose <- data.frame(
++    Subject  = "1",
++    Time     = c(0, 25),
++    Dose     = 5,
++    duration = 1
++  )
++  o_conc_dense <- PKNCAconc(
++    d_conc,
++    formula  = conc~Time|Subject,
++    volume   = "volume",
++    duration = "duration"
++  )
++  o_dose_dense <- PKNCAdose(
++    d_dose,
++    formula  = Dose~Time|Subject,
++    route    = "intravascular",
++    duration = "duration"
++  )
++  
++  # ── Sparse data setup ─────────────────────────────────────────────────────
++  # Each subject measured at DIFFERENT time points
++  # → no shared times → off-diagonal covariance = 0
++  # → no warning fires → df calculable (NA only when n=1, silently)
++  d_sparse <- data.frame(
++    conc = c(
++      1.0, 3.0, 2.0, 0.5,    # Subject A
++      2.0, 2.5, 1.5, 0.8,    # Subject B
++      1.5, 3.5, 1.8, 0.6     # Subject C
++    ),
++    time = c(
++      0,  3,  7, 11,          # Subject A — unique times
++      1,  4,  8, 12,          # Subject B — unique times
++      2,  5,  9, 10           # Subject C — unique times
++    ),
++    Subject = c(rep("A", 4), rep("B", 4), rep("C", 4))
++  )
++  d_dose_sparse <- data.frame(
++    Subject  = c("A", "B", "C"),
++    time     = c(0, 0, 0),
++    Dose     = c(5, 5, 5),
++    duration = c(1, 1, 1)
++  )
++  
++  o_conc_sparse <- PKNCAconc(
++    d_sparse,
++    formula = conc~time|Subject,
++    sparse  = TRUE
++  )
++  o_dose_sparse <- PKNCAdose(
++    d_dose_sparse,
++    formula  = Dose~time|Subject,
++    route    = "extravascular",
++    duration = "duration"
++  )
++  
++  # ── Params that cannot be tested independently ────────────────────────────
++  # These require special data structures or multi-dose designs
++  # and are tested in dedicated tests elsewhere
++  non_pknca_covered_params <- c(
++    "f", "time_above",
++    "sparse_auc_se", "sparse_auc_df",
++    "sparse_aumc_se", "sparse_aumc_df",
++    "ceoi"
++  )
++  
++  all_params <- setdiff(
++    names(get.interval.cols()),
++    c("start", "end", non_pknca_covered_params)
++  )
++  
++  # ── Classify params as sparse or dense ───────────────────────────────────
++  all_interval_cols <- get.interval.cols()
++  sparse_params <- Filter(
++    function(p) isTRUE(all_interval_cols[[p]]$sparse),
++    all_params
++  )
++  dense_params <- setdiff(all_params, sparse_params)
++  
++  # ── Intervals ─────────────────────────────────────────────────────────────
++  intervals_dense  <- data.frame(start = c(0, 25), end = c(25, Inf))
++  
++  # sparse_auclast and sparse_aumclast must be TRUE so that
++  # dependent params (cl.sparse.last, mrt.sparse.last etc.)
++  # have their dependencies available in the pipeline
++  intervals_sparse <- data.frame(
++    start           = 0,
++    end             = 12,
++    sparse_auclast  = TRUE,
++    sparse_aumclast = TRUE
++  )
++  
++  # ── Test dense params with dense data ────────────────────────────────────
++  for (param in dense_params) {
++    intervals_with_param <- intervals_dense
++    intervals_with_param[[param]] <- TRUE
++    o_data <- PKNCAdata(o_conc_dense, o_dose_dense,
++                        intervals = intervals_with_param)
++    expect_no_error(
++      param_res <- pk.nca(o_data)
++    )
++    expect_false(
++      all(is.na(param_res$result$PPORRES)),
++      info = paste0("Parameter ", param, " can be calculated independently")
++    )
++  }
++  
++  # ── Test sparse params with sparse data ──────────────────────────────────
++  for (param in sparse_params) {
++    intervals_with_param <- intervals_sparse
++    intervals_with_param[[param]] <- TRUE
++    o_data <- PKNCAdata(o_conc_sparse, o_dose_sparse,
++                        intervals = intervals_with_param)
++    expect_no_error(
++      param_res <- pk.nca(o_data)
++    )
++    expect_false(
++      all(is.na(param_res$result$PPORRES)),
++      info = paste0("Parameter ", param, " can be calculated independently")
++    )
++  }
++})
++
++
++test_that("Cannot include and exclude half-life points at the same time (#406)", {
++  o_conc <- PKNCAconc(data = data.frame(conc = 1, time = 0, inex = TRUE), conc~time, include_half.life = "inex", exclude_half.life = "inex")
++  d_interval <- data.frame(start = 0, end = Inf, half.life = TRUE)
++  o_data <- PKNCAdata(o_conc, intervals = d_interval)
++  expect_error(
++    suppressMessages(pk.nca(o_data)),
++    regexp = "Cannot both include and exclude half-life points for the same interval"
++  )
++})
++
++test_that("pk.nca.interval covers route, volume.group, duration.conc.group, dose.group, duration.dose.group, route.group branches", {
++  # Lines 449, 457, 459, 461, 467, 469 in pk.calc.all.R are only reached when a
++  # registered NCA function has one of these names as a formal argument.
++  # Register a temporary test function that accepts all six, save and restore state.
++  fn_name <- "pknca_test_grp_args_cov_fn_"
++  assign(
++    fn_name,
++    function(conc, time, route, volume.group, duration.conc.group,
++             dose.group, duration.dose.group, route.group) {
++      sum(conc, na.rm = TRUE)
++    },
++    envir = .GlobalEnv
++  )
++  old_cols <- get("interval.cols", envir = PKNCA:::.PKNCAEnv)
++  old_sorted <- get0("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv)
++  on.exit({
++    assign("interval.cols", old_cols, envir = PKNCA:::.PKNCAEnv)
++    if (!is.null(old_sorted)) {
++      assign("interval.cols_sorted", old_sorted, envir = PKNCA:::.PKNCAEnv)
++    } else if (exists("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv, inherits = FALSE)) {
++      rm("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv)
++    }
++    rm(list = fn_name, envir = .GlobalEnv)
++  }, add = TRUE)
++
++  add.interval.col(
++    "pknca_test_grp_args_cov_col_",
++    FUN = fn_name,
++    unit_type = "conc",
++    pretty_name = "Test: group arg branches",
++    desc = "Coverage test for group arg branches"
++  )
++
++  d <- as.data.frame(datasets::Theoph[datasets::Theoph$Subject == "1", ])
++  d$volume <- 1
++  d$duration <- 1
++  d_dose <- d[d$Time == 0, , drop = FALSE]
++
++  o_conc <- PKNCAconc(d, formula = conc~Time|Subject, volume = "volume", duration = "duration")
++  o_dose <- PKNCAdose(d_dose, formula = Dose~Time|Subject, route = "intravascular", duration = "duration")
++  o_data <- PKNCAdata(
++    o_conc, o_dose,
++    intervals = data.frame(start = 0, end = 24, pknca_test_grp_args_cov_col_ = TRUE)
++  )
++  result <- pk.nca(o_data)
++  expect_true("pknca_test_grp_args_cov_col_" %in% as.data.frame(result)$PPTESTCD)
++})
++
++test_that("pk.nca sorts group data by time so unsorted input works (#568)", {
++  conc_data <-
++    data.frame(
++      MRRLT = c(16, -0.8, 3, 6, 8, 12, 20, 25),
++      AVAL = c(120, 260, 340, 300, 210, 150, 110, 90)
++    )
++  conc_sorted <- conc_data[order(conc_data$MRRLT), ]
++  dose_data <- data.frame(EXDOSE = 1)
++
++  run_nca <- function(cdat) {
++    o_conc <- PKNCAconc(cdat, AVAL ~ MRRLT)
++    o_dose <- PKNCAdose(dose_data, EXDOSE ~ .)
++    intervals <-
++      data.frame(
++        start = 0, end = 24,
++        aucint.all = TRUE, aucint.last = TRUE, aucint.inf.obs = TRUE,
++        cmax = TRUE, half.life = TRUE
++      )
++    o_data <-
++      PKNCAdata(
++        o_conc, o_dose, intervals = intervals,
++        options = list(auc.method = "linear")
++      )
++    as.data.frame(suppressWarnings(pk.nca(o_data)))
++  }
++
++  # Previously errored with "Assertion on 'time' failed: Must be sorted."
++  res_unsorted <- expect_no_error(run_nca(conc_data))
++  res_sorted <- run_nca(conc_sorted)
++
++  # aucint* parameters (which use the group-level time/conc) are calculable and
++  # identical regardless of the input ordering.
++  expect_equal(
++    res_unsorted$PPORRES[res_unsorted$PPTESTCD == "aucint.all"],
++    4523.263157894737
++  )
++  # Every parameter matches the pre-sorted calculation.
++  merged <-
++    merge(
++      res_unsorted[, c("PPTESTCD", "PPORRES")],
++      res_sorted[, c("PPTESTCD", "PPORRES")],
++      by = "PPTESTCD", suffixes = c(".uns", ".srt")
++    )
++  expect_equal(merged$PPORRES.uns, merged$PPORRES.srt)
++})
++
++test_that("mrt.md and vss.md get tau from the intervals or the dose times (#151)", {
++  # Steady-state profile for a one-compartment IV bolus with CL=0.5, V=10
++  # (k=0.05) dosed 100 every 24 hours, so the true MRT is 1/k = 20 and the true
++  # Vss is V = 10.
++  tau <- 24
++  d_time <- c(0, 0.5, 1, 2, 4, 6, 8, 12, 18, 24)
++  d_conc <- 10/(1 - exp(-0.05*tau))*exp(-0.05*d_time)
++
++  # A single dose in the dosing data (the common steady-state design): tau
++  # cannot be detected, so it comes from the interval specification.
++  o_conc_1 <- PKNCAconc(data.frame(subj=1, time=d_time, conc=d_conc), conc~time|subj)
++  o_dose_1 <- PKNCAdose(data.frame(subj=1, time=0, dose=100), dose~time|subj, route="intravascular")
++  interval_tau <-
++    data.frame(
++      start=0, end=tau, tau=tau,
++      auclast=TRUE, aumclast=TRUE, aucinf.obs=TRUE, cl.last=TRUE,
++      mrt.md.obs=TRUE, vss.md.obs=TRUE
++    )
++  res_1 <- as.data.frame(pk.nca(PKNCAdata(o_conc_1, o_dose_1, intervals=interval_tau)))
++  value_1 <- stats::setNames(res_1$PPORRES, res_1$PPTESTCD)
++
++  # The multiple-dose equation recovers the model's true MRT and Vss exactly
++  # here; the single-dose parameters over the same interval do not (mrt.last is
++  # AUMClast/AUClast = 9.66).
++  expect_equal(value_1[["mrt.md.obs"]], 20, tolerance=1e-8)
++  expect_equal(value_1[["vss.md.obs"]], 10, tolerance=1e-8)
++  # The wiring is what is under test: confirm the reported value is the
++  # multiple-dose equation applied to this interval's own AUC and AUMC.
++  expect_equal(
++    value_1[["mrt.md.obs"]],
++    value_1[["aumclast"]]/value_1[["auclast"]] +
++      tau*(value_1[["aucinf.obs"]] - value_1[["auclast"]])/value_1[["auclast"]]
++  )
++  expect_equal(value_1[["vss.md.obs"]], value_1[["cl.last"]]*value_1[["mrt.md.obs"]])
++
++  # The same profile as the last of four q24h doses: tau is detected from the
++  # dose times, so no tau column is needed.
++  o_conc_4 <-
++    PKNCAconc(data.frame(subj=1, time=3*tau + d_time, conc=d_conc), conc~time|subj)
++  o_dose_4 <-
++    PKNCAdose(
++      data.frame(subj=1, time=(0:3)*tau, dose=100),
++      dose~time|subj, route="intravascular"
++    )
++  interval_detect <-
++    data.frame(
++      start=3*tau, end=4*tau,
++      auclast=TRUE, aumclast=TRUE, aucinf.obs=TRUE, cl.last=TRUE,
++      mrt.md.obs=TRUE, vss.md.obs=TRUE
++    )
++  res_4 <- as.data.frame(pk.nca(PKNCAdata(o_conc_4, o_dose_4, intervals=interval_detect)))
++  value_4 <- stats::setNames(res_4$PPORRES, res_4$PPTESTCD)
++  expect_equal(value_4[["mrt.md.obs"]], value_1[["mrt.md.obs"]])
++  expect_equal(value_4[["vss.md.obs"]], value_1[["vss.md.obs"]])
++
++  # A tau column overrides detection
++  interval_override <- interval_detect
++  interval_override$tau <- 12
++  res_override <-
++    as.data.frame(pk.nca(PKNCAdata(o_conc_4, o_dose_4, intervals=interval_override)))
++  value_override <- stats::setNames(res_override$PPORRES, res_override$PPTESTCD)
++  expect_equal(
++    value_override[["mrt.md.obs"]],
++    value_1[["aumclast"]]/value_1[["auclast"]] +
++      12*(value_1[["aucinf.obs"]] - value_1[["auclast"]])/value_1[["auclast"]]
++  )
++
++  # Without a tau column and without repeating doses, the parameter is NA
++  # rather than silently falling back to the single-dose equation.
++  interval_no_tau <- interval_tau
++  interval_no_tau$tau <- NULL
++  expect_warning(
++    res_na <- as.data.frame(pk.nca(PKNCAdata(o_conc_1, o_dose_1, intervals=interval_no_tau))),
++    class="pknca_warning_tau_undetermined"
++  )
++  value_na <- stats::setNames(res_na$PPORRES, res_na$PPTESTCD)
++  expect_equal(value_na[["mrt.md.obs"]], NA_real_)
++  expect_equal(value_na[["vss.md.obs"]], NA_real_)
++  # The single-dose parameters in the same interval are unaffected
++  expect_equal(value_na[["auclast"]], value_1[["auclast"]])
++})
++
++test_that("mrt.md.pred and vss.md.pred get tau the same way (#151)", {
++  tau <- 12
++  d_time <- c(0, 0.5, 1, 2, 4, 6, 9, 12)
++  d_conc <- 10/(1 - exp(-0.1*tau))*exp(-0.1*d_time)
++  o_conc <- PKNCAconc(data.frame(subj=1, time=d_time, conc=d_conc), conc~time|subj)
++  o_dose <- PKNCAdose(data.frame(subj=1, time=0, dose=50), dose~time|subj, route="intravascular")
++  interval <-
++    data.frame(
++      start=0, end=tau, tau=tau,
++      auclast=TRUE, aumclast=TRUE, aucinf.pred=TRUE, cl.last=TRUE,
++      mrt.md.pred=TRUE, vss.md.pred=TRUE
++    )
++  res <- as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals=interval)))
++  value <- stats::setNames(res$PPORRES, res$PPTESTCD)
++  expect_equal(
++    value[["mrt.md.pred"]],
++    value[["aumclast"]]/value[["auclast"]] +
++      tau*(value[["aucinf.pred"]] - value[["auclast"]])/value[["auclast"]]
++  )
++  expect_equal(value[["vss.md.pred"]], value[["cl.last"]]*value[["mrt.md.pred"]])
++  expect_false(is.na(value[["mrt.md.pred"]]))
++})
++
++test_that("mrt.ivmd and vss.ivmd correct the multiple-dose MRT for the infusion duration (#151)", {
++  # The same steady-state one-compartment profile as above (CL=0.5, V=10,
++  # k=0.05, 100 q24h) given as a 4 hour infusion instead of a bolus.  The true
++  # MRT is still 1/k = 20 and the true Vss is still V = 10.
++  tau <- 24
++  duration <- 4
++  d_time <- c(0, 1, 2, 3, 4, 5, 6, 8, 12, 18, 24)
++  # Superposition of the single-dose infusion profile over many prior doses
++  conc_single <- function(t) {
++    rate <- 100/duration
++    ifelse(
++      t <= duration,
++      rate/0.5*(1 - exp(-0.05*t)),
++      rate/0.5*(1 - exp(-0.05*duration))*exp(-0.05*(t - duration))
++    )
++  }
++  d_conc <- rowSums(sapply(0:400, function(i) conc_single(d_time + i*tau)))
++
++  o_conc <- PKNCAconc(data.frame(subj=1, time=d_time, conc=d_conc), conc~time|subj)
++  o_dose <-
++    PKNCAdose(
++      data.frame(subj=1, time=0, dose=100, duration=duration),
++      dose~time|subj, route="intravascular", duration="duration"
++    )
++  interval <-
++    data.frame(
++      start=0, end=tau, tau=tau, cl.last=TRUE,
++      mrt.md.obs=TRUE, vss.md.obs=TRUE,
++      mrt.ivmd.obs=TRUE, vss.ivmd.obs=TRUE,
++      mrt.ivmd.pred=TRUE, vss.ivmd.pred=TRUE
++    )
++  res <- as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals=interval)))
++  value <- stats::setNames(res$PPORRES, res$PPTESTCD)
++
++  # The IV form hits the true MRT and Vss; the non-IV form is high by
++  # duration/2 and by cl.last*duration/2 respectively.
++  expect_equal(value[["mrt.ivmd.obs"]], 20, tolerance=1e-3)
++  expect_equal(value[["vss.ivmd.obs"]], 10, tolerance=1e-3)
++  expect_equal(value[["mrt.ivmd.obs"]], value[["mrt.md.obs"]] - duration/2)
++  expect_equal(
++    value[["vss.md.obs"]] - value[["vss.ivmd.obs"]],
++    value[["cl.last"]]*duration/2
++  )
++  expect_equal(value[["vss.ivmd.obs"]], value[["cl.last"]]*value[["mrt.ivmd.obs"]])
++  expect_equal(value[["vss.ivmd.pred"]], value[["cl.last"]]*value[["mrt.ivmd.pred"]])
++
++  # tau reaches the IV form the same way it reaches the non-IV form.  One
++  # warning is raised per requested parameter that takes tau, so collect them
++  # all rather than letting the ones expect_warning() does not take escape.
++  interval_no_tau <- interval
++  interval_no_tau$tau <- NULL
++  warn_class <- character()
++  res_na <-
++    withCallingHandlers(
++      as.data.frame(pk.nca(PKNCAdata(o_conc, o_dose, intervals=interval_no_tau))),
++      warning = function(w) {
++        warn_class <<- c(warn_class, class(w)[1])
++        invokeRestart("muffleWarning")
++      }
++    )
++  expect_equal(warn_class, rep("pknca_warning_tau_undetermined", 3),
++               info="one warning per requested parameter taking tau")
++  value_na <- stats::setNames(res_na$PPORRES, res_na$PPTESTCD)
++  expect_equal(value_na[["mrt.ivmd.obs"]], NA_real_)
++  expect_equal(value_na[["vss.ivmd.obs"]], NA_real_)
++  expect_equal(value_na[["mrt.ivmd.pred"]], NA_real_)
++  expect_equal(value_na[["vss.ivmd.pred"]], NA_real_)
++})
++
++test_that("an I()-wrapped formalsmap value is passed to the function as a constant", {
++  fn_name <- "pknca_test_formalsmap_constant_"
++  assign(
++    fn_name,
++    function(conc, time, multiplier) {
++      multiplier * length(conc)
++    },
++    envir = .GlobalEnv
++  )
++  old_cols <- get("interval.cols", envir = PKNCA:::.PKNCAEnv)
++  old_sorted <- get0("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv)
++  on.exit({
++    assign("interval.cols", old_cols, envir = PKNCA:::.PKNCAEnv)
++    if (!is.null(old_sorted)) {
++      assign("interval.cols_sorted", old_sorted, envir = PKNCA:::.PKNCAEnv)
++    } else if (exists("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv, inherits = FALSE)) {
++      rm("interval.cols_sorted", envir = PKNCA:::.PKNCAEnv)
++    }
++    rm(list = fn_name, envir = .GlobalEnv)
++  }, add = TRUE)
++
++  add.interval.col(
++    "pknca_test_formalsmap_constant_col_",
++    FUN = fn_name,
++    unit_type = "conc",
++    pretty_name = "Test: formalsmap constant",
++    desc = "Coverage test for a formalsmap constant",
++    formalsmap = list(multiplier = I(10))
++  )
++  # A constant is the value itself, not a reference to another parameter
++  expect_equal(
++    get.parameter.deps("pknca_test_formalsmap_constant_col_", recursive = TRUE),
++    c("conc", "time")
++  )
++
++  d_conc <- data.frame(conc = c(1, 2, 3), time = c(0, 1, 2))
++  o_data <-
++    PKNCAdata(
++      PKNCAconc(d_conc, conc~time),
++      PKNCAdose(data.frame(dose = 1, time = 0), dose~time),
++      intervals =
++        data.frame(start = 0, end = 24, pknca_test_formalsmap_constant_col_ = TRUE)
++    )
++  result <- as.data.frame(pk.nca(o_data))
++  expect_equal(
++    result$PPORRES[result$PPTESTCD == "pknca_test_formalsmap_constant_col_"],
++    30
++  )
++})
+\ No newline at end of file
+diff --git a/vignettes/v80-writing-parameter-functions.Rmd b/vignettes/v80-writing-parameter-functions.Rmd
+index 2427cd385..0474bb7dd 100644
+--- a/vignettes/v80-writing-parameter-functions.Rmd
++++ b/vignettes/v80-writing-parameter-functions.Rmd
+@@ -58,6 +58,31 @@ Just writing a function doesn't connect it to the rest of PKNCA.  You have to te
+ * `formalsmap` remaps the (formal) function arguments.  `formalsmap` is usually used when the same function may be used for multiple different parameters, for example the function `pk.calc.thalf.eff` is used to calculate the parameters `thalf.eff.obs`, `thalf.eff.pred`, `thalf.eff.last`, `thalf.eff.iv.obs`, `thalf.eff.iv.pred`, and `thalf.eff.iv.last` with different mean residence time inputs.
+ * `desc` is a text description of the parameter.
+ 
++## Passing a Constant with `formalsmap`
++
++A `formalsmap` value is normally the name of an NCA parameter or of one of the data inputs (`"conc"`, `"time"`, `"dose"`, and the rest listed in `help("add.interval.col")`).  Wrapping the value in `I()` passes it to the function unchanged instead of looking it up:
++
++    formalsmap = list(auc="aucall", auc.type=I("AUCall"))
++
++Use this when one function serves several parameters and an argument selects which variant to calculate.  `pk.calc.auciv` is shared by all six IV AUC parameters, and each registration names its own `auc.type`:
++
++    add.interval.col(
++      name = "aucivlast",
++      FUN = "pk.calc.auciv",
++      unit_type = "auc",
++      pretty_name = "AUClast (IV dosing)",
++      depends = c("auclast", "c0"),
++      desc = "AUClast, IV back-extrap C0",
++      formalsmap = list(auc="auclast", auc.type=I("AUClast"), lambda.z=NULL, clast=NULL)
++    )
++
++Without `I()`, `"AUCall"` would be looked up as a parameter name, not found, and the argument would silently keep its default.
++
++Two related points:
++
++* A constant is not a calculation dependency, so it does not appear in `get.parameter.deps(recursive=TRUE)` and does not affect whether PKNCA reports the parameter as needing dose or volume information.
++* Mapping an argument to `NULL` (as with `lambda.z` and `clast` above) drops it from the call so that it keeps its default.  Do this for any argument whose name matches an NCA parameter that this parameter does not use.  An argument named `lambda.z` that is left out of the `formalsmap` is filled from the calculated `lambda.z` when one exists, and otherwise from the interval column of the same name, which is the `TRUE`/`FALSE` requesting the parameter rather than a value.
++
+ # Tell PKNCA How to Summarize the Parameter
+ 
+ For any parameter, PKNCA needs to know how to summarize it for the `summary` function of the `PKNCAresults` class.  To tell PKNCA how to summarize a parameter, use the `PKNCA.set.summary` function.  It takes at least these four arguments:

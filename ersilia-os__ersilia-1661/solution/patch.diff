@@ -1,0 +1,463 @@
+diff --git a/ersilia/default.py b/ersilia/default.py
+index 6ef0d94d6..c3d8b5193 100644
+--- a/ersilia/default.py
++++ b/ersilia/default.py
+@@ -115,7 +115,7 @@
+ 
+ H5_EXTENSION = ".h5"
+ H5_DATA_FILE = "data.h5"
+-REDIS_SERVER = "redis://127.0.0.1:6379"
++REDIS_SERVER = "redis://redis:6379"
+ # Other
+ FEATURE_MERGE_PATTERN = "---"
+ HEADER_INDICATORS = [
+@@ -128,8 +128,7 @@
+ # URLS
+ REDIS_EXPIRATION = 3600 * 24 * 7
+ REDIS_PORT = 6379
+-REDIS_SERVER = "redis://localhost:%s" % REDIS_PORT
+-REDIS_CONTAINER_NAME = "redis-server"
++REDIS_CONTAINER_NAME = "redis"
+ REDIS_IMAGE = "redis:latest"
+ REDIS_HOST = "localhost"
+ ERSILIA_WEB_URL = "https://ersilia.io"
+diff --git a/ersilia/serve/autoservice.py b/ersilia/serve/autoservice.py
+index 3c2e4a700..adb4337bc 100644
+--- a/ersilia/serve/autoservice.py
++++ b/ersilia/serve/autoservice.py
+@@ -418,12 +418,12 @@ def serve(self):
+         self.clean_temp_dir()
+         self.close()
+         self.service.serve()
++        self.logger.info("Setting up Redis")
++        self.setup_redis.ensure_redis_running()
+         tmp_file = tmp_pid_file(self.model_id)
+         with open(tmp_file, "a+") as f:
+             f.write("{0} {1}{2}".format(self.service.pid, self.service.url, os.linesep))
+         # setting up the Redis container
+-        self.logger.info("Setting up Redis")
+-        self.setup_redis.ensure_redis_running()
+ 
+     def close(self):
+         """
+diff --git a/ersilia/serve/services.py b/ersilia/serve/services.py
+index 47a065406..f9424ba7e 100644
+--- a/ersilia/serve/services.py
++++ b/ersilia/serve/services.py
+@@ -1368,29 +1368,32 @@ def serve(self):
+         Serve the model using the Docker image service.
+         """
+         self._create_docker_network()
+-
+         self._stop_all_containers_of_image()
+-        self.container_name = "{0}_{1}".format(self.model_id, str(uuid.uuid4())[:4])
+-        self.logger.debug("Trying to run container")
+-        if self._mem_gb is None:
+-            self.container = self.client.containers.run(
+-                self.image_name,
+-                name=self.container_name,
+-                detach=True,
+-                ports={"80/tcp": self.port},
+-            )
+-        else:
+-            self.container = self.client.containers.run(
+-                self.image_name,
+-                name=self.container_name,
+-                detach=True,
+-                ports={"80/tcp": self.port},
+-                mem_limit="{0}g".format(self._mem_gb),
+-            )
+-        self.logger.debug("Serving container {0}".format(self.container_name))
++        self.container_name = f"{self.model_id}_{str(uuid.uuid4())[:4]}"
++
++        env = {
++            "REDIS_HOST": os.getenv("REDIS_HOST", "redis"),
++            "REDIS_PORT": os.getenv("REDIS_PORT", "6379"),
++            "REDIS_URI": os.getenv("REDIS_URI", "redis://redis:6379"),
++            "REDIS_EXPIRATION": os.getenv("REDIS_EXPIRATION", str(3600 * 24 * 7)),
++        }
++
++        run_kwargs = dict(
++            image=self.image_name,
++            name=self.container_name,
++            detach=True,
++            ports={"80/tcp": self.port},
++            environment=env,
++            network=DEFAULT_DOCKER_NETWORK_NAME,
++        )
++
++        if self._mem_gb is not None:
++            run_kwargs["mem_limit"] = f"{self._mem_gb}g"
++
++        self.logger.debug(f"Running container with env: {env!r}")
++        self.container = self.client.containers.run(**run_kwargs)
+ 
+         self.container_id = self.container.id
+-        self.logger.debug(f"Running container {self.container_id}")
+         self.url = f"http://0.0.0.0:{self.port}"
+         self._wait_until_container_is_running()
+         self._apis_list = self._get_apis()
+diff --git a/ersilia/store/api.py b/ersilia/store/api.py
+index 955d8b6cc..98dd14a1c 100644
+--- a/ersilia/store/api.py
++++ b/ersilia/store/api.py
+@@ -118,7 +118,7 @@ def get_precalculations(self, inputs: list) -> str:
+                 return self._handle_strict_local(inputs)
+ 
+             shards = self._submit_and_get_shards(inputs)
+-            return self._merge_shards(shards)
++            return self._merge_shards(shards, inputs)
+ 
+         except Abort:
+             echo_sys_exited(self.click)
+@@ -293,10 +293,11 @@ def _submit_and_get_shards(self, inputs: list) -> list:
+ 
+         return shards
+ 
+-    def _merge_shards(self, shards: list) -> str:
++    def _merge_shards(self, shards: list, inputs: list) -> str:
+         self.files.merge_shards(
+             shards,
+             self.header,
++            inputs,
+             self.output_path,
+             self.api,
+             self.click,
+diff --git a/ersilia/store/utils.py b/ersilia/store/utils.py
+index cd2865681..1324047dc 100644
+--- a/ersilia/store/utils.py
++++ b/ersilia/store/utils.py
+@@ -484,104 +484,200 @@ def upload_to_s3(presigned_info: dict, file_path: str):
+ 
+     @staticmethod
+     def merge_shards(
+-        shards: list,
+-        header: list,
+-        output_path: Path,
++        shards,
++        header,
++        smiles_list,
++        output_path,
+         downloader,
+-        click_iface: ClickInterface,
+-        local_cache_csv_path: str,
++        click_iface,
++        local_cache_csv_path,
+     ):
+         """
+         Download, decompress, and concatenate multiple CSV shards into a single file.
++        If `smiles_list` is non-empty, reorder the rows to match its order;
++        otherwise, just merge them sequentially.
+ 
+-        Parameters
+-        ----------
+-        shards : list
+-            List of dicts with keys 'url', 'key', and optional 'size'.
+-        header : list
+-            CSV header row.
+-        output_path : Path
+-            Path to write the merged CSV.
+-        downloader : ApiClient
+-            Used for HEAD and streaming GET requests.
+-        click_iface : ClickInterface
+-            CLI interface for printing progress and warnings.
+         """
++        gz_shards = [
++            s
++            for s in shards
++            if s.get("key", "").endswith(".gz") or s.get("url", "").endswith(".gz")
++        ]
+         total_size = 0
+-        for shard in shards:
+-            size = shard.get("size", 0)
++        for s in gz_shards:
++            size = s.get("size", 0)
+             try:
+-                headers = downloader.head(shard["url"])
+-                size = int(headers.get("Content-Length", size))
+-            except requests.HTTPError:
++                hdrs = downloader.head(s["url"])
++                size = int(hdrs.get("Content-Length", size))
++            except Exception:
+                 pass
+             total_size += size
+-        click_iface.echo(
+-            f"{log_prefix()}Total download file size: {total_size / 1024:.1f} KB",
+-            fg="blue",
+-            bold=False,
+-        )
+ 
+         click_iface.echo(
+-            f"{log_prefix()}Downloading and merging each file content",
+-            fg="blue",
+-            bold=False,
++            f"⬇ Total download size: {total_size / 1024:.1f} KB", fg="blue"
+         )
+-        gz_shards = [
+-            s
+-            for s in shards
+-            if s.get("key", "").endswith(".gz") or s.get("url", "").endswith(".gz")
+-        ]
+ 
+-        with open(output_path, "w", encoding="utf-8", newline="") as out_f:
+-            out_f.write(",".join(header) + "\n")
+-            first = True
+-
+-            total_size = sum(s["size"] for s in gz_shards)
+-            pbar = click_iface.progress_bar(
+-                total=total_size,
+-                unit="B",
+-                unit_scale=True,
+-                unit_divisor=1024,
+-                desc="⬇",
+-                colour="blue",
+-                ncols=80,
+-                bar_format="{desc}: [{bar}] {percentage:3.0f}% {n_fmt}/{total_fmt} • {rate_fmt} • ETA: {remaining}",
++        if not smiles_list:
++            click_iface.echo(
++                "⬇ No reorder list provided; merging sequentially", fg="blue"
+             )
+-
+-            for shard in gz_shards:
+-                buf = io.BytesIO()
+-                for chunk in downloader.download_stream(shard["url"]):
+-                    buf.write(chunk)
+-                    pbar.update(len(chunk))
+-
+-                decompressed = gzip.decompress(buf.getvalue())
+-                text = decompressed.decode("utf-8", errors="replace")
+-
+-                for i, line in enumerate(text.splitlines(keepends=True)):
+-                    if not first and i == 0 and line.startswith(header[0]):
+-                        continue
+-                    out_f.write(line)
+-
+-                first = False
+-
+-            pbar.close()
++            with open(output_path, "w", newline="", encoding="utf-8") as out_f:
++                writer = csv.writer(out_f)
++                writer.writerow(header)
++                pbar = click_iface.progress_bar(
++                    total=total_size,
++                    unit="B",
++                    unit_scale=True,
++                    unit_divisor=1024,
++                    desc="⬇ downloading shards",
++                    colour="blue",
++                    ncols=80,
++                )
++                first_shard = True
++                for shard in gz_shards:
++                    buf = io.BytesIO()
++                    for chunk in downloader.download_stream(shard["url"]):
++                        buf.write(chunk)
++                        pbar.update(len(chunk))
++                    text = gzip.decompress(buf.getvalue()).decode(
++                        "utf-8", errors="replace"
++                    )
++                    reader = csv.reader(io.StringIO(text))
++                    if first_shard:
++                        first_shard = False
++                    for row in reader:
++                        writer.writerow(row)
++                pbar.close()
+ 
+             if (
+                 os.path.exists(local_cache_csv_path)
+                 and os.path.getsize(local_cache_csv_path) > 0
+             ):
+-                with open(local_cache_csv_path, "r", encoding="utf-8") as cache_f:
++                # fmt: off
++                with open(local_cache_csv_path, "r", encoding="utf-8") as cache_f, open(output_path, "a", newline="", encoding="utf-8") as out_f:
+                     next(cache_f, None)
+                     for line in cache_f:
+                         out_f.write(line)
+-
+                 try:
+                     os.remove(local_cache_csv_path)
+-                except OSError as e:
+-                    raise Exception(
+-                        f"Warning: could not delete cache file {local_cache_csv_path}: {e}"
+-                    )
++                except OSError:
++                    pass
++                # fmt: off
++
++            click_iface.echo(
++                f"✅ Sequential merge written to {output_path}", fg="green"
++            )
++            return
++
++        if "input" not in header:
++            raise KeyError("Header must contain 'input' to reorder")
++
++        col_idx = header.index("input")
++
++        normalized = []
++        for item in smiles_list:
++            if isinstance(item, str):
++                normalized.append(item)
++            elif isinstance(item, dict) and "input" in item:
++                normalized.append(item["input"])
++            else:
++                raise TypeError(f"Cannot extract 'input' from {item}")
++
++        click_iface.echo("⬇ Building lookup and reordering by 'input'", fg="blue")
++        lookup = {}
++        pbar = click_iface.progress_bar(
++            total=total_size,
++            unit="B",
++            unit_scale=True,
++            unit_divisor=1024,
++            desc="⬇ downloading shards",
++            colour="blue",
++            ncols=80,
++        )
++        first_shard = True
++        for shard in gz_shards:
++            buf = io.BytesIO()
++            for chunk in downloader.download_stream(shard["url"]):
++                buf.write(chunk)
++                pbar.update(len(chunk))
++            text = gzip.decompress(buf.getvalue()).decode("utf-8", errors="replace")
++            reader = csv.reader(io.StringIO(text))
++            if first_shard:
++                first_shard = False
++            for row in reader:
++                lookup[row[col_idx]] = row
++        pbar.close()
++
++        with open(output_path, "w", newline="", encoding="utf-8") as out_f:
++            writer = csv.writer(out_f)
++            writer.writerow(header)
++            for inp in normalized:
++                row = lookup.get(inp)
++                if row:
++                    writer.writerow(row)
++                else:
++                    empty_row = [""] * len(header)
++                    empty_row[col_idx] = inp
++                    writer.writerow(empty_row)
++
++        if (
++            os.path.exists(local_cache_csv_path)
++            and os.path.getsize(local_cache_csv_path) > 0
++        ):
++            with open(local_cache_csv_path, "r", encoding="utf-8") as cache_f:
++                cache_reader = csv.reader(cache_f)
++                next(cache_reader, None)
++                cache_rows = list(cache_reader)
++
++            with open(output_path, "r", newline="", encoding="utf-8") as merged_f:
++                merged_reader = csv.reader(merged_f)
++                merged_header = next(merged_reader)
++                merged_rows = list(merged_reader)
++
++            if "input" in merged_header:
++                idx = merged_header.index("input")
++            else:
++                idx = None
++
++            def is_full(row):
++                return all(cell.strip() for cell in row)
++
++            final_cache = []
++            for cro in cache_rows:
++                match = None
++                for mro in merged_rows:
++                    if idx is not None and cro[idx] == mro[idx]:
++                        match = mro
++                        break
++                    elif idx is None and cro == mro:
++                        match = mro
++                        break
++
++                if match and not is_full(cro) and is_full(match):
++                    final_cache.append(match)
++                else:
++                    final_cache.append(cro)
++
++            with open(output_path, "w", newline="", encoding="utf-8") as wf:
++                writer = csv.writer(wf)
++                writer.writerow(merged_header)
++
++                seen = set()
++                for row in final_cache:
++                    writer.writerow(row)
++                    key = row[idx] if idx is not None else tuple(row)
++                    seen.add(key)
++
++                for mro in merged_rows:
++                    key = mro[idx] if idx is not None else tuple(mro)
++                    if key not in seen:
++                        writer.writerow(mro)
++            try:
++                os.remove(local_cache_csv_path)
++            except OSError:
++                pass
++
++        click_iface.echo(f"✅ Final ordered CSV written to {output_path}", fg="green")
+ 
+ 
+ class InferenceStoreMessage(object):
+diff --git a/ersilia/utils/cache.py b/ersilia/utils/cache.py
+index 17ef81995..82c432ab2 100644
+--- a/ersilia/utils/cache.py
++++ b/ersilia/utils/cache.py
+@@ -80,6 +80,7 @@ def ensure_redis_running(self):
+             RuntimeError: If the container fails to start.
+         """
+         logger.info("Checking Redis server status...")
++
+         if not self._is_amenable()[0]:
+             return
+ 
+@@ -98,7 +99,6 @@ def ensure_redis_running(self):
+ 
+         time.sleep(0.5)
+         self._configure_redis_memory_policy()
+-
+         logger.info("Redis server setup completed.")
+ 
+     def _is_amenable(self):
+@@ -245,22 +245,34 @@ def _start_new_container(self):
+         self._create_docker_network()
+         self._create_data_volume()
+ 
+-        logger.info(f"Starting a new container: {REDIS_CONTAINER_NAME}")
+         try:
++            container = self.client.containers.get(REDIS_CONTAINER_NAME)
++            networks = container.attrs["NetworkSettings"]["Networks"].keys()
++            if DEFAULT_DOCKER_NETWORK_NAME not in networks:
++                logger.info(
++                    f"Attaching existing Redis to network {DEFAULT_DOCKER_NETWORK_NAME}"
++                )
++                self.network.connect(container)
++            else:
++                logger.info(
++                    "Redis container is already running on the correct network."
++                )
++            return container
++
++        except docker.errors.NotFound:
+             container = self.client.containers.run(
+                 image=REDIS_IMAGE,
+                 name=REDIS_CONTAINER_NAME,
++                volumes={self.volume.name: {"bind": "/data", "mode": "rw"}},
+                 detach=True,
+                 ports={f"{REDIS_PORT}/tcp": REDIS_PORT},
+                 network=DEFAULT_DOCKER_NETWORK_NAME,
+-                volumes={self.volume.name: {"bind": "/data", "mode": "rw"}},
+                 auto_remove=True,
+             )
+             logger.info(
+-                f"Container {REDIS_CONTAINER_NAME} started successfully. ID: {container.id}"
++                f"Started new Redis container on {self.network.name}: {container.id}"
+             )
+-        except docker.errors.APIError:
+-            logger.error("Failed to start new container.")
++            return container
+ 
+     def _pull_and_start_container(self):
+         try:

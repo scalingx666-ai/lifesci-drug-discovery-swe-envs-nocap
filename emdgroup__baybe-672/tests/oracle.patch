@@ -1,0 +1,804 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 52a959223b..04dfb82ae7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -17,9 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Scalar addition and subtraction for `Interval` objects
+ - Methods `hshift` and `vshift` to `Transformation` for conveniently performing
+   horizontal / vertical shifts
++- `Objective.to_botorch_posterior_transform` for use of affine transformations with
++  analytical acquisition functions
++- `DesirabilityObjective.normalized_weights` property 
++
++### Changed
++- Creating one-element composite transformations now returns the contained
++  transformation directly
+ 
+ ### Fixed
+ - Random seed not entering simulation when explicitly passed to `simulate_scenarios`
++- `DesirabilityObjective` now properly interplays with analytical acquisition functions
++
++### Removed
++- `AffinePosteriorTransformation` class (since BoTorch provides equivalent functionality)
+  
+ ## [0.14.1] - 2025-10-01
+ ### Added
+diff --git a/baybe/acquisition/_builder.py b/baybe/acquisition/_builder.py
+index a38b74ed4f..ea40f25bb8 100644
+--- a/baybe/acquisition/_builder.py
++++ b/baybe/acquisition/_builder.py
+@@ -4,7 +4,7 @@
+ from functools import cached_property
+ from inspect import signature
+ from types import MappingProxyType
+-from typing import Any, cast
++from typing import Any
+ 
+ import pandas as pd
+ import torch
+@@ -28,7 +28,11 @@
+ )
+ from baybe.acquisition.base import AcquisitionFunction, _get_botorch_acqf_class
+ from baybe.acquisition.utils import make_partitioning
+-from baybe.exceptions import IncompatibilityError, IncompleteMeasurementsError
++from baybe.exceptions import (
++    IncompatibilityError,
++    IncompleteMeasurementsError,
++    NonGaussianityError,
++)
+ from baybe.objectives.base import Objective
+ from baybe.objectives.desirability import DesirabilityObjective
+ from baybe.objectives.single import SingleTargetObjective
+@@ -36,7 +40,7 @@
+ from baybe.surrogates.base import SurrogateProtocol
+ from baybe.targets.binary import BinaryTarget
+ from baybe.targets.numerical import NumericalTarget
+-from baybe.transformations import AffineTransformation, IdentityTransformation
++from baybe.transformations import IdentityTransformation
+ from baybe.utils.basic import match_attributes
+ from baybe.utils.dataframe import handle_missing_values, to_tensor
+ 
+@@ -204,41 +208,24 @@ def _set_target_transformation(self) -> None:
+         #   We use the former for affine transformations and the latter to handle
+         #   all other cases.
+ 
++        # TODO: Needs to be revisited once binary targets are supported more generally
++        match self.objective:
++            case SingleTargetObjective(_target=BinaryTarget()):
++                return
++
+         if self.acqf.is_analytic:
+-            if not isinstance(self.objective, SingleTargetObjective):
+-                targets = self.objective.targets
++            try:
++                transform = self.objective.to_botorch_posterior_transform()
++            except NonGaussianityError as ex:
+                 raise IncompatibilityError(
+-                    f"The selected analytic acquisition "
+-                    f"'{self.acqf.__class__.__name__}' can handle one target only but "
+-                    f"the specified objective comprises {len(targets)} targets: "
+-                    f"{[t.name for t in targets]}"
+-                )
+-
+-            match target := self.objective._target:
+-                case NumericalTarget():
+-                    pass
+-                case BinaryTarget():
+-                    return
+-                case _:
+-                    raise NotImplementedError("No transformation handling implemented.")
+-
+-            match t := target.transformation:
+-                case IdentityTransformation() | AffineTransformation():
+-                    # The identity/affine type narrowing is lost due to the `negate`
+-                    # call, but we know that the result will be an AffineTransformation
+-                    # in this specific context
+-                    oriented = cast(
+-                        AffineTransformation, t.negate() if target.minimize else t
+-                    )
+-                    self._args.posterior_transform = (
+-                        oriented.to_botorch_posterior_transform()
+-                    )
+-                case _:
+-                    raise NotImplementedError(
+-                        f"The selected analytic acquisition "
+-                        f"'{self.acqf.__class__.__name__}' supports only affine "
+-                        f"target transformations. "
+-                    )
++                    f"The selected analytical acquisition function "
++                    f"'{type(self.acqf).__name__}' is incompatible with the "
++                    f"assigned objective '{type(self.objective).__name__}' "
++                    f"because the former requires a Gaussian distribution and the "
++                    f"latter is configured to produce non-Gaussian outcomes."
++                ) from ex
++
++            self._args.posterior_transform = transform
+         else:
+             # TODO: Enable once clarified:
+             # https://github.com/pytorch/botorch/discussions/2849
+diff --git a/baybe/exceptions.py b/baybe/exceptions.py
+index 4d2d1d7ed6..6331e8acdf 100644
+--- a/baybe/exceptions.py
++++ b/baybe/exceptions.py
+@@ -73,6 +73,10 @@ class IncompatibleArgumentError(IncompatibilityError):
+     """An incompatible argument was passed to a callable."""
+ 
+ 
++class NonGaussianityError(Exception):
++    """An operation assuming Gaussianity is attempted on a non-Gaussian distribution."""
++
++
+ class InfeasibilityError(Exception):
+     """An optimization problem has no feasible solution."""
+ 
+diff --git a/baybe/objectives/base.py b/baybe/objectives/base.py
+index fadcba040d..5b4d1b8e2e 100644
+--- a/baybe/objectives/base.py
++++ b/baybe/objectives/base.py
+@@ -18,7 +18,7 @@
+ from baybe.utils.metadata import Metadata, to_metadata
+ 
+ if TYPE_CHECKING:
+-    from botorch.acquisition.objective import MCAcquisitionObjective
++    from botorch.acquisition.objective import MCAcquisitionObjective, PosteriorTransform
+ 
+ 
+ # TODO: Reactive slots in all classes once cached_property is supported:
+@@ -96,7 +96,7 @@ def _full_transformation(self) -> MCAcquisitionObjective:
+         return self.to_botorch()
+ 
+     def to_botorch(self) -> MCAcquisitionObjective:
+-        """Convert to BoTorch representation."""
++        """Convert to BoTorch objective."""
+         if not is_all_instance(targets := self._oriented_targets, NumericalTarget):
+             raise NotImplementedError(
+                 "Conversion to BoTorch is only supported for numerical targets."
+@@ -117,6 +117,15 @@ def to_botorch(self) -> MCAcquisitionObjective:
+             )
+         )
+ 
++    @abstractmethod
++    def to_botorch_posterior_transform(self) -> PosteriorTransform:
++        """Convert to BoTorch posterior transform, if possible.
++
++        A representation as posterior transformation is only possible if Gaussianity
++        is preserved by the involved operations, that is, when all targets are
++        inherently numerical and their assigned transformations are affine.
++        """
++
+     def _pre_transform(
+         self,
+         df: pd.DataFrame,
+diff --git a/baybe/objectives/desirability.py b/baybe/objectives/desirability.py
+index bee6f3f70a..fec0d6ec3b 100644
+--- a/baybe/objectives/desirability.py
++++ b/baybe/objectives/desirability.py
+@@ -4,7 +4,7 @@
+ 
+ import gc
+ from functools import cached_property
+-from typing import TYPE_CHECKING, ClassVar
++from typing import TYPE_CHECKING, ClassVar, cast
+ 
+ import cattrs
+ import numpy as np
+@@ -13,20 +13,24 @@
+ from attrs.validators import deep_iterable, gt, instance_of, min_len
+ from typing_extensions import override
+ 
+-from baybe.exceptions import IncompatibilityError
++from baybe.exceptions import IncompatibilityError, NonGaussianityError
+ from baybe.objectives.base import Objective
+ from baybe.objectives.enum import Scalarizer
+ from baybe.objectives.validation import validate_target_names
+ from baybe.targets import NumericalTarget
+ from baybe.targets.base import Target
+ from baybe.targets.numerical import UncertainBool
+-from baybe.utils.basic import to_tuple
++from baybe.transformations.basic import AffineTransformation, IdentityTransformation
++from baybe.utils.basic import is_all_instance, to_tuple
+ from baybe.utils.conversion import to_string
+ from baybe.utils.dataframe import pretty_print_df
+ from baybe.utils.validation import finite_float
+ 
+ if TYPE_CHECKING:
+-    from botorch.acquisition.objective import MCAcquisitionObjective
++    from botorch.acquisition.objective import (
++        MCAcquisitionObjective,
++        ScalarizedPosteriorTransform,
++    )
+     from torch import Tensor
+ 
+ _OUTPUT_NAME = "Desirability"
+@@ -173,15 +177,15 @@ def supports_partial_measurements(self) -> bool:
+         return not self.as_pre_transformation
+ 
+     @cached_property
+-    def _normalized_weights(self) -> np.ndarray:
++    def normalized_weights(self) -> tuple[float, ...]:
+         """The normalized target weights."""
+-        return np.asarray(self.weights) / np.sum(self.weights)
++        return tuple(np.asarray(self.weights) / np.sum(self.weights))
+ 
+     @override
+     def __str__(self) -> str:
+         targets_list = [target.summary() for target in self.targets]
+         targets_df = pd.DataFrame(targets_list)
+-        targets_df["Weight"] = self.weights
++        targets_df["Weights"] = self.normalized_weights
+ 
+         fields = [
+             to_string("Type", self.__class__.__name__, single_line=True),
+@@ -236,11 +240,11 @@ def _to_botorch_full(self) -> MCAcquisitionObjective:
+ 
+         outer: MCAcquisitionObjective
+         if self.scalarizer is Scalarizer.MEAN:
+-            outer = LinearMCObjective(torch.tensor(self._normalized_weights))
++            outer = LinearMCObjective(torch.tensor(self.normalized_weights))
+         elif self.scalarizer is Scalarizer.GEOM_MEAN:
+             outer = GenericMCObjective(
+                 lambda samples, X: _geometric_mean(
+-                    samples, torch.tensor(self._normalized_weights)
++                    samples, torch.tensor(self.normalized_weights)
+                 )
+             )
+         else:
+@@ -251,6 +255,64 @@ def _to_botorch_full(self) -> MCAcquisitionObjective:
+         inner = super().to_botorch()
+         return ChainedMCObjective(inner, outer)
+ 
++    @override
++    def to_botorch_posterior_transform(self) -> ScalarizedPosteriorTransform:
++        if self.as_pre_transformation:
++            return IdentityTransformation().to_botorch_posterior_transform()
++
++        targets = self.targets
++        transformations = [t.transformation for t in targets]
++        if (
++            self.scalarizer is not Scalarizer.MEAN
++            or not is_all_instance(targets, NumericalTarget)
++            or not is_all_instance(
++                transformations, (IdentityTransformation, AffineTransformation)
++            )
++        ):
++            raise NonGaussianityError(
++                f"Converting an objective of type '{type(self).__name__}' is only "
++                f"possible when the transformation result is Gaussian. This is the "
++                f"case when all targets are of type '{NumericalTarget.__name__}' and "
++                f"1) either "
++                f"'{fields(DesirabilityObjective).as_pre_transformation.name}' "
++                f"is set to 'True' "
++                f"2) or when the assigned transformations are affine and arithmetic "
++                f"averaging is used as desirability scalarization operation."
++            )
++
++        import torch
++        from botorch.acquisition.objective import ScalarizedPosteriorTransform
++
++        from baybe.utils.torch import DTypeFloatTorch
++
++        # Account for minimization
++        oriented = [
++            tr if not t.minimize else tr.negate()
++            for t, tr in zip(targets, transformations, strict=True)
++        ]
++
++        # Treat identity transformations as affine for harmonized logic below
++        # TODO[typing]: The cast is necessary because the `is_all_instance` TypeGuard
++        #   above does not properly handle union types
++        converted = cast(
++            list[AffineTransformation],
++            [
++                AffineTransformation() if isinstance(tr, IdentityTransformation) else tr
++                for tr in oriented
++            ],
++        )
++
++        # Compute the distribution parameters of the weighted sum of Gaussians
++        weights = torch.tensor(
++            [w * tr.factor for w, tr in zip(self.normalized_weights, converted)],
++            dtype=DTypeFloatTorch,
++        )
++        offset = torch.tensor(
++            sum(w * tr.shift for w, tr in zip(self.normalized_weights, converted)),
++            dtype=DTypeFloatTorch,
++        ).item()
++        return ScalarizedPosteriorTransform(weights, offset)
++
+     @override
+     def _pre_transform(
+         self,
+diff --git a/baybe/objectives/pareto.py b/baybe/objectives/pareto.py
+index 8e685f3c52..987c2a981d 100644
+--- a/baybe/objectives/pareto.py
++++ b/baybe/objectives/pareto.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ import gc
+-from typing import ClassVar
++from typing import ClassVar, NoReturn
+ 
+ from attrs import define, field
+ from attrs.validators import deep_iterable, instance_of, min_len
+@@ -48,6 +48,13 @@ def output_names(self) -> tuple[str, ...]:
+     def supports_partial_measurements(self) -> bool:
+         return True
+ 
++    @override
++    def to_botorch_posterior_transform(self) -> NoReturn:
++        raise NotImplementedError(
++            f"Objectives of type '{type(self).__name__}' do not support conversion "
++            f"to BoTorch posterior transforms."
++        )
++
+ 
+ # Collect leftover original slotted classes processed by `attrs.define`
+ gc.collect()
+diff --git a/baybe/objectives/single.py b/baybe/objectives/single.py
+index abecd1e14f..d0f76b0f22 100644
+--- a/baybe/objectives/single.py
++++ b/baybe/objectives/single.py
+@@ -10,16 +10,19 @@
+ from attrs.validators import instance_of
+ from typing_extensions import override
+ 
++from baybe.exceptions import NonGaussianityError
+ from baybe.objectives.base import Objective
+ from baybe.targets.base import Target
+ from baybe.targets.numerical import NumericalTarget
++from baybe.transformations.basic import AffineTransformation, IdentityTransformation
+ from baybe.utils.conversion import to_string
+-from baybe.utils.dataframe import (
+-    pretty_print_df,
+-)
++from baybe.utils.dataframe import pretty_print_df
+ 
+ if TYPE_CHECKING:
+-    from botorch.acquisition.objective import MCAcquisitionObjective
++    from botorch.acquisition.objective import (
++        MCAcquisitionObjective,
++        ScalarizedPosteriorTransform,
++    )
+ 
+ 
+ @define(frozen=True, slots=False)
+@@ -70,6 +73,23 @@ def to_botorch(self) -> MCAcquisitionObjective:
+ 
+         return IdentityMCObjective()
+ 
++    @override
++    def to_botorch_posterior_transform(self) -> ScalarizedPosteriorTransform:
++        if not (
++            isinstance((t := self._target), NumericalTarget)
++            and isinstance(
++                (tr := t.transformation), (IdentityTransformation, AffineTransformation)
++            )
++        ):
++            raise NonGaussianityError(
++                f"Converting an objective of type '{type(self).__name__}' is only "
++                f"possible when the transformation result is Gaussian, that is, "
++                f"when the target is of type '{NumericalTarget.__name__}' and the "
++                f"assigned transformation is affine."
++            )
++
++        return (tr.negate() if t.minimize else tr).to_botorch_posterior_transform()
++
+ 
+ # Collect leftover original slotted classes processed by `attrs.define`
+ gc.collect()
+diff --git a/baybe/targets/botorch.py b/baybe/targets/botorch.py
+deleted file mode 100644
+index b6f79189c0..0000000000
+--- a/baybe/targets/botorch.py
++++ /dev/null
+@@ -1,23 +0,0 @@
+-"""BoTorch target transformations."""
+-
+-from botorch.acquisition.objective import PosteriorTransform
+-from botorch.posteriors import GPyTorchPosterior
+-from torch import Tensor
+-from typing_extensions import override
+-
+-
+-class AffinePosteriorTransform(PosteriorTransform):
+-    """An affine posterior transformation."""
+-
+-    def __init__(self, factor: float, shift: float) -> None:
+-        super().__init__()
+-        self.factor = factor
+-        self.shift = shift
+-
+-    @override
+-    def forward(self, posterior: GPyTorchPosterior) -> GPyTorchPosterior:  # noqa: D102
+-        return GPyTorchPosterior(posterior.distribution * self.factor + self.shift)
+-
+-    @override
+-    def evaluate(self, Y: Tensor) -> Tensor:  # noqa: D102
+-        raise NotImplementedError()
+diff --git a/baybe/transformations/basic.py b/baybe/transformations/basic.py
+index 739f06c8b3..e5e528c269 100644
+--- a/baybe/transformations/basic.py
++++ b/baybe/transformations/basic.py
+@@ -22,10 +22,9 @@
+ from baybe.utils.validation import finite_float
+ 
+ if TYPE_CHECKING:
++    from botorch.acquisition.objective import ScalarizedPosteriorTransform
+     from torch import Tensor
+ 
+-    from baybe.targets.botorch import AffinePosteriorTransform
+-
+     TensorCallable = Callable[[Tensor], Tensor]
+     """Type alias for a torch-based function mapping from reals to reals."""
+ 
+@@ -52,15 +51,13 @@ def __call__(self, x: Tensor, /) -> Tensor:
+ class IdentityTransformation(MonotonicTransformation):
+     """The identity transformation."""
+ 
+-    def to_botorch_posterior_transform(self) -> AffinePosteriorTransform:
++    def to_botorch_posterior_transform(self) -> ScalarizedPosteriorTransform:
+         """Convert to BoTorch posterior transform.
+ 
+         Returns:
+             The representation of the transform as BoTorch posterior transform.
+         """
+-        from baybe.targets.botorch import AffinePosteriorTransform
+-
+-        return AffinePosteriorTransform(factor=1.0, shift=0.0)
++        return AffineTransformation().to_botorch_posterior_transform()
+ 
+     @override
+     def __call__(self, x: Tensor, /) -> Tensor:
+@@ -72,6 +69,11 @@ def __or__(self, other: Any) -> Transformation:
+             return other
+         return NotImplemented
+ 
++    if TYPE_CHECKING:
++
++        @override
++        def negate(self) -> AffineTransformation: ...
++
+ 
+ @define(frozen=True, init=False)
+ class ClampingTransformation(MonotonicTransformation):
+@@ -127,15 +129,21 @@ def __eq__(self, other: Any, /) -> bool:
+             return self.factor == other.factor and self.shift == other.shift
+         return NotImplemented
+ 
+-    def to_botorch_posterior_transform(self) -> AffinePosteriorTransform:
++    def to_botorch_posterior_transform(self) -> ScalarizedPosteriorTransform:
+         """Convert to BoTorch posterior transform.
+ 
+         Returns:
+             The representation of the transform as BoTorch posterior transform.
+         """
+-        from baybe.targets.botorch import AffinePosteriorTransform
++        import torch
++        from botorch.acquisition.objective import ScalarizedPosteriorTransform
+ 
+-        return AffinePosteriorTransform(self.factor, self.shift)
++        from baybe.utils.torch import DTypeFloatTorch
++
++        return ScalarizedPosteriorTransform(
++            weights=torch.tensor([self.factor], dtype=DTypeFloatTorch),
++            offset=torch.tensor(self.shift, dtype=DTypeFloatTorch).item(),
++        )
+ 
+     @classmethod
+     def from_values_mapped_to_unit_interval(
+@@ -175,6 +183,11 @@ def __call__(self, x: Tensor, /) -> Tensor:
+ 
+         return x * self.factor + self.shift
+ 
++    if TYPE_CHECKING:
++
++        @override
++        def negate(self) -> AffineTransformation: ...
++
+ 
+ @_image_equals_codomain
+ @define(frozen=True)
+diff --git a/baybe/transformations/composite.py b/baybe/transformations/composite.py
+index 09ed2f50d2..b7a3f680c8 100644
+--- a/baybe/transformations/composite.py
++++ b/baybe/transformations/composite.py
+@@ -3,15 +3,19 @@
+ from __future__ import annotations
+ 
+ import gc
++import inspect
+ from functools import reduce
+ from typing import TYPE_CHECKING, Any
+ 
+-from attrs import define, field
++from attrs import define, field, fields
+ from attrs.validators import deep_iterable, instance_of, max_len, min_len
+ from typing_extensions import override
+ 
+ from baybe.transformations.base import Transformation
+-from baybe.transformations.utils import compress_transformations
++from baybe.transformations.utils import (
++    compress_transformations,
++    sum_affine_transformations,
++)
+ from baybe.utils.basic import compose, to_tuple
+ from baybe.utils.interval import Interval
+ 
+@@ -23,9 +27,6 @@
+ class ChainedTransformation(Transformation):
+     """A chained transformation composing several individual transformations."""
+ 
+-    # https://github.com/python-attrs/attrs/issues/1462
+-    __hash__ = object.__hash__
+-
+     transformations: tuple[Transformation, ...] = field(
+         converter=compress_transformations,
+         validator=[
+@@ -36,14 +37,19 @@ class ChainedTransformation(Transformation):
+     """The transformations to be composed (the first element gets applied first)."""
+ 
+     @override
+-    def __eq__(self, other: Any, /) -> bool:
+-        if len(self.transformations) == 1:
+-            # A chained transformation with only one element is equivalent to that
+-            # element
+-            return self.transformations[0] == other
+-        if isinstance(other, ChainedTransformation):
+-            return self.transformations == other.transformations
+-        return NotImplemented
++    def __new__(cls, *args: Any, **kwargs: Any) -> Transformation:  # type: ignore[misc]
++        # If the transformations can be condensed into one, we return that instead
++        sig = inspect.signature(cls.__init__)
++        try:
++            bound = sig.bind(None, *args, **kwargs)
++        except TypeError:
++            # Unpickling first creates an uninitialized instance, i.e. the args/kwargs
++            # are not provided. Hence, we simply return an raw object.
++            return super().__new__(cls)
++        transformations = bound.arguments[fields(cls).transformations.name]
++        if len(compressed := compress_transformations(transformations)) == 1:
++            return compressed[0]
++        return super().__new__(cls)
+ 
+     @override
+     def get_codomain(self, interval: Interval | None = None, /) -> Interval:
+@@ -75,6 +81,21 @@ class AdditiveTransformation(Transformation):
+     )
+     """The transformations to be added."""
+ 
++    @override
++    def __new__(cls, *args: Any, **kwargs: Any) -> Transformation:  # type: ignore[misc]
++        # If the transformations can be condensed into one, we return that instead
++        sig = inspect.signature(cls.__init__)
++        try:
++            bound = sig.bind(None, *args, **kwargs)
++        except TypeError:
++            # Unpickling first creates an uninitialized instance, i.e. the args/kwargs
++            # are not provided. Hence, we simply return an raw object.
++            return super().__new__(cls)
++        transformations = bound.arguments[fields(cls).transformations.name]
++        if len(compressed := sum_affine_transformations(transformations)) == 1:
++            return compressed.pop()
++        return super().__new__(cls)
++
+     @override
+     def get_codomain(self, interval: Interval | None = None, /) -> Interval:
+         interval = Interval.create(interval)
+diff --git a/baybe/transformations/utils.py b/baybe/transformations/utils.py
+index eb51c67e3d..c20ac5bccd 100644
+--- a/baybe/transformations/utils.py
++++ b/baybe/transformations/utils.py
+@@ -2,23 +2,27 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Callable, Iterable
++from collections.abc import Callable, Collection, Iterable
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ from attrs import evolve
+ 
+-from baybe.transformations.base import Transformation
++from baybe.transformations.basic import AffineTransformation, IdentityTransformation
++from baybe.utils.basic import is_all_instance
+ 
+ if TYPE_CHECKING:
+     from torch import Tensor
+ 
++    from baybe.transformations.base import Transformation
++
+     TensorCallable = Callable[[Tensor], Tensor]
+     """Type alias for a torch-based function mapping from reals to reals."""
+ 
+ 
+ def convert_transformation(x: Transformation | TensorCallable, /) -> Transformation:
+     """Autowrap a torch callable as transformation (with transformation passthrough)."""
++    from baybe.transformations.base import Transformation
+     from baybe.transformations.basic import CustomTransformation
+ 
+     return x if isinstance(x, Transformation) else CustomTransformation(x)
+@@ -55,16 +59,21 @@ def _flatten_transformations(
+ def compress_transformations(
+     transformations: Iterable[Transformation], /
+ ) -> tuple[Transformation, ...]:
+-    """Compress any iterable of transformations by removing redundancies.
++    """Compress any chain of transformations by removing redundancies.
+ 
+     Drops identity transformations and combines subsequent affine transformations.
+ 
+     Args:
+         transformations: An iterable of transformations.
+ 
++    Raises:
++        TypeError: If any of the passed elements is not a
++            :class:`baybe.transformations.base.Transformation`.
++
+     Returns:
+         The minimum sequence of transformations that is equivalent to the input.
+     """
++    from baybe.transformations.base import Transformation
+     from baybe.transformations.basic import (
+         AffineTransformation,
+         BellTransformation,
+@@ -73,6 +82,10 @@ def compress_transformations(
+         TwoSidedAffineTransformation,
+     )
+ 
++    transformations = list(transformations)
++    if not is_all_instance(transformations, Transformation):
++        raise TypeError(f"All elements must be of type '{Transformation.__name__}'.")
++
+     aggregated: list[Transformation] = []
+     id_ = IdentityTransformation()
+ 
+@@ -108,3 +121,43 @@ def compress_transformations(
+         return (IdentityTransformation(),)
+ 
+     return tuple(aggregated)
++
++
++def sum_affine_transformations(
++    transformations: Collection[Transformation], /
++) -> set[Transformation]:
++    """Additively combine affine transformations in a given transformation collection.
++
++    Args:
++        transformations: A collection of transformations.
++
++    Raises:
++        TypeError: If any of the passed elements is not a
++            :class:`baybe.transformations.base.Transformation`.
++
++    Returns:
++        A condensed version of the collection where all affine transformations have been
++        combined into one.
++    """
++    from baybe.transformations.base import Transformation
++
++    if not is_all_instance(transformations, Transformation):
++        raise TypeError(f"All elements must be of type '{Transformation.__name__}'.")
++
++    # Split into affine and non-affine transformations
++    is_affine = [
++        isinstance(tr, (IdentityTransformation, AffineTransformation))
++        for tr in transformations
++    ]
++    affines = [tr for tr, is_aff in zip(transformations, is_affine) if is_aff]
++    non_affines = [tr for tr, is_aff in zip(transformations, is_affine) if not is_aff]
++
++    # Compute the combined affine transformation coeffiecients
++    factor = sum(
++        tr.factor if isinstance(tr, AffineTransformation) else 1.0 for tr in affines
++    )
++    shift = sum(
++        tr.shift if isinstance(tr, AffineTransformation) else 0.0 for tr in affines
++    )
++
++    return {AffineTransformation(factor=factor, shift=shift), *non_affines}
+diff --git a/docs/userguide/transformations.md b/docs/userguide/transformations.md
+index d926842077..5e349cc971 100644
+--- a/docs/userguide/transformations.md
++++ b/docs/userguide/transformations.md
+@@ -301,9 +301,9 @@ t2 = (
+ )
+ t3 = AffineTransformation(factor=2, shift=3)  # compressed version
+ 
+-assert isinstance(t1, ChainedTransformation)  # t1 is a explicitly constructed as chain
+-assert not isinstance(t2, ChainedTransformation)  # not a chain due to auto-compression
+-assert t1 == t2 == t3  # all are equal, even though t1 is a ChainedTransformation object
++assert isinstance(t1, AffineTransformation)  # dispatches to affine during instantiation
++assert isinstance(t2, AffineTransformation)  # auto-compresses in each chaining step
++assert t1 == t2 == t3  # as a consequence, all objects equal in the end
+ ```
+ ````
+ 
+diff --git a/tests/integration/test_affine_transformations.py b/tests/integration/test_affine_transformations.py
+new file mode 100644
+index 0000000000..c81d02dfe2
+--- /dev/null
++++ b/tests/integration/test_affine_transformations.py
+@@ -0,0 +1,45 @@
++"""Tests for using analytic acquisition functions with affine transformations."""
++
++from contextlib import nullcontext
++
++import pandas as pd
++import pytest
++
++from baybe.acquisition import ProbabilityOfImprovement
++from baybe.exceptions import IncompatibilityError
++from baybe.objectives import DesirabilityObjective
++from baybe.parameters.numerical import NumericalContinuousParameter
++from baybe.recommenders import BotorchRecommender
++from baybe.targets import NumericalTarget
++
++searchspace = NumericalContinuousParameter("p", (0, 1)).to_searchspace()
++candidates = pd.DataFrame({"p": [0.2, 0.3]})
++measurements = pd.DataFrame({"p": [0.1], "t1": [0.2], "t2": [0.3]})
++
++
++@pytest.mark.parametrize(
++    ("objective", "allowed"),
++    [
++        ((NumericalTarget("t1") * 2 + 1).to_objective(), True),
++        (NumericalTarget("t1").abs().to_objective(), False),
++        (
++            DesirabilityObjective(
++                [NumericalTarget("t1"), NumericalTarget("t2")],
++                scalarizer="MEAN",
++                require_normalization=False,
++            ),
++            True,
++        ),
++    ],
++    ids=["single-affine", "single-nonlinear", "multi-affine"],
++)
++def test_analytic_acqf_with_affine_target(objective, allowed):
++    """Analytic acquisition functions can be used with affine target transformations."""
++    with nullcontext() if allowed else pytest.raises(IncompatibilityError):
++        BotorchRecommender().acquisition_values(
++            candidates,
++            searchspace,
++            objective,
++            measurements,
++            acquisition_function=ProbabilityOfImprovement(),
++        )
+diff --git a/tests/test_imports.py b/tests/test_imports.py
+index 4d314c6c38..0755751f79 100644
+--- a/tests/test_imports.py
++++ b/tests/test_imports.py
+@@ -77,7 +77,6 @@ def test_imports(module: str):
+         "baybe.acquisition.partial",
+         "baybe.acquisition._builder",
+         "baybe.objectives.botorch",
+-        "baybe.targets.botorch",
+         "baybe.surrogates._adapter",
+         "baybe.utils.torch",
+     ],
+@@ -91,7 +90,6 @@ def test_imports(module: str):
+         "baybe.insights.shap",
+         "baybe.objectives.botorch",
+         "baybe.surrogates._adapter",
+-        "baybe.targets.botorch",
+         "baybe.utils.chemistry",
+         "baybe.utils.clustering_algorithms",
+         "baybe.utils.clustering_algorithms.third_party",
+diff --git a/tests/test_objective.py b/tests/test_objective.py
+index c0e41b32de..ecd4753dc0 100644
+--- a/tests/test_objective.py
++++ b/tests/test_objective.py
+@@ -66,9 +66,9 @@ def test_unknown_target_images_for_desirability(self):
+         """Unknown target images are not allowed unless explicitly declared."""
+         # Create some targets with bounded codomain but unknown image
+         t = IdentityTransformation()
+-        t1 = NumericalTarget.match_bell("t1", 0, 1)._append_transformation(t + t)
+-        t2 = NumericalTarget.match_bell("t2", 0, 1)._append_transformation(t + t)
+-        assert t1.get_codomain() == Interval(0, 2)
++        t1 = NumericalTarget.match_bell("t1", 0, 1)._append_transformation(t * t)
++        t2 = NumericalTarget.match_bell("t2", 0, 1)._append_transformation(t * t)
++        assert t1.get_codomain() == Interval(0, 1)
+ 
+         with pytest.raises(ValueError, match="normalization status is unclear"):
+             DesirabilityObjective([t1, t2], require_normalization=True)

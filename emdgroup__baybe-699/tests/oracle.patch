@@ -1,0 +1,205 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4664796571..b91be986aa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -24,8 +24,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Changed
+ - Creating one-element composite transformations now returns the contained
+   transformation directly
+-
+-### Changed
+ - Dataframe-to-tensor conversion now yields contiguous tensors, improving
+   reproducibility of downstream operations
+ 
+@@ -33,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - Random seed not entering simulation when explicitly passed to `simulate_scenarios`
+ - `DesirabilityObjective` now properly interplays with analytical acquisition functions
+ - `farthest_point_sampling` now correctly handles predefined `initialization` indices
++- `SearchSpace.from_dataframe` now validates that dataframes contain only
++  `active_values`, raising `IncompatibilityError` otherwise
+ 
+ ### Removed
+ - `AffinePosteriorTransformation` class (since BoTorch provides equivalent functionality)
+diff --git a/baybe/searchspace/core.py b/baybe/searchspace/core.py
+index 8f55ef7a9d..492844f995 100644
+--- a/baybe/searchspace/core.py
++++ b/baybe/searchspace/core.py
+@@ -11,9 +11,7 @@
+ from attrs import define, field
+ from typing_extensions import override
+ 
+-from baybe.constraints import (
+-    validate_constraints,
+-)
++from baybe.constraints import validate_constraints
+ from baybe.constraints.base import Constraint
+ from baybe.parameters import TaskParameter
+ from baybe.parameters.base import Parameter
+@@ -23,7 +21,10 @@
+     SubspaceDiscrete,
+     validate_simplex_subspace_from_config,
+ )
+-from baybe.searchspace.validation import validate_parameters
++from baybe.searchspace.validation import (
++    validate_dataframe_active_values,
++    validate_parameters,
++)
+ from baybe.serialization import SerialMixin, converter, select_constructor_hook
+ from baybe.utils.conversion import to_string
+ 
+@@ -178,6 +179,8 @@ def from_dataframe(
+         disc_params = [p for p in parameters if p.is_discrete]
+         cont_params = [p for p in parameters if p.is_continuous]
+ 
++        validate_dataframe_active_values(df, disc_params)
++
+         return SearchSpace(
+             discrete=SubspaceDiscrete.from_dataframe(
+                 df[[p.name for p in disc_params]],
+diff --git a/baybe/searchspace/validation.py b/baybe/searchspace/validation.py
+index f72c8277f5..6045301878 100644
+--- a/baybe/searchspace/validation.py
++++ b/baybe/searchspace/validation.py
+@@ -6,11 +6,16 @@
+ 
+ import pandas as pd
+ 
+-from baybe.exceptions import EmptySearchSpaceError
++from baybe.exceptions import EmptySearchSpaceError, IncompatibilityError
+ from baybe.parameters import TaskParameter
+-from baybe.parameters.base import Parameter
++from baybe.parameters.base import Parameter, _DiscreteLabelLikeParameter
+ from baybe.utils.dataframe import get_transform_objects
+ 
++try:  # For python < 3.11, use the exceptiongroup backport
++    ExceptionGroup
++except NameError:
++    from exceptiongroup import ExceptionGroup
++
+ _T = TypeVar("_T", bound=Parameter)
+ 
+ 
+@@ -48,6 +53,39 @@ def validate_parameters(parameters: Collection[Parameter]) -> None:  # noqa: DOC
+     validate_parameter_names(parameters)
+ 
+ 
++def validate_dataframe_active_values(
++    df: pd.DataFrame, /, parameters: Sequence[Parameter]
++) -> None:
++    """Validate a dataframe content against the active values of certain parameters.
++
++    Args:
++        df: The dataframe to validate.
++        parameters: The parameters to check against.
++
++    Raises:
++        ExceptionGroup: Contains a :class:`~baybe.exceptions.IncompatibilityError`
++            for each dataframe column with values outside the active values set of
++            the corresponding parameter.
++    """
++    exceptions: list[IncompatibilityError] = []
++
++    for param in parameters:
++        if isinstance(param, _DiscreteLabelLikeParameter):
++            df_values = set(df[param.name])
++            active_values = set(param.active_values)
++            if invalid_values := df_values - active_values:
++                exceptions.append(
++                    IncompatibilityError(
++                        f"Dataframe column '{param.name}' contains the following "
++                        f"invalid values: {invalid_values}. Only values from the "
++                        f"active values of the corresponding parameter are allowed: "
++                        f"{param.active_values}."
++                    )
++                )
++    if exceptions:
++        raise ExceptionGroup("Dataframe validation errors", exceptions)
++
++
+ def get_transform_parameters(
+     parameters: Sequence[_T],
+     df: pd.DataFrame,
+diff --git a/tests/test_searchspace.py b/tests/test_searchspace.py
+index 85126b0713..9c0738a190 100644
+--- a/tests/test_searchspace.py
++++ b/tests/test_searchspace.py
+@@ -12,11 +12,12 @@
+     DiscreteSumConstraint,
+     ThresholdCondition,
+ )
+-from baybe.exceptions import EmptySearchSpaceError
++from baybe.exceptions import EmptySearchSpaceError, IncompatibilityError
+ from baybe.parameters import (
+     CategoricalParameter,
+     NumericalContinuousParameter,
+     NumericalDiscreteParameter,
++    TaskParameter,
+ )
+ from baybe.searchspace import (
+     SearchSpace,
+@@ -28,6 +29,12 @@
+     parameter_cartesian_prod_pandas,
+     parameter_cartesian_prod_polars,
+ )
++from baybe.utils.basic import is_all_instance
++
++try:
++    ExceptionGroup
++except NameError:
++    from exceptiongroup import ExceptionGroup
+ 
+ 
+ def test_empty_parameters():
+@@ -361,3 +368,52 @@ def test_polars_pandas_equivalence(parameters):
+ 
+     # Assert equality
+     assert_frame_equal(df_pl.to_pandas(), df_pd)
++
++
++def test_task_parameter_active_values_validation():
++    """Test SearchSpace.from_dataframe with TaskParameter active_values validation."""
++    df = pd.DataFrame(
++        [
++            {"task": "source", "method": "old", "x1": 1.0},
++            {"task": "source", "method": "old", "x1": 2.0},
++            {"task": "source", "method": "new", "x1": 1.0},
++            {"task": "target", "method": "new", "x1": 2.0},
++        ]
++    )
++
++    num_param = NumericalDiscreteParameter(name="x1", values=[1.0, 2.0])
++    task_param = TaskParameter(
++        name="task", values=["source1", "source2", "target"], active_values=["target"]
++    )
++    cat_param = CategoricalParameter(
++        name="method", values=["old", "new"], active_values=["new"]
++    )
++
++    # Two parameters invalid
++    with pytest.raises(ExceptionGroup) as exc_info:
++        SearchSpace.from_dataframe(df, parameters=[num_param, task_param, cat_param])
++
++    exceptions = exc_info.value.exceptions
++    assert len(exceptions) == 2
++    assert is_all_instance(exceptions, IncompatibilityError)
++    assert all("contains the following invalid values" in str(e) for e in exceptions)
++
++    # One parameter invalid
++    single_source_df = df[df["method"] == "new"]
++    with pytest.raises(ExceptionGroup) as exc_info:
++        SearchSpace.from_dataframe(
++            single_source_df, parameters=[num_param, task_param, cat_param]
++        )
++
++    exceptions = exc_info.value.exceptions
++    assert len(exceptions) == 1
++    assert is_all_instance(exceptions, IncompatibilityError)
++    assert all("contains the following invalid values" in str(e) for e in exceptions)
++
++    # All parameters valid
++    target_df = df[(df["task"] == "target") & (df["method"] == "new")]
++    searchspace = SearchSpace.from_dataframe(
++        target_df, parameters=[num_param, task_param, cat_param]
++    )
++    assert len(searchspace.discrete.exp_rep) == 1
++    assert all(searchspace.discrete.exp_rep["task"] == "target")

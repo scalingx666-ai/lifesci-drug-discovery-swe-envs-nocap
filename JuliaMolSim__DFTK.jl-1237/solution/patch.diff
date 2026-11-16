@@ -1,0 +1,533 @@
+diff --git a/src/gpu/linalg.jl b/src/gpu/linalg.jl
+index 989d78407a..7cef0eb43f 100644
+--- a/src/gpu/linalg.jl
++++ b/src/gpu/linalg.jl
+@@ -15,15 +15,15 @@ function compute_λ(X::AbstractGPUArray{T}, AX::AbstractGPUArray{T}, BX::Abstrac
+ end
+ 
+ function columnwise_dots(A::AbstractGPUArray{T}, B::AbstractGPUArray{T}) where {T}
+-    sum(conj(A) .* B; dims=1)
++    vec(sum(conj(A) .* B; dims=1))
+ end
+ 
+ function columnwise_dots(A::AbstractGPUArray{T}, M, B::AbstractGPUArray{T}) where {T}
+-    sum(conj(A) .* (M * B); dims=1)
++    vec(sum(conj(A) .* (M * B); dims=1))
+ end
+ 
+ function columnwise_dots(A::AbstractGPUArray{T}, D::Diagonal, B::AbstractGPUArray{T}) where {T}
+-    sum(conj(A) .* (D.diag .* B); dims=1)
++    vec(sum(conj(A) .* (D.diag .* B); dims=1))
+ end
+ 
+ function ldiv!(Y::AbstractGPUArray{T}, P::PreconditionerTPA, R::AbstractGPUArray{T}) where {T}
+diff --git a/src/postprocess/refine.jl b/src/postprocess/refine.jl
+index 5f3a29ca5c..127fe69f04 100644
+--- a/src/postprocess/refine.jl
++++ b/src/postprocess/refine.jl
+@@ -34,6 +34,7 @@
+ #     *Practical error bounds for properties in plane-wave electronic structure calculations*
+ #     [SIAM Journal on Scientific Computing 44 (5), B1312-B1340](https://doi.org/10.1137/21M1456224)
+ 
++using LinearMaps
+ import DifferentiationInterface: AutoForwardDiff, value_and_derivative
+ 
+ """
+diff --git a/src/response/cg.jl b/src/response/cg.jl
+index 70f4b51343..094b66a3c3 100644
+--- a/src/response/cg.jl
++++ b/src/response/cg.jl
+@@ -1,70 +1,132 @@
+-using LinearMaps
+ using LinearAlgebra: dot
++using LinearMaps
+ 
+ function default_cg_print(info)
+     # Default callback prints on all MPI ranks
+     @printf("%3d\t%1.2e\n", info.n_iter, info.residual_norm)
+ end
+ 
++"""
++Matrix-vector product used in the CG solver. The CG locking mechanism is such that the first
++and last converged columns of x in Ax = b are ignored by considering a contiguous active set
++of columns,defined by first(!converged_columns):last(!converged_columns). The mask must be a
++contiguous range for GPU compatibility. This is the default implementation for matrix-like A.
++Custom opertators must implement their own method for mul_masked!.
++"""
++@timing mul_masked!(Ax, A::Union{AbstractArray{T}, LinearMap{T}}, x;
++                    mask::UnitRange) where {T} = @views mul!(Ax[:, mask], A, x[:, mask])
++
+ """
+ Implementation of the conjugate gradient method which allows for preconditioning
+-and projection operations along iterations.
++and projection operations along iterations. The solver is optimized for generic
++input arrays with multiple columns, i.e. solutions of A x[:, n] = b[:, n] for all
++columns n are sought simultaneously. Single column vectors, i.e. size(x, 2) == 1,
++are also supported. To reduce allocations, an in-place mul_masked! matrix-vector
++product is used for A*x,  and projector proj! is also expected to be in-place.
++A basic locking meachnism for converged columns is implemented.
+ """
+-function cg!(x::AbstractVector{T}, A::LinearMap{T}, b::AbstractVector{T};
+-             precon=I, proj=identity, callback=identity,
+-             tol=1e-10, maxiter=100, miniter=1,
+-             my_dot=dot) where {T}
+-    my_norm(x) = sqrt(real(my_dot(x, x)))
++function cg!(x::AbstractArray{T}, A, b::AbstractArray{T};
++             precon=I, proj! =copy!, callback=identity,
++             tol=1e-10*ones(real(T), size(b, 2)), maxiter=100, miniter=1,
++             my_columnwise_dots=columnwise_dots) where {T}
++
++    # Columnwise dot products and norms. A custom definition of the dot product can be provided,
++    # from which the norms are derived. The default is the standard dot porduct: 
++    # [dot(x[:, i], x[:, i])] for all columns i.
++    my_columnwise_norms(x) = sqrt.(real.(my_columnwise_dots(x, x)))
+ 
+     # initialisation
+     # r = b - Ax is the residual
+     r = copy(b)
+     # c is an intermediate variable to store A*p and precon\r
+-    c = zero(b)
++    c = zeros_like(b)
++
++    # projection buffer to avoid allocations
++    proj_buffer = similar(b)
+ 
+     # save one matrix-vector product
+     if !iszero(x)
+-        mul!(c, A, x)
++        mul_masked!(c, A, x; mask=1:size(x, 2))
+         r .-= c
+     end
+     ldiv!(c, precon, r)
+-    γ = my_dot(r, c)
++    γ = similar(b, T, size(b, 2))  # explicit type for stability
++    γ .= my_columnwise_dots(r, c)
+     # p is the descent direction
+     p = copy(c)
+     n_iter = 0
+-    residual_norm = my_norm(r)
++    residual_norms = zeros(real(T), size(b, 2))  # explicit type stability
++    residual_norms .= to_cpu(my_columnwise_norms(r))
++    converged_cols = falses(size(b, 2))
+ 
+     # convergence history
+     converged = false
+ 
++    # Keep track of full arrays to enable locking of converged columns
++    full_x = x
++    full_r = r
++    full_c = c
++    full_p = p
++    full_b = b
++    full_buff = proj_buffer
++    full_γ = γ
++    full_residuals = residual_norms
++
+     # preconditioned conjugate gradient
+     while n_iter < maxiter
+         # output
+-        info = (; A, b, n_iter, x, r, residual_norm, converged, stage=:iterate)
++        info = (; A, b=full_b, n_iter, x=full_x, r=full_r, residual_norms=full_residuals,
++                  converged, stage=:iterate)
+         callback(info)
+         n_iter += 1
+-        if (n_iter ≥ miniter) && residual_norm ≤ tol
++        converged_cols .= full_residuals .<= tol
++        if (n_iter ≥ miniter) && all(converged_cols)
+             converged = true
+             break
+         end
+-        mul!(c, A, p)
+-        α = γ / my_dot(p, c)
++
++        # Lock columns that are already converged. Because we can only take views with
++        # contiguous ranges in GPU arrays, we lock the first and last converged columns.
++        locked_lb = findfirst(!, converged_cols)
++        locked_ub = findlast(!, converged_cols)
++        active = locked_lb : locked_ub
++
++        @views begin
++            x = full_x[:, active]
++            r = full_r[:, active]
++            c = full_c[:, active]
++            p = full_p[:, active]
++            b = full_b[:, active]
++            proj_buffer = full_buff[:, active]
++            γ = full_γ[active]
++            residual_norms = full_residuals[active]
++        end
++
++        mul_masked!(full_c, A, full_p; mask=active)  # full_c[:, active] = A*full_p[:, active]
++        tmp = zeros_like(γ)
++        tmp .= my_columnwise_dots(p, c)
++        α = γ ./ tmp
+ 
+         # update iterate and residual while ensuring they stay in Ran(proj)
+-        x .= proj(x .+ α .* p)
+-        r .= proj(r .- α .* c)
+-        residual_norm = my_norm(r)
++        proj_buffer .= x .+ p .* α'
++        proj!(x, proj_buffer)  # x .= proj(x .+ p .* α')
++        proj_buffer .= r .- c .* α'
++        proj!(r, proj_buffer)  # r .= proj(r .- c .* α')
++        residual_norms .= to_cpu(my_columnwise_norms(r))
+ 
+-        # apply preconditioner and prepare next iteration
+-        ldiv!(c, precon, r)
+-        γ_prev, γ = γ, my_dot(r, c)
+-        β = γ / γ_prev
+-        p .= proj(c .+ β .* p)
++        # apply preconditioner and prepare next iteration. Preconditioner applied to full
++        # arrays, because the FunctionPreconditioner type makes it hard to change the
++        # active set (cheap enough). c is also updated, as it is a view into full_c
++        # TODO: allow masking in the preconditioner ?
++        ldiv!(full_c, precon, full_r)
++        copy!(tmp, γ)  # previous γ stored in tmp array 
++        γ .= my_columnwise_dots(r, c)
++        β = γ ./ tmp
++        proj_buffer .= c .+ p .* β'
++        proj!(p, proj_buffer)  # p .= proj(c .+ p .* β')/
+     end
+-    info = (; x, converged, tol, residual_norm, n_iter, maxiter, stage=:finalize)
++    info = (; x=full_x, converged, tol, residual_norms=full_residuals, n_iter, maxiter, stage=:finalize)
+     callback(info)
+     info
+ end
+-cg!(x::AbstractVector, A::AbstractMatrix, b::AbstractVector; kwargs...) = cg!(x, LinearMap(A), b; kwargs...)
+-cg(A::LinearMap, b::AbstractVector; kwargs...) = cg!(zero(b), A, b; kwargs...)
+-cg(A::AbstractMatrix, b::AbstractVector; kwargs...) = cg(LinearMap(A), b; kwargs...)
++cg(A, b::AbstractArray; kwargs...) = cg!(zeros_like(b), A, b; kwargs...)
+\ No newline at end of file
+diff --git a/src/response/chi0.jl b/src/response/chi0.jl
+index de06831fc8..b1a23c63eb 100644
+--- a/src/response/chi0.jl
++++ b/src/response/chi0.jl
+@@ -1,5 +1,3 @@
+-using LinearMaps
+-
+ @doc raw"""
+ Compute the independent-particle susceptibility. Will blow up for large systems.
+ For non-spin-polarized calculations the matrix dimension is
+@@ -103,21 +101,29 @@ LinearAlgebra.ldiv!(y::T, P::FunctionPreconditioner, x) where {T} = P.preconditi
+ LinearAlgebra.ldiv!(P::FunctionPreconditioner, x) = (x .= P.precondition!(similar(x), x))
+ precondprep!(P::FunctionPreconditioner, ::Any) = P
+ 
+-# Solves (1-P) (H-ε) (1-P) δψn = - (1-P) rhs
++struct MaskedOperator{T}
++    masked_product!::T  # masked_product!(Ax, x; mask)
++end
++@timing mul_masked!(Ax, M::MaskedOperator, x; mask) = M.masked_product!(Ax, x; mask)
++
++# Solves (1-P) (H-ε) (1-P) δψ = - (1-P) rhs
+ # where 1-P is the projector on the orthogonal of ψk
++# The solver simultaneously solves for multiple right-hand sides, i.e.:
++# (1-P) (H-ε) (1-P) δψ[:, n] = - (1-P) rhs[:, n] for all columns n.
+ # /!\ It is assumed (and not checked) that ψk'Hk*ψk = Diagonal(εk) (extra states
+ # included).
+-@timing function sternheimer_solver(Hk, ψk, ε, rhs;
++function sternheimer_solver(Hk, ψk, ε, rhs;
+                                     callback=identity,
+-                                    ψk_extra=zeros_like(ψk, size(ψk, 1), 0), εk_extra=zeros(0),
+-                                    Hψk_extra=zeros_like(ψk, size(ψk, 1), 0), tol=1e-9,
++                                    ψk_extra=zeros_like(ψk), εk_extra=zeros_like(ε),
++                                    Hψk_extra=zeros_like(ψk), tol=1e-9,
+                                     miniter=1, maxiter=100)
+-    # TODO This whole projector business allocates a lot, which is rather slow.
+-    #      We should optimise this a bit to avoid allocations where possible.
+-
+     basis  = Hk.basis
+     kpoint = Hk.kpoint
+ 
++    # Note: to maintain clearer mathematical formulas, all commements assume the problem
++    #       is solved band by band, with ψkn = ψk[:, n]. In practice, the problem is solved
++    #       for all bands simultaneously for performance reasons.
++
+     # We use a Schur decomposition of the orthogonal of the occupied states
+     # into a part where we have the partially converged, non-occupied bands
+     # (which are Rayleigh-Ritz wrt to Hk) and the rest.
+@@ -131,8 +137,15 @@ precondprep!(P::FunctionPreconditioner, ::Any) = P
+     P_computed(ϕ) = P(ϕ) + P_extra(ϕ)
+     # Q = 1-P is the projector onto the orthogonal of converged states
+     Q(ϕ) = ϕ - P(ϕ)
++
+     # R = 1-P_computed is the projector onto the orthogonal of computed states
+-    R(ϕ) = ϕ - P_computed(ϕ)
++    # Implement allocation light, in-place version for performance
++    function R!(Rϕ, ϕ)
++        mul!(Rϕ, ψk, ψk' * ϕ)  # P(ϕ)
++        mul!(Rϕ, ψk_extra, ψk_extra' * ϕ, -1, -1)  # -P(ϕ) - P_extra(ϕ)
++        Rϕ .+= ϕ  # R = ϕ -P(ϕ) - P_extra(ϕ)
++    end
++    R(ϕ) = R!(similar(ϕ), ϕ)
+ 
+     # We put things into the form
+     # δψkn = ψk_extra * αkn + δψknᴿ ∈ Ran(Q)
+@@ -149,11 +162,13 @@ precondprep!(P::FunctionPreconditioner, ::Any) = P
+     # |-----------|--------------|------------------------
+     # 1     N_occupied  N_occupied + N_extra
+ 
+-    # ψk_extra are not converged but have been Rayleigh-Ritzed (they are NOT
+-    # eigenvectors of H) so H(ψk_extra) = ψk_extra' (Hk-ε) ψk_extra should be a
+-    # real diagonal matrix.
+-    H(ϕ) = Hk * ϕ - ε * ϕ
+-    ψk_exHψk_ex = Diagonal(real.(εk_extra .- ε))
++    # Define the operator H-ε by its action on a set of vectors ϕ: 
++    # (H-ε)ϕ = Hϕ - ϕ * Diagonal(ε). Application can be restriced to a
++    #given active range of columns of x, define by a mask.
++    function H(ϕ; mask=1:size(ϕ, 2))
++        Hϕ = Hk * ϕ[:, mask]
++        mul!(Hϕ, ϕ[:, mask], Diagonal(ε[mask]), -1, 1)  # Hϕ - ϕ * Diagonal(ε)
++    end
+ 
+     # 1) solve for δψknᴿ
+     # ----------------------------
+@@ -165,34 +180,54 @@ precondprep!(P::FunctionPreconditioner, ::Any) = P
+     # where M = ψk_extra * (ψk_extra' (H-ε) ψk_extra)^{-1} * ψk_extra'
+     # is defined above and b is the projection of -rhs onto Ran(Q).
+     #
++    # ψk_extra are not converged but have been Rayleigh-Ritzed (they are NOT
++    # eigenvectors of H) so H(ψk_extra) = ψk_extra' (Hk-ε) ψk_extra should be a
++    # real diagonal matrix with εk_extra - ε_l on the diagonal (ε_l is a scalar).
++    #
++    # When solving for multiple RHS at once, ε is a vector, and the above becomes
++    # a 3-tensor: ψmk_extra' (H - ε_l) ψnk_extra = δmn (εk_extra_n - ε_l)
++    # Applying M * b becomes:
++    # ψkm_extra * 1/(εk_extra_n - ε_l) * ψkn_extra' * b[:, l]
++    # 1/(εk_extra_n - ε_l) is stored in matrix form as inv_ψk_exHψk_ex[n, l],
++    # and multiplies ψkn_extra' * b[:, l] elementwise when applying M * b.
++    inv_ψk_exHψk_ex = 1 ./(real.(εk_extra) .- ε')
++
+     b = -Q(rhs)
+-    bb = R(b -  Hψk_extra * (ψk_exHψk_ex \ ψk_extra'b))
+-    @timing function RAR(ϕ)
+-        Rϕ = R(ϕ)
++    bb = R(b -  Hψk_extra * (inv_ψk_exHψk_ex .* ψk_extra'b))  # R * (1-M) * b
++
++    # Implementation of: R * (H - ε) * (1 - M * (H - ε)) * R * ϕ
++    @views function RAR!(RARϕ, ϕ; mask)
++        R!(RARϕ[:, mask], ϕ[:, mask])
++        HRϕ = H(RARϕ; mask)
+         # Schur complement of (1-P) (H-ε) (1-P)
+         # with the splitting Ran(1-P) = Ran(P_extra) ⊕ Ran(R)
+-        R(H(Rϕ) - Hψk_extra * (ψk_exHψk_ex \ Hψk_extra'Rϕ))
++        # HRϕ[:, n] -= Hψk_extra[:, n] * [1/(εk_extra_n - ε_l)] .* Hψk_extra[:, n]' Rϕ[:, l]
++        mul!(HRϕ, Hψk_extra, inv_ψk_exHψk_ex[:, mask] .* Hψk_extra'RARϕ[:, mask], -1, 1)
++        R!(RARϕ[:, mask], HRϕ)
+     end
++    A = MaskedOperator(RAR!)
+     precon = PreconditionerTPA(basis, kpoint)
+     # First column of ψk as there is no natural kinetic energy.
+     # We take care of the (rare) cases when ψk is empty.
+-    precondprep!(precon, size(ψk, 2) ≥ 1 ? ψk[:, 1] : nothing)
++    precondprep!(precon, size(ψk, 2) ≥ 1 ? repeat(ψk[:, 1], 1, size(bb, 2)) : nothing)
+     @timing function R_ldiv!(x, y)
+-        x .= R(precon \ R(y))
++        R!(x, precon \ R(y))
+     end
+-    J = LinearMap{eltype(ψk)}(RAR, size(Hk, 1))
+-    cg_res = cg(J, bb; precon=FunctionPreconditioner(R_ldiv!), tol, proj=R,
++    cg_res = cg(A, bb; precon=FunctionPreconditioner(R_ldiv!), tol, proj! =R!,
+                 callback=info -> callback(merge(info, (; basis, kpoint))),
+                 miniter, maxiter)
+-    δψknᴿ = cg_res.x
++    δψkᴿ = cg_res.x
+ 
+-    # 2) solve for αkn now that we know δψknᴿ
+-    # Note that αkn is an empty array if there is no extra bands.
+-    αkn = ψk_exHψk_ex \ (ψk_extra' * (b - H(δψknᴿ)))
++    # 2) solve for αk now that we know δψkᴿ
++    # We again do this for all right-hand sides at once, such that
++    # αk[m, l] = 1/(εk_extra_n - ε_l) δnm (ψk_extra[:, n]' 
++    #                                      * (b[:, l] - (H - ε_l) * δψkᴿ[:, l])
++    # Note that αk is an empty array if there is no extra bands.
++    αk = inv_ψk_exHψk_ex .* (ψk_extra' * (b - H(δψkᴿ)))
+ 
+-    δψkn = ψk_extra * αkn + δψknᴿ
++    δψk = ψk_extra * αk + δψkᴿ
+ 
+-    (; δψkn, cg_res.n_iter, cg_res.residual_norm, cg_res.converged, cg_res, tol)
++    (; δψk, cg_res.n_iter, cg_res.residual_norms, cg_res.converged, cg_res, tol)
+ end
+ 
+ # Apply the four-point polarizability operator χ0_4P = -Ω^-1
+@@ -325,7 +360,7 @@ in `basis.kpoints[ik]` from which `δψ` is computed (but expressed in `basis.kp
+ function compute_δψ!(δψ, basis::PlaneWaveBasis{T}, H, ψ, εF, ε, δHψ, ε_minus_q=ε;
+                      ψ_extra=[zeros_like(ψk, size(ψk,1), 0) for ψk in ψ],
+                      q=zero(Vec3{T}), bandtol_minus_q, kwargs_sternheimer...) where {T}
+-    # We solve the Sternheimer equation
++    # We solve the Sternheimer equation for all columns n at once
+     #   (H_k - ε_{n,k-q}) δψ_{n,k} = - (1 - P_{k}) δHψ_{n, k-q},
+     # where P_{k} is the projector on ψ_{k} and with the conventions:
+     # * δψ_{k} is the variation of ψ_{k-q}, which implies (for ℬ_{k} the `basis.kpoints`)
+@@ -342,7 +377,7 @@ function compute_δψ!(δψ, basis::PlaneWaveBasis{T}, H, ψ, εF, ε, δHψ, ε
+     n_iter = [Vector{Int}() for _ in 1:length(ψ)]
+     converged = true
+ 
+-    # Compute δψnk band per band
++    # Compute δψk for each k-point
+     for ik = 1:length(ψ)
+         Hk   = H[ik]
+         ψk   = ψ[ik]
+@@ -359,6 +394,7 @@ function compute_δψ!(δψ, basis::PlaneWaveBasis{T}, H, ψ, εF, ε, δHψ, ε
+             Hψk_extra = Hk * ψk_extra
+             εk_extra  = diag(real.(ψk_extra' * Hψk_extra))
+         end
++        α = zeros_like(εk, length(εk), length(εk_minus_q))
+         for n = 1:length(εk_minus_q)
+             fnk_minus_q = filled_occ * Smearing.occupation(smearing, (εk_minus_q[n]-εF) / temperature)
+ 
+@@ -370,22 +406,25 @@ function compute_δψ!(δψ, basis::PlaneWaveBasis{T}, H, ψ, εF, ε, δHψ, ε
+                 fmk = filled_occ * Smearing.occupation(smearing, (εk[m]-εF) / temperature)
+                 ddiff = Smearing.occupation_divided_difference
+                 ratio = filled_occ * ddiff(smearing, εk[m], εk_minus_q[n], εF, temperature)
+-                αmn = compute_αmn(fmk, fnk_minus_q, ratio)  # fnk_minus_q * αmn + fmk * αnm = ratio
+-                δψk[:, n] .+= ψk[:, m] .* αmn .* dot(ψk[:, m], δHψ[ik][:, n])
++                α[m, n] = compute_αmn(fmk, fnk_minus_q, ratio)  # fnk_minus_q * αmn + fmk * αnm = ratio
+             end
+-
+-            # Sternheimer contribution
+-            res = sternheimer_solver(Hk, ψk, εk_minus_q[n], δHψ[ik][:, n]; ψk_extra,
+-                                     εk_extra, Hψk_extra, tol=tolk_minus_q[n], kwargs_sternheimer...)
+-
+-            !res.converged && @warn("Sternheimer CG not converged", ik, n, res.n_iter,
+-                                    res.tol, res.residual_norm)
+-
+-            δψk[:, n] .+= res.δψkn
+-            push!(residual_norms[ik], res.residual_norm)
+-            push!(n_iter[ik], res.n_iter)
+-            converged = converged && res.converged
+         end
++        # Array operations for GPU efficiency
++        dot_prods = ψk' * δHψ[ik]
++        dot_prods .*= to_device(basis.architecture, α)
++        mul!(δψk, ψk, dot_prods, 1, 1)
++
++        # Sternheimer contribution, for all columns of δψk at once.
++        εk_minus_q_device = to_device(basis.architecture, εk_minus_q)
++        res = sternheimer_solver(Hk, ψk, εk_minus_q_device, δHψ[ik];
++                                 ψk_extra, εk_extra, Hψk_extra,
++                                 tol=tolk_minus_q, kwargs_sternheimer...)
++        !res.converged && @warn("Sternheimer CG not converged", res.tol, res.residual_norms)
++
++        δψk .+= res.δψk
++        append!(residual_norms[ik], res.residual_norms)
++        push!(n_iter[ik], res.n_iter)
++        converged = converged && res.converged
+     end
+ 
+     (; δψ, n_iter, residual_norms, converged)
+diff --git a/src/response/hessian.jl b/src/response/hessian.jl
+index f7207f87d6..bfcc61cc07 100644
+--- a/src/response/hessian.jl
++++ b/src/response/hessian.jl
+@@ -1,4 +1,5 @@
+ using KrylovKit
++using LinearMaps
+ 
+ # The Hessian of P -> E(P) (E being the energy) is Ω+K, where Ω and K are
+ # defined below (cf. [1] for more details).
+@@ -100,7 +101,7 @@ function (cb::ResponseCallback)(info)
+     runtime_ns = current_time - cb.prev_time[]
+     cb.prev_time[] = current_time
+ 
+-    resnorm = @sprintf "%20.2f" log10(info.residual_norm)
++    resnorm = @sprintf "%20.2f" log10(only(info.residual_norms))
+     time = @sprintf "% 6s" TimerOutputs.prettytime(runtime_ns)
+     @printf "% 3d   %s   %s\n" info.n_iter resnorm time
+     flush(stdout)
+@@ -155,21 +156,22 @@ that is return δψ where (Ω+K) δψ = -δHextψ.
+     J = LinearMap{T}(ΩpK, size(δHextψ_pack, 1))
+ 
+     # solve (Ω+K) δψ = -δHextψ on the tangent space with CG
+-    function proj(x)
++    function proj!(Px, x)
+         δψ = unpack(x)
+         proj_tangent!(δψ, ψ)
+-        pack(δψ)
++        Px .= pack(δψ)
+     end
+     # custom inner product that Ω+K is self-adjoint with respect to
+-    function weighted_dot(x, y)
++    function weighted_dots(x, y)
+         δψx = unsafe_unpack(x)
+         δψy = unsafe_unpack(y)
+         # real(dot) here because we work in R^2N rather than C^N
+-        weighted_ksum(basis, [real(dot(δψx[ik], δψy[ik])) for ik in 1:length(basis.kpoints)])
++        [weighted_ksum(basis, [real(dot(δψx[ik], δψy[ik])) for ik in 1:length(basis.kpoints)])]
+     end
+-    res = cg(J, -δHextψ_pack; precon=FunctionPreconditioner(f_ldiv!), proj, tol,
+-             callback=info -> callback(merge(info, (; basis=basis))), my_dot=weighted_dot)
+-    (; δψ=unpack(res.x), res.converged, res.tol, res.residual_norm,
++    res = cg(J, -δHextψ_pack; precon=FunctionPreconditioner(f_ldiv!), proj!,
++             tol=tol, callback=info -> callback(merge(info, (; basis=basis))),
++             my_columnwise_dots=weighted_dots)
++    (; δψ=unpack(res.x), res.converged, res.tol, res.residual_norms,
+      res.n_iter)
+ end
+ 
+@@ -233,6 +235,7 @@ function (cb::OmegaPlusKDefaultCallback)(info)
+         @printf(io, "%21s%s  %10s  %7.1f%s  %s\n",
+                 "", label_s[3], "", avgCG, tstr, "Final orbitals")
+     end
++    flush(stdout)
+     info
+ end
+ 
+diff --git a/src/scf/mixing.jl b/src/scf/mixing.jl
+index ca46556668..37d58ac66a 100644
+--- a/src/scf/mixing.jl
++++ b/src/scf/mixing.jl
+@@ -1,5 +1,4 @@
+ using KrylovKit
+-using LinearMaps
+ using Statistics
+ import Base: @kwdef
+ 
+diff --git a/src/scf/newton.jl b/src/scf/newton.jl
+index 7ad66017cc..b50e840ab4 100644
+--- a/src/scf/newton.jl
++++ b/src/scf/newton.jl
+@@ -1,5 +1,3 @@
+-using LinearMaps
+-
+ # Newton's algorithm to solve SCF equations
+ #
+ # Newton algorithm consists of iterating over density matrices like
+diff --git a/src/transfer.jl b/src/transfer.jl
+index d320380f1d..d414f81300 100644
+--- a/src/transfer.jl
++++ b/src/transfer.jl
+@@ -211,15 +211,17 @@ element of `basis.kpoints` equivalent to ``k-q``.
+ """
+ @views function multiply_ψ_by_blochwave(basis::PlaneWaveBasis{T}, ψ, f_real, q=zero(Vec3{T})) where {T}
+     fψ = zero.(ψ)
++    real_buffer = similar(f_real, Complex{T}, basis.fft_size...)
++    norm = basis.fft_grid.fft_normalization * basis.fft_grid.ifft_normalization
+     # First, express ψ_{[k-q]} in the basis of k-q points…
+     ψ_minus_q = transfer_blochwave_equivalent_to_actual(basis, ψ, -q)
+     for (ik, kpt) in enumerate(basis.kpoints)
+         # … then perform the multiplication with f in real space and get the Fourier
+         # coefficients.
+         for n = 1:size(ψ[ik], 2)
+-            fψ[ik][:, n] = fft(basis, kpt,
+-                               ifft(basis, ψ_minus_q[ik].kpt, ψ_minus_q[ik].ψk[:, n])
+-                                 .* f_real[:, :, :, kpt.spin])
++            ifft!(real_buffer, basis, ψ_minus_q[ik].kpt, ψ_minus_q[ik].ψk[:, n]; normalize=false)
++            real_buffer .*= f_real[:, :, :, kpt.spin] .* norm
++            fft!(fψ[ik][:, n], basis, kpt, real_buffer; normalize=false)
+         end
+     end
+     fψ
+diff --git a/test/cg.jl b/test/cg.jl
+index 085f9f5d1e..fe22e49fa3 100644
+--- a/test/cg.jl
++++ b/test/cg.jl
+@@ -18,7 +18,7 @@
+ 
+             # test type stability
+             f(b) = DFTK.cg(A, b; tol, maxiter=2n).x
+-            g(b) = DFTK.cg(A, b; tol, maxiter=2n).residual_norm
++            g(b) = DFTK.cg(A, b; tol, maxiter=2n).residual_norms[1]
+             @test res.x ≈ @inferred f(b)
+             @test tol ≥ @inferred g(b)
+         end

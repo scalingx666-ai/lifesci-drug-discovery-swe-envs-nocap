@@ -1,0 +1,429 @@
+diff --git a/htmd/data b/htmd/data
+index 2d372f205..5c395f6f6 160000
+--- a/htmd/data
++++ b/htmd/data
+@@ -1 +1 @@
+-Subproject commit 2d372f205bff56a10f6847edcebf3c7a2e66dfdd
++Subproject commit 5c395f6f680c72880ca5c33105ee7fe6f112af53
+diff --git a/htmd/parameterization/cli.py b/htmd/parameterization/cli.py
+index bced0af88..bb4632b95 100755
+--- a/htmd/parameterization/cli.py
++++ b/htmd/parameterization/cli.py
+@@ -525,7 +525,7 @@ def _output_results(mol, parameters, original_coords, args):
+ def main_parameterize(arguments=None):
+ 
+     from htmd.parameterization.parameterset import recreateParameters, createMultitermDihedralTypes, inventAtomTypes
+-    from htmd.parameterization.util import minimize, fitDihedrals, detectChiralCenters
++    from htmd.parameterization.util import detectChiralCenters, scanDihedrals, filterQMResults, minimize
+ 
+     logger.info('===== Parameterize =====')
+ 
+@@ -570,21 +570,28 @@ def main_parameterize(arguments=None):
+ 
+     # Get QM calculators
+     qm_calculator = None
++    qm_name = ''
+     if args.min_type == 'qm' or args.charge_type == 'ESP' or (args.fit_dihedral and not args.nnp):
+         qm_calculator = _get_qm_calculator(args, queue)
++        qm_name = '{}/{}'.format(qm_calculator.theory, qm_calculator.basis)
++        if args.fake_qm:
++            qm_name = 'Fake QM'
+ 
+     # Get NNP calculators
+     nnp_calculator = None
++    nnp_name = ''
+     if args.nnp:
+         nnp_calculator = _get_nnp_calculator(args, queue)
++        nnp_name = args.npp
+ 
+     # Set the reference calculator
+     if args.nnp:
+         ref_calculator = nnp_calculator
+-        logger.info('Reference method: NNP')
++        ref_name = nnp_name
+     else:
+         ref_calculator = qm_calculator
+-        logger.info('Reference method: QM')
++        ref_name = qm_name
++    logger.info('Reference method: {}'.format(ref_name))
+ 
+     # Assign atom types and initial force field parameters
+     mol, parameters = _get_initial_parameters(mol, args)
+@@ -634,6 +641,8 @@ def main_parameterize(arguments=None):
+     # TODO refactor
+     if len(selected_dihedrals) > 0:
+ 
++        from htmd.parameterization.dihedral import DihedralFitting  # Slow import
++
+         logger.info('=== Dihedral angle scanning and parameter fitting ===')
+ 
+         if args.dihed_opt_type == 'None':
+@@ -666,15 +675,40 @@ def main_parameterize(arguments=None):
+             assert not args.nnp
+             ref_calculator._parameters = parameters
+ 
++        # Scan dihedral angles
++        scan_results = scanDihedrals(mol, ref_calculator, selected_dihedrals, args.outdir,
++                                     scan_type=args.dihed_opt_type, mm_minimizer=mm_minimizer)
++
++        # Filter scan results
++        scan_results = filterQMResults(scan_results, mol=mol)
++
+         # Set random number generator seed
+         if args.seed:
+             np.random.seed(args.seed)
+ 
+-        # Fit the parameters
+-        # TODO separate scanning and fitting
+-        parameters = fitDihedrals(mol, ref_calculator, parameters, selected_dihedrals, args.outdir,
+-                                  dihed_opt_type=args.dihed_opt_type, mm_minimizer=mm_minimizer,
+-                                  num_searches=args.dihed_num_searches)
++        # Fit the dihedral parameters
++        df = DihedralFitting()
++        df.parameters = parameters
++        df.molecule = mol
++        df.dihedrals = selected_dihedrals
++        df.qm_results = scan_results
++        df.num_searches = args.dihed_num_searches
++        df.result_directory = os.path.join(args.outdir, 'parameters')
++
++        # In case of FakeQM, the initial parameters are set to zeros.
++        # It prevents DihedralFitting class from cheating :D
++        if args.fake_qm:
++            df.zeroed_parameters = True
++
++        # Fit dihedral parameters
++        parameters = df.run()
++
++        # Plot dihedral profiles
++        plot_dir = os.path.join(args.outdir, 'parameters', 'plots')
++        os.makedirs(plot_dir, exist_ok=True)
++        df.plotConformerEnergies(plot_dir, ref_name=ref_name)
++        for idihed in range(len(df.dihedrals)):
++            df.plotDihedralEnergies(idihed, plot_dir, ref_name=ref_name)
+ 
+     # Output the parameters and other results
+     _output_results(mol, parameters, initial_coords, args)
+diff --git a/htmd/parameterization/dihedral.py b/htmd/parameterization/dihedral.py
+index 8f0169f2a..f2a91a059 100644
+--- a/htmd/parameterization/dihedral.py
++++ b/htmd/parameterization/dihedral.py
+@@ -11,17 +11,17 @@
+ 
+ import matplotlib
+ matplotlib.use('Agg') # Use Agg to work on Travis
+-
+ import matplotlib.pyplot as plt
++
+ import nlopt
+ import numpy as np
+ 
+ from sklearn.linear_model import LinearRegression
+ 
+-from htmd.numbautil import dihedralAngle
+ from htmd.ffevaluation.ffevaluate import FFEvaluate
+-from htmd.parameterization.parameterset import findDihedralType
++from htmd.numbautil import dihedralAngle
+ from htmd.parameterization.detect import detectParameterizableDihedrals
++from htmd.parameterization.parameterset import findDihedralType
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -79,8 +79,6 @@ def __init__(self):
+ 
+         self._dihedral_atomtypes = None
+ 
+-        self._plot_directory = None
+-
+     @property
+     def numDihedrals(self):
+         """Number of dihedral angles"""
+@@ -94,17 +92,16 @@ def _setup(self):
+         # Get dihedral names
+         self._names = ['-'.join(self.molecule.name[dihedral]) for dihedral in self.dihedrals]
+ 
+-        # Get equivalent dihedral atom indices
++        # Get all equivalent dihedrals
++        all_equivalent_dihedrals = detectParameterizableDihedrals(self.molecule)
++        all_equivalent_dihedrals = {tuple(dihedrals[0]): dihedrals for dihedrals in all_equivalent_dihedrals}
++
++        # Choose the selected dihedrals
+         self._equivalent_dihedrals = []
+-        for idihed, dihedral in enumerate(self.dihedrals):
+-            found = False
+-            for parameterizableDihedral in detectParameterizableDihedrals(self.molecule):
+-                if np.all(list(parameterizableDihedral[0]) == dihedral):
+-                    self._equivalent_dihedrals.append(parameterizableDihedral)
+-                    found = True
+-                    break
+-            if not found:
+-                raise ValueError('%s is not recognized as a parameterizable dihedral\n' % self._names[idihed])
++        for dihedral, name in zip(self.dihedrals, self._names):
++            if tuple(dihedral) not in all_equivalent_dihedrals:
++                raise ValueError('{} is not a parameterizable dihedral!'.format(name))
++            self._equivalent_dihedrals.append(all_equivalent_dihedrals[tuple(dihedral)])
+ 
+         # Get dihedral atom types
+         self._dihedral_atomtypes = [findDihedralType(tuple(self.molecule.atomtype[dihedral]), self.parameters) for dihedral in self.dihedrals]
+@@ -136,8 +133,7 @@ def _setup(self):
+             self._initial_energies.append(np.array(energies))
+ 
+         # Make result directories
+-        self._plot_directory = os.path.join(self.result_directory, 'plots')
+-        os.makedirs(self._plot_directory, exist_ok=True)
++        os.makedirs(self.result_directory, exist_ok=True)
+ 
+     def _getBounds(self):
+         """
+@@ -396,77 +392,95 @@ def _check(self):
+         if self.num_searches != 0:
+             assert np.isclose(self.loss, loss, rtol=0, atol=1e-5)
+ 
+-        self.plotConformerEnergies()
+-        for idihed in range(len(self.dihedrals)):
+-            self.plotDihedralEnergies(idihed)
+-
+     def run(self):
+ 
+         self._setup()
+         self._fit()
+         self._check()
+ 
+-        return self.loss
++        return self.parameters
+ 
+-    def plotDihedralEnergies(self, idihed, write_data=True):
++    def plotDihedralEnergies(self, idihed, directory='.', ref_name = 'Ref', write_data=True):
+         """
+         Plot conformer energies for a specific dihedral angle, including QM, original and fitted MM energies.
+         """
+ 
+-        angle = np.rad2deg(self._angle_values[idihed][idihed][:, 0])
+-        reference_energy = self._reference_energies[idihed] - np.min(self._reference_energies[idihed])
+-        initial_energy = self._initial_energies[idihed] - np.min(self._initial_energies[idihed])
+-        fitted_energy = self._fitted_energies[idihed] - np.min(self._fitted_energies[idihed])
+-        indices = np.argsort(angle)
++        path = os.path.join(directory, self._names[idihed])
++
++        # Get data
++        angle_values = self._angle_values[idihed][idihed][:, 0]
++        reference_energies = self._reference_energies[idihed]
++        initial_energies = self._initial_energies[idihed]
++        fitted_energies = self._fitted_energies[idihed]
++
++        # Convert and offset data
++        angle_values = np.rad2deg(angle_values)
++        reference_energies -= np.min(reference_energies)
++        initial_energies -= np.min(initial_energies)
++        fitted_energies -= np.min(fitted_energies)
+ 
+-        path = os.path.join(self._plot_directory, self._names[idihed])
++        # Sort data
++        indices = np.argsort(angle_values)
++        angle_values = angle_values[indices]
++        reference_energies = reference_energies[indices]
++        initial_energies = initial_energies[indices]
++        fitted_energies = fitted_energies[indices]
+ 
+         if write_data:
+             fmtsz = 8
+-            header = ''.join('{:{size}}'.format(s, size=fmtsz) for s in ['# angle', 'QM_ref', 'MM_init', 'MM_fit'])
+-            data = np.column_stack((angle[indices], reference_energy[indices], initial_energy[indices],
+-                                    fitted_energy[indices]))
++            header = ''.join('{:{size}}'.format(s, size=fmtsz) for s in ['# angle', 'ref', 'MM_init', 'MM_fit'])
++            data = np.column_stack((angle_values, reference_energies, initial_energies, fitted_energies))
+             np.savetxt(path + '.dat', data, fmt='%{size}.3f'.format(size=fmtsz), header=header, comments='')
+ 
++        # Impose periodic boundaries
++        angle_values = np.concatenate([[angle_values[-1] - 360], angle_values, [angle_values[0] + 360]])
++        reference_energies = np.concatenate([[reference_energies[-1]], reference_energies, [reference_energies[0]]])
++        initial_energies = np.concatenate([[initial_energies[-1]], initial_energies, [initial_energies[0]]])
++        fitted_energies = np.concatenate([[fitted_energies[-1]], fitted_energies, [fitted_energies[0]]])
++
+         plt.figure()
+-        plt.title(self._names[idihed])
+-        plt.xlabel('Dihedral angle, deg')
++        plt.title('Dihedral angle: {}'.format(self._names[idihed]))
++        plt.xlabel('Dihedral angle [deg]')
+         plt.xlim(-180, 180)
+         plt.xticks([-180, -135, -90, -45, 0, 45, 90, 135, 180])
+-        plt.ylabel('Energy, kcal/mol')
+-        plt.plot(angle[indices], reference_energy[indices], 'r-', marker='o', lw=3, label='QM')
+-        plt.plot(angle[indices], initial_energy[indices], 'g-', marker='o', label='MM initial')
+-        plt.plot(angle[indices], fitted_energy[indices], 'b-', marker='o', label='MM fitted')
++        plt.ylabel('Energy [kcal/mol]')
++        plt.plot(angle_values, reference_energies, 'r-', marker='o', lw=3, label=ref_name)
++        plt.plot(angle_values, initial_energies, 'g-', marker='o', lw=2, label='MM initial')
++        plt.plot(angle_values, fitted_energies, 'b-', marker='o', lw=2, label='MM fitted')
+         plt.legend()
+         plt.savefig(path + '.svg')
+         plt.close()
+ 
+-    def plotConformerEnergies(self, write_data=True):
++    def plotConformerEnergies(self, directory='.', ref_name='Ref', write_data=True):
+         """
+         Plot all conformer QM energies versus MM energies with the fitted parameters
+         """
+ 
++        path = os.path.join(directory, 'conformer-energies')
++
++        # Get data
+         qm_energy = np.concatenate(self._reference_energies)[:, None]
+         mm_energy = np.concatenate(self._fitted_energies)[:, None]
++
++        # Offset data
+         qm_energy -= np.min(qm_energy)
+         mm_energy -= np.min(mm_energy)
+ 
++        # Fit a linear regression
+         regression = LinearRegression(fit_intercept=False)
+         regression.fit(qm_energy, mm_energy)
+         prediction = regression.predict(qm_energy)
+ 
+-        path = os.path.join(self._plot_directory, 'conformer-energies')
+-
+         if write_data:
+             fmtsz = 8
+-            header = ''.join('{:{size}}'.format(s, size=fmtsz) for s in ['# QM', 'MM'])
++            header = ''.join('{:{size}}'.format(s, size=fmtsz) for s in ['# ref', 'MM'])
+             data = np.column_stack((qm_energy, mm_energy))
+             np.savetxt(path + '.dat', data, fmt='%{size}.3f'.format(size=fmtsz), header=header, comments='')
+ 
+         plt.figure()
+-        plt.title('Conformer Energies MM vs QM')
+-        plt.xlabel('QM energy, kcal/mol')
+-        plt.ylabel('MM energy, kcal/mol')
++        plt.title('{} vs MM energies'.format(ref_name))
++        plt.xlabel('{} energy [kcal/mol]'.format(ref_name))
++        plt.ylabel('MM energy [kcal/mol]')
+         plt.plot(qm_energy, mm_energy, 'ko')
+         plt.plot(qm_energy, prediction, 'r-', lw=2)
+         plt.savefig(path + '.svg')
+diff --git a/htmd/parameterization/util.py b/htmd/parameterization/util.py
+index 98a7d21d5..d67cfd28c 100644
+--- a/htmd/parameterization/util.py
++++ b/htmd/parameterization/util.py
+@@ -139,89 +139,68 @@ def minimize(mol, qm, outdir, min_type='qm', mm_minimizer=None):
+     return mol
+ 
+ 
+-def fitDihedrals(mol, qm, prm, dihedrals, outdir, dihed_opt_type='qm', mm_minimizer=None, num_searches=None):
++def scanDihedrals(mol, ref, dihedrals, outdir, scan_type='qm', mm_minimizer=None):
+     """
+     Dihedrals passed as 4 atom indices
+     """
+-    from htmd.parameterization.dihedral import DihedralFitting
+-    from htmd.qm import FakeQM2
++    num_rotamers = 36  # Number of rotamers for each dihedral to compute
+ 
+     # Create molecules with rotamers
++    # TODO factor out dihedral generation
+     molecules = []
+     for dihedral in dihedrals:
+-        nrotamers = 36  # Number of rotamers for each dihedral to compute
+ 
+         # Create a copy of molecule with "nrotamers" frames
+-        tmpmol = mol.copy()
+-        tmpmol.coords = np.tile(tmpmol.coords, (1, 1, nrotamers))
+-        tmpmol.box = np.zeros((3, tmpmol.numFrames), dtype=np.float32)
++        new_mol = mol.copy()
++        new_mol.coords = np.tile(new_mol.coords, (1, 1, num_rotamers))
++        new_mol.box = np.zeros((3, new_mol.numFrames), dtype=np.float32)
+ 
+         # Set rotamer coordinates
+-        angles = np.linspace(-np.pi, np.pi, num=nrotamers, endpoint=False)
++        angles = np.linspace(-np.pi, np.pi, num=num_rotamers, endpoint=False)
+         for frame, angle in enumerate(angles):
+-            tmpmol.frame = frame
+-            tmpmol.setDihedral(dihedral, angle, bonds=tmpmol.bonds)
++            new_mol.frame = frame
++            new_mol.setDihedral(dihedral, angle, bonds=new_mol.bonds)
+ 
+-        molecules.append(tmpmol)
++        molecules.append(new_mol)
+ 
+     # Minimize with MM if requested
+-    if dihed_opt_type == 'mm':
+-        for dihedral, tmpmol in zip(dihedrals, molecules):
+-            for f in range(tmpmol.numFrames):
+-                tmpmol.coords[:, :, f] = mm_minimizer.minimize(tmpmol.coords[:, :, f], restrained_dihedrals=[dihedral,])
++    if scan_type == 'mm':
++        for dihedral, molecule in zip(dihedrals, molecules):
++            for iframe in range(molecule.numFrames):
++                molecule.coords[:, :, iframe] = mm_minimizer.minimize(molecule.coords[:, :, iframe],
++                                                                      restrained_dihedrals=[dihedral])
+ 
+     # Create directories for QM data
+     directories = []
+-    dihedral_directory = 'dihedral-opt' if dihed_opt_type == 'qm' else 'dihedral-single-point'
++    dihedral_directory = 'dihedral-opt' if scan_type == 'qm' else 'dihedral-single-point'
+     for dihedral in dihedrals:
+         dihedral_name = '-'.join(mol.name[dihedral])
+-        directory = os.path.join(outdir, dihedral_directory, dihedral_name, _qm_method_name(qm))
++        directory = os.path.join(outdir, dihedral_directory, dihedral_name, _qm_method_name(ref))
+         os.makedirs(directory, exist_ok=True)
+         directories.append(directory)
+ 
+     # Setup and submit QM calculations
+     for molecule, dihedral, directory in zip(molecules, dihedrals, directories):
+-        qm.molecule = molecule
+-        qm.esp_points = None
+-        qm.optimize = (dihed_opt_type == 'qm')
+-        qm.restrained_dihedrals = np.array([dihedral])
+-        qm.directory = directory
+-        qm.setup()
+-        qm.submit()
++        ref.molecule = molecule
++        ref.esp_points = None
++        ref.optimize = (scan_type == 'qm')
++        ref.restrained_dihedrals = np.array([dihedral])
++        ref.directory = directory
++        ref.setup()
++        ref.submit()
+ 
+     # Wait and retrieve QM calculation data
+-    qm_results = []
++    scan_results = []
+     for molecule, dihedral, directory in zip(molecules, dihedrals, directories):
+-        qm.molecule = molecule
+-        qm.esp_points = None
+-        qm.optimize = (dihed_opt_type == 'qm')
+-        qm.restrained_dihedrals = np.array([dihedral])
+-        qm.directory = directory
+-        qm.setup()  # QM object is reused, so it has to be properly set up before retrieving.
+-        qm_results.append(qm.retrieve())
+-
+-    # Filter QM results
+-    qm_results = filterQMResults(qm_results, mol=mol)
+-
+-    # Fit the dihedral parameters
+-    df = DihedralFitting()
+-    df.parmedMode = True
+-    df.parameters = prm
+-    df.molecule = mol
+-    df.dihedrals = dihedrals
+-    df.qm_results = qm_results
+-    df.num_searches = num_searches
+-    df.result_directory = os.path.join(outdir, 'parameters')
+-
+-    # In case of FakeQM, the initial parameters are set to zeros.
+-    # It prevents DihedralFitting class from cheating :D
+-    if isinstance(qm, FakeQM2):
+-        df.zeroed_parameters = True
+-
+-    # Fit dihedral parameters
+-    df.run()
+-
+-    return df.parameters
++        ref.molecule = molecule
++        ref.esp_points = None
++        ref.optimize = (scan_type == 'qm')
++        ref.restrained_dihedrals = np.array([dihedral])
++        ref.directory = directory
++        ref.setup()  # QM object is reused, so it has to be properly set up before retrieving.
++        scan_results.append(ref.retrieve())
++
++    return scan_results
+ 
+ 
+ def guessBondType(mol):

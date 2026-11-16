@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** python3.pkgs.optking: fix hash
+
+## Description
+
+The hash of the Optking release tag has somehow changed. Update to the current one.
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `d529c2c47eea`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

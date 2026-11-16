@@ -1,0 +1,1595 @@
+diff --git a/codedeps.yaml b/codedeps.yaml
+index f41b34a764b..80505e42e74 100644
+--- a/codedeps.yaml
++++ b/codedeps.yaml
+@@ -1608,13 +1608,13 @@ data:
+     repository: null
+     cmake:
+       name: cuEST
+-      constraint: "0.1"
++      constraint: ">=0.2.1"
+       target: cuEST::cuEST
+       components: null
+     conda:
+       channel: conda-forge
+       name: libcuest-dev
+-      constraint: "=0.1"
++      constraint: ">=0.2.1"
+       aux_build_names:
+         - cuda-nvcc
+         - libcublas-dev
+diff --git a/psi4/src/psi4/libfock/cuESTJK.cc b/psi4/src/psi4/libfock/cuESTJK.cc
+index 0c03581e5fe..479f6425935 100644
+--- a/psi4/src/psi4/libfock/cuESTJK.cc
++++ b/psi4/src/psi4/libfock/cuESTJK.cc
+@@ -88,6 +88,8 @@ cuESTJK::cuESTJK(std::shared_ptr<BasisSet> primary, std::shared_ptr<BasisSet> au
+ 
+     condition_ = options.get_double("DF_FITTING_CONDITION");
+     pq_threshold_ = options.get_double("INTS_TOLERANCE");
++    dfk_slices_ = options.get_int("CUEST_DFK_SLICES");
++    dfk_moduli_ = options.get_int("CUEST_DFK_MODULI");
+ }
+ 
+ cuESTJK::~cuESTJK() {
+@@ -121,6 +123,33 @@ void cuESTJK::preiterations()
+     // DF Int Plan List
+     cuestDFIntPlanParameters_t dfint_params;
+     CHECK_CUEST(cuestParametersCreate(CUEST_DFINTPLAN_PARAMETERS, reinterpret_cast<void**>(&dfint_params)));
++    
++    // Psi4 and cuEST both represent exact exchange as alpha / r + beta erf(omega r) / r.
++    double exchange_fraction = omega_alpha_;
++    double lrc_exchange_fraction = omega_beta_;
++    double lr_exchange_omega = omega_;
++
++    //Set omega params if applicable 
++    CHECK_CUEST(cuestParametersConfigure(
++        CUEST_DFINTPLAN_PARAMETERS, 
++        dfint_params,
++        CUEST_DFINTPLAN_PARAMETERS_EXCHANGE_FRACTION,
++        &exchange_fraction,
++        sizeof(double)));
++
++    CHECK_CUEST(cuestParametersConfigure(
++        CUEST_DFINTPLAN_PARAMETERS, 
++        dfint_params,
++        CUEST_DFINTPLAN_PARAMETERS_LRC_EXCHANGE_FRACTION,
++        &lrc_exchange_fraction,
++        sizeof(double)));
++
++    CHECK_CUEST(cuestParametersConfigure(
++        CUEST_DFINTPLAN_PARAMETERS, 
++        dfint_params,
++        CUEST_DFINTPLAN_PARAMETERS_LRC_EXCHANGE_OMEGA,
++        &lr_exchange_omega,
++        sizeof(double)));
+ 
+     CHECK_CUEST(cuestDFIntPlanCreateWorkspaceQuery(cuest_handle,
+         cuest_primary_basis_, cuest_auxiliary_basis_, cuest_pair_list_,
+@@ -143,6 +172,29 @@ void cuESTJK::preiterations()
+     CHECK_CUEST(cuestParametersCreate(CUEST_DFCOULOMBCOMPUTE_PARAMETERS, reinterpret_cast<void**>(&cuest_coulomb_compute_params_)));
+     CHECK_CUEST(cuestParametersCreate(CUEST_DFSYMMETRICEXCHANGECOMPUTE_PARAMETERS, reinterpret_cast<void**>(&cuest_exchange_compute_params_)));
+ 
++    // Set J & K compute parameters
++    CHECK_CUEST(cuestParametersConfigure(
++        CUEST_DFSYMMETRICEXCHANGECOMPUTE_PARAMETERS,
++        cuest_exchange_compute_params_,
++        CUEST_DFSYMMETRICEXCHANGECOMPUTE_PARAMETERS_INT8_SLICE_COUNT,
++        &dfk_slices_,
++        sizeof(uint64_t)));
++
++    CHECK_CUEST(cuestParametersConfigure(
++        CUEST_DFSYMMETRICEXCHANGECOMPUTE_PARAMETERS, 
++        cuest_exchange_compute_params_,
++        CUEST_DFSYMMETRICEXCHANGECOMPUTE_PARAMETERS_INT8_MODULUS_COUNT,
++        &dfk_moduli_,
++        sizeof(uint64_t)));
++
++    // Set global math mode, if CUEST_NATIVE_FP64_MATH_MODE, all forms of mixed precision emulation will be turned off
++    if (!options_.get_bool("CUEST_MIXED_PRECISION")) {
++        CHECK_CUEST(cuestSetMathMode(
++            cuest_handle,
++            CUEST_NATIVE_FP64_MATH_MODE
++        ));
++    }
++
+     initialized_ = true;
+ }
+ 
+diff --git a/psi4/src/psi4/libfock/cuESTJK.h b/psi4/src/psi4/libfock/cuESTJK.h
+index 076c9948e22..fa2e672996c 100644
+--- a/psi4/src/psi4/libfock/cuESTJK.h
++++ b/psi4/src/psi4/libfock/cuESTJK.h
+@@ -53,6 +53,8 @@ class PSI_API cuESTJK : public JK {
+ 
+     double condition_;
+     double pq_threshold_;
++    uint64_t dfk_slices_;
++    uint64_t dfk_moduli_;
+ 
+     bool initialized_;
+ 
+@@ -86,6 +88,10 @@ class PSI_API cuESTJK : public JK {
+     ~cuESTJK() override;
+ 
+     void set_condition(double condition) { condition_ = condition; }
++    void set_do_wK(bool do_wK) override {
++        do_wK_ = do_wK;
++        do_K_ = do_K_ || do_wK;  // cuEST returns full- and long-range exchange together in K.
++    }
+     void print_header() const override;
+ 
+     cuestDFIntPlan_t cuest_df_plan() { return cuest_df_plan_; }
+diff --git a/psi4/src/psi4/libfock/v.cc b/psi4/src/psi4/libfock/v.cc
+index a5c8bb01541..dd7eaf63b56 100644
+--- a/psi4/src/psi4/libfock/v.cc
++++ b/psi4/src/psi4/libfock/v.cc
+@@ -63,6 +63,7 @@
+ #endif
+ 
+ #ifdef USING_cuEST
++#include <array>
+ #include <cuest.h>
+ #include <xc.h>
+ #include <cublas_v2.h>
+@@ -106,6 +107,99 @@ extern bool brianBuildingNLCGrid;
+ 
+ namespace psi {
+ 
++#ifdef USING_cuEST
++namespace {
++
++struct CuestXCField {
++    const double* component_values;
++    double* accumulated_values;
++    size_t components_per_point;
++};
++
++template <size_t N>
++inline void accumulate_cuest_xc_component(size_t start_point, size_t end_point, double component_weight,
++                                           const std::array<CuestXCField, N>& fields) {
++    for (size_t point = start_point; point < end_point; ++point) {
++        bool finite = true;
++        for (const auto& field : fields) {
++            for (size_t component = 0; component < field.components_per_point; ++component) {
++                if (!std::isfinite(field.component_values[field.components_per_point * point + component])) {
++                    finite = false;
++                    break;
++                }
++            }
++            if (!finite) break;
++        }
++
++        if (finite) {
++            for (const auto& field : fields) {
++                for (size_t component = 0; component < field.components_per_point; ++component) {
++                    const size_t index = field.components_per_point * point + component;
++                    field.accumulated_values[index] += component_weight * field.component_values[index];
++                }
++            }
++        }
++    }
++}
++
++inline void validate_cuest_xc_components(const std::shared_ptr<SuperFunctional>& functional) {
++    const auto validate = [](const std::vector<std::shared_ptr<Functional>>& components) {
++        for (const auto& component : components) {
++            auto* libxc_component = dynamic_cast<LibXCFunctional*>(component.get());
++            if (libxc_component == nullptr) {
++                throw PSIEXCEPTION("cuEST Vxc requires semilocal component '" + component->name() +
++                                   "' to be a LibXC functional.");
++            }
++            if (libxc_component->xc_functional()->info->flags & XC_FLAGS_NEEDS_LAPLACIAN) {
++                throw PSIEXCEPTION("cuEST Vxc does not support LibXC component '" + component->name() +
++                                   "' because it requires the density Laplacian.");
++            }
++        }
++    };
++
++    validate(functional->x_functionals());
++    validate(functional->c_functionals());
++}
++
++// Ensures that cuEST uses the appropriate LibXC component for mixed rung (GGA+metaGGA) functionals
++inline void evaluate_cuest_xc_component(
++    const std::shared_ptr<Functional>& component, size_t start_point, size_t end_point, size_t rho_components,
++    size_t gamma_components, size_t tau_components, const double* rho, const double* gamma, const double* tau,
++    double* f, double* f_rho, double* f_gamma, double* f_tau, double* full_f, double* full_f_rho,
++    double* full_f_gamma, double* full_f_tau) {
++    auto* libxc_component = static_cast<LibXCFunctional*>(component.get());
++    const size_t npoints = end_point - start_point;
++
++    if (component->is_meta()) {
++        xc_mgga_exc_vxc(libxc_component->xc_functional(), npoints, rho + rho_components * start_point,
++                        gamma + gamma_components * start_point, nullptr, tau + tau_components * start_point,
++                        f + start_point, f_rho + rho_components * start_point,
++                        f_gamma + gamma_components * start_point, nullptr, f_tau + tau_components * start_point);
++        accumulate_cuest_xc_component(
++            start_point, end_point, component->alpha(),
++            std::array{CuestXCField{f, full_f, 1}, CuestXCField{f_rho, full_f_rho, rho_components},
++                       CuestXCField{f_gamma, full_f_gamma, gamma_components},
++                       CuestXCField{f_tau, full_f_tau, tau_components}});
++    } else if (component->is_gga()) {
++        xc_gga_exc_vxc(libxc_component->xc_functional(), npoints, rho + rho_components * start_point,
++                       gamma + gamma_components * start_point, f + start_point,
++                       f_rho + rho_components * start_point, f_gamma + gamma_components * start_point);
++        accumulate_cuest_xc_component(
++            start_point, end_point, component->alpha(),
++            std::array{CuestXCField{f, full_f, 1}, CuestXCField{f_rho, full_f_rho, rho_components},
++                       CuestXCField{f_gamma, full_f_gamma, gamma_components}});
++    } else {
++        xc_lda_exc_vxc(libxc_component->xc_functional(), npoints, rho + rho_components * start_point,
++                       f + start_point, f_rho + rho_components * start_point);
++        accumulate_cuest_xc_component(
++            start_point, end_point, component->alpha(),
++            std::array{CuestXCField{f, full_f, 1}, CuestXCField{f_rho, full_f_rho, rho_components}});
++    }
++}
++
++}  // namespace
++#endif
++
+ VBase::VBase(std::shared_ptr<SuperFunctional> functional, std::shared_ptr<BasisSet> primary, Options& options)
+     : options_(options), primary_(primary), functional_(functional) {
+     common_init();
+@@ -251,6 +345,7 @@ void VBase::initialize() {
+ #ifdef USING_cuEST
+     // No workers are needed for cuEST, so we can just create the XC Integral Plan here and return
+     if (options_.get_bool("USE_CUEST")) {
++        validate_cuest_xc_components(functional_);
+         cuest_common::ensure_cuest_initialized();
+ 
+         cuestXCIntPlanParameters_t xcint_params;
+@@ -1563,7 +1658,6 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+         double* p_f, *p_f_rho, *p_f_gamma, *p_f_tau;
+         SharedMatrix full_f, full_f_rho, full_f_gamma, full_f_tau;
+         double *p_full_f, *p_full_f_rho, *p_full_f_gamma, *p_full_f_tau;
+-        LibXCFunctional* libxc_functional;
+         double *rho_0, *rho_x, *rho_y, *rho_z, *tau_0;
+         switch (ansatz_type) {
+             case CUEST_XCADVANCED_PARAMETERS_APPROXIMATION_LDA:
+@@ -1600,51 +1694,16 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+                     #endif
+ 
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -1695,59 +1754,16 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point);
+-    
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -1809,75 +1825,16 @@ void RV::compute_V(std::vector<SharedMatrix> ret) {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        if (libxc_functional->xc_functional()->info->flags & XC_FLAGS_NEEDS_LAPLACIAN) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional needs laplacian corrections, which are not supported by cuEST.");
+-                        }
+-
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            nullptr,
+-                            p_tau + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point,
+-                            nullptr,
+-                            p_f_tau + start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                                p_full_f_tau[i] += p_f_tau[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 1, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            nullptr,
+-                            p_tau + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point,
+-                            nullptr,
+-                            p_f_tau + start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                                p_full_f_tau[i] += p_f_tau[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 1, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -2876,7 +2833,6 @@ SharedMatrix RV::compute_gradient() {
+         double* p_f, *p_f_rho, *p_f_gamma, *p_f_tau;
+         SharedMatrix full_f, full_f_rho, full_f_gamma, full_f_tau;
+         double *p_full_f, *p_full_f_rho, *p_full_f_gamma, *p_full_f_tau;
+-        LibXCFunctional* libxc_functional;
+         double *rho_0, *rho_x, *rho_y, *rho_z, *tau_0;
+         switch (ansatz_type) {
+             case CUEST_XCADVANCED_PARAMETERS_APPROXIMATION_LDA:
+@@ -2913,51 +2869,16 @@ SharedMatrix RV::compute_gradient() {
+                     #endif
+ 
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -3008,59 +2929,16 @@ SharedMatrix RV::compute_gradient() {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point);
+-    
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -3122,75 +3000,16 @@ SharedMatrix RV::compute_gradient() {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        if (libxc_functional->xc_functional()->info->flags & XC_FLAGS_NEEDS_LAPLACIAN) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional needs laplacian corrections, which are not supported by cuEST.");
+-                        }
+-
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            nullptr,
+-                            p_tau + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point,
+-                            nullptr,
+-                            p_f_tau + start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                                p_full_f_tau[i] += p_f_tau[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 1, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("RV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + start_point,
+-                            p_gamma + start_point,
+-                            nullptr,
+-                            p_tau + start_point,
+-                            p_f + start_point,
+-                            p_f_rho + start_point,
+-                            p_f_gamma + start_point,
+-                            nullptr,
+-                            p_f_tau + start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[i])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[i] += p_f_rho[i];
+-                                p_full_f_gamma[i] += p_f_gamma[i];
+-                                p_full_f_tau[i] += p_f_tau[i];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 1, 1, 1, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -4193,7 +4012,6 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+         double* p_f, *p_f_rho, *p_f_gamma, *p_f_tau;
+         SharedMatrix full_f, full_f_rho, full_f_gamma, full_f_tau;
+         double *p_full_f, *p_full_f_rho, *p_full_f_gamma, *p_full_f_tau;
+-        LibXCFunctional* libxc_functional;
+         double *rho_0_a, *rho_x_a, *rho_y_a, *rho_z_a, *tau_0_a;
+         double *rho_0_b, *rho_x_b, *rho_y_b, *rho_z_b, *tau_0_b;
+         switch (ansatz_type) {
+@@ -4233,55 +4051,16 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 *start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 *start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 * start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -4350,71 +4129,16 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 *start_point,
+-                            p_gamma + 3 *start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 *start_point,
+-                            p_f_gamma + 3 * start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 * start_point,
+-                            p_gamma + 3 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 * start_point,
+-                            p_f_gamma + 3 * start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -4504,90 +4228,16 @@ void UV::compute_V(std::vector<SharedMatrix> ret) {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 *start_point,
+-                            p_gamma + 3 *start_point,
+-                            nullptr,
+-                            p_tau + 2 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 *start_point,
+-                            p_f_gamma + 3 * start_point,
+-                            nullptr,
+-                            p_f_tau + 2 * start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                                p_full_f_tau[2 * i + 0] += p_f_tau[2 * i + 0];
+-                                p_full_f_tau[2 * i + 1] += p_f_tau[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 2, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        if (libxc_functional->xc_functional()->info->flags & XC_FLAGS_NEEDS_LAPLACIAN) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional needs laplacian corrections, which are not supported by cuEST.");
+-                        }
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 * start_point,
+-                            p_gamma + 3 * start_point,
+-                            nullptr,
+-                            p_tau + 2 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 * start_point,
+-                            p_f_gamma + 3 * start_point,
+-                            nullptr,
+-                            p_f_tau + 2 * start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                                p_full_f_tau[2 * i + 0] += p_f_tau[2 * i + 0];
+-                                p_full_f_tau[2 * i + 1] += p_f_tau[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 2, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -6130,7 +5780,6 @@ SharedMatrix UV::compute_gradient() {
+         double* p_f, *p_f_rho, *p_f_gamma, *p_f_tau;
+         SharedMatrix full_f, full_f_rho, full_f_gamma, full_f_tau;
+         double *p_full_f, *p_full_f_rho, *p_full_f_gamma, *p_full_f_tau;
+-        LibXCFunctional* libxc_functional;
+         double *rho_0_a, *rho_x_a, *rho_y_a, *rho_z_a, *tau_0_a;
+         double *rho_0_b, *rho_x_b, *rho_y_b, *rho_z_b, *tau_0_b;
+         switch (ansatz_type) {
+@@ -6170,55 +5819,16 @@ SharedMatrix UV::compute_gradient() {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 *start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 *start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_gradient: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_lda_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 * start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 0, 0, p_rho, nullptr,
++                                                    nullptr, p_f, p_f_rho, nullptr, nullptr, p_full_f,
++                                                    p_full_f_rho, nullptr, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -6287,71 +5897,16 @@ SharedMatrix UV::compute_gradient() {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 *start_point,
+-                            p_gamma + 3 *start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 *start_point,
+-                            p_f_gamma + 3 * start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_V: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_gga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 * start_point,
+-                            p_gamma + 3 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 * start_point,
+-                            p_f_gamma + 3 * start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 0, p_rho, p_gamma,
++                                                    nullptr, p_f, p_f_rho, p_f_gamma, nullptr, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, nullptr);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+@@ -6441,90 +5996,16 @@ SharedMatrix UV::compute_gradient() {
+                     uint64_t end_point = npoints;
+                     #endif
+                     // => Exchange contribution(s) <= //
+-                    for (const auto& functional : functional_->x_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_gradient: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 *start_point,
+-                            p_gamma + 3 *start_point,
+-                            nullptr,
+-                            p_tau + 2 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 *start_point,
+-                            p_f_gamma + 3 * start_point,
+-                            nullptr,
+-                            p_f_tau + 2 * start_point);
+-                        // Accumulate this exchange functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                                p_full_f_tau[2 * i + 0] += p_f_tau[2 * i + 0];
+-                                p_full_f_tau[2 * i + 1] += p_f_tau[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->x_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 2, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     // => Correlation contribution(s) <= //
+-                    for (const auto& functional : functional_->c_functionals()) {
+-                        libxc_functional = dynamic_cast<LibXCFunctional*>(functional.get());
+-                        if (libxc_functional == nullptr) {
+-                            throw PSIEXCEPTION("UV::compute_gradient: Functional is not a LibXC functional, which is required by the CUEST Vxc interface.");
+-                        }
+-                        if (libxc_functional->xc_functional()->info->flags & XC_FLAGS_NEEDS_LAPLACIAN) {
+-                            throw PSIEXCEPTION("UV::compute_gradient: Functional needs laplacian corrections, which are not supported by cuEST.");
+-                        }
+-                        xc_mgga_exc_vxc(
+-                            libxc_functional->xc_functional(),
+-                            end_point - start_point,
+-                            p_rho + 2 * start_point,
+-                            p_gamma + 3 * start_point,
+-                            nullptr,
+-                            p_tau + 2 * start_point,
+-                            p_f + start_point,
+-                            p_f_rho + 2 * start_point,
+-                            p_f_gamma + 3 * start_point,
+-                            nullptr,
+-                            p_f_tau + 2 * start_point);
+-
+-                        // Accumulate this correlation functional's contributions to the full values, ignoring NaNs
+-                        for (size_t i = start_point; i < end_point; i++) {
+-                            bool nan_found = false;
+-                            if (!std::isfinite(p_f[i])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_rho[2 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 1])) nan_found = true;
+-                            if (!std::isfinite(p_f_gamma[3 * i + 2])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 0])) nan_found = true;
+-                            if (!std::isfinite(p_f_tau[2 * i + 1])) nan_found = true;
+-                            if (!nan_found) {
+-                                p_full_f[i] += p_f[i];
+-                                p_full_f_rho[2 * i + 0] += p_f_rho[2 * i + 0];
+-                                p_full_f_rho[2 * i + 1] += p_f_rho[2 * i + 1];
+-                                p_full_f_gamma[3 * i + 0] += p_f_gamma[3 * i + 0];
+-                                p_full_f_gamma[3 * i + 1] += p_f_gamma[3 * i + 1];
+-                                p_full_f_gamma[3 * i + 2] += p_f_gamma[3 * i + 2];
+-                                p_full_f_tau[2 * i + 0] += p_f_tau[2 * i + 0];
+-                                p_full_f_tau[2 * i + 1] += p_f_tau[2 * i + 1];
+-                            }
+-                        }
++                    for (const auto& component : functional_->c_functionals()) {
++                        evaluate_cuest_xc_component(component, start_point, end_point, 2, 3, 2, p_rho, p_gamma,
++                                                    p_tau, p_f, p_f_rho, p_f_gamma, p_f_tau, p_full_f,
++                                                    p_full_f_rho, p_full_f_gamma, p_full_f_tau);
+                     }
+                     for (int point = start_point; point < end_point; point++) {
+                         double w = p_weights[point];
+diff --git a/psi4/src/psi4/libscf_solver/rhf.cc b/psi4/src/psi4/libscf_solver/rhf.cc
+index 5966941de57..126a8c67c96 100644
+--- a/psi4/src/psi4/libscf_solver/rhf.cc
++++ b/psi4/src/psi4/libscf_solver/rhf.cc
+@@ -204,7 +204,12 @@ void RHF::form_G() {
+     const std::vector<SharedMatrix>& K = jk_->K();
+     const std::vector<SharedMatrix>& wK = jk_->wK();
+     J_ = J[0];
+-    if (functional_->is_x_hybrid()) {
++#ifdef USING_cuEST
++    const bool use_cuest = options_.get_bool("USE_CUEST");
++#else
++    const bool use_cuest = false;
++#endif
++    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
+         K_ = K[0];
+     }
+     if (functional_->is_x_lrc()) {
+@@ -224,13 +229,22 @@ void RHF::form_G() {
+     }
+ #endif
+ 
+-    if (functional_->is_x_hybrid() && !(functional_->is_x_lrc() && jk_->get_wcombine())) {
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (use_cuest) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
++    if ((functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) &&
++        !(functional_->is_x_lrc() && jk_->get_wcombine())) {
+         G_->axpy(-alpha, K_);
+     } else {
+         K_->zero();
+     }
+ 
+-    if (functional_->is_x_lrc()) {
++    if (functional_->is_x_lrc() && !use_cuest) { // if using cuEST, wK is encapsulated in K
+         if (jk_->get_wcombine()) {
+             G_->axpy(-1.0, wK_);
+         } else {
+@@ -323,6 +337,12 @@ double RHF::compute_E() {
+     double alpha = functional_->x_alpha();
+     double beta = functional_->x_beta();
+ 
++#ifdef USING_cuEST
++    const bool use_cuest = options_.get_bool("USE_CUEST");
++#else
++    const bool use_cuest = false;
++#endif
++
+ #ifdef USING_BrianQC
+     if (brianEnable and brianEnableDFT) {
+         // BrianQC multiplies with the exact exchange factors inside the Fock building, so we must not do it here
+@@ -331,10 +351,18 @@ double RHF::compute_E() {
+     }
+ #endif
+ 
+-    if (functional_->is_x_hybrid()) {
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (use_cuest) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
++    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
+         exchange_E -= alpha * Da_->vector_dot(K_);
+     }
+-    if (functional_->is_x_lrc()) {
++    if (functional_->is_x_lrc() && !use_cuest) {
+         if (jk_->get_do_wK() && jk_->get_wcombine()) {
+             exchange_E -= Da_->vector_dot(wK_);
+         } else {
+@@ -524,6 +552,14 @@ std::vector<SharedMatrix> RHF::twoel_Hx_full(std::vector<SharedMatrix> x_vec, bo
+     }
+ #endif
+ 
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (options_.get_bool("USE_CUEST")) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
+     std::vector<SharedMatrix> ret;
+     if (!singlet) {
+         for (size_t i = 0; i < x_vec.size(); i++) {
+@@ -1107,6 +1143,14 @@ void RHF::openorbital_scf() {
+     }
+ #endif
+ 
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (options_.get_bool("USE_CUEST")) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
+     std::vector<arma::mat> Vxc(nirrep_);
+     if (functional_->needs_xc()) {
+       // Psi4 expects density matrices without the factor 2
+diff --git a/psi4/src/psi4/libscf_solver/uhf.cc b/psi4/src/psi4/libscf_solver/uhf.cc
+index c2fdb4756c4..8c2849e76ea 100644
+--- a/psi4/src/psi4/libscf_solver/uhf.cc
++++ b/psi4/src/psi4/libscf_solver/uhf.cc
+@@ -205,7 +205,12 @@ void UHF::form_G() {
+     const std::vector<SharedMatrix>& wK = jk_->wK();
+     J_->copy(J[0]);
+     J_->add(J[1]);
+-    if (functional_->is_x_hybrid()) {
++#ifdef USING_cuEST
++    const bool use_cuest = options_.get_bool("USE_CUEST");
++#else
++    const bool use_cuest = false;
++#endif
++    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
+         Ka_ = K[0];
+         Kb_ = K[1];
+     }
+@@ -227,7 +232,15 @@ void UHF::form_G() {
+     }
+ #endif
+ 
+-    if (functional_->is_x_hybrid() && !(functional_->is_x_lrc() && jk_->get_wcombine())) {
++#ifdef USING_cuEST
++    if (use_cuest) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
++    if ((functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) &&
++        !(functional_->is_x_lrc() && jk_->get_wcombine())) {
+         Ga_->axpy(-alpha, Ka_);
+         Gb_->axpy(-alpha, Kb_);
+     } else {
+@@ -235,7 +248,7 @@ void UHF::form_G() {
+         Kb_->zero();
+     }
+ 
+-    if (functional_->is_x_lrc()) {
++    if (functional_->is_x_lrc() && !use_cuest) { // if using cuEST, wK is encapsulated in K
+         if (jk_->get_wcombine()) {
+             Ga_->axpy(-1.0, wKa_);
+             Gb_->axpy(-1.0, wKb_);
+@@ -380,6 +393,12 @@ double UHF::compute_E() {
+     double alpha = functional_->x_alpha();
+     double beta = functional_->x_beta();
+ 
++#ifdef USING_cuEST
++    const bool use_cuest = options_.get_bool("USE_CUEST");
++#else
++    const bool use_cuest = false;
++#endif
++
+ #ifdef USING_BrianQC
+     if (brianEnable and brianEnableDFT) {
+         // BrianQC multiplies with the exact exchange factors inside the Fock building, so we must not do it here
+@@ -388,12 +407,20 @@ double UHF::compute_E() {
+     }
+ #endif
+ 
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (use_cuest) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
+     double exchange_E = 0.0;
+-    if (functional_->is_x_hybrid()) {
++    if (functional_->is_x_hybrid() || (use_cuest && functional_->is_x_lrc())) {
+         exchange_E -= alpha * Da_->vector_dot(Ka_);
+         exchange_E -= alpha * Db_->vector_dot(Kb_);
+     }
+-    if (functional_->is_x_lrc()) {
++    if (functional_->is_x_lrc() && !use_cuest) {
+         if (jk_->get_do_wK() && jk_->get_wcombine()) {
+             exchange_E -= Da_->vector_dot(wKa_);
+             exchange_E -= Db_->vector_dot(wKb_);
+@@ -649,6 +676,14 @@ std::vector<SharedMatrix> UHF::twoel_Hx(std::vector<SharedMatrix> x_vec, bool co
+     }
+ #endif
+ 
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (options_.get_bool("USE_CUEST")) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
+     std::vector<SharedMatrix> ret;
+     if (combine) {
+         for (size_t i = 0; i < nvecs; i++) {
+@@ -1331,6 +1366,14 @@ void UHF::openorbital_scf() {
+     }
+ #endif
+ 
++#ifdef USING_cuEST
++    // cuEST constructs K & wK at the same time, so we must set them to 1.0 here as well
++    if (options_.get_bool("USE_CUEST")) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++#endif
++
+     std::vector<arma::mat> Vxca(nirrep_), Vxcb(nirrep_);
+     if (functional_->needs_xc()) {
+       auto Padummy = linalg::doublet(Cadummy, Cadummy, false, true);
+diff --git a/psi4/src/psi4/scfgrad/scf_grad.cc b/psi4/src/psi4/scfgrad/scf_grad.cc
+index 3c748b358dc..a2e45ad37cd 100644
+--- a/psi4/src/psi4/scfgrad/scf_grad.cc
++++ b/psi4/src/psi4/scfgrad/scf_grad.cc
+@@ -248,8 +248,19 @@ SharedMatrix SCFDeriv::compute_gradient()
+ #ifndef USING_cuEST
+     std::shared_ptr<JKGrad> jk = JKGrad::build_JKGrad(1, mintshelper_);
+ #else
++    // In order to expose range-seperated functioinals through cuEST, cuest_df_plan_ was passed alpha, beta, and omega in cuESTJK.cc.
++    // These quantities must be reset here, as the gradient computation re-uses the same cuest_df_plan_ and thus already implicitly carries alpha, beta.
++    const bool use_cuest_grad = options_.get_str("SCF_TYPE").find("DF") != std::string::npos
++                                && options_.get_bool("USE_CUEST")
++                                && !functional_->is_x_lrc();
++
++    if (use_cuest_grad) {
++        alpha = 1.0;
++        beta = 1.0;
++    }
++
+     std::shared_ptr<JKGrad> jk;
+-    if (options_.get_str("SCF_TYPE").find("DF") != std::string::npos && options_.get_bool("USE_CUEST") && !functional_->is_x_lrc()) {
++    if (use_cuest_grad) {
+         if (!jk_) {
+             throw PSIEXCEPTION(
+                 "cuESTJKGrad requires the SCF JK object to be preserved across finalization. "
+@@ -293,7 +304,7 @@ SharedMatrix SCFDeriv::compute_gradient()
+ #endif
+ 
+     std::map<std::string, SharedMatrix>& jk_gradients = jk->gradients();
+-    gradients_["Coulomb"] = jk_gradients["Coulomb"];
++    gradients_["Coulomb"] = jk_gradients["Coulomb"]; // cuEST packs the combined J/K gradient into this buffer, gradients_["Exchange"] remains a zero matrix
+     if (functional_->is_x_hybrid()) {
+         gradients_["Exchange"] = jk_gradients["Exchange"];
+         gradients_["Exchange"]->scale(-alpha);
+diff --git a/psi4/src/read_options.cc b/psi4/src/read_options.cc
+index ad4e3940404..faa08d3f089 100644
+--- a/psi4/src/read_options.cc
++++ b/psi4/src/read_options.cc
+@@ -170,6 +170,12 @@ int read_options(const std::string &name, Options &options, bool suppress_printi
+ #endif
+     /*- Whether to enable NVIDIA cuEST GPU acceleration (requires CUDA and cuEST libraries) -*/
+     options.add_bool("USE_CUEST", false);
++    /*- Whether to allow GPU calculations to use mixed precision emulation (requires CUDA and cuEST libraries) -*/
++    options.add_bool("CUEST_MIXED_PRECISION", true);
++    /*- Tune # of Ozaki Slices in emulated DF K computations (requires CUDA and cuEST libraries) -*/
++    options.add_int("CUEST_DFK_SLICES", 5);
++    /*- Tune # of Ozaki Moduli in emulated DF K computations (requires CUDA and cuEST libraries) -*/
++    options.add_int("CUEST_DFK_MODULI", 8);
+ 
+     // Note that case-insensitive options are only functional as
+     //   globals, not as module-level, and should be defined sparingly
+diff --git a/tests/pytests/test_cuest.py b/tests/pytests/test_cuest.py
+index 221f0d5b230..645ce04cdf5 100644
+--- a/tests/pytests/test_cuest.py
++++ b/tests/pytests/test_cuest.py
+@@ -231,6 +231,43 @@
+                           [ 0.0136558688, -0.0099903752, -0.0240889545]]
+     }, id='methylamine_um06_vacuum_spherical'),
+ 
++    pytest.param({
++        "geom": __geoms["methylamine"],
++        "methodname": "pw6b95",
++        "args": {
++            "basis": "def2-svp",
++            "dft_spherical_points": 590,
++            "dft_radial_points": 100,
++            },
++        "ref_energy": -95.891979193935711,
++        "ref_gradient": [[ 0.0035623300,  0.0011535385, -0.0028500117],
++                         [ 0.0092168605, -0.0094680146,  0.0034988231],
++                         [-0.0011688988,  0.0010378132, -0.0014311974],
++                         [-0.0116414462,  0.0032048803,  0.0032445416],
++                         [-0.0005877578,  0.0020011832, -0.0003293703],
++                         [-0.0009796034, -0.0011343016, -0.0035287499],
++                         [ 0.0015980964,  0.0032045977,  0.0013964163]]
++    }, id='methylamine_rpw6b95_vacuum_spherical'),
++
++    pytest.param({
++        "geom": __geoms["methylamine_cation"],
++        "methodname": "pw6b95",
++        "args": {
++            "basis": "def2-svp",
++            "dft_spherical_points": 590,
++            "dft_radial_points": 100,
++            "reference": "uhf",
++            },
++        "ref_energy":  -95.545516905743852,
++        "ref_gradient":  [[-0.0641789973, -0.0162144750,  0.0475569199],
++                          [ 0.0298746048,  0.0250976880, -0.0373331997],
++                          [-0.0036131281, -0.0046448509, -0.0008717052],
++                          [-0.0024133635, -0.0111916599,  0.0109828317],
++                          [-0.0001348544,  0.0011744476,  0.0057748601],
++                          [ 0.0259943907,  0.0125974876, -0.0019683850],
++                          [ 0.0144707663, -0.0068188042, -0.0241408920]]
++    }, id='methylamine_upw6b95_vacuum_spherical'),
++
+     pytest.param({
+         "geom": __geoms["methylamine"],
+         "methodname": "b97m-v",
+@@ -323,10 +360,12 @@ def test_cuest_scf(inp, request):
+         'dft_nuclear_scheme': 'stratmann', # To get cuEST and Psi4 to agree exactly for DFT
+         'df_basis_scf': 'def2-universal-JKFIT',
+         'maxiter': 300,
++        'e_convergence': 10, 
+         'd_convergence': 9,
+         "puream": True,
+         "reference": "rhf",
+         'use_cuest': True,
++        'cuest_mixed_precision': False,
+     })
+ 
+     # Override with the test-specific options from above
+diff --git a/tests/pytests/test_cuest_range_separated.py b/tests/pytests/test_cuest_range_separated.py
+new file mode 100644
+index 00000000000..25bea3e59c4
+--- /dev/null
++++ b/tests/pytests/test_cuest_range_separated.py
+@@ -0,0 +1,77 @@
++import psi4
++import pytest
++
++from addons import using, uusing
++from psi4.driver.procrouting.dft import dft_builder
++
++
++pytestmark = [pytest.mark.psi, pytest.mark.api]
++
++
++def _range_separated_functionals():
++    parameters = []
++    for name in sorted(dft_builder.dict_functionals):
++        definition = dft_builder.dict_functionals[name]
++        if not dft_builder.functional_available(definition):
++            continue
++
++        # failing with max iter for psi4 and ADIIS error for cuEST
++        if name == 'hjs-b88': 
++            continue
++
++        functional = dft_builder.build_superfunctional_from_dictionary(definition, 1, 1, True)[0]
++        if not functional.is_x_lrc():
++            continue
++
++        marks = []
++        dispersion_type = definition.get("dispersion", {}).get("type", "")
++        if dispersion_type.startswith("d3"):
++            marks.extend(using("dftd3"))
++        elif dispersion_type.startswith("d4"):
++            marks.extend(using("dftd4"))
++        parameters.append(pytest.param(definition["name"], id=definition["name"], marks=marks))
++
++    return parameters
++
++
++@uusing("cuest")
++@uusing("cuda_cc8")
++@pytest.mark.parametrize("functional", _range_separated_functionals())
++def test_cuest_range_separated_energy(functional):
++    psi4.core.set_num_threads(4)
++    molecule = psi4.geometry(
++        """
++        0 1
++        H 0.0 0.0 -0.7
++        H 0.0 0.0  0.7
++        units bohr
++        symmetry c1
++        """
++    )
++
++    options = {
++        "basis": "def2-svp",
++        "scf_type": "df",
++        "dft_nuclear_scheme": "stratmann",
++        "df_basis_scf": "def2-universal-JKFIT",
++        "maxiter": 300,
++        "e_convergence": 9,
++        "d_convergence": 10, 
++        "puream": True,
++        "reference": "rhf",
++    }
++
++    psi4.set_options({**options, "use_cuest": False})
++    psi4_energy = psi4.energy(functional, molecule=molecule)
++
++    psi4.core.clean()
++    psi4.set_options({**options, "use_cuest": True, "cuest_mixed_precision": False})
++    cuest_energy = psi4.energy(functional, molecule=molecule)
++
++    assert psi4.compare_values(
++        psi4_energy,
++        cuest_energy,
++        atol=5.0e-4, # difference in DF scheme
++        label=f"{functional} Psi4 DF versus cuEST DF energy",
++    )
++

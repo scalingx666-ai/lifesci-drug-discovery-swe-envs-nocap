@@ -1,0 +1,894 @@
+diff --git a/autode/calculation.py b/autode/calculation.py
+index 5fedafa55..b1a7931d1 100644
+--- a/autode/calculation.py
++++ b/autode/calculation.py
+@@ -86,7 +86,7 @@ def __init__(self,
+         self.n_cores = int(n_cores)
+ 
+         # ------------------- Calculation input/output ------------------------
+-        self.input = CalculationInput(keywords=deepcopy(keywords),
++        self.input = CalculationInput(keywords=keywords.copy(),
+                                       additional_input=other_input_block,
+                                       added_internals=bond_ids_to_add,
+                                       point_charges=point_charges)
+@@ -352,7 +352,7 @@ def get_gradients(self) -> Gradient:
+         logger.info(f'Getting gradients from {self.output.filename}')
+         gradients = Gradient(self.method.get_gradients(self))
+ 
+-        if len(gradients) != self.molecule.n_atoms:
++        if gradients.shape != (self.molecule.n_atoms, 3):
+             raise ex.CouldNotGetProperty(name='gradients')
+ 
+         return gradients
+@@ -367,7 +367,8 @@ def get_hessian(self) -> Hessian:
+                       .              .               .              . )
+ 
+         Returns:
+-            (autode.values.Hessian): Hessian matrix. shape = (3N, 3N) for N atoms
++            (autode.values.Hessian): Hessian matrix. shape = (3N, 3N),
++                                     for N atoms
+ 
+         Raises:
+             (autode.exceptions.CouldNotGetProperty):
+@@ -424,15 +425,16 @@ def clean_up(self,
+         filenames = self.input.filenames
+         if everything:
+             filenames.append(self.output.filename)
++            filenames += [fn for fn in os.listdir() if fn.startswith(self.name)]
+ 
+-        logger.info(f'Deleting {filenames}')
++        logger.info(f'Deleting: {set(filenames)}')
+ 
+-        # Delete the files that exist
+-        for filename in filenames:
+-            if not os.path.exists(filename):
++        for filename in set(filenames):
++
++            try:
++                os.remove(filename)
++            except FileNotFoundError:
+                 logger.warning(f'Could not delete {filename} it did not exist')
+-                continue
+-            os.remove(filename)
+ 
+         return None
+ 
+diff --git a/autode/hessians.py b/autode/hessians.py
+index 8197b5e0e..83bdc70b5 100644
+--- a/autode/hessians.py
++++ b/autode/hessians.py
+@@ -3,10 +3,15 @@
+ for mathematical background
+ """
+ import numpy as np
+-from typing import List, Tuple
++from typing import List, Tuple, Iterator
++from multiprocessing import Pool
++from autode.wrappers.keywords import GradientKeywords
++from autode.log import logger
+ from autode.utils import cached_property
++from autode.config import Config
+ from autode.constants import Constants
+ from autode.values import ValueArray, Frequency, Coordinates
++from autode.utils import work_in, hashable
+ from autode.units import (wavenumber,
+                           ha_per_ang_sq, ha_per_a0_sq, J_per_m_sq, J_per_ang_sq,
+                           J_per_ang_sq_kg)
+@@ -312,3 +317,198 @@ def frequencies_proj(self) -> List[Frequency]:
+         vib_freqs = self._eigenvalues_to_freqs(lambdas)
+ 
+         return trans_rot_freqs + vib_freqs
++
++
++def calculate_numerical_hessian(species, *args, **kwargs) -> None:
++    """
++    Calculate a numerical Hessian by shifting atoms and evaluating the gradient
++    with or without central differences to evaluate the numerical derivatives.
++    Sets species.hessian and requires analytic gradients to be available
++
++    ---------------------------------------------------------------------------
++    Arguments:
++        species: Species to calculate the numerical Hesssian for
++
++        *args: Arguments passed to the calculator
++
++        **kwargs: Keyword arguments passed to the calculator
++
++    Raises:
++        (ValueError): For unsupported input
++
++        (CalculationException): For a failed gradient evaluation
++    """
++
++    calculator = _NumericalHessianCalculator(species, *args, **kwargs)
++    calculator.calculate()
++
++    species.hessian = calculator.hessian
++
++    return None
++
++
++class _NumericalHessianCalculator:
++
++    def __init__(self,
++                 species:   'autode.species.Species',
++                 method:    'autode.wrappers.base.Method',
++                 keywords:  'autode.wrappers.keywords.GradientKeywords',
++                 do_c_diff:  bool,
++                 shift: 'autode.values.Distance'
++                 ):
++
++        self._species = species
++        self._method = method
++        self._keywords = self._validated(keywords)
++
++        self._do_c_diff = do_c_diff
++        self._shift = shift
++
++        self._hessian = Hessian(np.zeros(shape=self._hessian_shape),
++                                units='Ha Å^-2')
++        self._calculated_rows = []
++
++        # Number of cores per process to use e.g. a 6x6 Hessian with
++        # Config.n_cores = 12 -> _n_cores = 2
++        self._n_cores = max(Config.n_cores // self._n_rows, 1)
++
++    @work_in('numerical_hessian')
++    def calculate(self) -> None:
++        """Calculate the Hessian"""
++        logger.info(f'Calculating a numerical Hessian'
++                    f'{"with" if self._do_c_diff else "without"} central '
++                    f'differences using {self._n_cores} per process')
++
++        if not self._do_c_diff:
++            logger.info('Calculating gradient at current point')
++            self._init_gradient = self._gradient(species=self._species)
++
++        # Although n_rows may be < n_cores there will not be > n_rows processes
++        with Pool(processes=Config.n_cores) as pool:
++
++            func_name = '_cdiff_row' if self._do_c_diff else '_diff_row'
++
++            res = [pool.apply_async(hashable(func_name, self),
++                                    args=(i, k))
++                   for (i, k) in self._idxs_to_calculate()]
++
++            for row_idx, row in enumerate(res):
++                self._hessian[row_idx, :] = row.get(timeout=None)
++
++        return None
++
++    @property
++    def hessian(self) -> Hessian:
++        return self._hessian
++
++    @property
++    def _hessian_shape(self) -> Tuple[int, int]:
++        """Shape of the Hessian matrix for the species"""
++        return 3 * self._species.n_atoms, 3 * self._species.n_atoms
++
++    @property
++    def _n_rows(self) -> int:
++        """Number of rows in the Hessian"""
++        return 3 * self._species.n_atoms
++
++    def _new_species(self, atom_idx: int, component: int, direction: str):
++        """
++        New species with an applied shift to an atom. For example, water_0x+
++        for a water molecule where the 0th atom has been shifted in the
++        positive x direction
++        """
++        assert direction in ('+', '-')    # Positive or negative
++
++        species = self._species.new_species()
++
++        c = ['x', 'y', 'z'][component]
++        species.name = f'{self._species.name}_{atom_idx}{c}{direction}'
++
++        vec = self._shift_vector(component=component)
++        species.atoms[atom_idx].translate(vec if direction == '+' else -vec)
++
++        return species
++
++    def _idxs_to_calculate(self) -> Iterator:
++        """Generate the indexes of atoms and cartesian components that
++         need to be calculated"""
++
++        for row_idx in range(self._n_rows):
++
++            if row_idx not in self._calculated_rows:
++                self._calculated_rows.append(row_idx)
++
++                atom_idx = row_idx // 3
++                component = row_idx % 3    # 0: x, 1: y, 2: z
++
++                yield atom_idx, component
++
++        return
++
++    def _validated(self,
++                   keywords: 'autode.keywords.Keywords'
++                   ) -> 'autode.keywords.GradientKeywords':
++        """Validate the keywords"""
++
++        if not isinstance(keywords, GradientKeywords):
++            raise ValueError('Numerical Hessian require the keywords to be '
++                             'GradientKeywords')
++
++        if keywords.contain_any_of('hess', 'freq', 'hessian', 'frequency'):
++            raise ValueError('Cannot calculate numerical Hessian with keywords'
++                             ' that contain Hess or Freq. Must be only grad')
++
++        return keywords
++
++    def _shift_vector(self, component: int) -> np.ndarray:
++        """Vector to shift an atom by along a defined Cartesian component,
++        where, for example, component=0 -> x translation in +h direction"""
++
++        vec = np.zeros(shape=(3,))
++        vec[component] += float(self._shift)
++
++        return vec
++
++    def _gradient(self, species) -> 'autode.values.Gradient':
++        """Evaluate the flat gradient, with shape = (3 n_atoms,) """
++        from autode.calculation import Calculation
++
++        calc = Calculation(name=species.name,
++                           molecule=species,
++                           method=self._method,
++                           keywords=self._keywords,
++                           n_cores=self._n_cores)
++        calc.run()
++
++        return calc.get_gradients().flatten()
++
++    @property
++    def _init_gradient(self) -> 'autode.values.Gradient':
++        """Gradient at the initial geometry of the species"""
++        return np.array(self._species.gradient).flatten()
++
++    @_init_gradient.setter
++    def _init_gradient(self, value):
++        """Set the initial gradient"""
++        self._species.gradient = value.reshape(self._species.n_atoms, 3)
++
++    def _cdiff_row(self, atom_idx, component) -> np.ndarray:
++        """Calculate a Hessian row with central differences"""
++
++        s_plus = self._new_species(atom_idx, component, direction='+')
++        s_minus = self._new_species(atom_idx, component, direction='-')
++
++        row = ((self._gradient(s_plus) - self._gradient(s_minus))
++               / (2 * self._shift))
++
++        return row
++
++    def _diff_row(self, atom_idx, component) -> np.ndarray:
++        """Calculate a Hessian row with one-sided differences"""
++
++        s_plus = self._new_species(atom_idx, component, direction='+')
++
++        row = ((self._gradient(s_plus) - self._init_gradient)
++               / self._shift)
++
++        return row
+diff --git a/autode/species/species.py b/autode/species/species.py
+index 8c2c7c52f..b8aa2bb31 100644
+--- a/autode/species/species.py
++++ b/autode/species/species.py
+@@ -13,16 +13,18 @@
+ from autode.conformers.conformers import Conformers
+ from autode.solvent import get_solvent, Solvent, ExplicitSolvent
+ from autode.calculation import Calculation
+-from autode.wrappers.keywords import OptKeywords, HessianKeywords, SinglePointKeywords
+ from autode.config import Config
+ from autode.input_output import atoms_to_xyz_file
+ from autode.mol_graphs import make_graph, reorder_nodes, is_isomorphic
+ from autode.methods import get_lmethod, get_hmethod, ElectronicStructureMethod
+-from autode.hessians import Hessian
++from autode.hessians import Hessian, calculate_numerical_hessian
+ from autode.units import ha_per_ang_sq, ha_per_ang
+ from autode.thermochemistry.symmetry import symmetry_number
+ from autode.thermochemistry.igm import calculate_thermo_cont, LFMethod
+ from autode.utils import requires_atoms, work_in, requires_conformers
++from autode.wrappers.keywords import (OptKeywords,
++                                      HessianKeywords,
++                                      SinglePointKeywords)
+ 
+ 
+ class Species(AtomCollection):
+@@ -254,10 +256,11 @@ def hessian(self,
+                 value: Union[Hessian, np.ndarray, None]):
+         """Set the Hessian matrix as a Hessian value"""
+ 
+-        req_shape = (3*self.n_atoms, 3*self.n_atoms)
+-        if hasattr(value, 'shape') and value.shape != req_shape:
++        required_shape = (3*self.n_atoms, 3*self.n_atoms)
++
++        if hasattr(value, 'shape') and value.shape != required_shape:
+             raise ValueError('Could not set the Hessian. Incorrect shape: '
+-                             f'{value.shape} != {req_shape}')
++                             f'{value.shape} != {required_shape}')
+ 
+         if value is None:
+             self._hess = None
+@@ -970,8 +973,6 @@ def calc_thermo(self,
+                     method:     Optional[ElectronicStructureMethod] = None,
+                     calc:       Optional[Calculation] = None,
+                     temp:       float = 298.15,
+-                    lfm_method: Union[LFMethod, str, None] = None,
+-                    ss:         Optional[str] = None,
+                     keywords:   Union[Sequence[str], str, None] = None,
+                     **kwargs) -> None:
+         """
+@@ -988,35 +989,28 @@ def calc_thermo(self,
+ 
+             temp (float): Temperature in K
+ 
+-            lfm_method (LFMethod | str | None): Method to treat low freqency
+-                                           modes. {'igm', 'truhlar', 'grimme'}.
+-                                           Defaults to Config.lfm_method
++        Keyword Arguments:
++
++            lfm_method (LFMethod | str): Method to treat low frequency
++                                         modes. {'igm', 'truhlar', 'grimme'}.
++                                         Defaults to Config.lfm_method
+ 
+-            ss (str | None): Standard state to use.
+-                             Defaults to Config.standard_state
++            ss (str): Standard state to use.  Defaults to Config.standard_state
+ 
+         Raises:
+-            (autode.exceptions.CalculationException | KeyError):
++            (autode.exceptions.CalculationException | ValueError):
+ 
+         See Also:
+             :meth:`autode.thermochemistry.igm.calculate_thermo_cont` for
+             additional kwargs
+         """
+-        if lfm_method is not None:
+-            kwargs['lfm_method'] = lfm_method
+ 
+-        if type(lfm_method) is str:
++        if 'lfm_method' in kwargs:
+             try:
+-                kwargs['lfm_method'] = LFMethod[lfm_method.lower()]
++                kwargs['lfm_method'] = LFMethod[kwargs['lfm_method'].lower()]
+             except KeyError:
+-                raise ValueError(f'{lfm_method} is not valid. Must be on of '
+-                                 f'{[m for m in LFMethod]}')
+-
+-        if ss is not None:
+-            if ss.lower() not in ('1m', '1atm'):
+-                raise ValueError(f'{ss} is not a valid standard state. Must be'
+-                                 ' either "1m" or "1atm"')
+-            kwargs['ss'] = ss.lower()
++                raise ValueError(f'{kwargs["lfm_method"]} is not valid. Must '
++                                 f'be one of: {[m for m in LFMethod]}')
+ 
+         if calc is not None and calc.output.exists:
+             self.atoms = calc.get_final_atoms()
+@@ -1198,5 +1192,60 @@ def explicitly_solvate(self,
+         self.solvent.randomise_around(self)
+         return None
+ 
++    def calc_hessian(self,
++                     method:                  ElectronicStructureMethod,
++                     keywords:                Union[Sequence[str], str, None] = None,
++                     numerical:               bool = False,
++                     use_central_differences: bool = False,
++                     coordinate_shift:        Union[float, val.Distance] = val.Distance(2E-3, units='Å')
++                     ) -> None:
++        """
++        Calculate the Hessian
++
++        -----------------------------------------------------------------------
++        Arguments:
++            method: Method to use to calculate the Hessian
++
++            keywords: Keywords to use to calculate the Hessian, or gradient if
++                      numerical = True
++
++            numerical: Whether to do a numerical frequency calculation using
++                       analytic gradients
++
++            use_central_differences: Use central differences to calculate the
++                                 numerical Hessian. If True then use
++                                df/dx = [f(x+h) - f(x-h)] / 2h
++                                otherwise use single sided differences (faster
++                                but less accurate)
++                                df/dx = [f(x+h) - f(x)] / h
++
++            coordinate_shift: Shift applied to each Cartesian coordinate (h)
++                              in the calculation of the numerical Hessian
++        """
++
++        if numerical:
++
++            if not isinstance(coordinate_shift, val.Distance):
++                logger.warning(f'Calculating numerical Hessian with '
++                               f'h = {coordinate_shift}. Assuming units of Å')
++                coordinate_shift = val.Distance(coordinate_shift, units='Å')
++
++            if keywords is None:
++                logger.info('Using default gradient keywords to evaluate '
++                            'numerical Hessian')
++                keywords = method.keywords.grad
++
++            calculate_numerical_hessian(self,
++                                        method=method,
++                                        keywords=keywords,
++                                        do_c_diff=use_central_differences,
++                                        shift=coordinate_shift)
++
++        if not numerical:
++            self._run_hess_calculation(method=method,
++                                       calc=None,
++                                       keywords=keywords)
++        return None
++
+     # --- Method aliases ---
+     symmetry_number = sn
+diff --git a/autode/wrappers/QChem.py b/autode/wrappers/QChem.py
+index e9ba1bba4..44f89f9a4 100644
+--- a/autode/wrappers/QChem.py
++++ b/autode/wrappers/QChem.py
+@@ -188,6 +188,33 @@ def get_energy(self, calc) -> float:
+     def get_gradients(self, calc) -> np.ndarray:
+         """Gradient of the potential energy"""
+ 
++        try:
++            grad = self._raw_opt_gradient(calc)
++
++        except CouldNotGetProperty:
++            # Failed to get gradient from optimisation
++            grad = self._raw_scf_grad(calc)
++
++        # Convert from Ha a0^-1 to Ha A-1
++        return np.array(grad) / Constants.a0_to_ang
++
++    def get_hessian(self, calc) -> np.ndarray:
++        """Extract the mass-weighted non projected Hessian matrix
++        NOTE: Required $rem vibman_print 4 $end in the input"""
++
++        hess = self._extract_mass_weighted_hessian(calc)
++        atom_masses = self._extract_atomic_masses(calc)
++
++        # Un-mass weight
++        mass_arr = np.repeat(atom_masses, repeats=3, axis=np.newaxis)
++        hess *= np.sqrt(np.outer(mass_arr, mass_arr))
++
++        # and convert from atomic units (Ha/a0^2) to base units (Ha/Å^2)
++        return hess / Constants.a0_to_ang ** 2
++
++    @staticmethod
++    def _raw_opt_gradient(calc) -> list:
++
+         grad = []
+ 
+         for i, line in enumerate(calc.output.file_lines):
+@@ -196,7 +223,7 @@ def get_gradients(self, calc) -> np.ndarray:
+                 continue
+ 
+             """e.g.
+-            
++
+                         Cartesian Gradient (au)
+              ATOM              X           Y           Z
+             1  O           0.000005   -0.000002    0.000000
+@@ -204,28 +231,58 @@ def get_gradients(self, calc) -> np.ndarray:
+             3  H          -0.000021    0.000001    0.000000
+             """
+ 
+-            start_idx = i+2
+-            end_idx = start_idx+calc.molecule.n_atoms
++            start_idx = i + 2
++            end_idx = start_idx + calc.molecule.n_atoms
+ 
+             grad = [[float(val) for val in _l.split()[2:]]
+                     for _l in calc.output.file_lines[start_idx:end_idx]]
+ 
+-        # Convert from Ha a0^-1 to Ha A-1
+-        return np.array(grad) / Constants.a0_to_ang
++        if len(grad) == 0:
++            raise CouldNotGetProperty('gradient')
+ 
+-    def get_hessian(self, calc) -> np.ndarray:
+-        """Extract the mass-weighted non projected Hessian matrix
+-        NOTE: Required $rem vibman_print 4 $end in the input"""
++        return grad
+ 
+-        hess = self._extract_mass_weighted_hessian(calc)
+-        atom_masses = self._extract_atomic_masses(calc)
++    @staticmethod
++    def _raw_scf_grad(calc):
++        grad = []
++        n_grad_lines = (calc.molecule.n_atoms // 6 + 1) * 4
+ 
+-        # Un-mass weight
+-        mass_arr = np.repeat(atom_masses, repeats=3, axis=np.newaxis)
+-        hess *= np.sqrt(np.outer(mass_arr, mass_arr))
++        for i, line in enumerate(calc.output.file_lines):
+ 
+-        # and convert from atomic units (Ha/a0^2) to base units (Ha/Å^2)
+-        return hess / Constants.a0_to_ang ** 2
++            if 'Gradient of SCF Energy' not in line:
++                continue
++
++            """e.g.
++
++            -----------------------------------------------------------------
++            Calculating analytic gradient of the SCF energy
++            Gradient of SCF Energy
++                       1           2           3           4           5
++               1  -0.0108562  -0.0095972   0.0087634   0.0032518  -0.0040093
++            """
++
++            start_idx = i + 1
++            end_idx = start_idx + n_grad_lines
++            lines_slice = calc.output.file_lines[start_idx:end_idx]
++
++            grad = []
++
++            for j in range(len(lines_slice)//4):
++
++                x_line = lines_slice[4*j+1]
++                y_line = lines_slice[4*j+2]
++                z_line = lines_slice[4*j+3]
++
++                for k in range(1, len(x_line.split())):
++
++                    grad.append([float(x_line.split()[k]),
++                                 float(y_line.split()[k]),
++                                 float(z_line.split()[k])])
++
++        if len(grad) == 0:
++            raise CouldNotGetProperty('gradient')
++
++        return grad
+ 
+     @staticmethod
+     def _extract_atomic_masses(calc) -> np.ndarray:
+diff --git a/autode/wrappers/XTB.py b/autode/wrappers/XTB.py
+index ff3744579..65053a502 100644
+--- a/autode/wrappers/XTB.py
++++ b/autode/wrappers/XTB.py
+@@ -1,5 +1,6 @@
+-import numpy as np
+ import os
++import shutil
++import numpy as np
+ from autode.wrappers.base import ElectronicStructureMethod
+ from autode.utils import run_external
+ from autode.wrappers.keywords import OptKeywords, GradientKeywords
+@@ -159,7 +160,7 @@ def execute(self, calc):
+             flags += ['--input', calc.input.additional_filenames[-1]]
+ 
+         @work_in_tmp_dir(filenames_to_copy=calc.input.filenames,
+-                         kept_file_exts=('.xyz', '.out', '.pc', '.grad', 'gradient'),
++                         kept_file_exts=('.xyz', '.out', '.pc', '.grad'),
+                          use_ll_tmp=True)
+         def execute_xtb():
+             logger.info(f'Setting the number of OMP threads to {calc.n_cores}')
+@@ -168,6 +169,9 @@ def execute_xtb():
+             run_external(params=[calc.method.path, calc.input.filename]+flags,
+                          output_filename=calc.output.filename)
+ 
++            if os.path.exists('gradient'):
++                shutil.move('gradient', f'{calc.name}_OLD.grad')
++
+         execute_xtb()
+         return None
+ 
+@@ -319,8 +323,8 @@ def get_gradients(self, calc):
+                     x, y, z = line.split()
+                     gradients.append(np.array([float(x), float(y), float(z)]))
+ 
+-        elif os.path.exists('gradient'):
+-            with open('gradient', 'r') as grad_file:
++        elif os.path.exists(f'{calc.name}_OLD.grad'):
++            with open(f'{calc.name}_OLD.grad', 'r') as grad_file:
+                 for i, line in enumerate(grad_file):
+                     if i > 1 and len(line.split()) == 3:
+                         x, y, z = line.split()
+@@ -330,10 +334,11 @@ def get_gradients(self, calc):
+ 
+                         gradients.append(np.array(vec))
+ 
++            os.remove(f'{calc.name}_OLD.grad')
++
+             with open(f'{calc.name}_xtb.grad', 'w') as new_grad_file:
+                 [print('{:^12.8f} {:^12.8f} {:^12.8f}'.format(*line),
+                        file=new_grad_file) for line in gradients]
+-            os.remove('gradient')
+ 
+         # Convert from Ha a0^-1 to Ha A-1
+         gradients = [grad / Constants.a0_to_ang for grad in gradients]
+diff --git a/autode/wrappers/keywords.py b/autode/wrappers/keywords.py
+index f669366e7..8bcdf8e5c 100644
+--- a/autode/wrappers/keywords.py
++++ b/autode/wrappers/keywords.py
+@@ -333,6 +333,22 @@ def bstring(self):
+ 
+         return string
+ 
++    def contain_any_of(self, *words: str) -> bool:
++        """
++        Do these keywords contain any of a set of other words? Not case
++        sensitive.
++
++        -----------------------------------------------------------------------
++        Arguments:
++            *words: Words that may be present in these keywords
++
++        Returns:
++            (bool):
++        """
++        kwds = set(w.lower() for w in self)
++
++        return not kwds.isdisjoint(w.lower() for w in words)
++
+     def copy(self):
+         return deepcopy(self)
+ 
+diff --git a/doc/changelog.rst b/doc/changelog.rst
+index bc54e3b82..23ca78091 100644
+--- a/doc/changelog.rst
++++ b/doc/changelog.rst
+@@ -42,6 +42,7 @@ Functionality improvements
+ - Removes criteria on using a TS template with large distance differences between the structure and the template in favour of running sequential constrained optimisations to the required point
+ - Rewrites :code:`autode.pes` into a consistent module while maintaining much of the functionality. Simplifies the interface
+ - Adds a QChem electronic structure method wrapper
++- Adds :code:`autode.species.Species.calc_hessian` to calculate either an analytic or numerical Hessian (in parallel)
+ 
+ 
+ Bug Fixes
+diff --git a/tests/data/num_hess.zip b/tests/data/num_hess.zip
+new file mode 100644
+index 000000000..dfafd68ce
+Binary files /dev/null and b/tests/data/num_hess.zip differ
+diff --git a/tests/data/qchem.zip b/tests/data/qchem.zip
+index 9fddb07d5..f802e21c2 100644
+Binary files a/tests/data/qchem.zip and b/tests/data/qchem.zip differ
+diff --git a/tests/test_hessian.py b/tests/test_hessian.py
+index 13f7c1635..ebd7a374e 100644
+--- a/tests/test_hessian.py
++++ b/tests/test_hessian.py
+@@ -4,15 +4,20 @@
+ import autode as ade
+ from . import testutils
+ from autode.atoms import Atom, Atoms
+-from autode.methods import ORCA
++from autode.methods import ORCA, XTB
+ from autode.calculation import Calculation
+ from autode.species import Molecule
+ from autode.values import Frequency
+-from autode.hessians import Hessian
+ from autode.geom import calc_rmsd
+ from autode.units import wavenumber
+ from autode.exceptions import CalculationException
+ from autode.transition_states.base import displaced_species_along_mode
++from autode.values import Distance
++from autode.wrappers.keywords import HessianKeywords, GradientKeywords
++from autode.hessians import (Hessian,
++                             calculate_numerical_hessian,
++                             _NumericalHessianCalculator)
++
+ here = os.path.dirname(os.path.abspath(__file__))
+ 
+ 
+@@ -376,3 +381,107 @@ def test_extract_wrong_molecule_hessian():
+     # N atoms (1 here)
+     with pytest.raises(CalculationException):
+         _ = calc.get_hessian()
++
++
++def test_num_hess_invalid_input():
++
++    water = Molecule(smiles='O')
++    orca = ORCA()
++
++    # Keywords must be GradientKeywords that don't include any 'Hessian'
++    # or 'frequency' keywords
++    for invalid_kwds in (None,
++                         GradientKeywords(['Freq', 'PBE', 'Def2-SVP']),
++                         HessianKeywords(['PBE', 'Def2-SVP'])):
++
++        with pytest.raises(ValueError):
++            calculate_numerical_hessian(species=water,
++                                        method=orca,
++                                        keywords=invalid_kwds,
++                                        do_c_diff=False,
++                                        shift=Distance(1E-3, units='Å'))
++
++
++@testutils.work_in_zipped_dir(os.path.join(here, 'data', 'num_hess.zip'))
++def test_h2_hessian():
++
++    h2 = Molecule(name='H2', atoms=[Atom('H'), Atom('H', x=0.77)])
++
++    h2.calc_hessian(method=ORCA(), numerical=False)
++    analytic_hessian = h2.hessian.copy()
++
++    h2.hessian = None  # Clear the analytic Hessian
++
++    h2.calc_hessian(method=ORCA(), numerical=True)
++    assert h2.hessian is not None
++
++    num_hessian = h2.hessian.copy()
++
++    assert np.allclose(analytic_hessian,
++                       num_hessian,
++                       atol=1E-2)
++
++
++@testutils.work_in_zipped_dir(os.path.join(here, 'data', 'num_hess.zip'))
++def test_h2_c_diff_hessian():
++
++    h2 = Molecule(name='H2', atoms=[Atom('H'), Atom('H', x=0.77)])
++
++    h2.calc_hessian(method=ORCA(), numerical=False)
++    analytic_hessian = h2.hessian.copy()
++
++    h2.hessian = None  # Clear the analytic Hessian and calculate a numerical
++    h2.calc_hessian(method=ORCA(), numerical=True, use_central_differences=True)
++
++    # Central differences should afford a very good Hessian cf. analytic
++    assert np.allclose(analytic_hessian,
++                       h2.hessian,
++                       atol=1E-3)
++
++
++@testutils.work_in_zipped_dir(os.path.join(here, 'data', 'num_hess.zip'))
++@testutils.requires_with_working_xtb_install
++def test_h2_xtb_vs_orca_hessian():
++
++    h2 = Molecule(name='H2', atoms=[Atom('H'), Atom('H', x=0.77)])
++
++    h2.calc_hessian(method=ORCA(), numerical=False)
++    orca_hessian = h2.hessian.copy()
++
++    h2.calc_hessian(method=XTB(), numerical=True, use_central_differences=True)
++    xtb_hessian = h2.hessian.copy()
++
++    # ORCA and XTB Hessians should be similar, ish
++    assert np.allclose(orca_hessian,
++                       xtb_hessian,
++                       atol=0.3)
++
++
++@testutils.work_in_zipped_dir(os.path.join(here, 'data', 'num_hess.zip'))
++@testutils.requires_with_working_xtb_install
++def test_ind_num_hess_row():
++    """Calculate d^2E/dx0dx0 using numerical displacements with and
++    without central differences"""
++
++    h2 = Molecule(name='H2', atoms=[Atom('H'), Atom('H', x=0.77)])
++    xtb = XTB()
++
++    for flag in (True, False):
++
++        calculator = _NumericalHessianCalculator(species=h2,
++                                                 method=xtb,
++                                                 keywords=xtb.keywords.grad,
++                                                 do_c_diff=flag,
++                                                 shift=0.001)
++
++        # Non central differences require an initial gradient at the curr geom
++        calculator._init_gradient = calculator._gradient(calculator._species)
++
++        if flag:
++            row = calculator._cdiff_row(atom_idx=0, component=0)
++        else:
++            row = calculator._diff_row(atom_idx=0, component=0)
++
++        assert np.isclose(row[0],
++                          1.00957,
++                          atol=1E-1)
+diff --git a/tests/test_keywords.py b/tests/test_keywords.py
+index 861f6267b..64e6722c7 100644
+--- a/tests/test_keywords.py
++++ b/tests/test_keywords.py
+@@ -200,3 +200,14 @@ def test_type_inference():
+ 
+     keyword_set.hess = ['a']
+     assert isinstance(keyword_set.hess, HessianKeywords)
++
++
++def test_keywords_contain():
++
++    kwds = SinglePointKeywords(['PBE', 'Opt'])
++
++    assert kwds.contain_any_of('pbe')
++    assert kwds.contain_any_of('pbe', 'opt')
++    assert kwds.contain_any_of('opt')
++
++    assert not kwds.contain_any_of('PBE0')
+diff --git a/tests/test_qchem.py b/tests/test_qchem.py
+index 347af25ef..7290b30ac 100644
+--- a/tests/test_qchem.py
++++ b/tests/test_qchem.py
+@@ -309,6 +309,17 @@ def test_gradient_extraction_h2o():
+     assert not method.optimisation_nearly_converged(calc)
+ 
+ 
++@work_in_zipped_dir(qchem_data_zip_path)
++def test_gradient_extraction_h2():
++
++    calc = _blank_calc()
++    calc.molecule = Molecule(atoms=[Atom('H'), Atom('H', x=0.77)])
++    calc.output.filename = 'H2_qchem.out'
++
++    grad = calc.get_gradients()
++    assert grad.shape == (2, 3)
++
++
+ @work_in_zipped_dir(qchem_data_zip_path)
+ def test_butane_gradient_extraction():
+ 
+@@ -361,6 +372,23 @@ def test_broken_hessian_extraction():
+         os.remove('tmp.out')
+ 
+ 
++def test_broken_gradient_extraction():
++
++    calc = _broken_output_calc()
++
++    with pytest.raises(CalculationException):
++        _ = method.get_gradients(calc)
++
++    calc = _custom_output_calc('some', 'output', 'then',
++                               'Mass-Weighted Hessian Matrix', 'X')
++
++    with pytest.raises(CalculationException):
++        _ = method.get_gradients(calc)
++
++    if os.path.exists('tmp.out'):
++        os.remove('tmp.out')
++
++
+ @work_in_zipped_dir(qchem_data_zip_path)
+ def test_calc_terminated_normally_max_opt_cycles():
+ 
+@@ -480,3 +508,23 @@ def test_unsupported_solvent_type():
+ 
+     with pytest.raises(CalculationException):
+         calc.generate_input()
++
++
++@work_in_zipped_dir(qchem_data_zip_path)
++def test_butane_grad_extract():
++
++    calc = _blank_calc()
++    calc.molecule = Molecule(smiles='CCCC')
++    calc.output.filename = 'C4H10_sp_qchem.out'
++
++    grad = calc.get_gradients()
++    flat_grad = grad.to('Ha a0^-1').flatten()
++
++    # Check the final element of the gradient is as expected
++    assert np.isclose(flat_grad[-1],
++                      0.0055454,
++                      atol=1E-5)
++
++    assert np.isclose(flat_grad[5],
++                      0.0263383,
++                      atol=1E-5)
+diff --git a/tests/test_species.py b/tests/test_species.py
+index b99545612..08aaa3f27 100644
+--- a/tests/test_species.py
++++ b/tests/test_species.py
+@@ -471,6 +471,12 @@ def test_hessian_calculation():
+     assert h2o.frequencies is not None
+ 
+ 
++def test_numerical_hessian_invalid_delta():
++
++    with pytest.raises(ValueError):
++        mol.calc_hessian(method=orca, coordinate_shift='a', numerical=True)
++
++
+ def test_enthalpy_doc_example():
+ 
+     _h2 = Molecule(smiles='[H][H]')

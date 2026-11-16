@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** change helperfunction
+
+## Description
+
+only unique atoms are allowed in fA.dat and fB.dat file
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `3ac2465ce093`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

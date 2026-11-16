@@ -1,0 +1,435 @@
+diff --git a/bionemo-recipes/recipes/evo2_megatron/README.md b/bionemo-recipes/recipes/evo2_megatron/README.md
+index c0c251af0b..dc80e8f39d 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/README.md
++++ b/bionemo-recipes/recipes/evo2_megatron/README.md
+@@ -67,12 +67,12 @@ torchrun --nproc-per-node 2 --no-python \
+   --use-subquadratic-ops
+ ```
+ 
+-> **Tip:** The `--use-subquadratic-ops` flag enables a fused back-to-back
+-> causal convolution CUDA kernel for the Hyena short-conv layers. This
+-> provides a meaningful speed-up for training and prediction and is
+-> recommended for all production runs. It does not apply to autoregressive
+-> inference (`infer_evo2`). There is a one-time compilation cost on first
+-> use.
++> **Tip:** The `--use-subquadratic-ops` flag enables fused subquadratic-ops
++> CUDA kernels (`b2b_causal_conv1d` for proj+mixer fusion in prefill,
++> `fft_causal_conv1d` / `causal_conv1d` inside `engine.parallel_fir`). It
++> applies to training, batch prediction (`predict_evo2`), and the prefill
++> phase of autoregressive inference (`infer_evo2`); per-token decode is
++> already in optimal recurrent form and is unaffected.
+ 
+ ### Autoregressive generation (`infer_evo2`)
+ 
+@@ -97,6 +97,9 @@ Options:
+ - `--top-k` / `--top-p` — top-k or nucleus sampling (0 = disabled).
+ - `--tensor-parallel-size` — tensor parallelism for large models (default: 1).
+ - `--max-seq-length` — maximum sequence length (default: 8192).
++- `--use-subquadratic-ops` — use fused subquadratic-ops kernels for prefill
++  (b2b causal conv, FFT/causal conv1d in `parallel_fir`). Recommended when
++  processing many prompts in one process.
+ 
+ ### Batch sequence scoring (`predict_evo2`)
+ 
+diff --git a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/engine.py b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/engine.py
+index 5aaa6a16e9..c9ff82ba00 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/engine.py
++++ b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/engine.py
+@@ -20,6 +20,15 @@
+ from einops import rearrange
+ 
+ 
++try:
++    from subquadratic_ops_torch.causal_conv1d import causal_conv1d as _subq_causal_conv1d
++    from subquadratic_ops_torch.fft_causal_conv1d import fft_causal_conv1d as _subq_fft_causal_conv1d
++except ImportError as _subq_import_error:
++    _subq_causal_conv1d = None
++    _subq_fft_causal_conv1d = None
++    _subq_error_msg = f"subquadratic_ops_torch not available: {_subq_import_error}"
++
++
+ def adjust_filter_shape_for_broadcast(u, h):
+     """Adjust filter shape for broadcasting compatibility with input tensor."""
+     h = h.squeeze()  # Standardize to [D, L] from [1, D, L] and [D, 1, L]
+@@ -63,27 +72,47 @@ def parallel_fir(
+     gated_bias,
+     fir_length,
+     compute_state,
++    use_subquadratic_ops=False,
+ ):
+     """Compute parallel finite impulse response filtering with optional state computation."""
+     L = u.shape[1]  # noqa: N806
+     u = rearrange(u, "b l d -> b d l")
+ 
++    if use_subquadratic_ops and _subq_fft_causal_conv1d is None:
++        raise ImportError(_subq_error_msg)
++
+     if fir_length >= 128:
+-        with torch.autocast("cuda"):
+-            z = fftconv_func(
+-                u=u.to(torch.float32),
+-                k=weight[:, :, :L].to(torch.float32),
+-                D=bias,
+-            ).to(dtype=u.dtype)
++        if use_subquadratic_ops:
++            # subq-ops fft_causal_conv1d expects [B, D, L] input and [D, L] filter; dtypes must match
++            k = weight[:, :, :L].squeeze(1) if weight.dim() == 3 else weight[:, :L]
++            u_fp32 = u.to(torch.float32)
++            z = _subq_fft_causal_conv1d(u_fp32, k.to(torch.float32))
++            if bias is not None:
++                z = z + u_fp32 * bias.unsqueeze(-1)
++            z = z.to(u.dtype)
++        else:
++            with torch.autocast("cuda"):
++                z = fftconv_func(
++                    u=u.to(torch.float32),
++                    k=weight[:, :, :L].to(torch.float32),
++                    D=bias,
++                ).to(dtype=u.dtype)
+     else:
+-        z = F.conv1d(
+-            u.to(torch.float32),
+-            weight.to(torch.float32),
+-            bias=None,
+-            stride=1,
+-            padding=fir_length - 1,
+-            groups=u.shape[1],  # always set to D, regardless of filter grouping
+-        )[..., :L]
++        if use_subquadratic_ops:
++            # subq-ops causal_conv1d expects pre-padded [B, D, L+pad] input and [D, K] weight; dtypes must match
++            pad_size = fir_length - 1
++            x_padded = F.pad(u.to(torch.float32), (pad_size, 0))
++            w = weight.squeeze(1) if weight.dim() == 3 else weight
++            z = _subq_causal_conv1d(x_padded, w.to(torch.float32))[..., pad_size:]
++        else:
++            z = F.conv1d(
++                u.to(torch.float32),
++                weight.to(torch.float32),
++                bias=None,
++                stride=1,
++                padding=fir_length - 1,
++                groups=u.shape[1],  # always set to D, regardless of filter grouping
++            )[..., :L]
+ 
+         z = z.to(u.dtype)
+ 
+diff --git a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_mixer.py b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_mixer.py
+index 587742b955..d8cb265e31 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_mixer.py
++++ b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_mixer.py
+@@ -22,6 +22,7 @@
+ 
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F  # noqa: N812
+ from einops import rearrange
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer.module import MegatronModule
+@@ -307,14 +308,20 @@ def forward(self, x, layer_past=None, inference_context=None, _hyena_use_cp=True
+         else:
+             features = rearrange(features, "l b d -> b d l").contiguous()
+ 
+-        if (
+-            self.use_subquadratic_ops
+-            and self.operator_type in ["hyena_short_conv", "hyena_medium_conv"]
+-            and inference_context is None
+-        ):
+-            # todo: support inference_context for b2b_kernel
+-            # Use the B2BCausalConv1dModule wrapper with the existing weights from the original model
++        is_b2b_eligible = self.use_subquadratic_ops and self.operator_type in [
++            "hyena_short_conv",
++            "hyena_medium_conv",
++        ]
++        # b2b runs during training (no inference_context) or during prefill (no FIR cache yet).
++        # During decode (cache populated, L=1) we fall back to the regular per-token step path.
++        is_prefill = inference_context is not None and id(self.hyena_proj_conv) not in getattr(
++            inference_context, "fir_filter_state_dict", {}
++        )
++
++        if is_b2b_eligible and (inference_context is None or is_prefill):
+             z = self.b2b_kernel(features, _use_cp=_proj_use_cp)
++            if is_prefill:
++                self._populate_b2b_inference_state(features, inference_context)
+         else:
+             features = self.hyena_proj_conv(
+                 features, _use_cp=_proj_use_cp, inference_context=inference_context
+@@ -330,3 +337,59 @@ def forward(self, x, layer_past=None, inference_context=None, _hyena_use_cp=True
+             z = rearrange(z, "b d l -> l b d").contiguous()
+         y, bias = self.dense(z)
+         return y, bias
++
++    def _populate_b2b_inference_state(self, features, inference_context):
++        """Populate FIR state for proj_conv and mixer after a b2b prefill.
++
++        The b2b kernel doesn't expose its post-projection intermediate, but subsequent
++        decode steps need (a) the proj_conv input tail and (b) the tail of `x2 * v`
++        — the gated stream that mixer's short_conv operates on. We get (b) by running
++        a windowed proj_conv on just the last (K_proj + K_mixer - 2) input positions.
++        """
++        proj_kernel_size = self.hyena_proj_conv.kernel_size
++
++        # (a) proj_conv FIR state: input tail in [B, D, K_proj-1]
++        proj_state = features[..., -(proj_kernel_size - 1) :].contiguous()
++        proj_dict = getattr(inference_context, "fir_filter_state_dict", {})
++        proj_dict[id(self.hyena_proj_conv)] = proj_state
++        setattr(inference_context, "fir_filter_state_dict", proj_dict)
++
++        # (b) mixer FIR state: tail of (x2 * v), the gated post-projection stream
++        if self.operator_type == "hyena_short_conv":
++            mixer_kernel_size = self.mixer.short_conv.kernel_size
++        else:  # hyena_medium_conv
++            mixer_kernel_size = self.mixer.kernel_size
++
++        tail_in_len = proj_kernel_size + mixer_kernel_size - 2
++        if features.shape[-1] < tail_in_len:
++            tail_in = F.pad(features, (tail_in_len - features.shape[-1], 0))
++        else:
++            tail_in = features[..., -tail_in_len:].contiguous()
++
++        # Reuse the cached transformed weight from get_weight() (lru_cache'd).
++        proj_weight = self.hyena_proj_conv.get_weight()
++
++        intermediate = F.conv1d(
++            F.pad(tail_in.to(torch.float32), (proj_kernel_size - 1, 0)),
++            proj_weight,
++            bias=None,
++            stride=1,
++            padding=0,
++            groups=tail_in.shape[1],
++        )[..., -(mixer_kernel_size - 1) :].to(features.dtype)
++
++        x1, x2, v = rearrange(intermediate, "b (g dg p) l -> b (g dg) p l", p=3, g=self.num_groups_per_tp_rank).unbind(
++            dim=2
++        )
++        mixer_input_tail = (x2 * v).contiguous()  # [B, D, K_mixer-1]
++
++        if self.operator_type == "hyena_short_conv":
++            mixer_state_owner_id = id(self.mixer.short_conv)
++            mixer_dict_key = "fir_filter_state_dict"
++        else:  # hyena_medium_conv
++            mixer_state_owner_id = id(self.mixer)
++            mixer_dict_key = "inner_fir_filter_state_dict"
++
++        mixer_dict = getattr(inference_context, mixer_dict_key, {})
++        mixer_dict[mixer_state_owner_id] = mixer_input_tail
++        setattr(inference_context, mixer_dict_key, mixer_dict)
+diff --git a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_utils.py b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_utils.py
+index b84819110f..44be308aaf 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_utils.py
++++ b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/models/megatron/hyena/hyena_utils.py
+@@ -1051,6 +1051,7 @@ def get_filter_state(filter_name):
+                 L=L,
+                 fir_length=self.kernel_size,  # self.short_filter_length,
+                 compute_state=inference_context is not None,
++                use_subquadratic_ops=self.use_subquadratic_ops,
+             )
+             y = rearrange(y, "b d l -> b l d")
+             y = y * x1
+@@ -1656,12 +1657,16 @@ def __init__(self, *args, **kwargs):
+         self.get_weight = lru_cache(maxsize=1)(self._get_weight)
+ 
+     def _get_weight(self):
+-        """Expand and cache the convolution weight, freeing the raw parameter."""
++        """Expand and cache the convolution weight in inference-friendly form."""
++        # previously deleted self._parameters["short_conv_weight"] here as a
++        # memory micro-optimization, but the raw param is also read directly by
++        # B2BCausalConv1dModule on every prefill call. With subq-ops enabled in
++        # inference, the second prompt's b2b call fails after decode triggers
++        # this method on the first prompt
+         weight = self.short_conv_weight
+         if len(weight.shape) == 2:
+             weight = weight.unsqueeze(1)
+         weight = weight.repeat_interleave(self.group_dim, dim=0).to(torch.float32)
+-        del self._parameters["short_conv_weight"]
+         return weight
+ 
+     def forward(self, x, inference_context=None, _use_cp=True):  # noqa: D102
+@@ -1697,6 +1702,7 @@ def get_filter_state(filter_name):
+                 gated_bias=False,
+                 fir_length=self.kernel_size,  # self.short_filter_length,
+                 compute_state=inference_context is not None,
++                use_subquadratic_ops=self.use_subquadratic_ops,
+             )
+         else:
+             if len(u.shape) > 2:
+diff --git a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/run/infer.py b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/run/infer.py
+index 9ab0f36bbf..0ed9d4defb 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/run/infer.py
++++ b/bionemo-recipes/recipes/evo2_megatron/src/bionemo/evo2/run/infer.py
+@@ -358,6 +358,7 @@ def setup_inference_engine(
+     vortex_style_fp8: bool = False,
+     random_seed: int = 1234,
+     prompt_segmentation_threshold: Optional[int] = None,
++    use_subquadratic_ops: bool = False,
+ ) -> Evo2InferenceComponents:
+     """Setup the Evo2 inference engine and related components.
+ 
+@@ -379,6 +380,9 @@ def setup_inference_engine(
+             segmented during prefill to reduce peak memory. The first segment
+             runs as a normal prefill; remaining tokens are processed one at a
+             time before generation begins.
++        use_subquadratic_ops: Use fused subquadratic-ops kernels (b2b causal
++            conv1d in prefill, fft_causal_conv1d / causal_conv1d in
++            parallel_fir).
+ 
+     Returns:
+         Evo2InferenceComponents containing all inference components.
+@@ -412,6 +416,7 @@ def setup_inference_engine(
+     model_provider.sequence_parallel = False
+ 
+     model_provider.flash_decode = True
++    model_provider.use_subquadratic_ops = use_subquadratic_ops
+ 
+     if vortex_style_fp8:
+         model_provider.vortex_style_fp8 = True
+@@ -808,6 +813,14 @@ def parse_args() -> argparse.Namespace:
+         "generation begins. Useful for long prompts that would otherwise OOM. "
+         "Also settable via EVO2_PST env var.",
+     )
++    ap.add_argument(
++        "--use-subquadratic-ops",
++        action="store_true",
++        default=False,
++        help="Use fused subquadratic-ops CUDA kernels (b2b causal conv1d in prefill, "
++        "fft_causal_conv1d / causal_conv1d in parallel_fir). Speeds up prompt processing "
++        "but has no effect on per-token decode throughput.",
++    )
+ 
+     return ap.parse_args()
+ 
+@@ -831,6 +844,7 @@ def infer(
+     max_seq_length: int = 8192,
+     max_batch_size: int = 1,
+     prompt_segmentation_threshold: Optional[int] = None,
++    use_subquadratic_ops: bool = False,
+ ) -> List[Dict[str, Any]]:
+     """Run autoregressive text generation with Evo2 using MCore inference.
+ 
+@@ -858,6 +872,7 @@ def infer(
+             GPU memory proportional to this value. For large models, only 1 may fit.
+         prompt_segmentation_threshold: If set, prompts longer than this are segmented
+             during prefill to reduce peak memory.
++        use_subquadratic_ops: Use fused subquadratic-ops kernels in the inference path.
+ 
+     Returns:
+         List of JSONL-serialisable result dicts.
+@@ -878,6 +893,7 @@ def infer(
+         vortex_style_fp8=vortex_style_fp8,
+         random_seed=random_seed,
+         prompt_segmentation_threshold=prompt_segmentation_threshold,
++        use_subquadratic_ops=use_subquadratic_ops,
+     )
+ 
+     mem_after_setup_gb = torch.cuda.max_memory_allocated() / (1024**3)
+@@ -1003,6 +1019,7 @@ def main() -> None:
+         max_seq_length=max_seq_length,
+         max_batch_size=args.max_batch_size,
+         prompt_segmentation_threshold=prompt_segmentation_threshold,
++        use_subquadratic_ops=args.use_subquadratic_ops,
+     )
+ 
+ 
+diff --git a/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/run/test_infer.py b/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/run/test_infer.py
+index 012088c9b8..e2428f4b4f 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/run/test_infer.py
++++ b/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/run/test_infer.py
+@@ -284,6 +284,7 @@ def run_infer_subprocess(
+     temperature: float = 1.0,
+     top_k: int = 1,
+     seed: int = 42,
++    use_subquadratic_ops: bool = False,
+ ):
+     """Helper function to run inference as a subprocess.
+ 
+@@ -295,6 +296,7 @@ def run_infer_subprocess(
+         temperature: Sampling temperature
+         top_k: Top-k sampling parameter (1 for greedy)
+         seed: Random seed for reproducibility
++        use_subquadratic_ops: Pass --use-subquadratic-ops to the CLI.
+ 
+     Returns:
+         The generated completion text from the first JSONL record
+@@ -326,6 +328,8 @@ def run_infer_subprocess(
+         "--seed",
+         str(seed),
+     ]
++    if use_subquadratic_ops:
++        cmd.append("--use-subquadratic-ops")
+ 
+     env = copy.deepcopy(PRETEST_ENV)
+ 
+@@ -517,6 +521,47 @@ def test_identical_prompts_should_be_identical(mbridge_checkpoint_path, tmp_path
+     )
+ 
+ 
++def test_subquadratic_ops_matches_baseline(mbridge_checkpoint_path, tmp_path):
++    """Greedy generation with --use-subquadratic-ops must match the standard path.
++
++    This is the end-to-end correctness check for the subq-ops inference path:
++    Phase 1 routes engine.parallel_fir through subq-ops kernels during prefill,
++    Phase 2 fuses proj+mixer convs via b2b_causal_conv1d during prefill and
++    populates FIR caches for the subsequent decode steps. With greedy decoding
++    (top_k=1) and the same seed, both paths must produce identical output.
++    """
++    output_baseline = tmp_path / "output_baseline.jsonl"
++    output_subq = tmp_path / "output_subq.jsonl"
++
++    generated_baseline = run_infer_subprocess(
++        mbridge_checkpoint_path,
++        prompt=PROMPT_1,
++        output_file=output_baseline,
++        max_new_tokens=20,
++        temperature=1.0,
++        top_k=1,
++        seed=42,
++        use_subquadratic_ops=False,
++    )
++
++    generated_subq = run_infer_subprocess(
++        mbridge_checkpoint_path,
++        prompt=PROMPT_1,
++        output_file=output_subq,
++        max_new_tokens=20,
++        temperature=1.0,
++        top_k=1,
++        seed=42,
++        use_subquadratic_ops=True,
++    )
++
++    assert len(generated_baseline) > 0, "Baseline generation produced empty output"
++    assert len(generated_subq) > 0, "Subq-ops generation produced empty output"
++    assert generated_baseline == generated_subq, (
++        f"Subq-ops path diverged from baseline:\nBaseline: {generated_baseline}\nSubq-ops: {generated_subq}"
++    )
++
++
+ def test_different_prompts_produce_different_outputs(mbridge_checkpoint_path, tmp_path):
+     """Test that different prompts produce different sequences.
+ 
+diff --git a/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/test_evo2.py b/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/test_evo2.py
+index d6c41d3b1e..1e2d9e3347 100644
+--- a/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/test_evo2.py
++++ b/bionemo-recipes/recipes/evo2_megatron/tests/bionemo/evo2/test_evo2.py
+@@ -269,6 +269,13 @@ def _check_matchrate(*, ckpt_name, matchrate, assert_matchrate=True):
+         pytest.param(
+             "evo2/1b-8k-bf16:1.0", [96.27, 67.93, 77.50, 80.30], False, True, id="1b-8k-bf16-subquadratic-ops"
+         ),
++        pytest.param(
++            "evo2/1b-8k-bf16:1.0",
++            [96.27, 67.93, 77.50, 80.30],
++            True,
++            True,
++            id="1b-8k-bf16-subquadratic-ops-flash",
++        ),
+         pytest.param(
+             "evo2/1b-8k:1.0",
+             [96.27, 67.93, 77.50, 80.30],
+@@ -310,8 +317,6 @@ def test_forward_manual(
+ 
+     is_fp8_supported, compute_capability, device_info = check_fp8_support(torch.cuda.current_device())
+     skip = "evo2/1b-8k:" in ckpt_name and not is_fp8_supported
+-    if subquadratic_ops and flash_decode:
+-        pytest.skip(f"Skipping {ckpt_name} because subquadratic ops and flash decode are not supported together")
+     vortex_style_fp8 = is_fp8_supported and ("bf16" not in ckpt_name or "7b" not in ckpt_name)
+     if skip:
+         # This checkpoint is sensitive to FP8, so we skip it if it is not supported on the current device.

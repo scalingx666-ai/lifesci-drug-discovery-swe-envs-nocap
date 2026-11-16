@@ -1,0 +1,564 @@
+diff --git a/qcfractal/qcfractal/flask_app/auth_v1/test_auth_jwt.py b/qcfractal/qcfractal/flask_app/auth_v1/test_auth_jwt.py
+index 228a376f7..a86cfc3b6 100644
+--- a/qcfractal/qcfractal/flask_app/auth_v1/test_auth_jwt.py
++++ b/qcfractal/qcfractal/flask_app/auth_v1/test_auth_jwt.py
+@@ -2,6 +2,7 @@
+ 
+ import jwt
+ import pytest
++import requests
+ 
+ from qcarchivetesting.testing_classes import (
+     QCATestingSnowflake,
+@@ -144,3 +145,31 @@ def test_jwt_refresh_user_deleted(postgres_server, client_encoding):
+ 
+         with pytest.raises(AuthenticationFailure, match="User account no longer exists"):
+             client.list_datasets()
++
++
++def test_jwt_login_server_error(secure_snowflake):
++    # A login that fails because the server (or a proxy in front of it) is having problems
++    # is not an authentication failure - the credentials may be fine
++    client = secure_snowflake.user_client("submit_user")
++
++    # Force a fresh login on the next request
++    client._jwt_refresh_exp = 1
++
++    def _send(*args, **kwargs):
++        r = requests.Response()
++        r.status_code = 502
++        r.reason = "Bad Gateway"
++        r.headers["Content-Type"] = "text/html"
++        r._content = b"<html><body>Bad Gateway</body></html>"
++        return r
++
++    client._req_session.send = _send
++    try:
++        with pytest.raises(PortalRequestError) as err:
++            client.list_datasets()
++        assert err.value.status_code == 502
++    finally:
++        del client._req_session.send
++
++    # Logs in again once the server is back
++    client.list_datasets()
+diff --git a/qcfractalcompute/qcfractalcompute/compute_manager.py b/qcfractalcompute/qcfractalcompute/compute_manager.py
+index 3dcb32472..274e77cc1 100644
+--- a/qcfractalcompute/qcfractalcompute/compute_manager.py
++++ b/qcfractalcompute/qcfractalcompute/compute_manager.py
+@@ -21,7 +21,7 @@
+ 
+ from qcfractalcompute.apps.app_manager import AppManager
+ from qcportal import ManagerClient
+-from qcportal.client_base import AllowedConnectionExceptions
++from qcportal.client_base import PortalRequestError, is_temporary_server_error
+ from qcportal.managers import ManagerName
+ from qcportal.metadata_models import TaskReturnMetadata
+ from qcportal.record_models import RecordTask
+@@ -36,6 +36,22 @@
+     from parsl.executors.base import ParslExecutor
+ 
+ 
++def _is_manager_inactive_error(ex: BaseException) -> bool:
++    """
++    Determines if an error from the server means that this manager is no longer active on the server
++
++    This happens if the server deactivated the manager (for example, after missing too many heartbeats during
++    a long outage). The server will have already returned the manager's tasks to the queue.
++    """
++
++    # The server signals this with a 400 and a message only. Messages vary between endpoints
++    # ("Manager X is not active", "Cannot update resource stats for manager X - does not exist", etc)
++    if isinstance(ex, PortalRequestError) and ex.status_code == 400:
++        return "is not active" in ex.msg or "does not exist" in ex.msg
++
++    return False
++
++
+ class InterruptableScheduler(sched.scheduler):
+     """
+     A scheduler that can be interrupted
+@@ -353,6 +369,32 @@ def stop(self) -> None:
+         # This interrupts the scheduler, which will cause the rest of the start() method to run
+         self.scheduler.interrupt()
+ 
++    def _handle_server_error(self, ex: Exception) -> None:
++        """
++        Handles an error from communicating with the server
++
++        If the error is temporary, this just returns, and the caller should try again later.
++
++        If the server says this manager is no longer active, the manager is stopped. The caller
++        should then treat it like a temporary error (results that could not be returned will be
++        reported at shutdown).
++
++        All other errors are re-raised.
++        """
++
++        if _is_manager_inactive_error(ex):
++            if not self._is_stopping:
++                self.logger.error(
++                    f"The server reports that this manager is no longer active: {str(ex).strip()}. "
++                    "It was probably deactivated after missing heartbeats, and its tasks were returned to the "
++                    "queue. Shutting down."
++                )
++                self.stop()
++            return
++
++        if not is_temporary_server_error(ex):
++            raise ex
++
+     def heartbeat(self) -> None:
+         """
+         Provides a heartbeat to the connected Server.
+@@ -367,7 +409,11 @@ def heartbeat(self) -> None:
+             )
+             self._failed_heartbeats = 0
+ 
+-        except AllowedConnectionExceptions as ex:
++        except Exception as ex:
++            self._handle_server_error(ex)
++            if self._is_stopping:
++                return
++
+             self._failed_heartbeats += 1
+             self.logger.warning(f"Heartbeat failed: {str(ex).strip()}. QCFractal server down?")
+             self.logger.warning(f"Missed {self._failed_heartbeats} heartbeats so far")
+@@ -498,7 +544,9 @@ def _update_deferred_tasks(self) -> Dict[int, TaskReturnMetadata]:
+                         f"Did not successfully push jobs from {attempts+1} updates ago. Error: {return_meta.error_string}"
+                     )
+ 
+-            except AllowedConnectionExceptions:
++            except Exception as ex:
++                self._handle_server_error(ex)
++
+                 # Tried and failed
+                 attempts += 1
+ 
+@@ -553,8 +601,11 @@ def _update(self, new_tasks) -> None:
+                     status_rows.extend([(task_id, "rejected", reason) for task_id, reason in return_meta.rejected_info])
+                     self.statistics.total_rejected_tasks += return_meta.n_rejected
+ 
+-                except AllowedConnectionExceptions:
+-                    self.logger.warning("Returning complete tasks failed. Attempting again on next update.")
++                except Exception as ex:
++                    self._handle_server_error(ex)
++                    self.logger.warning(
++                        f"Returning complete tasks failed: {str(ex).strip()}. Attempting again on next update."
++                    )
+                     self._deferred_tasks[0].update(executor_results)
+ 
+                     status_rows.extend([(task_id, "deferred", "") for task_id in executor_results.keys()])
+@@ -629,7 +680,7 @@ def _update(self, new_tasks) -> None:
+         self.logger.info(worker_stats_str)
+         self.statistics.last_update_time = time.time()
+ 
+-        if new_tasks and server_up:
++        if new_tasks and server_up and not self._is_stopping:
+             # What do we have for each executor?
+             active_tasks = self.n_active_tasks
+ 
+@@ -648,7 +699,8 @@ def _update(self, new_tasks) -> None:
+                     try:
+                         executor_programs = self.executor_programs[executor_label]
+                         new_task_info = self.client.claim(executor_programs, executor_config.compute_tags, open_slots)
+-                    except AllowedConnectionExceptions as ex:
++                    except Exception as ex:
++                        self._handle_server_error(ex)
+                         self.logger.warning(f"Acquisition of new tasks failed: {str(ex).strip()}")
+                         return
+ 
+diff --git a/qcfractalcompute/qcfractalcompute/test_compute_manager.py b/qcfractalcompute/qcfractalcompute/test_compute_manager.py
+index a5ba417c1..e0eb5feee 100644
+--- a/qcfractalcompute/qcfractalcompute/test_compute_manager.py
++++ b/qcfractalcompute/qcfractalcompute/test_compute_manager.py
+@@ -2,9 +2,11 @@
+ 
+ import threading
+ import time
++from contextlib import contextmanager
+ from typing import TYPE_CHECKING
+ 
+ import pytest
++import requests
+ 
+ from qcarchivetesting import wait_until
+ from qcfractalcompute.compute_manager import ComputeManager
+@@ -18,6 +20,55 @@
+     from qcarchivetesting.testing_classes import QCATestingSnowflake
+ 
+ 
++@contextmanager
++def server_outage(snowflake: QCATestingSnowflake, compute: ComputeManager, error):
++    """
++    Simulates the server being unavailable to the manager
++
++    error is either "stop_api" (actually stop the server, so connections are refused), an HTTP status
++    code (returned as an HTML error page, as a reverse proxy in front of a down server would), or an
++    exception to raise from the connection
++    """
++
++    if error == "stop_api":
++        snowflake.stop_api()
++        try:
++            yield
++        finally:
++            snowflake.start_api()
++        return
++
++    def _send(*args, **kwargs):
++        if isinstance(error, int):
++            r = requests.Response()
++            r.status_code = error
++            r.reason = "Gateway Problems"
++            r.headers["Content-Type"] = "text/html"
++            r._content = b"<html><body>The server is unavailable</body></html>"
++            return r
++        raise error
++
++    session = compute.client._req_session
++    session.send = _send
++    try:
++        yield
++    finally:
++        del session.send
++
++
++# Errors the manager should ride out
++outage_errors = [
++    "stop_api",
++    500,
++    502,
++    503,
++    504,
++    429,
++    requests.exceptions.ChunkedEncodingError("Connection broken"),
++    requests.exceptions.ReadTimeout("Read timed out"),
++]
++
++
+ def test_manager_keepalive(snowflake: QCATestingSnowflake):
+     storage_socket = snowflake.get_storage_socket()
+ 
+@@ -143,7 +194,7 @@ def test_manager_tags_duplicate(snowflake: QCATestingSnowflake, tmp_path):
+     assert compute.all_compute_tags == ["tag1", "tag2", "*"]
+ 
+ 
+-@pytest.mark.filterwarnings("ignore:Exception in thread")
++@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+ def test_manager_claim_inactive(snowflake: QCATestingSnowflake):
+     storage_socket = snowflake.get_storage_socket()
+     snowflake.start_job_runner()
+@@ -161,12 +212,13 @@ def test_manager_claim_inactive(snowflake: QCATestingSnowflake):
+     # Mark as inactive from the server side
+     storage_socket.managers.deactivate([manager_name])
+ 
+-    # Next update should kill the process
++    # Next update should cleanly shut down the manager
+     wait_until(
+         lambda: not compute.is_alive(),
+         timeout=compute._compute._compute_config.update_frequency + 60,
+         message="Manager was not shut down after being deactivated",
+     )
++    assert compute._compute._is_stopping
+ 
+ 
+ def test_manager_claim_return(snowflake: QCATestingSnowflake):
+@@ -186,7 +238,11 @@ def test_manager_claim_return(snowflake: QCATestingSnowflake):
+     assert r is True
+ 
+ 
+-def test_manager_deferred_return(snowflake: QCATestingSnowflake):
++@pytest.mark.parametrize("error", outage_errors)
++def test_manager_deferred_return(snowflake: QCATestingSnowflake, error):
++    # The server becomes unavailable in various ways (not accepting connections at all, a reverse
++    # proxy returning 502/503/504, etc). The manager should hold on to its results and return them
++    # once the server is back
+     storage_socket = snowflake.get_storage_socket()
+     all_id, result_data = populate_db(storage_socket)
+ 
+@@ -195,40 +251,117 @@ def test_manager_deferred_return(snowflake: QCATestingSnowflake):
+     compute = compute_thread._compute
+ 
+     time.sleep(1)  # wait for manager to register
+-    managers = storage_socket.managers.query(ManagerQueryFilters())
+-    assert len(managers) == 1
+-    assert compute.n_total_active_tasks == 0  # haven't updated - we are doing manual updates
+ 
+-    # Get some tasks
+     compute.update(new_tasks=True)
+     assert compute.n_total_active_tasks > 0
+     assert compute.n_deferred_tasks == 0
+ 
+-    # Sever goes down
+-    snowflake.stop_api()
+-
+-    # Let manager complete some tasks
+     time.sleep(3)  # Mock testing adapter waits for two seconds before returning result
+-    compute.update(new_tasks=True)
+-    assert compute.n_deferred_tasks > 0
+-    deferred_task_ids = list(compute._deferred_tasks[0].keys())
+-    deferred_record_ids = [compute._record_id_map[x] for x in deferred_task_ids]
+ 
+-    # Now server comes back
+-    snowflake.start_api()
++    with server_outage(snowflake, compute, error):
++        compute.update(new_tasks=True)
++        assert compute.n_deferred_tasks > 0
++        deferred_task_ids = list(compute._deferred_tasks[0].keys())
+ 
+-    # Manager can now update
+-    compute.update(new_tasks=True)
++        # Retrying the deferred tasks also fails, but that is fine too
++        compute.update(new_tasks=True)
++        assert set(compute._deferred_tasks[1].keys()) == set(deferred_task_ids)
++
++        # Missed heartbeats are counted, but the manager keeps going
++        compute.heartbeat()
++        assert compute._failed_heartbeats == 1
++
++    assert compute_thread.is_alive()
++    assert not compute._is_stopping
++
++    compute.heartbeat()
++    assert compute._failed_heartbeats == 0
+ 
+-    # No more deferred tasks
++    compute.update(new_tasks=True)
+     assert compute.n_deferred_tasks == 0
+-    assert compute.n_total_active_tasks > 0
++    assert compute.n_total_active_tasks > 0  # claimed more tasks
+ 
+-    # Record is complete on the server
++    deferred_record_ids = [compute._record_id_map[x] for x in deferred_task_ids]
+     r = storage_socket.records.get(deferred_record_ids)
+     assert all(x["status"] == "complete" for x in r)
+     assert all(x["manager_name"] == compute.name for x in r)
+ 
++    compute_thread.stop()
++
++
++@pytest.mark.parametrize("error", [502, 504])
++def test_manager_claim_outage(snowflake: QCATestingSnowflake, error):
++    storage_socket = snowflake.get_storage_socket()
++
++    compute_thread = QCATestingComputeThread(snowflake._qcf_config, {})
++    compute_thread.start(manual_updates=True)
++    compute = compute_thread._compute
++
++    time.sleep(1)  # wait for manager to register
++
++    with server_outage(snowflake, compute, error):
++        compute.update(new_tasks=True)
++
++    assert compute_thread.is_alive()
++    assert compute.n_total_active_tasks == 0
++
++    # Claims work again once the server is back
++    all_id, _ = populate_db(storage_socket)
++    compute.update(new_tasks=True)
++    assert compute.n_total_active_tasks > 0
++
++    compute_thread.stop()
++
++
++def test_manager_outage_missed_heartbeats_shutdown(snowflake: QCATestingSnowflake):
++    compute_thread = QCATestingComputeThread(snowflake._qcf_config)
++    compute_thread.start(manual_updates=True)
++    compute = compute_thread._compute
++
++    max_missed = compute.client.server_info["manager_heartbeat_max_missed"]
++
++    with server_outage(snowflake, compute, 504):
++        for i in range(max_missed):
++            compute.heartbeat()
++            assert not compute._is_stopping
++
++        compute.heartbeat()
++        assert compute._is_stopping
++
++    compute_thread._compute_thread.join(30)
++    assert compute_thread.is_alive() is False
++
++
++@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
++def test_manager_deactivated_during_outage(snowflake: QCATestingSnowflake):
++    # The server was down long enough that it deactivated the manager (missed heartbeats) once it
++    # came back. The manager can no longer return its results, and should shut down cleanly
++    storage_socket = snowflake.get_storage_socket()
++    all_id, result_data = populate_db(storage_socket)
++
++    compute_thread = QCATestingComputeThread(snowflake._qcf_config, result_data)
++    compute_thread.start(manual_updates=True)
++    compute = compute_thread._compute
++
++    time.sleep(1)  # wait for manager to register
++
++    compute.update(new_tasks=True)
++    assert compute.n_total_active_tasks > 0
++
++    time.sleep(3)  # Mock testing adapter waits for two seconds before returning result
++
++    with server_outage(snowflake, compute, 503):
++        compute.update(new_tasks=True)
++        assert compute.n_deferred_tasks > 0
++
++    storage_socket.managers.deactivate([compute.name])
++
++    compute.update(new_tasks=True)
++    assert compute._is_stopping
++
++    compute_thread._compute_thread.join(30)
++    assert compute_thread.is_alive() is False
++
+ 
+ def test_manager_missed_heartbeats_shutdown(snowflake: QCATestingSnowflake):
+     compute_thread = QCATestingComputeThread(snowflake._qcf_config)
+diff --git a/qcportal/qcportal/__init__.py b/qcportal/qcportal/__init__.py
+index aa955ca7e..9b7b0a3f0 100644
+--- a/qcportal/qcportal/__init__.py
++++ b/qcportal/qcportal/__init__.py
+@@ -8,7 +8,7 @@
+ 
+ # Add imports here
+ from .client import PortalClient
+-from .client_base import PortalRequestError
++from .client_base import PortalRequestError, is_temporary_server_error
+ from .manager_client import ManagerClient
+ 
+ # Some other helpful functions
+diff --git a/qcportal/qcportal/client_base.py b/qcportal/qcportal/client_base.py
+index 8d46939ff..960aa7a78 100644
+--- a/qcportal/qcportal/client_base.py
++++ b/qcportal/qcportal/client_base.py
+@@ -47,6 +47,8 @@ def _response_msg(response: requests.Response) -> str:
+     ConnectionError,
+     requests.exceptions.Timeout,
+     requests.exceptions.ConnectionError,
++    # The connection was dropped while the response was being read (eg, the server was stopped mid-request)
++    requests.exceptions.ChunkedEncodingError,
+     urllib3.exceptions.TimeoutError,
+ )
+ 
+@@ -96,6 +98,38 @@ def __str__(self) -> str:
+         return f"{self.msg} (HTTP status {self.status_code})"
+ 
+ 
++def is_temporary_server_error(ex: BaseException) -> bool:
++    """
++    Determines if an exception from communicating with a server is likely to be temporary
++
++    This includes being unable to connect at all, and HTTP errors meaning that the server - or a reverse
++    proxy or load balancer in front of it - could not handle the request right now (down, restarting,
++    overloaded, rate limiting, etc). Trying the same request again later may succeed.
++
++    500 (Internal Server Error) is included, since a server whose database is restarting or being upgraded
++    may return it. However, it can also come from a request that will always fail, so anything retrying on
++    this should eventually give up.
++
++    Parameters
++    ----------
++    ex
++        An exception raised while communicating with the server (for example, by a client method)
++
++    Returns
++    -------
++    :
++        True if the error is likely temporary, False otherwise
++    """
++
++    if isinstance(ex, AllowedConnectionExceptions):
++        return True
++
++    if isinstance(ex, PortalRequestError):
++        return ex.status_code >= 500 or ex.status_code in (408, 429)
++
++    return False
++
++
+ class PortalClientBase:
+     def __init__(
+         self,
+@@ -500,6 +534,11 @@ def _get_JWT_token(self) -> None:
+             self._jwt_access_exp = decoded_access_token["exp"]
+             self._jwt_refresh_exp = decoded_refresh_token["exp"]
+             self.user_id = int(decoded_access_token["sub"])  # "identity" "subject"
++        elif ret.status_code >= 500:
++            # The server (or a proxy in front of it) is having problems - this says nothing
++            # about whether the credentials are valid
++            msg = _response_msg(ret)
++            raise PortalRequestError(f"Login failed: {msg}", ret.status_code, {"msg": msg})
+         else:
+             raise AuthenticationFailure(_response_msg(ret))
+ 
+@@ -809,14 +848,23 @@ def ping(self) -> bool:
+             True if the server is up and responded to the ping. False otherwise
+         """
+ 
+-        uri = f"{self.address}/api/v1/ping"
++        uri = f"{self.address}api/v1/ping"
+ 
+         try:
+-            r = requests.get(uri)
+-            return r.json()["success"]
++            r = requests.get(uri, verify=self._verify, timeout=self.timeout)
+         except AllowedConnectionExceptions:
+             return False
+ 
++        # A down server behind a reverse proxy gives an error page (502/503/504, often HTML) rather than
++        # refusing the connection
++        if r.status_code != 200:
++            return False
++
++        try:
++            return r.json()["success"]
++        except (ValueError, KeyError, TypeError):
++            return False
++
+     def get_server_information(self) -> dict[str, Any]:
+         """Request general information about the server
+ 
+diff --git a/qcportal/qcportal/test_temporary_server_error.py b/qcportal/qcportal/test_temporary_server_error.py
+new file mode 100644
+index 000000000..5b204a05a
+--- /dev/null
++++ b/qcportal/qcportal/test_temporary_server_error.py
+@@ -0,0 +1,38 @@
++import pytest
++import requests
++
++from qcportal import PortalRequestError, is_temporary_server_error
++
++
++@pytest.mark.parametrize(
++    "ex",
++    [
++        ConnectionRefusedError("Could not connect"),
++        requests.exceptions.ConnectionError("Connection refused"),
++        requests.exceptions.ReadTimeout("Read timed out"),
++        requests.exceptions.ChunkedEncodingError("Connection broken"),
++        PortalRequestError("Internal Server Error", 500, {}),
++        PortalRequestError("Bad Gateway", 502, {}),
++        PortalRequestError("Service Unavailable", 503, {}),
++        PortalRequestError("Gateway Timeout", 504, {}),
++        PortalRequestError("Request Timeout", 408, {}),
++        PortalRequestError("Too Many Requests", 429, {}),
++    ],
++)
++def test_is_temporary_server_error(ex):
++    assert is_temporary_server_error(ex) is True
++
++
++@pytest.mark.parametrize(
++    "ex",
++    [
++        PortalRequestError("Bad Request", 400, {}),
++        PortalRequestError("Unauthorized", 401, {}),
++        PortalRequestError("Forbidden", 403, {}),
++        PortalRequestError("Not Found", 404, {}),
++        ValueError("not a server error"),
++        RuntimeError("Redirection is not allowed"),
++    ],
++)
++def test_is_not_temporary_server_error(ex):
++    assert is_temporary_server_error(ex) is False

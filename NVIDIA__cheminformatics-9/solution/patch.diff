@@ -1,0 +1,541 @@
+diff --git a/Dockerfile b/Dockerfile
+index a3f2903e..9e695f7b 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -17,7 +17,8 @@ RUN /opt/conda/envs/rapids/bin/pip install \
+     progressbar2 \
+     tables \
+     sqlalchemy \
+-    openpyxl
++    openpyxl \
++    tabulate
+ 
+ # misc python packages
+ RUN conda install -n rapids pywget
+diff --git a/benchmark.sh b/benchmark.sh
+index a809746e..aa5838d3 100644
+--- a/benchmark.sh
++++ b/benchmark.sh
+@@ -16,7 +16,9 @@
+ 
+ export PATH=/opt/conda/envs/rapids/bin:$PATH
+ 
+-BENCHMARK_FILE='benchmark.csv'
++BENCHMARK_DIR='/workspace/benchmark'
++BENCHMARK_PATH=${BENCHMARK_DIR}/benchmark.csv
++PLOT_PATH=${BENCHMARK_DIR}/benchmark.png
+ CLEAN_BENCHMARK=0
+ 
+ CACHE_DIR='/data/db'
+@@ -27,11 +29,13 @@ N_GPUS=(1 2 4 6 7)
+ N_CPUS=(39)
+ 
+ if [[ $CLEAN_BENCHMARK -eq 1 ]]; then
+-    if [ -e ${BENCHMARK_FILE} ]; then
+-       rm ${BENCHMARK_FILE}
++    if [ -e ${BENCHMARK_DIR} ]; then
++       rm -rf ${BENCHMARK_DIR}
+     fi
+ fi
+ 
++mkdir -p $BENCHMARK_DIR
++
+ if [[ $REBUILD_CACHE -eq 1 ]]; then
+     if [ ! -e ${CACHE_DIR} ]; then
+         mkdir -p ${CACHE_DIR}
+@@ -45,14 +49,14 @@ fi
+ for n_molecules in ${N_MOLECULES[*]}; do
+     for n_gpus in ${N_GPUS[*]}; do
+         echo "Benchmarking $n_molecules molecules on $n_gpus GPUs"
+-        python startdash.py analyze -b --cache ${CACHE_DIR} --n_gpu $n_gpus --n_mol $n_molecules
++        python startdash.py analyze -b --cache ${CACHE_DIR} --n_gpu $n_gpus --n_mol $n_molecules --output_path $BENCHMARK_PATH
+     done
+ 
+     for n_cpus in ${N_CPUS[*]}; do
+         echo "Benchmarking $n_molecules molecules on $n_cpus CPU cores"
+-        python startdash.py analyze -b --cache ${CACHE_DIR} --cpu --n_cpu $n_cpus --n_mol $n_molecules
++        python startdash.py analyze -b --cache ${CACHE_DIR} --cpu --n_cpu $n_cpus --n_mol $n_molecules --output_path $BENCHMARK_PATH
+     done
+ done
+ 
+ # Plot the results
+-python nvidia/cheminformatics/utils/plot_benchmark_results.py
++python nvidia/cheminformatics/utils/plot_benchmark_results.py --benchmark_file $BENCHMARK_PATH --output_path $PLOT_PATH
+diff --git a/nvidia/cheminformatics/utils/create_benchmark_data.py b/nvidia/cheminformatics/utils/create_benchmark_data.py
+index ac38b465..0cfcf67a 100644
+--- a/nvidia/cheminformatics/utils/create_benchmark_data.py
++++ b/nvidia/cheminformatics/utils/create_benchmark_data.py
+@@ -17,10 +17,12 @@
+ import os
+ import pandas as pd
+ import sqlite3
++import cudf
++import numpy as np
+ from nvidia.cheminformatics.fingerprint import MorganFingerprint
+ 
+ CHEMBL_DB_PATH = '/data/db/chembl_27.db'
+-DATA_BENCHMARK_DIR = '/workspace/nvidia/cheminformatics/data'
++DATA_BENCHMARK_DIR = '/workspace/tests/data'
+ 
+ 
+ def fetch_approved_drugs(chembl_db_path=CHEMBL_DB_PATH):
+@@ -69,10 +71,18 @@ def calc_morgan_figerprints(benchmark_df, smiles_col='canonical_smiles'):
+ 
+ if __name__ == '__main__':
+ 
+-    benchmark_df = fetch_approved_drugs()
++    benchmark_df = fetch_approved_drugs().set_index('molregno').sort_index()
++    benchmark_df.index = benchmark_df.index.astype(np.int64)
++
+     # TODO: benchmark SMILES have not been canonicalized. Should this be done?
+     fp = calc_morgan_figerprints(benchmark_df)
++    fp.columns = fp.columns.astype(np.int64)
++    fp.index = fp.index.astype(np.int64)
++    for col in fp.columns:
++        fp[col] = fp[col].astype(np.float32)
+ 
+     # Write results
+-    benchmark_df.reset_index().to_csv(os.path.join(DATA_BENCHMARK_DIR, 'benchmark_approved_drugs.csv'), index=False)
+-    fp.reset_index().to_csv(os.path.join(DATA_BENCHMARK_DIR, 'fingerprints_approved_drugs.csv'), index=False)
++    benchmark_df.to_csv(os.path.join(DATA_BENCHMARK_DIR, 'benchmark_approved_drugs.csv'))
++    fp.to_csv(os.path.join(DATA_BENCHMARK_DIR, 'fingerprints_approved_drugs.csv'))
++    fp_hdf5 = cudf.DataFrame(fp)
++    fp_hdf5.to_hdf(os.path.join(DATA_BENCHMARK_DIR, 'filter_00.h5', 'fingerprints', format='table'))
+diff --git a/nvidia/cheminformatics/utils/fileio.py b/nvidia/cheminformatics/utils/fileio.py
+index 9c13450b..099c543b 100644
+--- a/nvidia/cheminformatics/utils/fileio.py
++++ b/nvidia/cheminformatics/utils/fileio.py
+@@ -30,7 +30,7 @@ def initialize_logfile(benchmark_file=BENCHMARK_FILE):
+ def log_results(date, benchmark_type, step, time, n_molecules, n_workers, metric_name='', metric_value='', benchmark_file=BENCHMARK_FILE):
+     """Log benchmark results to a file"""
+ 
+-    out_list = [date, benchmark_type, step, time, n_workers, metric_name, metric_value]
++    out_list = [date, benchmark_type, step, time, n_molecules, n_workers, metric_name, metric_value]
+     out_fmt = ','.join(['{}'] * len(out_list)) + '\n'
+ 
+     with open(benchmark_file, 'a') as fh:
+diff --git a/nvidia/cheminformatics/utils/metrics.py b/nvidia/cheminformatics/utils/metrics.py
+index 6623e032..4e852b3a 100644
+--- a/nvidia/cheminformatics/utils/metrics.py
++++ b/nvidia/cheminformatics/utils/metrics.py
+@@ -20,12 +20,16 @@
+ import pandas
+ import numpy
+ 
++import dask
+ import dask_cudf
+ from sklearn.metrics import silhouette_score
+ from scipy.stats import spearmanr
+ 
++import logging
++logger = logging.getLogger(__name__)
+ 
+-def batched_silhouette_scores(embeddings, clusters, batch_size=5000, seed=0, on_gpu=True):
++
++def batched_silhouette_scores(embeddings, clusters, batch_size=5000, seed=0, downsample_size=500000, on_gpu=True):
+     """Calculate silhouette score in batches on the CPU. Compatible with data on GPU or CPU
+ 
+     Args:
+@@ -33,6 +37,7 @@ def batched_silhouette_scores(embeddings, clusters, batch_size=5000, seed=0, on_
+         clusters (cudf.DataFrame or cupy.ndarray): cluster values for each data point
+         batch_size (int, optional): Size for batching. Defaults to 5000.
+         seed (int, optional): Random seed. Defaults to 0.
++        downsample_size (int, optional): Limit on size of data used for silhouette score. Defaults to 500000.
+         on_gpu (bool, optional): Input data is on GPU. Defaults to True.
+ 
+     Returns:
+@@ -43,13 +48,6 @@ def batched_silhouette_scores(embeddings, clusters, batch_size=5000, seed=0, on_
+         arraylib = cupy
+         dflib = cudf
+         AsArray = cupy.asnumpy
+-
+-        # Convert dask_cudf objects to cudf objects.
+-        if isinstance(embeddings, dask_cudf.core.DataFrame):
+-            embeddings = embeddings.compute()
+-
+-        if isinstance(clusters, dask_cudf.core.Series):
+-            clusters = clusters.compute()
+     else:
+         arraylib = numpy
+         dflib = pandas
+@@ -60,14 +58,28 @@ def _silhouette_scores(input_data):
+         embeddings, clusters = input_data
+         return silhouette_score(AsArray(embeddings), AsArray(clusters))
+ 
+-    # Shuffle on GPU
++    # Compute dask objects
++    if isinstance(embeddings, dask_cudf.core.DataFrame) | isinstance(embeddings, dask.array.core.Array):
++        embeddings = embeddings.compute()
++
++    if isinstance(clusters, dask_cudf.core.Series) | isinstance(clusters, dask.array.core.Array):
++        clusters = clusters.compute()
++
++    # Shuffle
+     combined = dflib.DataFrame(embeddings) if not isinstance(embeddings, dflib.DataFrame) else embeddings
+     embeddings_columns = combined.columns
+     cluster_column = 'clusters'
+ 
+     clusters = dflib.Series(clusters, name=cluster_column)
+     combined[cluster_column] = clusters
+-    combined = combined.sample(n=len(combined), replace=False, random_state=seed) # shuffle via sampling
++
++    # Drop null values
++    mask = combined.notnull().any(axis=1)
++    combined = combined[mask]
++
++    n_data = min(len(combined), downsample_size)
++    logger.info('Calculating silhouette score on {} molecules with batch size of {}...'.format(n_data, batch_size))
++    combined = combined.sample(n=n_data, replace=False, random_state=seed) # shuffle via sampling
+ 
+     embeddings = combined[embeddings_columns]
+     clusters = combined[cluster_column]
+diff --git a/nvidia/cheminformatics/utils/plot_benchmark_results.py b/nvidia/cheminformatics/utils/plot_benchmark_results.py
+index 85868fec..5a36079d 100644
+--- a/nvidia/cheminformatics/utils/plot_benchmark_results.py
++++ b/nvidia/cheminformatics/utils/plot_benchmark_results.py
+@@ -14,15 +14,16 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
++import argparse
+ import pandas as pd
+ import numpy as np
+ import matplotlib.pyplot as plt
+ import matplotlib
++import sys
+ 
+ # default input and out files
+ BENCHMARK_FILE = 'benchmark.csv'
+-XLSX_FILE = 'benchmark.xlsx'
+-PLOT_FILE = 'benchmark.png'
+ 
+ # defaults to categorize steps for sorting
+ STEP_TYPE_DICT = {'dim_reduction': ['pca', 'svd'],
+@@ -37,7 +38,24 @@
+ NV_PALETTE = ['#86B637', '#8F231C', '#3D8366', '#541E7D', '#1B36B6']
+ 
+ 
+-def prepare_benchmark_df(benchmark_file, xlsx_file, step_type_dict, step_type_cat):
++def parse_args():
++    parser = argparse.ArgumentParser(description='Analyze and plot benchmark data')
++    parser.add_argument('-b', '--benchmark_file',
++                        dest='benchmark_file',
++                        type=str,
++                        default='/workspace/benchmark/benchmark.csv',
++                        help='Path to the CSV file containing benchmark results')
++    parser.add_argument('-o', '--output_path',
++                        dest='output_path',
++                        type=str,
++                        default='/workspace/benchmark/benchmark.png',
++                        help='Output directory for plot')
++
++    args = parser.parse_args(sys.argv)
++    return args
++
++
++def prepare_benchmark_df(benchmark_file, step_type_dict=STEP_TYPE_DICT, step_type_cat=STEP_TYPE_CAT):
+     """Read and prepare the benchmark data as a dataframe"""
+ 
+     # Load and format data
+@@ -86,12 +104,15 @@ def prepare_benchmark_df(benchmark_file, xlsx_file, step_type_dict, step_type_ca
+     # Do the normalization
+     bench_time_df[('stats', 'acceleration')] = bench_time_df[(
+         'stats', 'total')].div(norm_df).pow(-1)
+-    bench_time_df.to_excel(xlsx_file)
++
++    basename = os.path.splitext(benchmark_file)[0]
++    bench_time_df.to_excel(basename + '.xlsx')
++    # bench_time_df.to_markdown(basename + '.md') # TODO fix markdown export
+ 
+     return bench_time_df
+ 
+ 
+-def prepare_acceleration_stacked_plot(df, plot_file, palette=NV_PALETTE):
++def prepare_acceleration_stacked_plot(df, output_path, palette=NV_PALETTE):
+     """Prepare single plot of acceleration as stacked bars (by molecule) and hardware workers"""
+ 
+     grouper = df['stats'].groupby(level='n_molecules')
+@@ -140,13 +161,15 @@ def prepare_acceleration_stacked_plot(df, plot_file, palette=NV_PALETTE):
+ 
+     ax.legend(title='Num Molecules')
+     plt.tight_layout()
+-    fig.savefig(plot_file, dpi=300)
++    fig.savefig(output_path, dpi=300)
+     return
+ 
+ 
+ if __name__ == '__main__':
+ 
++    args = parse_args()
++
+     # Read and prepare the dataframe then plot
+-    bench_df = prepare_benchmark_df(benchmark_file=BENCHMARK_FILE, xlsx_file=XLSX_FILE,
+-                                    step_type_dict=STEP_TYPE_DICT, step_type_cat=STEP_TYPE_CAT)
+-    prepare_acceleration_stacked_plot(bench_df, plot_file=PLOT_FILE)
++    bench_df = prepare_benchmark_df(benchmark_file=args.benchmark_file, step_type_dict=STEP_TYPE_DICT, 
++                                    step_type_cat=STEP_TYPE_CAT)
++    prepare_acceleration_stacked_plot(bench_df, output_path=args.output_path)
+diff --git a/nvidia/cheminformatics/workflow.py b/nvidia/cheminformatics/workflow.py
+index c82556a0..c0c475c4 100644
+--- a/nvidia/cheminformatics/workflow.py
++++ b/nvidia/cheminformatics/workflow.py
+@@ -49,11 +49,13 @@ def __init__(self,
+                  client,
+                  n_molecules,
+                  pca_comps=64,
+-                 n_clusters=7,):
++                 n_clusters=7,
++                 benchmark_file='./benchmark.csv'):
+         self.client = client
+         self.n_molecules = n_molecules
+         self.pca_comps = pca_comps
+         self.n_clusters = n_clusters
++        self.benchmark_file = benchmark_file
+ 
+     def execute(self, mol_df):
+         logger.info("Executing CPU workflow...")
+@@ -71,7 +73,7 @@ def execute(self, mol_df):
+             runtime = datetime.now() - task_start_time
+             logger.info(
+                 '### Runtime PCA time (hh:mm:ss.ms) {}'.format(runtime))
+-            log_results(task_start_time, 'cpu', 'pca', runtime, n_molecules=self.n_molecules, n_workers=n_cpu, metric_name='', metric_value='')
++            log_results(task_start_time, 'cpu', 'pca', runtime, n_molecules=self.n_molecules, n_workers=n_cpu, metric_name='', metric_value='', benchmark_file=self.benchmark_file)
+         else:
+             df_fingerprints = mol_df.copy()
+ 
+@@ -80,11 +82,12 @@ def execute(self, mol_df):
+         # kmeans_float = sklearn.cluster.KMeans(n_clusters=self.n_clusters)
+         kmeans_float = dask_KMeans(n_clusters=self.n_clusters)
+         kmeans_float.fit(df_fingerprints)
++        kmeans_labels = kmeans_float.predict(df_fingerprints)
++        runtime = datetime.now() - task_start_time
+ 
+-        #silhouette_score = batched_silhouette_scores(df_fingerprints, kmeans_labels, on_gpu=False)
+-        silhouette_score = 0.0
++        silhouette_score = batched_silhouette_scores(df_fingerprints, kmeans_labels, on_gpu=False)
+         logger.info('### Runtime Kmeans time (hh:mm:ss.ms) {} and silhouette score {}'.format(runtime, silhouette_score))
+-        log_results(task_start_time, 'cpu', 'kmeans', runtime, n_molecules=self.n_molecules, n_workers=n_cpu, metric_name='silhouette_score', metric_value=silhouette_score)
++        log_results(task_start_time, 'cpu', 'kmeans', runtime, n_molecules=self.n_molecules, n_workers=n_cpu, metric_name='silhouette_score', metric_value=silhouette_score, benchmark_file=self.benchmark_file)
+ 
+         logger.info('UMAP...')
+         task_start_time = datetime.now()
+@@ -99,7 +102,7 @@ def execute(self, mol_df):
+         runtime = datetime.now() - task_start_time
+         
+         logger.info('### Runtime UMAP time (hh:mm:ss.ms) {}'.format(runtime))
+-        log_results(task_start_time, 'cpu', 'umap', runtime, n_molecules=self.n_molecules, n_workers=n_cpu, metric_name='', metric_value='')
++        log_results(task_start_time, 'cpu', 'umap', runtime, n_molecules=self.n_molecules, n_workers=n_cpu, metric_name='', metric_value='', benchmark_file=self.benchmark_file)
+ 
+         return mol_df
+ 
+@@ -110,11 +113,13 @@ def __init__(self,
+                  client,
+                  n_molecules,
+                  pca_comps=64,
+-                 n_clusters=7,):
++                 n_clusters=7,
++                 benchmark_file='./benchmark.csv'):
+         self.client = client
+         self.n_molecules = n_molecules
+         self.pca_comps = pca_comps
+         self.n_clusters = n_clusters
++        self.benchmark_file = benchmark_file
+ 
+     def re_cluster(self, gdf,
+                    new_figerprints=None,
+@@ -161,11 +166,10 @@ def re_cluster(self, gdf,
+         kmeans_cuml.fit(gdf)
+         kmeans_labels = kmeans_cuml.predict(gdf)
+         runtime = datetime.now() - task_start_time
+-
+-        # silhouette_score = batched_silhouette_scores(gdf, kmeans_labels, on_gpu=True)
+-        silhouette_score = 0.0
++        
++        silhouette_score = batched_silhouette_scores(gdf, kmeans_labels, on_gpu=True)
+         logger.info('### Runtime Kmeans time (hh:mm:ss.ms) {} and silhouette score {}'.format(runtime, silhouette_score))
+-        log_results(task_start_time, 'gpu', 'kmeans', runtime, n_molecules=self.n_molecules, n_workers=n_gpu, metric_name='silhouette_score', metric_value=silhouette_score)
++        log_results(task_start_time, 'gpu', 'kmeans', runtime, n_molecules=self.n_molecules, n_workers=n_gpu, metric_name='silhouette_score', metric_value=silhouette_score, benchmark_file=self.benchmark_file)
+ 
+         task_start_time = datetime.now()
+         local_model = cuUMAP()
+@@ -191,7 +195,7 @@ def re_cluster(self, gdf,
+         spearman_mean = spearman_rho(dist_array_tani, dist_array_eucl).mean()
+ 
+         logger.info('### Runtime UMAP time (hh:mm:ss.ms) {} with {} of {}'.format(runtime, 'spearman_rho', spearman_mean))
+-        log_results(task_start_time, 'gpu', 'umap', runtime, n_molecules=self.n_molecules, n_workers=n_gpu, metric_name='spearman_rho', metric_value=spearman_mean)
++        log_results(task_start_time, 'gpu', 'umap', runtime, n_molecules=self.n_molecules, n_workers=n_gpu, metric_name='spearman_rho', metric_value=spearman_mean, benchmark_file=self.benchmark_file)
+ 
+         # Add back the column required for plotting and to correlating data
+         # between re-clustering
+@@ -217,7 +221,7 @@ def execute(self, mol_df):
+             runtime = datetime.now() - task_start_time
+             logger.info(
+                 '### Runtime PCA time (hh:mm:ss.ms) {}'.format(runtime))
+-            log_results(task_start_time, 'gpu', 'pca', runtime, n_molecules=self.n_molecules, n_workers=n_gpu, metric_name='', metric_value='')
++            log_results(task_start_time, 'gpu', 'pca', runtime, n_molecules=self.n_molecules, n_workers=n_gpu, metric_name='', metric_value='', benchmark_file=self.benchmark_file)
+         else:
+             df_fingerprints = mol_df.copy()
+ 
+diff --git a/startdash.py b/startdash.py
+index 9d5c5773..5ecfc246 100755
+--- a/startdash.py
++++ b/startdash.py
+@@ -177,6 +177,11 @@ def analyze(self):
+                             default=100000,
+                             help='Number of molecules for analysis. Use negative numbers for using the whole dataset.')
+ 
++        parser.add_argument('-o', '--output_path',
++                            dest='output_path',
++                            type=str,
++                            help='Output path for benchmark results')
++
+         parser.add_argument('--n_gpu',
+                             dest='n_gpu',
+                             type=int,
+@@ -200,7 +205,7 @@ def analyze(self):
+         if args.debug:
+             logger.setLevel(logging.DEBUG)
+ 
+-        initialize_logfile()
++        initialize_logfile(args.output_path)
+ 
+         rmm.reinitialize(managed_memory=True)
+         cupy.cuda.set_allocator(rmm.rmm_cupy_allocator)
+@@ -260,12 +265,14 @@ def analyze(self):
+             workflow = GpuWorkflow(client,
+                                    n_molecules,
+                                    pca_comps=args.pca_comps,
+-                                   n_clusters=args.num_clusters)
++                                   n_clusters=args.num_clusters,
++                                   benchmark_file=args.output_path)
+         else:
+             workflow = CpuWorkflow(client,
+                                    n_molecules,
+                                    pca_comps=args.pca_comps,
+-                                   n_clusters=args.num_clusters)
++                                   n_clusters=args.num_clusters,
++                                   benchmark_file=args.output_path)
+ 
+         mol_df = workflow.execute(mol_df)
+ 
+@@ -280,11 +287,11 @@ def analyze(self):
+ 
+             runtime = datetime.now() - task_start_time
+             logger.info('Runtime workflow (hh:mm:ss.ms) {}'.format(runtime))
+-            log_results(task_start_time, runtype, 'workflow', runtime, n_molecules, n_workers, metric_name='', metric_value='')
++            log_results(task_start_time, runtype, 'workflow', runtime, n_molecules, n_workers, metric_name='', metric_value='', benchmark_file=args.output_path)
+ 
+             runtime = datetime.now() - start_time
+             logger.info('Runtime Total (hh:mm:ss.ms) {}'.format(runtime))
+-            log_results(task_start_time, runtype, 'total', runtime, n_molecules, n_workers, metric_name='', metric_value='')
++            log_results(task_start_time, runtype, 'total', runtime, n_molecules, n_workers, metric_name='', metric_value='', benchmark_file=args.output_path)
+         else:
+ 
+             logger.info("Starting interactive visualization...")
+diff --git a/nvidia/cheminformatics/data/benchmark_approved_drugs.csv b/tests/data/benchmark_approved_drugs.csv
+similarity index 100%
+rename from nvidia/cheminformatics/data/benchmark_approved_drugs.csv
+rename to tests/data/benchmark_approved_drugs.csv
+diff --git a/tests/data/filter_00.h5 b/tests/data/filter_00.h5
+new file mode 100644
+index 00000000..b82851bb
+Binary files /dev/null and b/tests/data/filter_00.h5 differ
+diff --git a/nvidia/cheminformatics/data/fingerprints_approved_drugs.csv b/tests/data/fingerprints_approved_drugs.csv
+similarity index 100%
+rename from nvidia/cheminformatics/data/fingerprints_approved_drugs.csv
+rename to tests/data/fingerprints_approved_drugs.csv
+diff --git a/tests/test_benchmark.py b/tests/test_benchmark.py
+new file mode 100644
+index 00000000..fbbf2fad
+--- /dev/null
++++ b/tests/test_benchmark.py
+@@ -0,0 +1,88 @@
++#!/opt/conda/envs/rapids/bin/python3
++#
++# Copyright (c) 2020, NVIDIA CORPORATION.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import pytest
++import unittest
++import tempfile
++import os
++import sys
++import shlex
++import glob
++import pandas as pd
++
++# Define paths for the tests
++_this_directory = os.path.dirname(os.path.realpath(__file__))
++_parent_directory = os.path.dirname(_this_directory)
++_data_dir = os.path.join(_this_directory, 'data')
++
++sys.path.insert(0, _parent_directory) # TODO better way to add this directory to the path
++from startdash import Launcher
++from nvidia.cheminformatics.utils.plot_benchmark_results import prepare_benchmark_df, prepare_acceleration_stacked_plot
++
++# Output directory
++temp_dir = tempfile.mkdtemp()
++
++# Parameter lists
++run_benchmark_params = [ ([{'test_type': 'gpu', 'n_workers':  1, 'n_mol': -1}, 
++                           {'test_type': 'cpu', 'n_workers': 19, 'n_mol': -1}], _data_dir, temp_dir) ]
++load_benchmark_params = [(temp_dir)]
++
++@pytest.mark.parametrize('benchmark_config_list, data_dir, output_dir', run_benchmark_params)
++def test_run_benchmark(benchmark_config_list, data_dir, output_dir):
++
++    temp_file = tempfile.NamedTemporaryFile(prefix='benchmark_', suffix='.csv', dir=output_dir, delete=False).name
++    
++    if os.path.exists(temp_file):
++        os.remove(temp_file)
++
++    for config in benchmark_config_list:
++        test_type = config['test_type']
++        n_workers = config['n_workers']
++        n_mol = config['n_mol']
++        
++        # Create run command and inject into sys.argv
++        command = f'startdash.py analyze -b --cache {data_dir} '
++        if test_type == 'cpu':
++            command += f'--{test_type} '
++        command += f'--n_{test_type} {n_workers} --n_mol {n_mol} --output_path {temp_file}'
++
++        sys_argv = shlex.split(command)
++        with unittest.mock.patch('sys.argv', sys_argv):
++            Launcher()
++
++    assert os.path.exists(temp_file)
++    benchmark_results = pd.read_csv(temp_file)
++    nrows, ncols = benchmark_results.shape
++    assert nrows >= 5
++    assert ncols == 8
++    # TODO add test for metrics and values
++
++
++@pytest.mark.parametrize('output_dir', load_benchmark_params)
++def test_load_benchmarks(output_dir):
++
++    csv_path = os.path.join(output_dir, 'benchmark_*.csv')
++    for benchmark_file in glob.glob(csv_path):
++        df = prepare_benchmark_df(benchmark_file)
++        basename = os.path.splitext(benchmark_file)[0]
++        excel_file = basename + '.xlsx'
++        assert os.path.exists(excel_file)
++        # md_file = basename + '.md'
++        # assert os.path.exists(md_file) # TODO add this when markdown export is fixed
++        
++        png_file = basename + '.png'
++        prepare_acceleration_stacked_plot(df, output_path=png_file)
++        assert os.path.exists(png_file)

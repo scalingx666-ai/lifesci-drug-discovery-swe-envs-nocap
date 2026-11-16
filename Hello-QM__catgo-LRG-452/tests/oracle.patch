@@ -1,0 +1,183 @@
+diff --git a/src/lib/api/transport/index.ts b/src/lib/api/transport/index.ts
+index 1403ff2f5..613543b1b 100644
+--- a/src/lib/api/transport/index.ts
++++ b/src/lib/api/transport/index.ts
+@@ -232,6 +232,16 @@ export function isMobile(): boolean {
+   return /macintosh/i.test(ua) && navigator.maxTouchPoints > 1
+ }
+ 
++/** iOS/iPadOS specifically (vs Android) — some WKWebView input quirks (e.g.
++ *  dictation delivering CJK as replacing `insertText` events) are iOS-only. */
++export function isIOS(): boolean {
++  if (typeof navigator === `undefined`) return false
++  const ua = navigator.userAgent
++  if (/iphone|ipod|ipad/i.test(ua)) return true
++  // iPadOS desktop-class UA (see isMobile above).
++  return /macintosh/i.test(ua) && navigator.maxTouchPoints > 1
++}
++
+ import { httpTransport } from './http'
+ import { tauriSshTransport } from './tauri-ssh'
+ 
+diff --git a/src/lib/mobile/MobileTerminal.svelte b/src/lib/mobile/MobileTerminal.svelte
+index 2ae3b9815..5629d1d79 100644
+--- a/src/lib/mobile/MobileTerminal.svelte
++++ b/src/lib/mobile/MobileTerminal.svelte
+@@ -20,8 +20,8 @@
+ <script lang="ts">
+   import { to_control } from '$lib/mobile/control-chars'
+   import { createInputDedup, reconcileReplacement } from '$lib/mobile/terminal-input-dedup'
+-  import { createImeGuard } from '$lib/mobile/terminal-ime'
+-  import { transport } from '$lib/api/transport'
++  import { createImeGuard, isCJK } from '$lib/mobile/terminal-ime'
++  import { isIOS, transport } from '$lib/api/transport'
+   import Icon from '$lib/Icon.svelte'
+   import MobileTerminalKeyBar from '$lib/structure/MobileTerminalKeyBar.svelte'
+   import { screen_wake, set_keep_awake } from '$lib/mobile/screen-wake.svelte'
+@@ -309,6 +309,11 @@
+             transport.ptyWrite(session_id, channel_id, encoder.encode(text))
+               .then(() => note_write(true), () => note_write(false))
+           },
++          // iOS dictation streams Chinese as replacing insertText events (same
++          // shape as Latin dictation) — those must reach the reconcile path
++          // below, not be written-on-arrival (that path is for Android IME
++          // commits, which are final). See terminal-ime.ts.
++          bypass_cjk_insert_text: isIOS(),
+         })
+         ime_ac = new AbortController()
+         const xt = term.textarea
+@@ -338,11 +343,16 @@
+             // typing always has a collapsed caret, so it skips this and stays on
+             // the dedup path. We do NOT preventDefault: the textarea must keep the
+             // running value so the next dictation event diffs against it.
++            // CJK dictation partials take this path even with a collapsed caret
++            // (the FIRST partial is a plain insert): the reconcile degenerates to
++            // an append, and the textarea keeps the running transcript so the
++            // next refinement diffs correctly. (Only reachable on iOS — on
++            // Android the guard consumes CJK insertText above.)
+             const ss = xt.selectionStart
+             const se = xt.selectionEnd
+             if (
+               ie.inputType === `insertText` && ie.data != null &&
+-              ss != null && se != null && ss !== se
++              ss != null && se != null && (ss !== se || isCJK(ie.data))
+             ) {
+               const { backspaces, send } = reconcileReplacement(xt.value, ss, se, ie.data)
+               const out = `\x7f`.repeat(backspaces) + send
+diff --git a/src/lib/mobile/__tests__/terminal-ime.test.ts b/src/lib/mobile/__tests__/terminal-ime.test.ts
+index e4bccf111..0ed66beea 100644
+--- a/src/lib/mobile/__tests__/terminal-ime.test.ts
++++ b/src/lib/mobile/__tests__/terminal-ime.test.ts
+@@ -154,4 +154,46 @@ describe(`createImeGuard`, () => {
+     // No trailing keydown/compositionend needed — both already written.
+     expect(write).toHaveBeenCalledTimes(2)
+   })
++
++  describe(`bypass_cjk_insert_text (iOS dictation)`, () => {
++    it(`does not consume Chinese insertText — the caller reconciles it`, () => {
++      // iOS dictation streams Chinese as insertText events that REPLACE the
++      // previous partial. Write-on-arrival (the Android path above) would re-send
++      // the full partial on every refinement ("你"+"你好"+"你好世界"), so with the
++      // bypass the guard must hand these to the caller's reconcile path.
++      const write = vi.fn()
++      const g = createImeGuard({ write, now: () => 0, bypass_cjk_insert_text: true })
++      expect(g.on_before_input(`insertText`, `你好`)).toBe(false)
++      expect(g.on_before_input(`insertText`, `你好世界`)).toBe(false)
++      expect(write).not.toHaveBeenCalled()
++      // Nothing buffered — xterm's echo of the reconciled text must not be eaten.
++      expect(g.should_suppress(`你好`)).toBe(false)
++    })
++
++    it(`still buffers Hangul insertText (typed jamo may be rebuilt)`, () => {
++      const write = vi.fn()
++      const g = createImeGuard({ write, now: () => 0, bypass_cjk_insert_text: true })
++      expect(g.on_before_input(`insertText`, `가`)).toBe(true)
++      expect(write).not.toHaveBeenCalled()
++      g.on_keydown(13)
++      expect(write).toHaveBeenCalledWith(`가`)
++    })
++
++    it(`flushes a pending Hangul buffer before handing Chinese to the caller`, () => {
++      // Ordering: text buffered from Korean typing must land on the PTY before
++      // the caller writes the Chinese dictation that followed it.
++      const write = vi.fn()
++      const g = createImeGuard({ write, now: () => 0, bypass_cjk_insert_text: true })
++      expect(g.on_before_input(`insertReplacementText`, `한`)).toBe(true)
++      expect(g.on_before_input(`insertText`, `你好`)).toBe(false)
++      expect(write).toHaveBeenCalledExactlyOnceWith(`한`)
++    })
++
++    it(`leaves Chinese Pinyin composition and Latin input unchanged`, () => {
++      const g = createImeGuard({ write: vi.fn(), now: () => 0, bypass_cjk_insert_text: true })
++      expect(g.on_before_input(`insertFromComposition`, `中`)).toBe(true)
++      expect(g.on_before_input(`insertText`, `h`)).toBe(false)
++      expect(g.on_before_input(`insertReplacementText`, `hello`)).toBe(false)
++    })
++  })
+ })
+diff --git a/src/lib/mobile/__tests__/terminal-input-dedup.test.ts b/src/lib/mobile/__tests__/terminal-input-dedup.test.ts
+index 5bb2d5632..fda3d7a3c 100644
+--- a/src/lib/mobile/__tests__/terminal-input-dedup.test.ts
++++ b/src/lib/mobile/__tests__/terminal-input-dedup.test.ts
+@@ -33,6 +33,30 @@ describe(`reconcileReplacement (iOS dictation)`, () => {
+     })
+   })
+ 
++  it(`appends a Chinese first partial (collapsed caret, empty textarea)`, () => {
++    // iOS Chinese dictation: the FIRST partial is a plain insert at a collapsed
++    // caret — the reconcile must degenerate to a pure append.
++    expect(reconcileReplacement(``, 0, 0, `你好`)).toEqual({
++      backspaces: 0,
++      send: `你好`,
++    })
++  })
++
++  it(`sends only the new tail when a Chinese partial is refined ("你好" -> "你好世界")`, () => {
++    expect(reconcileReplacement(`你好`, 0, 2, `你好世界`)).toEqual({
++      backspaces: 0,
++      send: `世界`,
++    })
++  })
++
++  it(`backspaces a corrected Chinese partial ("你号" -> "你好世界")`, () => {
++    // The recognizer revises a mis-heard character: erase the diverged tail, retype.
++    expect(reconcileReplacement(`你号`, 0, 2, `你好世界`)).toEqual({
++      backspaces: 1,
++      send: `好世界`,
++    })
++  })
++
+   it(`handles text after the replaced range`, () => {
+     // val "helloX", replace 0..5 ("hello") with "help"; X stays put.
+     expect(reconcileReplacement(`helloX`, 0, 5, `help`)).toEqual({
+diff --git a/src/lib/mobile/terminal-ime.ts b/src/lib/mobile/terminal-ime.ts
+index 77e34b0d4..8ffd86de8 100644
+--- a/src/lib/mobile/terminal-ime.ts
++++ b/src/lib/mobile/terminal-ime.ts
+@@ -74,6 +74,15 @@ export function createImeGuard(opts: {
+   write: (text: string) => void
+   /** Injectable clock for tests; defaults to performance.now. */
+   now?: () => number
++  /** iOS: dictation streams Chinese/Japanese as `insertText` events that REPLACE
++   *  the previous partial transcript (same shape as Latin dictation), so the
++   *  write-on-arrival below would re-send the full partial on every refinement
++   *  ("你"+"你好"+"你好世界") and preventDefault would starve the textarea the
++   *  caller diffs against. With this flag the guard flushes any pending buffer
++   *  and returns false for non-Hangul CJK insertText, letting the caller run its
++   *  dictation reconcile path instead. Hangul insertText is still buffered — a
++   *  typed jamo/syllable may be REBUILT by a following insertReplacementText. */
++  bypass_cjk_insert_text?: boolean
+ }): ImeGuard {
+   const now = opts.now ?? (() => performance.now())
+   let wk_composing = false // true while a WK synthetic composition is buffering
+@@ -111,6 +120,10 @@ export function createImeGuard(opts: {
+           // rebuild replaces rather than appends.
+           wk_composing = true
+           wk_pending = data
++        } else if (opts.bypass_cjk_insert_text) {
++          // iOS dictation partial — not consumed; the caller reconciles it
++          // against the textarea (see MobileTerminal's beforeinput handler).
++          return false
+         } else {
+           // Chinese / Japanese: the committed word arrives as a collapsed
+           // insertText with NO composition events on this WebView (observed on

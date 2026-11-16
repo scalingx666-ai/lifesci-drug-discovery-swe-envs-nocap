@@ -1,0 +1,174 @@
+diff --git a/gpusim.cpp b/gpusim.cpp
+index b473495..3a706cc 100644
+--- a/gpusim.cpp
++++ b/gpusim.cpp
+@@ -281,10 +281,17 @@ void GPUSimServer::incomingSearchRequest()
+     // Read incoming Fingerprint binary and put it in Fingerprint object
+     QByteArray data = clientConnection->readAll();
+     QDataStream qds(&data, QIODevice::ReadOnly);
+-    int results_requested;
++
++    // Used to guarantee Python reading the pipe reads correct request
++    int request_num;
++    qds >> request_num;
++
++    int results_requested; // Maximum results to return, may return less
+     qds >> results_requested;
++
+     float similarity_cutoff;
+     qds >> similarity_cutoff;
++
+     QByteArray fp_data;
+     qds >> fp_data;
+     const int* raw_fp_data = reinterpret_cast<const int*>(fp_data.constData());
+@@ -331,11 +338,12 @@ void GPUSimServer::incomingSearchRequest()
+     }
+ 
+     // Transmit binary data to client and flush the buffered data
+-    QByteArray rcount;
+-    QDataStream rcount_qds(&rcount, QIODevice::WriteOnly);
+-    rcount_qds << dedup_count;
++    QByteArray ints_qba;
++    QDataStream ints_qds(&ints_qba, QIODevice::WriteOnly);
++    ints_qds << request_num;
++    ints_qds << dedup_count;
+ 
+-    clientConnection->write(rcount);
++    clientConnection->write(ints_qba);
+     clientConnection->write(output_smiles);
+     clientConnection->write(output_ids);
+     clientConnection->write(output_scores);
+diff --git a/python/gpusim_server.py b/python/gpusim_server.py
+index eb5b86c..8dc74fa 100644
+--- a/python/gpusim_server.py
++++ b/python/gpusim_server.py
+@@ -4,7 +4,9 @@
+ """
+ 
+ import os
++import random
+ import subprocess
++import sys
+ import time
+ import tempfile
+ 
+@@ -22,6 +24,9 @@
+ BITCOUNT = 1024
+ sockets = {}
+ 
++# Make sure there's only ever a single search at a time
++search_mutex = QtCore.QMutex()
++
+ try:
+     from gpusim_server_loc import GPUSIM_EXEC  # Used in schrodinger env
+ except ImportError:
+@@ -38,6 +43,7 @@ class GPUSimHandler(BaseHTTPRequestHandler):
+     Retrieve the smiles passed into the form and the results from the backend
+     """
+ 
++
+     def get_posted_data(self):
+         form = cgi.FieldStorage(
+             fp=self.rfile,
+@@ -50,13 +56,14 @@ def get_posted_data(self):
+                 float(form["similarity_cutoff"].value))
+ 
+     def get_data(self, socket_name, src_smiles, return_count,
+-                 similarity_cutoff):
+-        fp_binary, canon_smile = gpusim_utils.smiles_to_fingerprint_bin(src_smiles)
++                 similarity_cutoff, request_num):
++        fp_binary, canon_smiles = gpusim_utils.smiles_to_fingerprint_bin(src_smiles)
+         fp_qba = QtCore.QByteArray(fp_binary)
+ 
+         output_qba = QtCore.QByteArray()
+         output_qds = QtCore.QDataStream(output_qba, QtCore.QIODevice.WriteOnly)
+ 
++        output_qds.writeInt(request_num)
+         output_qds.writeInt(return_count)
+         output_qds.writeFloat(similarity_cutoff)
+         output_qds << fp_qba
+@@ -73,16 +80,33 @@ def do_GET(self):
+         self.send_error(404, 'Server unavailable.')
+ 
+     def get_data_from_dbname(self, dbname):
+-        if dbname not in sockets:
+-            self.send_error(404, f'DB {dbname} not found in options: {sockets.keys()}') #noqa
+-            raise ValueError('DB not found')
+-        allsmiles, allids, allscores = [], [], []
+-        src_smiles, return_count, similarity_cutoff = self.get_posted_data()
+-        output_qba = self.get_data(dbname, src_smiles, return_count,
+-                                    similarity_cutoff)
+-        return_count, smiles, ids, scores = self.deserialize_results(output_qba)
+-
+-        return smiles, ids, scores, src_smiles
++        global search_mutex
++        search_mutex.lock()
++        try:
++            if dbname not in sockets:
++                self.send_error(404, f'DB {dbname} not found in options: {sockets.keys()}') #noqa
++                raise ValueError('DB not found')
++            allsmiles, allids, allscores = [], [], []
++            src_smiles, return_count, similarity_cutoff = self.get_posted_data()
++            request_num = random.randint(0, 2**31)
++            print("Processing request {}".format(request_num), file=sys.stderr)
++            output_qba = self.get_data(dbname, src_smiles, return_count,
++                                        similarity_cutoff, request_num)
++            try:
++                return_count, smiles, ids, scores = self.deserialize_results(
++                    request_num, output_qba)
++            except RuntimeError:
++                self.flush_socket(dbname)
++                raise
++
++            return smiles, ids, scores, src_smiles
++        finally:
++            search_mutex.unlock()
++
++    def flush_socket(self, dbname):
++        socket = sockets[dbname]
++        while not socket.atEnd():
++            socket.readAll()
+ 
+     def do_POST(self):
+         if not self.path.startswith("/similarity_search_json"):
+@@ -95,17 +119,20 @@ def do_POST(self):
+             return
+         self.do_json_POST(smiles, ids, scores)
+ 
+-    def deserialize_results(self, output_qba):
+-            data_reader = QtCore.QDataStream(output_qba)
+-            return_count = data_reader.readInt()
+-            smiles, ids, scores = [], [], []
+-            for i in range(return_count):
+-                smiles.append(data_reader.readString().decode("utf-8"))
+-            for i in range(return_count):
+-                ids.append(data_reader.readString().decode("utf-8"))
+-            for i in range(return_count):
+-                scores.append(data_reader.readFloat())
+-            return return_count, smiles, ids, scores
++    def deserialize_results(self, request_num, output_qba):
++        data_reader = QtCore.QDataStream(output_qba)
++        returned_request = data_reader.readInt()
++        if request_num != returned_request:
++            raise RuntimeError("Incorrect result ID returned!")
++        return_count = data_reader.readInt()
++        smiles, ids, scores = [], [], []
++        for i in range(return_count):
++            smiles.append(data_reader.readString().decode("utf-8"))
++        for i in range(return_count):
++            ids.append(data_reader.readString().decode("utf-8"))
++        for i in range(return_count):
++            scores.append(data_reader.readFloat())
++        return return_count, smiles, ids, scores
+ 
+     def results2json(self, smiles, ids, scores):
+         results = []
+@@ -260,7 +287,7 @@ def main():
+     else:
+         handler = GPUSimHandler
+     server = ThreadedHTTPServer((args.hostname, args.port), handler)
+-    print("Running HTTP server...")
++    print("Running HTTP server...", file=sys.stderr)
+     try:
+         server.serve_forever()
+     finally:

@@ -1,0 +1,541 @@
+diff --git a/polaris/benchmark/_base.py b/polaris/benchmark/_base.py
+index 3dd4c459..e488bc02 100644
+--- a/polaris/benchmark/_base.py
++++ b/polaris/benchmark/_base.py
+@@ -134,7 +134,6 @@ def validate_split(cls, v, values):
+         if "dataset" in values:
+             if any(i < 0 or i >= len(values["dataset"]) for i in train_indices + test_indices):
+                 raise ValueError("The predefined split contains invalid indices")
+-
+         return v
+ 
+     @root_validator(skip_on_failure=True)
+@@ -191,9 +190,19 @@ def _compute_checksum(dataset, target_cols, input_cols, split, metrics):
+         for m in sorted(metrics, key=lambda k: k.name):
+             hash_fn.update(m.name.encode("utf-8"))
+ 
+-        s = json.dumps(sorted(split))
++        if not isinstance(split[1], dict):
++            split = split[0], {"test": split[1]}
++
++        # Train set
++        s = json.dumps(sorted(split[0]))
+         hash_fn.update(s.encode("utf-8"))
+ 
++        # Test sets
++        for k in sorted(split[1].keys()):
++            s = json.dumps(sorted(split[1][k]))
++            hash_fn.update(k.encode("utf-8"))
++            hash_fn.update(s.encode("utf-8"))
++
+         checksum = hash_fn.hexdigest()
+         return checksum
+ 
+@@ -262,14 +271,20 @@ def evaluate(self, y_pred: PredictionsType) -> BenchmarkResults:
+         # See also the `hide_targets` parameter in the `Subset` class.
+         test = self.get_train_test_split()[1]
+ 
+-        with tmp_attribute_change(test, "_hide_targets", False):
+-            if isinstance(test, dict):
+-                y_true = {k: v.targets for k, v in test.items()}
+-            else:
+-                y_true = {"test": test.targets}
++        if not isinstance(test, dict):
++            test = {"test": test}
+ 
+-        if not isinstance(y_pred, dict) or all(isinstance(v, np.ndarray) for v in y_pred.values()):
++        y_true = {}
++        for k, test_subset in test.items():
++            with tmp_attribute_change(test_subset, "_hide_targets", False):
++                y_true[k] = test_subset.targets
++
++        if not isinstance(y_pred, dict) or all(k in self.target_cols for k in y_pred):
+             y_pred = {"test": y_pred}
++        if any(k not in y_pred for k in test.keys()):
++            raise KeyError(
++                f"Missing keys for at least one of the test sets. Expecting: {sorted(test.keys())}"
++            )
+ 
+         scores = {}
+ 
+diff --git a/polaris/dataset/_dataset.py b/polaris/dataset/_dataset.py
+index 5ee3ce6a..abd2c333 100644
+--- a/polaris/dataset/_dataset.py
++++ b/polaris/dataset/_dataset.py
+@@ -176,7 +176,7 @@ def from_zarr(cls, path: str):
+ 
+         expected_user_attrs = ["name", "description", "source", "annotations"]
+ 
+-        root = zarr.open_group(path)
++        root = zarr.open_group(path, "r")
+         if any(k not in root.attrs for k in expected_user_attrs):
+             raise InvalidDatasetError(
+                 f"To load a dataset from a .zarr hierarchy, the root group must contain "
+@@ -203,16 +203,18 @@ def from_zarr(cls, path: str):
+                     data[col][name] = fs.join(path, arr.path)
+ 
+         # Parse additional columns from the user attributes
+-        for col in root.attrs:
++        attrs = root.attrs.asdict()
++        cols = list(attrs.keys())
++        for col in cols:
+             if col not in expected_user_attrs:
+-                if not isinstance(root.attrs[col], dict):
++                if not isinstance(attrs[col], dict):
+                     raise TypeError(
+-                        f"Expected the dictionary type for user attr `{col}`, found {type(root.attrs[col])}"
++                        f"Expected the dictionary type for user attr `{col}`, found {type(attrs[col])}"
+                     )
+                 # All non-expected user attrs are assumed to be additional columns
+                 # These should be specified as dicts with index -> value
+                 d = {}
+-                for k, v in root.attrs.pop(col).items():
++                for k, v in attrs.pop(col).items():
+                     try:
+                         k = int(k)
+                     except ValueError as error:
+@@ -222,8 +224,7 @@ def from_zarr(cls, path: str):
+ 
+         # Construct the dataset
+         table = pd.DataFrame(data)
+-
+-        return cls(table=table, **root.attrs)
++        return cls(table=table, **attrs)
+ 
+     @staticmethod
+     def _compute_checksum(table, annotations):
+diff --git a/polaris/dataset/_subset.py b/polaris/dataset/_subset.py
+index 084236ee..e8055094 100644
+--- a/polaris/dataset/_subset.py
++++ b/polaris/dataset/_subset.py
+@@ -71,8 +71,6 @@ def targets(self):
+         Scikit-learn style access to the targets.
+         If the dataset is multi-target, this will return a dict of arrays.
+         """
+-        if self._hide_targets:
+-            raise TestAccessError("Within Polaris, you should not need to access the targets of the test set")
+         return self.as_array("y")
+ 
+     @staticmethod
+@@ -108,6 +106,9 @@ def as_array(self, data_type: Union[Literal["x"], Literal["y"], Literal["xy"]]):
+         if data_type == "xy":
+             return self.as_array("x"), self.as_array("y")
+ 
++        if data_type == "y" and self._hide_targets:
++            raise TestAccessError("Within Polaris, you should not need to access the targets of the test set")
++
+         if not self.is_multi_task:
+             return np.array([self._extract(ret, data_type) for ret in self])
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 67b9a547..7acee1fe 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -8,6 +8,30 @@
+ from polaris.utils import fs
+ 
+ 
++def _get_zarr_archive(tmp_path, datapoint_per_array: bool):
++    tmp_path = fs.join(str(tmp_path), "data.zarr")
++    root = zarr.open_group(tmp_path, mode="w")
++    group_a = root.create_group("A/")
++    group_b = root.create_group("B/")
++
++    def _populate_group(group):
++        if datapoint_per_array:
++            for i in range(100):
++                group.array(i, data=np.random.random((2048,)))
++        else:
++            group.array("data", data=np.random.random((100, 2048)))
++
++    _populate_group(group_a)
++    _populate_group(group_b)
++
++    root.attrs["C"] = {i: 0.0 for i in range(100)}
++    root.attrs["name"] = "Test"
++    root.attrs["description"] = "Go wild in your test cases with this awesome dataset"
++    root.attrs["source"] = "Imagination"
++    root.attrs["annotations"] = {"A": "MOLECULE_3D", "B": "IMAGE"}
++    return tmp_path
++
++
+ @pytest.fixture(scope="module")
+ def test_data():
+     return dm.data.freesolv()[:100]
+@@ -27,19 +51,13 @@ def test_dataset(test_data):
+ 
+ 
+ @pytest.fixture(scope="function")
+-def test_zarr_archive(tmp_path):
+-    tmp_path = fs.join(str(tmp_path), "data.zarr")
+-    root = zarr.open_group(tmp_path, mode="w")
+-    group_a = root.create_group("A/")
+-    group_b = root.create_group("B/")
+-    group_a.array(0, data=np.random.random((100, 2048)))
+-    group_b.array(0, data=np.random.random((100, 2048)))
+-    root.attrs["C"] = {0: 0.0}
+-    root.attrs["name"] = "Test"
+-    root.attrs["description"] = "Go wild in your test cases with this awesome dataset"
+-    root.attrs["source"] = "Imagination"
+-    root.attrs["annotations"] = {"A": "MOLECULE_3D", "B": "IMAGE"}
+-    return tmp_path
++def test_zarr_archive_multiple_arrays(tmp_path):
++    return _get_zarr_archive(tmp_path, datapoint_per_array=True)
++
++
++@pytest.fixture(scope="function")
++def test_zarr_archive_single_array(tmp_path):
++    return _get_zarr_archive(tmp_path, datapoint_per_array=False)
+ 
+ 
+ @pytest.fixture(scope="module")
+@@ -55,6 +73,19 @@ def test_single_task_benchmark(test_dataset):
+     )
+ 
+ 
++@pytest.fixture(scope="module")
++def test_single_task_benchmark_multiple_test_sets(test_dataset):
++    train_indices = list(range(90))
++    test_indices = {"test_1": list(range(90, 95)), "test_2": list(range(95, 100))}
++    return SingleTaskBenchmarkSpecification(
++        dataset=test_dataset,
++        metrics=["mean_absolute_error", "mean_squared_error"],
++        split=(train_indices, test_indices),
++        target_cols="expt",
++        input_cols="smiles",
++    )
++
++
+ @pytest.fixture(scope="module")
+ def test_multi_task_benchmark(test_dataset):
+     # For the sake of simplicity, just use a small set of indices
+diff --git a/tests/test_benchmark.py b/tests/test_benchmark.py
+index d50b3aeb..4b3ad513 100644
+--- a/tests/test_benchmark.py
++++ b/tests/test_benchmark.py
+@@ -9,6 +9,8 @@
+ 
+ @pytest.mark.parametrize("is_single_task", [True, False])
+ def test_split_verification(is_single_task, test_single_task_benchmark, test_multi_task_benchmark):
++    """Verifies that the split validation works as expected."""
++
+     obj = test_single_task_benchmark if is_single_task else test_multi_task_benchmark
+     cls = SingleTaskBenchmarkSpecification if is_single_task else MultiTaskBenchmarkSpecification
+ 
+@@ -55,6 +57,7 @@ def test_split_verification(is_single_task, test_single_task_benchmark, test_mul
+ 
+ @pytest.mark.parametrize("cls", [SingleTaskBenchmarkSpecification, MultiTaskBenchmarkSpecification])
+ def test_benchmark_column_verification(test_single_task_benchmark, test_multi_task_benchmark, cls):
++    """Verifies that the column validation works as expected."""
+     base = (
+         test_single_task_benchmark if cls == SingleTaskBenchmarkSpecification else test_multi_task_benchmark
+     )
+@@ -83,6 +86,7 @@ def test_benchmark_column_verification(test_single_task_benchmark, test_multi_ta
+ 
+ @pytest.mark.parametrize("cls", [SingleTaskBenchmarkSpecification, MultiTaskBenchmarkSpecification])
+ def test_benchmark_metrics_verification(test_single_task_benchmark, test_multi_task_benchmark, cls):
++    """Verifies that the metric validation works as expected."""
+     # By using the fixture as a default, we know it doesn't always fail
+     base = (
+         test_single_task_benchmark if cls == SingleTaskBenchmarkSpecification else test_multi_task_benchmark
+@@ -107,13 +111,8 @@ def test_benchmark_metrics_verification(test_single_task_benchmark, test_multi_t
+         )
+ 
+ 
+-def test_benchmark_split(test_single_task_benchmark):
+-    train, test = test_single_task_benchmark.get_train_test_split()
+-    assert isinstance(train, Subset) and isinstance(test, Subset)
+-    assert len(train) + len(test) <= len(test_single_task_benchmark.dataset)
+-
+-
+ def test_benchmark_from_yaml(test_single_task_benchmark, tmpdir):
++    """Test whether we can successfully save and load a benchmark from YAML."""
+     test_single_task_benchmark.to_yaml(str(tmpdir))
+ 
+     path = fs.join(str(tmpdir), "benchmark.yaml")
+@@ -126,6 +125,8 @@ def test_benchmark_from_yaml(test_single_task_benchmark, tmpdir):
+ 
+ @pytest.mark.parametrize("is_single_task", [True, False])
+ def test_benchmark_checksum(is_single_task, test_single_task_benchmark, test_multi_task_benchmark):
++    """Test whether the checksum captures our notion of equality."""
++
+     obj = test_single_task_benchmark if is_single_task else test_multi_task_benchmark
+     cls = SingleTaskBenchmarkSpecification if is_single_task else MultiTaskBenchmarkSpecification
+ 
+@@ -147,7 +148,7 @@ def test_benchmark_checksum(is_single_task, test_single_task_benchmark, test_mul
+     cls(**kwargs)
+ 
+     # With a different ordering of the split
+-    kwargs["split"] = kwargs["split"][::-1]
++    kwargs["split"] = kwargs["split"][0][::-1], kwargs["split"][1]
+     cls(**kwargs)
+ 
+     # --- Test that the checksum is NOT the same ---
+diff --git a/tests/test_dataset.py b/tests/test_dataset.py
+index b13799b8..237360ca 100644
+--- a/tests/test_dataset.py
++++ b/tests/test_dataset.py
+@@ -10,8 +10,34 @@
+ from polaris.utils.errors import PolarisChecksumError
+ 
+ 
++def _equality_test(dataset_1, dataset_2):
++    """
++    Utility function.
++
++    When saving a dataset to a different location, it should be considered the same dataset
++    but currently the dataset checksum is used for equality and with pointer columns,
++    the checksum uses the file path, not the file content (which thus changes when saving).
++
++    See also: https://github.com/datamol-io/polaris/issues/16
++    """
++    if dataset_1 == dataset_2:
++        return True
++    if len(dataset_1) != len(dataset_2):
++        return False
++    if (dataset_1.table.columns != dataset_2.table.columns).all():
++        return False
++
++    for i in range(len(dataset_1)):
++        for col in dataset_1.table.columns:
++            if (dataset_1.get_data(row=i, col=col) != dataset_2.get_data(row=i, col=col)).all():
++                return False
++    return True
++
++
+ @pytest.mark.parametrize("modality", [mod for mod in list(Modality) if mod.is_pointer()])
+ def test_load_data(modality, tmp_path):
++    """Test accessing the data, specifically whether pointer columns are properly handled."""
++
+     # Dummy data (could e.g. be a 3D structure or Image)
+     arr = np.random.random((100, 100))
+ 
+@@ -40,6 +66,8 @@ def test_load_data(modality, tmp_path):
+ 
+ 
+ def test_dataset_checksum(test_dataset):
++    """Test whether the checksum is a good indicator of whether the dataset has changed in a meaningful way."""
++
+     original = test_dataset.md5sum
+     assert original is not None
+ 
+@@ -79,20 +107,88 @@ def _check_for_failure(_kwargs):
+     assert dataset.md5sum is not None
+ 
+ 
+-def test_dataset_from_zarr(test_zarr_archive):
+-    dataset = Dataset.from_zarr(test_zarr_archive)
++@pytest.mark.parametrize("array_per_datapoint", [True, False])
++def test_dataset_from_zarr(
++    test_zarr_archive_single_array, test_zarr_archive_multiple_arrays, array_per_datapoint
++):
++    """Test whether loading works when the zarr archive contains a single array or multiple arrays."""
++    archive = test_zarr_archive_multiple_arrays if array_per_datapoint else test_zarr_archive_single_array
++    dataset = Dataset.from_zarr(archive)
+     assert len(dataset.table) == 100
+-    assert dataset.get_data(row=0, col="A").shape == (2048,)
+-    assert dataset.get_data(row=0, col="B").shape == (2048,)
+-    assert dataset.get_data(row=0, col="C") == 0.0
++    for i in range(100):
++        assert dataset.get_data(row=i, col="A").shape == (2048,)
++        assert dataset.get_data(row=i, col="B").shape == (2048,)
++        assert dataset.get_data(row=i, col="C") == 0.0
++
++
++def test_dataset_from_zarr_equality(test_zarr_archive_single_array, test_zarr_archive_multiple_arrays):
++    """
++    Test whether two methods for specifying .zarr datasets lead to the same dataset.
++    This specifically tests whether indexing a single arrow with our custom path syntax works.
++    """
++    dataset_1 = Dataset.from_zarr(test_zarr_archive_single_array)
++    dataset_2 = Dataset.from_zarr(test_zarr_archive_multiple_arrays)
++    assert _equality_test(dataset_1, dataset_2)
+ 
+ 
+ def test_dataset_from_yaml(test_dataset, tmpdir):
++    """Test whether the dataset can be saved and loaded from yaml."""
+     test_dataset.to_yaml(str(tmpdir))
+ 
+     path = fs.join(str(tmpdir), "dataset.yaml")
++
+     new_dataset = Dataset.from_yaml(path)
+-    assert test_dataset == new_dataset
++    assert _equality_test(test_dataset, new_dataset)
+ 
+     new_dataset = load_dataset(path)
+-    assert test_dataset == new_dataset
++    assert _equality_test(test_dataset, new_dataset)
++
++
++@pytest.mark.parametrize("array_per_datapoint", [True, False])
++def test_dataset_from_zarr_to_yaml(
++    test_zarr_archive_single_array,
++    test_zarr_archive_multiple_arrays,
++    array_per_datapoint,
++    tmpdir,
++):
++    """
++    Test whether a dataset with pointer columns, instantiated from a zarr archive,
++    can be saved to and loaded from yaml.
++    """
++
++    archive = test_zarr_archive_multiple_arrays if array_per_datapoint else test_zarr_archive_single_array
++    dataset = Dataset.from_zarr(archive)
++    dataset.to_yaml(str(tmpdir))
++
++    path = fs.join(str(tmpdir), "dataset.yaml")
++    new_dataset = Dataset.from_yaml(path)
++    assert _equality_test(dataset, new_dataset)
++
++    new_dataset = load_dataset(path)
++    assert _equality_test(dataset, new_dataset)
++
++
++@pytest.mark.parametrize("array_per_datapoint", [True, False])
++def test_dataset_caching(
++    test_zarr_archive_single_array,
++    test_zarr_archive_multiple_arrays,
++    array_per_datapoint,
++    tmpdir,
++):
++    """Test whether the dataset remains the same after caching."""
++    archive = test_zarr_archive_multiple_arrays if array_per_datapoint else test_zarr_archive_single_array
++
++    original_dataset = Dataset.from_zarr(archive)
++    cached_dataset = Dataset.from_zarr(archive)
++    assert original_dataset == cached_dataset
++
++    for i in range(len(cached_dataset)):
++        assert not cached_dataset.table.loc[i, "A"].startswith(original_dataset.cache_dir)
++        assert not cached_dataset.table.loc[i, "B"].startswith(original_dataset.cache_dir)
++
++    cached_dataset.cache()
++    for i in range(len(cached_dataset)):
++        assert cached_dataset.table.loc[i, "A"].startswith(original_dataset.cache_dir)
++        assert cached_dataset.table.loc[i, "B"].startswith(original_dataset.cache_dir)
++
++    assert _equality_test(cached_dataset, original_dataset)
+diff --git a/tests/test_import.py b/tests/test_import.py
+index 7f307384..84b0baff 100644
+--- a/tests/test_import.py
++++ b/tests/test_import.py
+@@ -1,2 +1,3 @@
+ def test_import():
++    """Sanity check."""
+     import polaris
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+index 294fcf72..f102c52b 100644
+--- a/tests/test_integration.py
++++ b/tests/test_integration.py
+@@ -5,6 +5,7 @@
+ 
+ 
+ def test_single_task_benchmark_loop(test_single_task_benchmark):
++    """Tests the integrated API for a single-task benchmark."""
+     train, test = test_single_task_benchmark.get_train_test_split()
+ 
+     model = RandomForestRegressor()
+@@ -19,7 +20,28 @@ def test_single_task_benchmark_loop(test_single_task_benchmark):
+     assert isinstance(scores, BenchmarkResults)
+ 
+ 
++def test_single_task_benchmark_loop_with_multiple_test_sets(test_single_task_benchmark_multiple_test_sets):
++    """Tests the integrated API for a single-task benchmark with multiple test sets."""
++    train, test = test_single_task_benchmark_multiple_test_sets.get_train_test_split()
++
++    smiles, y = train.as_array("xy")
++
++    x_train = [dm.to_fp(dm.to_mol(smi)) for smi in smiles]
++
++    model = RandomForestRegressor()
++    model.fit(X=x_train, y=y)
++
++    y_pred = {}
++    for k, test_subset in test.items():
++        x_test = [dm.to_fp(dm.to_mol(smi)) for smi in test_subset.inputs]
++        y_pred[k] = model.predict(x_test)
++
++    scores = test_single_task_benchmark_multiple_test_sets.evaluate(y_pred)
++    assert isinstance(scores, BenchmarkResults)
++
++
+ def test_multi_task_benchmark_loop(test_multi_task_benchmark):
++    """Tests the integrated API for a multi-task benchmark."""
+     train, test = test_multi_task_benchmark.get_train_test_split()
+ 
+     smiles, multi_y = train.as_array("xy")
+diff --git a/tests/test_subset.py b/tests/test_subset.py
+index 87ffb158..ca8aa708 100644
+--- a/tests/test_subset.py
++++ b/tests/test_subset.py
+@@ -1,38 +1,10 @@
++import pytest
+ from polaris.dataset import Subset
+-
+-
+-def test_single_task_indexing(test_dataset):
+-    target_col = "expt"
+-    input_col = "smiles"
+-
+-    task = Subset(test_dataset, list(range(5)), input_col, target_col)
+-
+-    assert len(task) == 5
+-    for i in range(5):
+-        assert test_dataset.table.loc[i, input_col] == task[i][0]
+-        assert test_dataset.table.loc[i, target_col] == task[i][1]
+-
+-
+-def test_multi_task_indexing(test_dataset):
+-    target_cols = ["expt", "calc"]
+-    input_col = "smiles"
+-
+-    task = Subset(test_dataset, [(i, [0, 1]) for i in range(5)], input_col, target_cols)
+-
+-    assert len(task) == 5
+-    for i in range(5):
+-        assert test_dataset.table.loc[i, input_col] == task[i][0]
+-        assert (test_dataset.table.loc[i, target_cols].values == task[i][1]).all()
+-
+-    # With sparsity (indices have changed)
+-    task = Subset(test_dataset, [(i, [0]) for i in range(5)], input_col, target_cols)
+-    assert len(task) == 5
+-    for i in range(5):
+-        assert test_dataset.table.loc[i, input_col] == task[i][0]
+-        assert test_dataset.table.loc[i, target_cols[0]] == task[i][1][0]
++from polaris.utils.errors import TestAccessError
+ 
+ 
+ def test_consistency_across_access_methods(test_dataset):
++    """Using the various endpoints of the Subset API should not lead to the same data."""
+     indices = list(range(5))
+     task = Subset(test_dataset, indices, "smiles", "expt")
+ 
+@@ -51,3 +23,28 @@ def test_consistency_across_access_methods(test_dataset):
+     # Property
+     assert (task.inputs == expected_smiles).all()
+     assert (task.targets == expected_targets).all()
++
++
++def test_access_to_test_set(test_single_task_benchmark):
++    """A user should not have access to the test set targets."""
++
++    train, test = test_single_task_benchmark.get_train_test_split()
++    assert test._hide_targets
++    assert not train._hide_targets
++
++    with pytest.raises(TestAccessError):
++        y = test.as_array("y")
++    with pytest.raises(TestAccessError):
++        y = test.targets
++
++    # Check if iterable style access returns just the SMILES
++    for x in test:
++        assert isinstance(x, str)
++    for i in range(len(test)):
++        assert isinstance(test[i], str)
++
++    # For the train set it should work
++    y = train.targets
++    y = train.as_array("y")
++    assert all(isinstance(y, float) for x, y in train)
++    assert all(isinstance(train[i][1], float) for i in range(len(train)))

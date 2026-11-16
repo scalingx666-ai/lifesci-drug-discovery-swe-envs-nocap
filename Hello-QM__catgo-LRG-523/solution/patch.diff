@@ -1,0 +1,249 @@
+diff --git a/desktop/App.svelte b/desktop/App.svelte
+index a81b4446f..0869760d9 100644
+--- a/desktop/App.svelte
++++ b/desktop/App.svelte
+@@ -1384,7 +1384,11 @@
+    * (import_many) so the CIF / cube / CHGCAR / trajectory branching lives once.
+    */
+   async function ingest_one(content: string | ArrayBuffer, filename: string): Promise<IngestOutcome> {
+-    const text = typeof content === `string` ? content : new TextDecoder().decode(content)
++    // Binary content (ASE .traj / HDF5) only needs `text` for format
++    // sniffing — decode a head slice, never the whole 48 MB buffer.
++    const text = typeof content === `string`
++      ? content
++      : new TextDecoder().decode(content.slice(0, 65536))
+     const ext = filename.replace(/\.(gz|bz2|xz|zst)$/i, ``).split(`.`).pop()?.toLowerCase() || ``
+ 
+     // CHGCAR / CHGDIFF / LOCPOT etc. → convert to Gaussian cube via wasm.
+@@ -1455,13 +1459,26 @@
+     }
+ 
+     if (is_trajectory_file(filename, text)) {
+-      const trajectory = await parse_trajectory_data(content, filename)
++      // parse_trajectory_async routes large .xyz/.extxyz/.traj through the
++      // indexed TrajFrameReader (offset index + 4 eager frames + deferred
++      // plot metadata) instead of the eager whole-file parse — a 48 MB .traj
++      // parsed eagerly blocks the main thread for tens of seconds, which is
++      // the only open path on the static web deploy (no backend to stream).
++      const { parse_trajectory_async } = await import(`$lib/trajectory/parse`)
++      const trajectory = await parse_trajectory_async(content, filename)
+       return {
+         kind: `entry`,
+         entry: {
+           filename, source_path: null, format: ext, structure: undefined, trajectory,
+           is_trajectory: true, cube_file: null,
+-          raw_traj_b64: content_to_base64(content),
++          // Base64 round-trip (HPC push-back) is O(n) string building — for a
++          // 48 MB trajectory that's a ~64 MB string and seconds of main-thread
++          // time. Skip above 8 MB; push-back degrades, open stays fast.
++          raw_traj_b64:
++            (typeof content === `string` ? content.length : content.byteLength) <=
++                8 * 1024 * 1024
++              ? content_to_base64(content)
++              : ``,
+           raw_traj_format: filename.split(`.`).pop()?.toLowerCase() || ``,
+         },
+       }
+diff --git a/src/lib/io/decompress.ts b/src/lib/io/decompress.ts
+index 8bc219e59..39eef9555 100644
+--- a/src/lib/io/decompress.ts
++++ b/src/lib/io/decompress.ts
+@@ -45,11 +45,20 @@ export async function decompress_data(
+   }
+ }
+ 
++/** Formats that must reach the parsers as raw bytes. Reading these as text
++ *  garbles the binary irreversibly: an ASE .traj picked in a browser (the
++ *  static web deploy has no backend to stream through) hit every text parser
++ *  as mojibake and failed with "Unsupported text format" even though a
++ *  client-side ulm parser exists (`parse_ase_trajectory`). */
++const BINARY_STRUCTURE_EXTS = /\.(traj|h5|hdf5)$/i
++
+ export function decompress_file(
+   file: File,
+-): Promise<{ content: string; filename: string }> {
++): Promise<{ content: string | ArrayBuffer; filename: string }> {
+   const format = detect_compression_format(file.name)
+   const is_supported = Boolean(format && ![`zip`, `xz`, `bz2`].includes(format))
++  const base_name = file.name.replace(COMPRESSION_EXTENSIONS_REGEX, ``)
++  const wants_binary = BINARY_STRUCTURE_EXTS.test(base_name)
+ 
+   return new Promise((resolve, reject) => {
+     const reader = new FileReader()
+@@ -60,11 +69,21 @@ export function decompress_file(
+         if (!result) throw new Error(`Failed to read file`)
+ 
+         if (is_supported && format) {
+-          const content = await decompress_data(result as ArrayBuffer, format)
+-          const filename = file.name.replace(COMPRESSION_EXTENSIONS_REGEX, ``)
+-          resolve({ content, filename })
++          const stream = new ReadableStream({
++            start(controller) {
++              controller.enqueue(new Uint8Array(result as ArrayBuffer))
++              controller.close()
++            },
++          })
++          const unzipped = stream.pipeThrough(
++            new DecompressionStream(format as `gzip` | `deflate` | `deflate-raw`),
++          )
++          const content = wants_binary
++            ? await new Response(unzipped).arrayBuffer()
++            : await new Response(unzipped).text()
++          resolve({ content, filename: base_name })
+         } else {
+-          resolve({ content: result as string, filename: file.name })
++          resolve({ content: result as string | ArrayBuffer, filename: file.name })
+         }
+       } catch (error) {
+         reject(error)
+@@ -73,7 +92,7 @@ export function decompress_file(
+ 
+     reader.onerror = () => reject(new Error(`Failed to read file ${file.name}`))
+ 
+-    if (is_supported) reader.readAsArrayBuffer(file)
++    if (is_supported || wants_binary) reader.readAsArrayBuffer(file)
+     else reader.readAsText(file)
+   })
+ }
+diff --git a/src/lib/structure/Structure.svelte b/src/lib/structure/Structure.svelte
+index af3993889..fa67b1758 100644
+--- a/src/lib/structure/Structure.svelte
++++ b/src/lib/structure/Structure.svelte
+@@ -3206,8 +3206,12 @@
+     }
+ 
+     try {
+-      // Read and parse the file
++      // Read and parse the file. Merge only understands text structure
++      // formats — binary trajectories (.traj/.h5) arrive as ArrayBuffer now.
+       const { content, filename } = await decompress_file(file)
++      if (typeof content !== `string`) {
++        throw new Error(`Cannot merge binary trajectory file ${filename}`)
++      }
+       const imported = parse_any_structure(content, filename)
+ 
+       if (imported && imported.sites && imported.sites.length > 0) {
+diff --git a/src/lib/trajectory/Trajectory.svelte b/src/lib/trajectory/Trajectory.svelte
+index 65bcad6b8..c21db221a 100644
+--- a/src/lib/trajectory/Trajectory.svelte
++++ b/src/lib/trajectory/Trajectory.svelte
+@@ -25,7 +25,7 @@
+   import { tooltip } from 'svelte-multiselect/attachments'
+   import type { HTMLAttributes } from 'svelte/elements'
+   import { full_data_extractor } from './extract'
+-  import { create_frame_position_cache } from './frame-positions'
++  import { create_frame_position_cache, FRAME_POS_CACHE_MAX } from './frame-positions'
+   import type {
+     ParseProgress,
+     TrajectoryDataExtractor,
+@@ -737,6 +737,64 @@
+     }
+   })
+ 
++  // ═══ Round-3 warmup: pre-convert frame positions during idle time ═══
++  // First visit of a frame pays chunk fetch/parse (loader paths) plus the
++  // 20k-site proxy walk that fills frame_pos_cache (~380 ms/frame at 20k
++  // atoms) — the first playback pass crawled at ~6 fps while later passes
++  // hit 20 fps. Warm the caches in requestIdleCallback slices so the first
++  // pass is as fast as a revisit. Generation-guarded: any new load or
++  // unload invalidates in-flight warmup; active playback naturally starves
++  // idle callbacks, so this never competes for frame budget.
++  let warmup_gen = 0
++  $effect(() => {
++    const traj = trajectory
++    void traj_load_seq
++    if (!traj || !topology_initialized) return
++    // Only the typed-positions playback path consumes frame_pos_cache.
++    if (untrack(() => trajectory_frame_positions) == null) return
++    const total = Math.min(
++      traj.total_frames ?? traj.frames.length,
++      FRAME_POS_CACHE_MAX,
++    )
++    if (total <= 1) return
++    const gen = ++warmup_gen
++    const loader = (traj as PaneTrajectory).frame_loader
++    let idx = 0
++    const step = async (deadline?: IdleDeadline) => {
++      while (idx < total && gen === warmup_gen) {
++        if (deadline && deadline.timeRemaining() < 8) break
++        const i = idx++
++        try {
++          let frame: TrajectoryFrame | undefined = untrack(() => traj.frames[i])
++          if (!frame?.structure && loader) {
++            frame = (await loader.load_frame(
++              untrack(() => orig_data) ?? ``,
++              i,
++            )) ?? undefined
++          }
++          const sites = frame?.structure?.sites
++          if (gen !== warmup_gen) return
++          if (sites?.length) frame_pos_cache.get(i, sites)
++        } catch {
++          // Unfetchable frame — playback's own path will surface errors.
++        }
++        if (!deadline) break // setTimeout fallback: one frame per tick
++      }
++      if (idx < total && gen === warmup_gen) schedule()
++    }
++    const schedule = () => {
++      if (typeof requestIdleCallback === `function`) {
++        requestIdleCallback((d) => void step(d), { timeout: 1000 })
++      } else {
++        setTimeout(() => void step(), 50)
++      }
++    }
++    schedule()
++    return () => {
++      warmup_gen++
++    }
++  })
++
+   // Track hidden elements (persists across frame changes)
+   let hidden_elements = $state(new Set<ElementSymbol>())
+ 
+diff --git a/src/lib/trajectory/parse.ts b/src/lib/trajectory/parse.ts
+index 1d8a125b6..e61bda879 100644
+--- a/src/lib/trajectory/parse.ts
++++ b/src/lib/trajectory/parse.ts
+@@ -307,7 +307,23 @@ export async function parse_trajectory_async(
+ 
+     const data_size = data instanceof ArrayBuffer ? data.byteLength : data.length
+     const is_large_file = data_size > LARGE_FILE_THRESHOLD
+-    const should_use_indexing = use_indexing ?? is_large_file
++    // ASE .traj carries a complete frame-offset table in its ulm header, so
++    // the index is free at ANY size — always take the indexed path. The
++    // eager path built every frame's 20k site objects up front; in the
++    // browser (deep $state proxies + per-pane clone) a 48 MB file — under
++    // the 50 MB text threshold — blocked the main thread for >30 s, which
++    // is the only available path on the static web deploy.
++    const ase_binary = data instanceof ArrayBuffer &&
++      filename.toLowerCase().endsWith(`.traj`)
++    // Text trajectories (.xyz/.extxyz) index with one boundary scan and then
++    // load 4 eager frames — strictly cheaper than the eager path (every
++    // frame's site objects up front) for anything beyond a few MB. The old
++    // 50 MB threshold left e.g. a 35 MB extxyz on the eager path, which
++    // blocks the browser main thread for tens of seconds (fatal on the
++    // static web deploy where no backend streaming exists).
++    const TEXT_INDEX_THRESHOLD = 2 * 1024 * 1024
++    const should_use_indexing = use_indexing ??
++      (ase_binary || data_size > TEXT_INDEX_THRESHOLD)
+ 
+     if (is_large_file) {
+       update_progress(5, `Large file detected (${Math.round(data_size / 1024 / 1024)}MB)`)
+diff --git a/src/lib/xrd/XrdPlot.svelte b/src/lib/xrd/XrdPlot.svelte
+index 771e1eda9..e2b7ab481 100644
+--- a/src/lib/xrd/XrdPlot.svelte
++++ b/src/lib/xrd/XrdPlot.svelte
+@@ -227,7 +227,11 @@
+       if (file) {
+         try {
+           const { content, filename } = await decompress_file(file)
+-          if (content) (on_file_drop || compute_and_add)(content, filename)
++          // XRD inputs are always text; binary structure formats (.traj/.h5)
++          // now arrive as ArrayBuffer and have no meaning here.
++          if (typeof content === `string` && content) {
++            ;(on_file_drop || compute_and_add)(content, filename)
++          }
+         } catch (exc) {
+           error_msg = `Failed to load file ${file.name}: ${
+             exc instanceof Error ? exc.message : String(exc)

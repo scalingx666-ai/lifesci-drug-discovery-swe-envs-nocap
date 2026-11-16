@@ -1,0 +1,857 @@
+diff --git a/src/mctc/lapack.f90 b/src/mctc/lapack.f90
+index 38a4602a1..accfa74e5 100644
+--- a/src/mctc/lapack.f90
++++ b/src/mctc/lapack.f90
+@@ -25,11 +25,11 @@ module xtb_mctc_lapack
+    use xtb_mctc_lapack_stdeigval, only : mctc_syev, lapack_syev, lapack_syevd, lapack_syevx, &
+       & lapack_syevr, lapack_spev, lapack_spevd, lapack_spevx, lapack_heev, &
+       & lapack_heevd, lapack_heevx, lapack_heevr, lapack_hpev, lapack_hpevd, &
+-      & lapack_hpevx
++      & lapack_hpevx, lapack_sytrd, lapack_stedc, lapack_ormtr
+    use xtb_mctc_lapack_trf, only : lapack_getrf, lapack_sytrf, lapack_sptrf, &
+       & lapack_potrf, lapack_pptrf
+    use xtb_mctc_lapack_tri, only : lapack_getri, lapack_sytri, lapack_sptri, &
+-      & lapack_potri, lapack_pptri
++      & lapack_potri, lapack_pptri, lapack_trtri
+    use xtb_mctc_lapack_trs, only : lapack_getrs, lapack_sytrs, lapack_sptrs, &
+       & lapack_potrs, lapack_pptrs
+    use xtb_mctc_lapack_wrap
+diff --git a/src/mctc/lapack/eigensolve.F90 b/src/mctc/lapack/eigensolve.F90
+index 1ecaae778..aba34309a 100644
+--- a/src/mctc/lapack/eigensolve.F90
++++ b/src/mctc/lapack/eigensolve.F90
+@@ -19,11 +19,13 @@
+ !> Wrapper for eigensolver routines
+ module xtb_mctc_lapack_eigensolve
+    use xtb_mctc_accuracy, only : sp, dp
+-   use xtb_mctc_blas_level3, only : blas_trsm
++   use xtb_mctc_blas_level3, only : blas_trsm, blas_trmm, blas_gemm
+    use xtb_mctc_lapack_geneigval, only : lapack_sygvd
+-   use xtb_mctc_lapack_stdeigval, only : lapack_syevd
++   use xtb_mctc_lapack_stdeigval, only : lapack_syevd, lapack_sytrd, &
++      & lapack_stedc, lapack_ormtr
+    use xtb_mctc_lapack_gst, only : lapack_sygst
+    use xtb_mctc_lapack_trf, only : mctc_potrf
++   use xtb_mctc_lapack_tri, only : mctc_trtri
+    use xtb_type_environment, only : TEnvironment
+ #ifdef USE_CUSOLVER
+    use xtb_mctc_global
+@@ -35,14 +37,30 @@ module xtb_mctc_lapack_eigensolve
+    public :: TEigenSolver, init
+ 
+ 
++   !> Column-panel width for upper-triangle congruence A = R^T H R (R = U^-1).
++   !> Because standard BLAS has no symmetric R^T H R routine, two full-matrix
++   !> blas_trmm calls cost 2*N^3 FLOPs; evaluating only rows 1:jj per column
++   !> panel j:jj exploits R^T being lower triangular to compute just the upper
++   !> triangle of A in 1*N^3 FLOPs (matching dsygst while using gemm + trmm).
++   integer, parameter :: nb = 96
++
++
+    type :: TEigenSolver
+       private
+       integer :: n
+       integer, allocatable :: iwork(:)
+       real(sp), allocatable :: swork(:)
+       real(sp), allocatable :: sbmat(:, :)
++      real(sp), allocatable :: szmat(:, :)
++      real(sp), allocatable :: stau(:)
++      real(sp), allocatable :: sesub(:)
++      real(sp), allocatable :: swork_trd(:)
+       real(dp), allocatable :: dwork(:)
+       real(dp), allocatable :: dbmat(:, :)
++      real(dp), allocatable :: dzmat(:, :)
++      real(dp), allocatable :: dtau(:)
++      real(dp), allocatable :: desub(:)
++      real(dp), allocatable :: dwork_trd(:)
+ #ifdef USE_CUSOLVER
+       integer :: lwork
+ #endif
+@@ -53,6 +71,12 @@ module xtb_mctc_lapack_eigensolve
+       generic :: fact_solve => sfact_solve, dfact_solve
+       procedure :: sfact_solve => mctc_ssygvd_factorized
+       procedure :: dfact_solve => mctc_dsygvd_factorized
++      generic :: fact_solve_subspace => sfact_solve_subspace, dfact_solve_subspace
++      procedure :: sfact_solve_subspace => mctc_ssygvd_fact_subspace
++      procedure :: dfact_solve_subspace => mctc_dsygvd_fact_subspace
++      generic :: fact_backtransform => sfact_backtransform, dfact_backtransform
++      procedure :: sfact_backtransform => mctc_ssygvd_fact_backtransform
++      procedure :: dfact_backtransform => mctc_dsygvd_fact_backtransform
+    end type TEigenSolver
+ 
+ 
+@@ -70,15 +94,31 @@ subroutine initSEigenSolver(self, env, bmat)
+    class(TEigenSolver), intent(out) :: self
+    type(TEnvironment), intent(inout) :: env
+    real(sp), intent(in) :: bmat(:, :)
++   integer :: info, lwork_trd, lda
++   real(sp) :: work_trd_q(1), work_orm_q(1)
++   logical :: exitRun
+ 
+    self%n = size(bmat, 1)
+ 
+    allocate(self%swork(1 + 6*self%n + 2*self%n**2))
+    allocate(self%iwork(3 + 5*self%n))
++   allocate(self%szmat(self%n, self%n), source=0.0_sp)
++   allocate(self%stau(self%n), self%sesub(self%n))
+ 
+    self%sbmat = bmat
++   lda = max(1, self%n)
++   call lapack_sytrd('U', self%n, self%szmat, lda, self%swork, self%sesub, &
++      & self%stau, work_trd_q, -1, info)
++   call lapack_ormtr('L', 'U', 'N', self%n, self%n, self%sbmat, lda, self%stau, &
++      & self%szmat, lda, work_orm_q, -1, info)
++   lwork_trd = max(1, self%n, int(work_trd_q(1)), int(work_orm_q(1)))
++   allocate(self%swork_trd(lwork_trd))
++
+    ! Check for Cholesky factorisation
+    call mctc_potrf(env, self%sbmat)
++   call env%check(exitRun)
++   if (exitRun) return
++   call mctc_trtri(env, self%sbmat)
+ 
+ end subroutine initSEigenSolver
+ 
+@@ -94,8 +134,12 @@ subroutine initDEigenSolver(self, env, bmat)
+    ! for cuSolverDnDsygvd -- it is okay to pass an empty array to cuSolverDnDsygvd_bufferSize
+    real(dp) :: dummy(:) 
+ #endif
++   integer :: info, ldwork_cpu, lwork_trd, lda
++   real(dp) :: work_trd_q(1), work_orm_q(1)
++   logical :: exitRun
+ 
+    self%n = size(bmat, 1)
++   ldwork_cpu = 1 + 6*self%n + 2*self%n**2
+ 
+ #ifdef USE_CUSOLVER
+    istat = cusolverDnDsygvd_bufferSize(cusolverDnH, CUSOLVER_EIG_TYPE_1, &
+@@ -106,15 +150,28 @@ subroutine initDEigenSolver(self, env, bmat)
+    end if
+ 
+    self%lwork = lwork
+-   allocate(self%dwork(lwork))
++   allocate(self%dwork(max(lwork, ldwork_cpu)))
+ #else
+-   allocate(self%dwork(1 + 6*self%n + 2*self%n**2))
+-   allocate(self%iwork(3 + 5*self%n))
++   allocate(self%dwork(ldwork_cpu))
+ #endif
++   allocate(self%iwork(3 + 5*self%n))
++   allocate(self%dzmat(self%n, self%n), source=0.0_dp)
++   allocate(self%dtau(self%n), self%desub(self%n))
+ 
+    self%dbmat = bmat
++   lda = max(1, self%n)
++   call lapack_sytrd('U', self%n, self%dzmat, lda, self%dwork, self%desub, &
++      & self%dtau, work_trd_q, -1, info)
++   call lapack_ormtr('L', 'U', 'N', self%n, self%n, self%dbmat, lda, self%dtau, &
++      & self%dzmat, lda, work_orm_q, -1, info)
++   lwork_trd = max(1, self%n, int(work_trd_q(1)), int(work_orm_q(1)))
++   allocate(self%dwork_trd(lwork_trd))
++
+    ! Check for Cholesky factorisation
+    call mctc_potrf(env, self%dbmat)
++   call env%check(exitRun)
++   if (exitRun) return
++   call mctc_trtri(env, self%dbmat)
+ 
+ end subroutine initDEigenSolver
+ 
+@@ -245,4 +302,168 @@ subroutine mctc_dsygvd_factorized(self, env, amat, bmat_factorized, eval)
+ 
+ end subroutine mctc_dsygvd_factorized
+ 
++
++subroutine mctc_ssygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
++   character(len=*), parameter :: source = 'mctc_lapack_ssygvd_fact_subspace'
++   class(TEigenSolver), intent(inout) :: self
++   type(TEnvironment), intent(inout) :: env
++   real(sp), intent(inout) :: amat(:, :)
++   real(sp), intent(out) :: eval(:)
++   real(sp), intent(inout), optional :: cmat(:, :)
++   integer, intent(in), optional :: m_sub
++   integer :: j, jj, k, info, lswork, liwork, lswork_trd
++
++   lswork_trd = size(self%swork_trd)
++   lswork = size(self%swork)
++   liwork = size(self%iwork)
++
++   do j = 1, self%n
++      do jj = 1, j - 1
++         amat(j, jj) = amat(jj, j)
++      end do
++   end do
++   do j = 1, self%n, nb
++      jj = min(self%n, j + nb - 1)
++      k = jj - j + 1
++      self%szmat(1:jj, j:jj) = amat(1:jj, j:jj)
++      call blas_trmm('R', 'U', 'N', 'N', jj, k, 1.0_sp, self%sbmat(j:jj, j:jj), k, &
++         & self%szmat(:, j:jj), self%n)
++      if (j > 1) then
++         call blas_gemm('N', 'N', jj, k, j - 1, 1.0_sp, amat, self%n, &
++            & self%sbmat(:, j:jj), self%n, 1.0_sp, self%szmat(:, j:jj), self%n)
++      end if
++      call blas_trmm('L', 'U', 'T', 'N', jj, k, 1.0_sp, self%sbmat, self%n, &
++         & self%szmat(:, j:jj), self%n)
++   end do
++   do j = 1, self%n
++      amat(1:j, j) = self%szmat(1:j, j)
++   end do
++
++   call lapack_sytrd('U', self%n, amat, self%n, eval, self%sesub, self%stau, &
++      & self%swork_trd, lswork_trd, info)
++   if (info == 0) then
++      call lapack_stedc('I', self%n, eval, self%sesub, self%szmat, self%n, &
++         & self%swork, lswork, self%iwork, liwork, info)
++   end if
++   if (info /= 0) then
++      call env%error("Failed to compute eigenvalues and eigenvectors", source)
++      return
++   end if
++
++   if (present(m_sub) .and. present(cmat)) then
++      if (m_sub > 0) then
++         call self%fact_backtransform(env, amat, cmat, 1, m_sub)
++      end if
++   end if
++
++end subroutine mctc_ssygvd_fact_subspace
++
++
++subroutine mctc_dsygvd_fact_subspace(self, env, amat, eval, cmat, m_sub)
++   character(len=*), parameter :: source = 'mctc_lapack_dsygvd_fact_subspace'
++   class(TEigenSolver), intent(inout) :: self
++   type(TEnvironment), intent(inout) :: env
++   real(dp), intent(inout) :: amat(:, :)
++   real(dp), intent(out) :: eval(:)
++   real(dp), intent(inout), optional :: cmat(:, :)
++   integer, intent(in), optional :: m_sub
++   integer :: j, jj, k, info, ldwork, liwork, ldwork_trd
++
++   ldwork_trd = size(self%dwork_trd)
++   ldwork = size(self%dwork)
++   liwork = size(self%iwork)
++
++   do j = 1, self%n
++      do jj = 1, j - 1
++         amat(j, jj) = amat(jj, j)
++      end do
++   end do
++   do j = 1, self%n, nb
++      jj = min(self%n, j + nb - 1)
++      k = jj - j + 1
++      self%dzmat(1:jj, j:jj) = amat(1:jj, j:jj)
++      call blas_trmm('R', 'U', 'N', 'N', jj, k, 1.0_dp, self%dbmat(j:jj, j:jj), k, &
++         & self%dzmat(:, j:jj), self%n)
++      if (j > 1) then
++         call blas_gemm('N', 'N', jj, k, j - 1, 1.0_dp, amat, self%n, &
++            & self%dbmat(:, j:jj), self%n, 1.0_dp, self%dzmat(:, j:jj), self%n)
++      end if
++      call blas_trmm('L', 'U', 'T', 'N', jj, k, 1.0_dp, self%dbmat, self%n, &
++         & self%dzmat(:, j:jj), self%n)
++   end do
++   do j = 1, self%n
++      amat(1:j, j) = self%dzmat(1:j, j)
++   end do
++
++   call lapack_sytrd('U', self%n, amat, self%n, eval, self%desub, self%dtau, &
++      & self%dwork_trd, ldwork_trd, info)
++   if (info == 0) then
++      call lapack_stedc('I', self%n, eval, self%desub, self%dzmat, self%n, &
++         & self%dwork, ldwork, self%iwork, liwork, info)
++   end if
++   if (info /= 0) then
++      call env%error("Failed to compute eigenvalues and eigenvectors", source)
++      return
++   end if
++
++   if (present(m_sub) .and. present(cmat)) then
++      if (m_sub > 0) then
++         call self%fact_backtransform(env, amat, cmat, 1, m_sub)
++      end if
++   end if
++
++end subroutine mctc_dsygvd_fact_subspace
++
++
++subroutine mctc_ssygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
++   character(len=*), parameter :: source = 'mctc_lapack_ssygvd_fact_backtransform'
++   class(TEigenSolver), intent(inout) :: self
++   type(TEnvironment), intent(inout) :: env
++   real(sp), intent(in) :: amat(:, :)
++   real(sp), intent(inout) :: cmat(:, :)
++   integer, intent(in) :: ilo, ihi
++   integer :: m, info, lswork_trd
++
++   m = ihi - ilo + 1
++   if (m <= 0) return
++   lswork_trd = size(self%swork_trd)
++
++   call lapack_ormtr('L', 'U', 'N', self%n, m, amat, self%n, self%stau, &
++      & self%szmat(:, ilo:ihi), self%n, self%swork_trd, lswork_trd, info)
++   if (info /= 0) then
++      call env%error("Failed to back-transform eigenvectors", source)
++      return
++   end if
++   call blas_trmm('L', 'U', 'N', 'N', self%n, m, 1.0_sp, self%sbmat, self%n, &
++      & self%szmat(:, ilo:ihi), self%n)
++   cmat(:, ilo:ihi) = self%szmat(:, ilo:ihi)
++
++end subroutine mctc_ssygvd_fact_backtransform
++
++
++subroutine mctc_dsygvd_fact_backtransform(self, env, amat, cmat, ilo, ihi)
++   character(len=*), parameter :: source = 'mctc_lapack_dsygvd_fact_backtransform'
++   class(TEigenSolver), intent(inout) :: self
++   type(TEnvironment), intent(inout) :: env
++   real(dp), intent(in) :: amat(:, :)
++   real(dp), intent(inout) :: cmat(:, :)
++   integer, intent(in) :: ilo, ihi
++   integer :: m, info, ldwork_trd
++
++   m = ihi - ilo + 1
++   if (m <= 0) return
++   ldwork_trd = size(self%dwork_trd)
++
++   call lapack_ormtr('L', 'U', 'N', self%n, m, amat, self%n, self%dtau, &
++      & self%dzmat(:, ilo:ihi), self%n, self%dwork_trd, ldwork_trd, info)
++   if (info /= 0) then
++      call env%error("Failed to back-transform eigenvectors", source)
++      return
++   end if
++   call blas_trmm('L', 'U', 'N', 'N', self%n, m, 1.0_dp, self%dbmat, self%n, &
++      & self%dzmat(:, ilo:ihi), self%n)
++   cmat(:, ilo:ihi) = self%dzmat(:, ilo:ihi)
++
++end subroutine mctc_dsygvd_fact_backtransform
++
+ end module xtb_mctc_lapack_eigensolve
+diff --git a/src/mctc/lapack/stdeigval.f90 b/src/mctc/lapack/stdeigval.f90
+index 016ac4d37..2c67ef7a1 100644
+--- a/src/mctc/lapack/stdeigval.f90
++++ b/src/mctc/lapack/stdeigval.f90
+@@ -27,6 +27,7 @@ module xtb_mctc_lapack_stdeigval
+    public :: lapack_spevd, lapack_spevx
+    public :: lapack_heev, lapack_heevd, lapack_heevx, lapack_heevr, lapack_hpev
+    public :: lapack_hpevd, lapack_hpevx
++   public :: lapack_sytrd, lapack_stedc, lapack_ormtr
+ 
+ 
+    interface mctc_syev
+@@ -34,6 +35,101 @@ module xtb_mctc_lapack_stdeigval
+       module procedure :: mctc_dsyev
+    end interface mctc_syev
+ 
++   interface lapack_sytrd
++      pure subroutine ssytrd(uplo, n, a, lda, d, e, tau, work, lwork, info)
++         import :: sp
++         character(len=1), intent(in) :: uplo
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++         real(sp), intent(inout) :: a(lda, *)
++         real(sp), intent(out) :: d(*)
++         real(sp), intent(out) :: e(*)
++         real(sp), intent(out) :: tau(*)
++         real(sp), intent(inout) :: work(*)
++         integer, intent(in) :: lwork
++         integer, intent(out) :: info
++      end subroutine ssytrd
++      pure subroutine dsytrd(uplo, n, a, lda, d, e, tau, work, lwork, info)
++         import :: dp
++         character(len=1), intent(in) :: uplo
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++         real(dp), intent(inout) :: a(lda, *)
++         real(dp), intent(out) :: d(*)
++         real(dp), intent(out) :: e(*)
++         real(dp), intent(out) :: tau(*)
++         real(dp), intent(inout) :: work(*)
++         integer, intent(in) :: lwork
++         integer, intent(out) :: info
++      end subroutine dsytrd
++   end interface lapack_sytrd
++
++   interface lapack_stedc
++      pure subroutine sstedc(compz, n, d, e, z, ldz, work, lwork, iwork, liwork, info)
++         import :: sp
++         character(len=1), intent(in) :: compz
++         integer, intent(in) :: n
++         integer, intent(in) :: ldz
++         real(sp), intent(inout) :: d(*)
++         real(sp), intent(inout) :: e(*)
++         real(sp), intent(inout) :: z(ldz, *)
++         real(sp), intent(inout) :: work(*)
++         integer, intent(in) :: lwork
++         integer, intent(inout) :: iwork(*)
++         integer, intent(in) :: liwork
++         integer, intent(out) :: info
++      end subroutine sstedc
++      pure subroutine dstedc(compz, n, d, e, z, ldz, work, lwork, iwork, liwork, info)
++         import :: dp
++         character(len=1), intent(in) :: compz
++         integer, intent(in) :: n
++         integer, intent(in) :: ldz
++         real(dp), intent(inout) :: d(*)
++         real(dp), intent(inout) :: e(*)
++         real(dp), intent(inout) :: z(ldz, *)
++         real(dp), intent(inout) :: work(*)
++         integer, intent(in) :: lwork
++         integer, intent(inout) :: iwork(*)
++         integer, intent(in) :: liwork
++         integer, intent(out) :: info
++      end subroutine dstedc
++   end interface lapack_stedc
++
++   interface lapack_ormtr
++      pure subroutine sormtr(side, uplo, trans, m, n, a, lda, tau, c, ldc, work, lwork, info)
++         import :: sp
++         character(len=1), intent(in) :: side
++         character(len=1), intent(in) :: uplo
++         character(len=1), intent(in) :: trans
++         integer, intent(in) :: m
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++         integer, intent(in) :: ldc
++         real(sp), intent(in) :: a(lda, *)
++         real(sp), intent(in) :: tau(*)
++         real(sp), intent(inout) :: c(ldc, *)
++         real(sp), intent(inout) :: work(*)
++         integer, intent(in) :: lwork
++         integer, intent(out) :: info
++      end subroutine sormtr
++      pure subroutine dormtr(side, uplo, trans, m, n, a, lda, tau, c, ldc, work, lwork, info)
++         import :: dp
++         character(len=1), intent(in) :: side
++         character(len=1), intent(in) :: uplo
++         character(len=1), intent(in) :: trans
++         integer, intent(in) :: m
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++         integer, intent(in) :: ldc
++         real(dp), intent(in) :: a(lda, *)
++         real(dp), intent(in) :: tau(*)
++         real(dp), intent(inout) :: c(ldc, *)
++         real(dp), intent(inout) :: work(*)
++         integer, intent(in) :: lwork
++         integer, intent(out) :: info
++      end subroutine dormtr
++   end interface lapack_ormtr
++
+ 
+    interface lapack_syev
+       pure subroutine ssyev(jobz, uplo, n, a, lda, w, work, lwork, info)
+diff --git a/src/mctc/lapack/tri.f90 b/src/mctc/lapack/tri.f90
+index 2080cbd76..39fcd49be 100644
+--- a/src/mctc/lapack/tri.f90
++++ b/src/mctc/lapack/tri.f90
+@@ -22,9 +22,10 @@ module xtb_mctc_lapack_tri
+    implicit none
+    private
+ 
+-   public :: mctc_getri, mctc_sytri, mctc_sptri, mctc_potri, mctc_pptri
++   public :: mctc_getri, mctc_sytri, mctc_sptri, mctc_potri, mctc_pptri, mctc_trtri
+ 
+-   public :: lapack_getri, lapack_sytri, lapack_sptri, lapack_potri, lapack_pptri
++   public :: lapack_getri, lapack_sytri, lapack_sptri, lapack_potri, lapack_pptri, &
++      & lapack_trtri
+ 
+ 
+    interface mctc_getri
+@@ -52,6 +53,11 @@ module xtb_mctc_lapack_tri
+       module procedure :: mctc_dpptri
+    end interface mctc_pptri
+ 
++   interface mctc_trtri
++      module procedure :: mctc_strtri
++      module procedure :: mctc_dtrtri
++   end interface mctc_trtri
++
+ 
+    interface lapack_getri
+       pure subroutine sgetri(n, a, lda, ipiv, work, lwork, info)
+@@ -178,6 +184,45 @@ pure subroutine zsptri(uplo, n, ap, ipiv, work, info)
+       end subroutine zsptri
+    end interface lapack_sptri
+ 
++   interface lapack_trtri
++      pure subroutine strtri(uplo, diag, n, a, lda, info)
++         import :: sp
++         real(sp), intent(inout) :: a(lda, *)
++         character(len=1), intent(in) :: uplo
++         character(len=1), intent(in) :: diag
++         integer, intent(out) :: info
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++      end subroutine strtri
++      pure subroutine dtrtri(uplo, diag, n, a, lda, info)
++         import :: dp
++         real(dp), intent(inout) :: a(lda, *)
++         character(len=1), intent(in) :: uplo
++         character(len=1), intent(in) :: diag
++         integer, intent(out) :: info
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++      end subroutine dtrtri
++      pure subroutine ctrtri(uplo, diag, n, a, lda, info)
++         import :: sp
++         complex(sp), intent(inout) :: a(lda, *)
++         character(len=1), intent(in) :: uplo
++         character(len=1), intent(in) :: diag
++         integer, intent(out) :: info
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++      end subroutine ctrtri
++      pure subroutine ztrtri(uplo, diag, n, a, lda, info)
++         import :: dp
++         complex(dp), intent(inout) :: a(lda, *)
++         character(len=1), intent(in) :: uplo
++         character(len=1), intent(in) :: diag
++         integer, intent(out) :: info
++         integer, intent(in) :: n
++         integer, intent(in) :: lda
++      end subroutine ztrtri
++   end interface lapack_trtri
++
+    interface lapack_potri
+       pure subroutine spotri(uplo, n, a, lda, info)
+          import :: sp
+@@ -526,4 +571,58 @@ subroutine mctc_dpptri(env, amat, uplo)
+ end subroutine mctc_dpptri
+ 
+ 
++subroutine mctc_strtri(env, amat, uplo, diag)
++   character(len=*), parameter :: source = 'mctc_lapack_trtri'
++   type(TEnvironment), intent(inout) :: env
++   real(sp), intent(inout) :: amat(:, :)
++   character(len=1), intent(in), optional :: uplo
++   character(len=1), intent(in), optional :: diag
++   character(len=1) :: ula, dia
++   integer :: info, n, lda
++   if (present(uplo)) then
++      ula = uplo
++   else
++      ula = 'u'
++   end if
++   if (present(diag)) then
++      dia = diag
++   else
++      dia = 'n'
++   end if
++   lda = max(1, size(amat, 1))
++   n = size(amat, 2)
++   call lapack_trtri(ula, dia, n, amat, lda, info)
++   if (info /= 0) then
++      call env%error("Inverting matrix failed", source)
++   end if
++end subroutine mctc_strtri
++
++
++subroutine mctc_dtrtri(env, amat, uplo, diag)
++   character(len=*), parameter :: source = 'mctc_lapack_trtri'
++   type(TEnvironment), intent(inout) :: env
++   real(dp), intent(inout) :: amat(:, :)
++   character(len=1), intent(in), optional :: uplo
++   character(len=1), intent(in), optional :: diag
++   character(len=1) :: ula, dia
++   integer :: info, n, lda
++   if (present(uplo)) then
++      ula = uplo
++   else
++      ula = 'u'
++   end if
++   if (present(diag)) then
++      dia = diag
++   else
++      dia = 'n'
++   end if
++   lda = max(1, size(amat, 1))
++   n = size(amat, 2)
++   call lapack_trtri(ula, dia, n, amat, lda, info)
++   if (info /= 0) then
++      call env%error("Inverting matrix failed", source)
++   end if
++end subroutine mctc_dtrtri
++
++
+ end module xtb_mctc_lapack_tri
+diff --git a/src/mctc/lapack/wrap.f90 b/src/mctc/lapack/wrap.f90
+index 30659ae08..5778ed056 100644
+--- a/src/mctc/lapack/wrap.f90
++++ b/src/mctc/lapack/wrap.f90
+@@ -22,7 +22,7 @@ module xtb_mctc_lapack_wrap
+    use xtb_mctc_lapack_trf, only : mctc_getrf, mctc_sytrf, mctc_sptrf, &
+       & mctc_potrf, mctc_pptrf
+    use xtb_mctc_lapack_tri, only : mctc_getri, mctc_sytri, mctc_sptri, &
+-      & mctc_potri, mctc_pptri
++      & mctc_potri, mctc_pptri, mctc_trtri
+    use xtb_mctc_lapack_trs, only : mctc_getrs, mctc_sytrs, mctc_sptrs, &
+       & mctc_potrs, mctc_pptrs
+    use xtb_type_environment, only : TEnvironment
+@@ -32,7 +32,7 @@ module xtb_mctc_lapack_wrap
+    public :: mctc_sygst, mctc_spgst
+    public :: mctc_getrs, mctc_sytrs, mctc_sptrs, mctc_potrs, mctc_pptrs
+    public :: mctc_getrf, mctc_sytrf, mctc_sptrf, mctc_potrf, mctc_pptrf
+-   public :: mctc_getri, mctc_sytri, mctc_sptri, mctc_potri, mctc_pptri
++   public :: mctc_getri, mctc_sytri, mctc_sptri, mctc_potri, mctc_pptri, mctc_trtri
+ 
+ 
+    interface mctc_getrs
+diff --git a/src/scc_core.f90 b/src/scc_core.f90
+index 1dd8c9289..1f8246c13 100644
+--- a/src/scc_core.f90
++++ b/src/scc_core.f90
+@@ -20,7 +20,7 @@ module xtb_scc_core
+    use xtb_mctc_accuracy, only : wp
+    use xtb_mctc_la, only : contract
+    use xtb_mctc_lapack, only : lapack_sygvd
+-   use xtb_mctc_blas, only : blas_gemm, mctc_symv, mctc_gemm
++   use xtb_mctc_blas, only : mctc_symv, mctc_gemm, mctc_syrk
+    use xtb_mctc_lapack_eigensolve, only : TEigenSolver
+    use xtb_type_environment, only : TEnvironment
+    use xtb_type_solvation, only : TSolvation
+@@ -262,12 +262,11 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+       &        pcem,shellShift,externShift, &
+       &        et,focc,focca,foccb,efa,efb, &
+       &        eel,ees,eaes,epol,ed,epcem,egap,emo,ihomo,ihomoa,ihomob, &
+-      &        H0,H,S,dpint,qpint,X,P,ies, &
++      &        H0,H,S,dpint,qpint,P,ies, &
+       &        maxiter,startpdiag,scfconv,qconv, &
+       &        minpr,pr, &
+       &        fail,jter)
+    use xtb_mctc_convert, only : autoev,evtoau
+-   use xtb_mctc_lapack_trf, only : mctc_potrf
+ 
+    use xtb_disp_dftd4,  only: disppot,edisp_scc
+    use xtb_aespot, only : gfn2broyden_diff,gfn2broyden_out,gfn2broyden_save, &
+@@ -363,8 +362,9 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+    real(wp),allocatable   :: dqlast(:)
+    real(wp),allocatable   :: omega(:)
+ !! ------------------------------------------------------------------------
+-!  Factorized overlap to avoid multiple factorizations
+-   real(wp), allocatable :: S_factorized(:,:)
++!  AO eigenvector buffer for occupied-orbital back-transformation
++   real(wp), allocatable :: C_occ(:,:)
++   integer  :: m_occ
+ !! ------------------------------------------------------------------------
+ !  results of the SCC iterator
+    real(wp),intent(out)   :: eel
+@@ -382,7 +382,6 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+    real(wp),intent(in)    :: H0(ndim*(ndim+1)/2)
+    real(wp),intent(out)   :: H(ndim,ndim)
+    real(wp),intent(inout) :: P(ndim,ndim)
+-   real(wp),intent(inout) :: X(ndim,ndim)
+    real(wp),intent(in)    :: S(ndim,ndim)
+    real(wp),intent(in)    :: dpint(3,ndim,ndim)
+    real(wp),intent(in)    :: qpint(6,ndim,ndim)
+@@ -408,9 +407,10 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+    logical  :: econverged
+    logical  :: qconverged
+ 
+-   allocate(S_factorized(ndim, ndim), source = 0.0_wp )
+-   S_factorized = S
+-   call mctc_potrf(env, S_factorized)
++   call env%check(fail)
++   if (fail) return
++   allocate(C_occ(ndim, ndim), source = 0.0_wp)
++   m_occ = 0
+ 
+    converged = .false.
+    lastdiag = .false.
+@@ -472,12 +472,12 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+ 
+    !call solve(fulldiag,ndim,ihomo,scfconv,H,S,X,P,emo,fail)
+ 
+-   call solver%fact_solve(env, H, S_factorized, emo)
++   call solver%fact_solve_subspace(env, H, emo)
+    call env%check(fail)
+-   if(fail)then
++   if (fail) then
+       call env%error("Diagonalization of Hamiltonian failed", source)
+       return
+-   endif
++   end if
+ 
+    if(ihomo+1.le.ndim.and.ihomo.ge.1)egap=emo(ihomo+1)-emo(ihomo)
+    ! automatic reset to small value
+@@ -509,8 +509,25 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+       call gfn2broyden_save(n,k,nbr,dipm,qp,q_in)
+    end if
+ 
++   ! Transform only occupied orbitals during SCC iterations
++   m_occ = 0
++   do i = ndim, 1, -1
++      if (abs(focc(i)) > 1.0e-16_wp) then
++         m_occ = i
++         exit
++      end if
++   end do
++   if (m_occ > 0) then
++      call solver%fact_backtransform(env, H, C_occ, 1, m_occ)
++      call env%check(fail)
++      if (fail) then
++         call env%error("Diagonalization of Hamiltonian failed", source)
++         return
++      end if
++   end if
++
+    ! density matrix
+-   call dmat(ndim,focc,H,P)
++   call dmat(ndim,focc,C_occ,P)
+ 
+    ! new q
+    call mpopsh(n,ndim,nshell,ao2sh,S,P,qsh)
+@@ -634,6 +651,18 @@ subroutine scc(env,xtbData,solver,n,nel,nopen,ndim,ndp,nqp,nmat,nshell, &
+ 
+    enddo scc_iterator
+ 
++   if (thisiter >= 1) then
++      if (m_occ < ndim) then
++         call solver%fact_backtransform(env, H, C_occ, m_occ + 1, ndim)
++         call env%check(fail)
++         if (fail) then
++            call env%error("Diagonalization of Hamiltonian failed", source)
++            return
++         end if
++      end if
++      H = C_occ
++   end if
++
+    jter = jter + min(iter,thisiter)
+    fail = .not.converged
+ 
+@@ -962,8 +991,8 @@ subroutine solve(full,ndim,ihomo,acc,H,S,X,P,e,fail)
+    else
+ !                                                     call timing(t0,w0)
+ !     go to MO basis using trafo(X) from first iteration (=full diag)
+-      call blas_gemm('N','N',ndim,ndim,ndim,1.0_wp,H,ndim,X,ndim,0.0_wp,P,ndim)
+-      call blas_gemm('T','N',ndim,ndim,ndim,1.0_wp,X,ndim,P,ndim,0.0_wp,H,ndim)
++      call mctc_gemm(H, X, P)
++      call mctc_gemm(X, P, H, transa='t')
+ !                                                     call timing(t1,w1)
+ !                       call prtime(6,1.5*(t1-t0),1.5*(w1-w0),'3xdgemm')
+ !                                                     call timing(t0,w0)
+@@ -972,7 +1001,7 @@ subroutine solve(full,ndim,ihomo,acc,H,S,X,P,e,fail)
+ !                                call prtime(6,t1-t0,w1-w0,'pseudodiag')
+ 
+ !     C = X C', P=scratch
+-      call blas_gemm('N','N',ndim,ndim,ndim,1.0_wp,X,ndim,H,ndim,0.0_wp,P,ndim)
++      call mctc_gemm(X, H, P)
+ !     save and output MO matrix in AO basis
+       H = P
+    endif
+@@ -1179,10 +1208,40 @@ subroutine dmat(ndim,focc,C,P)
+    real(wp),intent(in)  :: focc(:)
+    real(wp),intent(in)  :: C(:,:)
+    real(wp),intent(out) :: P(:,:)
+-   integer :: i,m
++   integer :: i,m,m_occ,m_core,n_act
+    real(wp),allocatable :: Ptmp(:,:)
+ 
+-   allocate(Ptmp(ndim,ndim))
++   m_occ = 0
++   do m = min(ndim, size(focc), size(C, 2)), 1, -1
++      if (abs(focc(m)) > 1.0e-16_wp) then
++         m_occ = m
++         exit
++      end if
++   end do
++   if (m_occ == 0) then
++      P = 0.0_wp
++      return
++   end if
++   m_core = 0
++   if (focc(1) > 0.0_wp) then
++      do m = 1, m_occ
++         if (focc(m) /= focc(1)) exit
++         m_core = m
++      end do
++      if (m_core < m_occ .and. m_core < 2) m_core = 0
++   end if
++   if (m_core > 0) then
++      call mctc_syrk(C(:, 1:m_core), P, alpha=focc(1))
++      do m = 1, ndim
++         do i = 1, m - 1
++            P(m, i) = P(i, m)
++         end do
++      end do
++      if (m_core == m_occ) return
++   end if
++
++   n_act = m_occ - m_core
++   allocate(Ptmp(ndim,n_act))
+    ! acc enter data create(Ptmp(:,:)) copyin(C(:, :), focc(:), P(:, :))
+    ! acc kernels default(present)
+    Ptmp = 0.0_wp
+@@ -1190,14 +1249,18 @@ subroutine dmat(ndim,focc,C,P)
+ 
+    ! acc parallel
+    ! acc loop gang collapse(2)
+-   do m=1,ndim
++   do m=1,n_act
+       do i=1,ndim
+-         Ptmp(i,m)=C(i,m)*focc(m)
++         Ptmp(i,m)=C(i,m_core+m)*focc(m_core+m)
+       enddo
+    enddo
+    ! acc end parallel
+    ! acc update host(Ptmp)
+-   call mctc_gemm(C, Ptmp, P, transb='t')
++   if (m_core > 0) then
++      call mctc_gemm(C(:, m_core+1:m_occ), Ptmp, P, transb='t', beta=1.0_wp)
++   else
++      call mctc_gemm(C(:, 1:m_occ), Ptmp, P, transb='t')
++   end if
+    ! acc exit data copyout(P(:,:)) delete(C(:,:), focc(:), Ptmp(:, :))
+ 
+    deallocate(Ptmp)
+@@ -1218,7 +1281,7 @@ subroutine get_wiberg(n,ndim,at,xyz,P,S,wb,fila2)
+    integer i,j,k,m
+ 
+    allocate(Ptmp(ndim,ndim))
+-   call blas_gemm('N','N',ndim,ndim,ndim,1.0d0,P,ndim,S,ndim,0.0d0,Ptmp,ndim)
++   call mctc_gemm(P, S, Ptmp)
+    wb = 0
+    !$omp parallel do default(none) &
+    !$omp private(i,j,k,m,xsum,rab) &
+@@ -1263,10 +1326,10 @@ subroutine get_unrestricted_wiberg(n,ndim,at,xyz,Pa,Pb,S,wb,fila2)
+    allocate(Ptmp_b(ndim,ndim))
+ 
+    ! P^(alpha) * S !
+-   call blas_gemm('N','N',ndim,ndim,ndim,1.0_wp,Pa,ndim,S,ndim,0.0_wp,Ptmp_a,ndim)
++   call mctc_gemm(Pa, S, Ptmp_a)
+    
+    ! P^(beta) * S !
+-   call blas_gemm('N','N',ndim,ndim,ndim,1.0_wp,Pb,ndim,S,ndim,0.0_wp,Ptmp_b,ndim)
++   call mctc_gemm(Pb, S, Ptmp_b)
+    
+    wb = 0
+    !$omp parallel do default(none) &
+diff --git a/src/scf_module.F90 b/src/scf_module.F90
+index 94d80417e..6b15410e0 100644
+--- a/src/scf_module.F90
++++ b/src/scf_module.F90
+@@ -123,7 +123,6 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
+ 
+ ! ========================================================================
+    real(wp),allocatable :: cn(:)
+-   real(wp),allocatable :: X(:,:)
+    real(wp),allocatable :: S(:,:)
+    real(wp),allocatable :: S12(:,:)
+    real(wp),allocatable :: H0(:)
+@@ -324,7 +323,6 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
+    allocate(H0(basis%nao*(basis%nao+1)/2), &
+    &        H0_noovlp(basis%nao*(basis%nao+1)/2), &
+    &        S(basis%nao,basis%nao),tmp(basis%nao), &
+-   &        X(basis%nao,basis%nao), &
+    &        ves(basis%nshell), &
+    &        zsh(basis%nshell),&
+    &        matlist (2,basis%nao*(basis%nao+1)/2))
+@@ -629,7 +627,7 @@ subroutine scf(env, mol, wfn, basis, pcem, xtbData, solvation, &
+       &     et,wfn%focc,wfn%focca,wfn%foccb,wfn%efa,wfn%efb, &
+       &     eel,ees,eaes,epol,ed,epcem,egap, &
+       &     wfn%emo,wfn%ihomo,wfn%ihomoa,wfn%ihomob, &
+-      &     H0,wfn%C,S,dpint,qpint,X,wfn%P,ies, &
++      &     H0,wfn%C,S,dpint,qpint,wfn%P,ies, &
+       &     maxiter,startpdiag,scfconv,qconv, &
+       &     minpr,pr, &
+       &     fail,jter)

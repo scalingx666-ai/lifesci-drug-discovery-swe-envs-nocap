@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Fixed wrong attribute name.
+
+## Description
+
+#236
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `33f993968125`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

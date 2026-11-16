@@ -1,0 +1,244 @@
+diff --git a/polaris/dataset/zarr/__init__.py b/polaris/dataset/zarr/__init__.py
+index b936b607..d6354d5b 100644
+--- a/polaris/dataset/zarr/__init__.py
++++ b/polaris/dataset/zarr/__init__.py
+@@ -1,5 +1,5 @@
+ from ._checksum import ZarrFileChecksum, compute_zarr_checksum
+-from ._manifest import generate_zarr_manifest
++from ._manifest import generate_zarr_manifest, calculate_file_md5
+ from ._memmap import MemoryMappedDirectoryStore
+ 
+ __all__ = [
+@@ -7,4 +7,5 @@
+     "compute_zarr_checksum",
+     "ZarrFileChecksum",
+     "generate_zarr_manifest",
++    "calculate_file_md5",
+ ]
+diff --git a/polaris/hub/client.py b/polaris/hub/client.py
+index 78e5c7ed..a4ee307a 100644
+--- a/polaris/hub/client.py
++++ b/polaris/hub/client.py
+@@ -945,9 +945,33 @@ def upload_model(
+             model.owner = HubOwner.normalize(owner or model.owner)
+             model_json = model.model_dump(by_alias=True, exclude_none=True)
+ 
++            file_content = None
++
++            # If model file is specified, generate file content
++            if model.file_path:
++                file_content = {
++                    "size": model.size,
++                    "fileType": "onnx",
++                    "md5Sum": model.md5sum,
++                }
++
+             # Make a request to the Hub
+             url = f"/v2/model/{model.artifact_id}"
+-            response = self._base_request_to_hub(url=url, method="PUT", json={"access": access, **model_json})
++            response = self._base_request_to_hub(
++                url=url,
++                method="PUT",
++                json={
++                    "access": access,
++                    "fileContent": file_content,
++                    **model_json,
++                },
++            )
++
++            # If model file is specified, upload it to the Hub
++            if model.file_path:
++                with StorageSession(self, "write", model.urn) as storage:
++                    with track_progress(description="Uploading model file", total=1):
++                        storage.streaming_set_file("model", model.file_path)
+ 
+             # Inform the user about where to find their newly created artifact.
+             model_url = urljoin(self.settings.hub_url, response.headers.get("Content-Location"))
+diff --git a/polaris/hub/oauth.py b/polaris/hub/oauth.py
+index a625ed49..69a2e865 100644
+--- a/polaris/hub/oauth.py
++++ b/polaris/hub/oauth.py
+@@ -97,11 +97,15 @@ class BenchmarkV2Paths(ArtifactPaths):
+     test_2: int = 0
+ 
+ 
++class ModelPaths(ArtifactPaths):
++    model: AnyUrlString = Field(json_schema_extra={"file": True})
++
++
+ class StorageTokenData(BaseModel):
+     key: str
+     secret: str
+     endpoint: HttpUrlString
+-    paths: DatasetV1Paths | DatasetV2Paths | BenchmarkV2Paths = Field(union_mode="smart")
++    paths: DatasetV1Paths | DatasetV2Paths | BenchmarkV2Paths | ModelPaths = Field(union_mode="smart")
+ 
+ 
+ class HubOAuth2Token(BaseModel):
+diff --git a/polaris/hub/storage.py b/polaris/hub/storage.py
+index 4e225e52..7c25dede 100644
+--- a/polaris/hub/storage.py
++++ b/polaris/hub/storage.py
+@@ -1,3 +1,4 @@
++import io
+ import re
+ from base64 import b64encode
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+@@ -19,7 +20,13 @@
+ from zarr.storage import Store
+ from zarr.util import buffer_size
+ 
+-from polaris.hub.oauth import BenchmarkV2Paths, DatasetV1Paths, DatasetV2Paths, HubStorageOAuth2Token
++from polaris.hub.oauth import (
++    BenchmarkV2Paths,
++    DatasetV1Paths,
++    DatasetV2Paths,
++    ModelPaths,
++    HubStorageOAuth2Token,
++)
+ from polaris.utils.context import track_progress
+ from polaris.utils.errors import PolarisHubError
+ from polaris.utils.types import ArtifactUrn, ZarrConflictResolution
+@@ -549,7 +556,7 @@ def ensure_active_token(self, token: OAuth2Token | None = None) -> bool:
+         return True
+ 
+     @property
+-    def paths(self) -> DatasetV1Paths | DatasetV2Paths | BenchmarkV2Paths:
++    def paths(self) -> DatasetV1Paths | DatasetV2Paths | BenchmarkV2Paths | ModelPaths:
+         return self.token.extra_data.paths
+ 
+     def _relative_path(self, path: str) -> PurePath:
+@@ -583,6 +590,34 @@ def set_file(self, path: str, value: bytes | bytearray):
+         )
+         store[relative_path.name] = value
+ 
++    def streaming_set_file(self, path: str, file_path: str):
++        """
++        Set a file at the given path, without loading the file into memory.
++        """
++        if path not in self.paths.files:
++            raise NotImplementedError(f"{type(self.paths).__name__} only supports files {self.paths.files}.")
++
++        relative_path = self._relative_path(getattr(self.paths, path))
++        bucket_name = relative_path.parts[0]
++        key = "/".join(relative_path.parts[1:])
++
++        match relative_path.suffix:
++            case _:
++                content_type = "application/octet-stream"
++
++        storage_data = self.token.extra_data
++        store = S3Store(
++            path=relative_path.parent,
++            access_key=storage_data.key,
++            secret_key=storage_data.secret,
++            token=f"jwt/{self.token.access_token}",
++            endpoint_url=storage_data.endpoint,
++            content_type=content_type,
++        )
++
++        with open(file_path, "rb") as file:
++            store.s3_client.upload_fileobj(file, bucket_name, key, ExtraArgs={"ContentType": content_type})
++
+     def get_file(self, path: str) -> bytes | bytearray:
+         """
+         Get the value at the given path.
+diff --git a/polaris/model/__init__.py b/polaris/model/__init__.py
+index 7ed5db6d..48777393 100644
+--- a/polaris/model/__init__.py
++++ b/polaris/model/__init__.py
+@@ -1,6 +1,12 @@
+ from polaris._artifact import BaseArtifactModel
+-from polaris.utils.types import HttpUrlString
+-from polaris.utils.types import AccessType, HubOwner
++from polaris.dataset.zarr import calculate_file_md5
++from polaris.utils.errors import InvalidModelError
++from polaris.utils.types import AccessType, HubOwner, HttpUrlString
++from pathlib import Path
++from pydantic import field_validator, computed_field
++
++# Constants
++_SUPPORTED_MODEL_EXTENSIONS = [".onnx"]
+ 
+ 
+ class Model(BaseArtifactModel):
+@@ -30,7 +36,7 @@ class Model(BaseArtifactModel):
+         readme (str): A detailed README describing the model.
+         code_url (HttpUrlString | None): Optional URL pointing to the model's code repository.
+         report_url (HttpUrlString | None): Optional URL linking to a report or publication related to the model.
+-
++        file_path (str | None): Optional path to a .onnx file containing the model.
+     Methods:
+         upload_to_hub(access: AccessType = "private", owner: HubOwner | str | None = None):
+             Uploads the model artifact to the Polaris Hub, associating it with a specified owner and access level.
+@@ -44,6 +50,30 @@ class Model(BaseArtifactModel):
+     code_url: HttpUrlString | None = None
+     report_url: HttpUrlString | None = None
+ 
++    file_path: str | None = None
++
++    @field_validator("file_path")
++    @classmethod
++    def _validate_file(cls, v: str | None) -> str | None:
++        if isinstance(v, str):
++            if not Path(v).exists() or Path(v).suffix not in _SUPPORTED_MODEL_EXTENSIONS:
++                raise InvalidModelError(f"{v} is not a valid .onnx file.")
++        return v
++
++    @computed_field
++    @property
++    def size(self) -> int | None:
++        if self.file_path:
++            return Path(self.file_path).stat().st_size
++        return None
++
++    @computed_field
++    @property
++    def md5sum(self) -> str | None:
++        if self.file_path:
++            return calculate_file_md5(self.file_path)
++        return None
++
+     def upload_to_hub(self, access: AccessType = "private", owner: HubOwner | str | None = None):
+         """
+         Uploads the model to the Polaris Hub.
+diff --git a/polaris/utils/errors.py b/polaris/utils/errors.py
+index f647f63d..654be273 100644
+--- a/polaris/utils/errors.py
++++ b/polaris/utils/errors.py
+@@ -17,6 +17,10 @@ class InvalidResultError(ValueError):
+     pass
+ 
+ 
++class InvalidModelError(ValueError):
++    pass
++
++
+ class TestAccessError(Exception):
+     # Prevent pytest to collect this as a test
+     __test__ = False
+diff --git a/pyproject.toml b/pyproject.toml
+index e127ad27..a1c93e1d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -78,9 +78,7 @@ doc = [
+     "mike >=1.0.0",
+     "nbconvert",
+ ]
+-codecs = [
+-    "imagecodecs",
+-]
++codecs = ["imagecodecs"]
+ 
+ 
+ [project.scripts]
+diff --git a/uv.lock b/uv.lock
+index 448c249a..26bd6b03 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1,4 +1,5 @@
+ version = 1
++revision = 1
+ requires-python = ">=3.10, <3.13"
+ resolution-markers = [
+     "python_full_version >= '3.12'",

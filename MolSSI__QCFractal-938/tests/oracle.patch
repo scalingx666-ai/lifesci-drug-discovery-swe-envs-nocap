@@ -1,0 +1,243 @@
+diff --git a/qcfractal/qcfractal/config.py b/qcfractal/qcfractal/config.py
+index 071f54d6e..a87398d88 100644
+--- a/qcfractal/qcfractal/config.py
++++ b/qcfractal/qcfractal/config.py
+@@ -482,6 +482,9 @@ class FractalConfig(ConfigBase):
+     homepage_redirect_url: Optional[str] = Field(None, description="Redirect to this URL when going to the root path")
+     homepage_directory: Optional[str] = Field(None, description="Use this directory to serve the homepage")
+ 
++    # File uploads
++    upload_directory: Optional[str] = Field(None, description="Directory to store user-uploaded files for processing")
++
+     # Other settings blocks
+     database: DatabaseConfig = Field(..., description="Configuration of the settings for the database")
+     api: WebAPIConfig = Field(..., description="Configuration of the REST interface")
+@@ -525,6 +528,10 @@ def _check_geoip2_dir(cls, v, values):
+     def _check_hompepage_directory_path(cls, v, values):
+         return _make_abs_path(v, values["base_folder"], None)
+ 
++    @validator("upload_directory")
++    def _check_upload_directory_path(cls, v, values):
++        return _make_abs_path(v, values["base_folder"], None)
++
+     @validator("logfile")
+     def _check_logfile_path(cls, v, values):
+         return _make_abs_path(v, values["base_folder"], None)
+diff --git a/qcfractal/qcfractal/flask_app/flask_app.py b/qcfractal/qcfractal/flask_app/flask_app.py
+index e971ea5bc..10ebde58b 100644
+--- a/qcfractal/qcfractal/flask_app/flask_app.py
++++ b/qcfractal/qcfractal/flask_app/flask_app.py
+@@ -69,6 +69,9 @@ def create_flask_app(
+     app.config["SESSION_COOKIE_NAME"] = qcfractal_config.api.user_session_cookie_name
+     app.config["PERMANENT_SESSION_LIFETIME"] = qcfractal_config.api.user_session_max_age
+ 
++    # Where we store user-uploaded files for processing
++    app.config["UPLOAD_FOLDER"] = qcfractal_config.upload_directory
++
+     # Any additional configuration
+     if qcfractal_config.api.extra_flask_options:
+         app.config.update(**qcfractal_config.api.extra_flask_options)
+diff --git a/qcfractal/qcfractal/flask_app/wrap_route.py b/qcfractal/qcfractal/flask_app/wrap_route.py
+index 5a45be205..417745cde 100644
+--- a/qcfractal/qcfractal/flask_app/wrap_route.py
++++ b/qcfractal/qcfractal/flask_app/wrap_route.py
+@@ -1,5 +1,9 @@
++import shutil
++import tempfile
+ from functools import wraps
+-from typing import Callable
++from typing import Callable, Optional, Iterable
++
++from flask import current_app
+ 
+ try:
+     import pydantic.v1 as pydantic
+@@ -12,7 +16,12 @@
+ from qcportal.serialization import deserialize, serialize
+ 
+ 
+-def wrap_global_route(requested_resource, requested_action, require_security: bool = False) -> Callable:
++def wrap_global_route(
++    requested_resource,
++    requested_action,
++    require_security: bool = False,
++    allowed_file_extensions: Optional[Iterable[str]] = None,
++) -> Callable:
+     """
+     Decorator that wraps a Flask route function, providing useful functionality
+ 
+@@ -34,12 +43,20 @@ def wrap_global_route(requested_resource, requested_action, require_security: bo
+     parameters are read, and then pydantic is used to convert the deserialized request body/params
+     into the appropriate type, after which they are passed to the function.
+ 
++    If `allowed_file_extensions` is not None, then this route will also accept file uploads. The wrapped
++    function will be passed the file objects as the `files` parameter. If this parameter does not exist,
++    an exception will be raised.
++
+     Parameters
+     ----------
+     requested_resource
+         The name of the major resource
+     requested_action
+-        e of action that this route handles (read, write, etc)
++        Type of action that this route handles (read, write, etc)
++    allowed_file_extensions
++        If not None, files are allowed to be uploaded with this route. The files must have these extensions.
++    require_security
++        If true, route is only accessible if security is enabled on the server.
+     """
+ 
+     def decorate(fn):
+@@ -72,16 +89,29 @@ def wrapper(*args, **kwargs):
+             body_model = annotations.get("body_data", None)
+             url_params_model = annotations.get("url_params", None)
+ 
++            # If files are allowed, check for the files parameter in the function
++            if allowed_file_extensions is not None:
++                if "files" not in annotations:
++                    raise BadRequest('Route allows uploads, but function doesn\'t have the "files" argument')
++
+             # 1. The body is stored in request.data
++            #    However, if it's not there, and we have files, it will be in request.files
++            #    (since you cannot send body data and files in the same request)
++            if "body_data" in request.files:
++                body_data = request.files["body_data"].read()
++                content_type = request.files["body_data"].content_type
++            else:
++                body_data = request.data
++
+             if body_model is not None:
+                 if content_type is None:
+                     raise BadRequest("No Content-Type specified")
+ 
+-                if not request.data:
++                if not body_data:
+                     raise BadRequest("Expected body, but it is empty")
+ 
+                 try:
+-                    deserialized_data = deserialize(request.data, content_type)
++                    deserialized_data = deserialize(body_data, content_type)
+                     kwargs["body_data"] = pydantic.parse_obj_as(body_model, deserialized_data)
+                 except Exception as e:
+                     raise BadRequest("Invalid body: " + str(e))
+@@ -93,8 +123,33 @@ def wrapper(*args, **kwargs):
+                 except Exception as e:
+                     raise BadRequest("Invalid request arguments: " + str(e))
+ 
++            # 3. File uploads
++            temp_dir = None
++            if allowed_file_extensions is not None:
++                kwargs["files"] = []
++
++                if "files" in request.files:
++                    temp_dir = tempfile.mkdtemp(dir=current_app.config["UPLOAD_FOLDER"])
++
++                    req_files = request.files.getlist("files")
++                    for f in req_files:
++                        if f.filename.split(".")[-1] not in allowed_file_extensions:
++                            raise BadRequest(
++                                f"Invalid file extension on file: {f.filename}. Allowed extensions: {allowed_file_extensions}"
++                            )
++
++                        with tempfile.NamedTemporaryFile("wb", dir=temp_dir, delete=False) as temp_file:
++                            f.save(temp_file)
++                            kwargs["files"].append((f.filename, temp_file.name))
++                else:
++                    kwargs["files"] = []
++
+             # Now call the function, and validate the output
+-            ret = fn(*args, **kwargs)
++            try:
++                ret = fn(*args, **kwargs)
++            finally:
++                if temp_dir is not None:
++                    shutil.rmtree(temp_dir)
+ 
+             # Serialize the output it it's not a normal flask response
+             if isinstance(ret, Response):
+diff --git a/qcportal/qcportal/client_base.py b/qcportal/qcportal/client_base.py
+index dc8cc57e1..635a6a652 100644
+--- a/qcportal/qcportal/client_base.py
++++ b/qcportal/qcportal/client_base.py
+@@ -20,7 +20,7 @@
+ except ImportError:
+     import pydantic
+ import requests
+-from typing import Tuple
++from typing import Tuple, Iterable
+ import yaml
+ import hashlib
+ from packaging.version import parse as parse_version
+@@ -281,7 +281,7 @@ def encoding(self) -> str:
+     @encoding.setter
+     def encoding(self, encoding: str):
+         self._encoding = encoding
+-        enc_headers = {"Content-Type": encoding, "Accept": encoding}
++        enc_headers = {"Accept": encoding}
+         self._req_session.headers.update(enc_headers)
+ 
+     def _send_request(self, req: requests.Request, allow_retries: bool = True) -> requests.Response:
+@@ -423,6 +423,7 @@ def _request(
+         *,
+         body: Optional[Union[bytes, str]] = None,
+         url_params: Optional[Dict[str, Any]] = None,
++        file_data: Optional[Iterable[Tuple[str, Any]]] = None,
+         internal_retry: Optional[bool] = True,
+         allow_retries: bool = True,
+         additional_headers: Optional[Dict[str, Any]] = None,
+@@ -436,8 +437,19 @@ def _request(
+             self._refresh_JWT_token()
+ 
+         full_uri = self.address + endpoint
++
++        headers = {}
++
++        # Let requests handle content-type if doing multipart
++        # but specify our encoding otherwise
++        if file_data is None:
++            headers = {"Content-Type": self.encoding}
++
++        if additional_headers is not None:
++            headers.update(additional_headers)
++
+         req = requests.Request(
+-            method=method.upper(), url=full_uri, data=body, params=url_params, headers=additional_headers
++            method=method.upper(), url=full_uri, data=body, params=url_params, files=file_data, headers=headers
+         )
+         r = self._send_request(req, allow_retries=allow_retries)
+ 
+@@ -472,6 +484,7 @@ def make_request(
+         url_params_model: Optional[Type[_U]] = None,
+         body: Optional[Union[_T, Dict[str, Any]]] = None,
+         url_params: Optional[Union[_U, Dict[str, Any]]] = None,
++        upload_files: Optional[Iterable[Tuple[str, str]]] = None,
+         allow_retries: bool = True,
+         additional_headers: Optional[Dict[str, Any]] = None,
+     ) -> _V:
+@@ -494,11 +507,26 @@ def make_request(
+         if isinstance(parsed_url_params, pydantic.BaseModel):
+             parsed_url_params = parsed_url_params.dict()
+ 
++        if upload_files is not None:
++            # Yes, a list of tuples. We always use the "files" key, and doing it this way
++            # allows for multiple files to be uploaded in a single request.
++            file_data = [("files", (fname, open(fpath, "rb"))) for fname, fpath in upload_files]
++
++            # We must also send the serialized body as part of the multipart upload
++            if serialized_body is not None:
++                file_data.append(("body_data", ("body_data", serialized_body, self.encoding)))
++                serialized_body = None
++        else:
++            file_data = None
++
++        assert (serialized_body is None) or (file_data is None)  # Just to check my logic
++
+         r = self._request(
+             method,
+             endpoint,
+             body=serialized_body,
+             url_params=parsed_url_params,
++            file_data=file_data,
+             allow_retries=allow_retries,
+             additional_headers=additional_headers,
+         )

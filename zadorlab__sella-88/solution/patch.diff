@@ -1,0 +1,271 @@
+diff --git a/sella/linalg.py b/sella/linalg.py
+index 7c5e722..40f636a 100644
+--- a/sella/linalg.py
++++ b/sella/linalg.py
+@@ -13,14 +13,17 @@
+ class NumericalHessian(LinearOperator):
+     dtype = np.dtype('float64')
+ 
+-    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None):
++    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None,
++                 evaluation_callback=None):
+         self.func = func
+         self.x0 = x0.copy()
+         self.g0 = g0.copy()
+         self.eta = eta
+         self.threepoint = threepoint
+         self.calls = 0
++        self.evaluations = 0
+         self.Uproj = Uproj
++        self.evaluation_callback = evaluation_callback
+         self.requires_secant_rank_cleanup = False
+ 
+         self.ntrue = len(self.x0)
+@@ -36,6 +39,13 @@ def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None):
+         self.Vs = np.empty((self.ntrue, 0), dtype=self.dtype)
+         self.AVs = np.empty((self.ntrue, 0), dtype=self.dtype)
+ 
++    def _evaluate(self, x):
++        result = self.func(x)
++        self.evaluations += 1
++        if self.evaluation_callback is not None:
++            self.evaluation_callback(self.evaluations)
++        return result
++
+     def _matvec(self, v):
+         self.calls += 1
+ 
+@@ -79,9 +89,13 @@ def _matvec(self, v):
+                 return np.zeros(self.Uproj.shape[1])
+             return np.zeros_like(v)
+         vnorm *= sign
+-        _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
++        _, gplus = self._evaluate(
++            self.x0 + self.eta * v.ravel() / vnorm
++        )
+         if self.threepoint:
+-            fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
++            _, gminus = self._evaluate(
++                self.x0 - self.eta * v.ravel() / vnorm
++            )
+             Av = vnorm * (gplus - gminus) / (2 * self.eta)
+         else:
+             Av = vnorm * (gplus - self.g0) / self.eta
+diff --git a/sella/optimize/optimize.py b/sella/optimize/optimize.py
+index 2f4ede4..202f399 100644
+--- a/sella/optimize/optimize.py
++++ b/sella/optimize/optimize.py
+@@ -69,6 +69,7 @@ def __init__(
+         rs: str = None,
+         nsteps_per_diag: int = 3,
+         diag_every_n: Optional[int] = None,
++        hessian_progress: bool = False,
+         hessian_function: Optional[Callable[[Atoms], np.ndarray]] = None,
+         optimize_cell: bool = False,
+         cell_mask: np.ndarray = None,
+@@ -147,6 +148,10 @@ def __init__(
+             object, call ``sella.configure_compute(max_cpu_threads=...)``
+             directly. GPU sharing is not handled here (CUDA exposes no runtime
+             GPU-thread cap); use CUDA MPS or the launcher.
++        hessian_progress : bool, optional
++            If True, write timestamped progress messages for numerical Hessian
++            force evaluations to ``logfile``. Default is False, which leaves
++            the standard optimization table unchanged.
+         """
+         # Cap CPU threads first, before any heavy BLAS work (Hessian
+         # refinement, internal-coordinate setup) runs in initialize_pes.
+@@ -239,7 +244,12 @@ def __init__(
+         self.eta = eta
+         self.delta_min = self.eta
+         self.constraints_tol = constraints_tol
+-        self.diagkwargs = dict(gamma=gamma, threepoint=threepoint)
++        self.diagkwargs = dict(
++            gamma=gamma,
++            threepoint=threepoint,
++            progress=(self._log_hessian_progress
++                      if hessian_progress else None),
++        )
+         self.rho = 1.
+ 
+         if self.ord != 0 and not self.eig:
+@@ -259,6 +269,35 @@ def __init__(
+         self._last_step_basis = None
+         self._last_step_eigenvalues = None
+ 
++    def _log_hessian_progress(self, event, evaluations):
++        if self.logfile is None:
++            return
++        prefix = f'# Sella {strftime("%H:%M:%S", localtime())}:'
++        evaluation_word = (
++            'evaluation' if evaluations == 1 else 'evaluations'
++        )
++        if event == 'start':
++            message = f'{prefix} starting Hessian diagonalization'
++        elif event == 'evaluation':
++            message = (
++                f'{prefix} Hessian force evaluation '
++                f'{evaluations} completed'
++            )
++        elif event == 'done':
++            message = (
++                f'{prefix} Hessian diagonalization completed after '
++                f'{evaluations} force {evaluation_word}'
++            )
++        elif event == 'failed':
++            message = (
++                f'{prefix} Hessian diagonalization failed after '
++                f'{evaluations} force {evaluation_word}'
++            )
++        else:  # pragma: no cover
++            raise ValueError(f'Unknown Hessian progress event: {event}')
++        self.logfile.write(message + '\n')
++        flush_logfile(self.logfile)
++
+     def initialize_pes(
+         self,
+         atoms: Atoms,
+diff --git a/sella/peswrapper.py b/sella/peswrapper.py
+index eebc0fd..85e6b81 100644
+--- a/sella/peswrapper.py
++++ b/sella/peswrapper.py
+@@ -866,7 +866,7 @@ def get_Ucons(self):
+         self._update(False)
+         return self.curr['Ucons']
+ 
+-    def diag(self, gamma=0.1, threepoint=False, maxiter=None):
++    def diag(self, gamma=0.1, threepoint=False, maxiter=None, progress=None):
+         if self.curr['f'] is None:
+             self._update(feval=True)
+ 
+@@ -892,12 +892,30 @@ def diag(self, gamma=0.1, threepoint=False, maxiter=None):
+         # Convert P to array
+         P = np.eye(nfree) if P_is_none else P.asarray()
+ 
+-        Hproj = NumericalHessian(self._calc_eg, self.get_x(), self.get_g(),
+-                                 self.eta, threepoint, Ufree)
++        if progress is not None:
++            progress('start', 0)
++
++        Hproj = NumericalHessian(
++            self._calc_eg,
++            self.get_x(),
++            self.get_g(),
++            self.eta,
++            threepoint,
++            Ufree,
++            evaluation_callback=(
++                None if progress is None
++                else lambda count: progress('evaluation', count)
++            ),
++        )
+         Hc = self.get_Hc()
+-        rayleigh_ritz(Hproj - Ufree.T @ Hc @ Ufree, gamma, P, v0=v0,
+-                      method=self.eigensolver,
+-                      maxiter=maxiter)
++        try:
++            rayleigh_ritz(Hproj - Ufree.T @ Hc @ Ufree, gamma, P, v0=v0,
++                          method=self.eigensolver,
++                          maxiter=maxiter)
++        except Exception:
++            if progress is not None:
++                progress('failed', Hproj.evaluations)
++            raise
+ 
+         # Extract eigensolver iterates
+         Vs = Hproj.Vs
+@@ -933,6 +951,8 @@ def diag(self, gamma=0.1, threepoint=False, maxiter=None):
+ 
+         # Update the approximate Hessian
+         self.H.update(Vs, AVs)
++        if progress is not None:
++            progress('done', Hproj.evaluations)
+ 
+         self.first_diag = False
+ 
+diff --git a/tests/test_hessian_progress.py b/tests/test_hessian_progress.py
+new file mode 100644
+index 0000000..17f1108
+--- /dev/null
++++ b/tests/test_hessian_progress.py
+@@ -0,0 +1,51 @@
++from ase import Atoms
++from ase.calculators.lj import LennardJones
++
++from sella import Sella
++
++
++def test_sella_logs_hessian_force_evaluation_progress(tmp_path):
++    atoms = Atoms('Ar2', positions=[[0, 0, 0], [1.5, 0, 0]])
++    atoms.calc = LennardJones()
++    logfile = tmp_path / 'sella.log'
++
++    opt = Sella(
++        atoms,
++        order=1,
++        internal=False,
++        logfile=str(logfile),
++        hessian_progress=True,
++    )
++    opt._ensure_initialized()
++    opt.close()
++
++    progress = [
++        line for line in logfile.read_text().splitlines()
++        if line.startswith('# Sella ')
++    ]
++    assert progress[0].endswith(': starting Hessian diagonalization')
++    assert 'Hessian force evaluation 1 completed' in progress[1]
++    assert 'Hessian diagonalization completed after' in progress[-1]
++
++    evaluations = [
++        int(line.split()[-2])
++        for line in progress
++        if line.endswith('completed')
++    ]
++    assert evaluations == list(range(1, len(evaluations) + 1))
++    suffix = 'evaluation' if len(evaluations) == 1 else 'evaluations'
++    assert progress[-1].endswith(
++        f'{len(evaluations)} force {suffix}'
++    )
++
++
++def test_hessian_progress_is_disabled_by_default(tmp_path):
++    atoms = Atoms('Ar2', positions=[[0, 0, 0], [1.5, 0, 0]])
++    atoms.calc = LennardJones()
++    logfile = tmp_path / 'sella.log'
++
++    opt = Sella(atoms, order=1, internal=False, logfile=str(logfile))
++    opt._ensure_initialized()
++    opt.close()
++
++    assert '# Sella ' not in logfile.read_text()
+diff --git a/tests/test_linalg.py b/tests/test_linalg.py
+index a15b256..5e49fb0 100644
+--- a/tests/test_linalg.py
++++ b/tests/test_linalg.py
+@@ -56,3 +56,25 @@ def test_NumericalHessian(dim, subdim, order, threepoint, eta=1e-6, atol=1e-4):
+     M1[:, 1] -= g1proj * (M1[:, 1] @ g1proj) / (g1proj @ g1proj)
+ 
+     np.testing.assert_allclose(H2.T.dot(M1), H3.T @ M1, **tol)
++
++
++@pytest.mark.parametrize('threepoint, expected', [(False, [1]),
++                                                   (True, [1, 2])])
++def test_numerical_hessian_reports_force_evaluations(threepoint, expected):
++    evaluations = []
++
++    def quadratic(x):
++        return 0.5 * x @ x, x
++
++    H = NumericalHessian(
++        quadratic,
++        x0=np.ones(3),
++        g0=np.ones(3),
++        eta=1e-4,
++        threepoint=threepoint,
++        evaluation_callback=evaluations.append,
++    )
++    H.dot(np.array([1.0, 0.0, 0.0]))
++
++    assert evaluations == expected
++    assert H.evaluations == len(expected)

@@ -1,0 +1,1483 @@
+diff --git a/devtools/conda-envs/opt-disp.yaml b/devtools/conda-envs/opt-disp.yaml
+index f5852e9df..55de669ba 100644
+--- a/devtools/conda-envs/opt-disp.yaml
++++ b/devtools/conda-envs/opt-disp.yaml
+@@ -10,6 +10,7 @@ dependencies:
+ 
+     # Mixed Tests
+   - dftd3 3.2.1
++  - dftd4-python
+   - mp2d >=1.1
+   - gcp
+   - geometric
+diff --git a/qcengine/programs/base.py b/qcengine/programs/base.py
+index 6d4846b3b..95ddca9c2 100644
+--- a/qcengine/programs/base.py
++++ b/qcengine/programs/base.py
+@@ -8,6 +8,7 @@
+ from .adcc import AdccHarness
+ from .cfour import CFOURHarness
+ from .dftd3 import DFTD3Harness
++from .dftd4 import DFTD4Harness
+ from .gamess import GAMESSHarness
+ from .gcp import GCPHarness
+ from .molpro import MolproHarness
+@@ -126,5 +127,6 @@ def list_available_programs() -> Set[str]:
+ 
+ # Analytical Corrections
+ register_program(DFTD3Harness())
++register_program(DFTD4Harness())
+ register_program(GCPHarness())
+ register_program(MP2DHarness())
+diff --git a/qcengine/programs/dftd3.py b/qcengine/programs/dftd3.py
+index 68acf3558..dc439a042 100644
+--- a/qcengine/programs/dftd3.py
++++ b/qcengine/programs/dftd3.py
+@@ -131,14 +131,6 @@ def build_input(
+         molrec = qcel.molparse.from_schema(input_model.molecule.dict())
+         # jobrec['molecule']['real'] = molrec['real']
+ 
+-        # env = {
+-        #    'HOME': os.environ.get('HOME'),
+-        #    'PATH': os.environ.get('PATH'),
+-        #    #'PATH': os.pathsep.join([os.path.abspath(x) for x in os.environ.get('PSIPATH', '').split(os.pathsep) if x != '']) + \
+-        #    #        os.pathsep + os.environ.get('PATH'),
+-        #    #'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH'),
+-        # }
+-
+         command = ["dftd3", "dftd3_geometry.xyz"]
+         if input_model.driver == "gradient":
+             command.append("-grad")
+@@ -146,7 +138,7 @@ def build_input(
+             command.append("-abc")
+ 
+         # Append `-anal` for pairwise atomic analysis
+-        if input_model.keywords.get("save_pairwise_dispersion") is True:
++        if input_model.keywords.get("pair_resolved", False):
+             command.append("-anal")
+ 
+         infiles = {
+@@ -272,13 +264,9 @@ def parse_output(self, outfiles: Dict[str, str], input_model: "AtomicInput") ->
+ 
+         # LOGtext += qcel.datum.print_variables({info.label: info for info in calcinfo})
+         calcinfo = {info.label: info.data for info in calcinfo}
+-        # calcinfo = qcel.util.unnp(calcinfo, flat=True)
+ 
+-        # got to even out who needs plump/flat/Decimal/float/ndarray/list
+         # Decimal --> str preserves precision
+-        calcinfo = {
+-            k.upper(): str(v) if isinstance(v, Decimal) else v for k, v in qcel.util.unnp(calcinfo, flat=True).items()
+-        }
++        calcinfo = {k.upper(): str(v) if isinstance(v, Decimal) else v for k, v in calcinfo.items()}
+ 
+         # jobrec['properties'] = {"return_energy": ene}
+         # jobrec["molecule"]["real"] = list(jobrec["molecule"]["real"])
+@@ -291,7 +279,9 @@ def parse_output(self, outfiles: Dict[str, str], input_model: "AtomicInput") ->
+ 
+         output_data = {
+             "extras": input_model.extras,
+-            "properties": {},
++            "properties": {
++                "return_energy": calcinfo[f"CURRENT ENERGY"],
++            },
+             "provenance": Provenance(
+                 creator="DFTD3", version=self.get_version(), routine=__name__ + "." + sys._getframe().f_code.co_name
+             ),
+@@ -300,8 +290,8 @@ def parse_output(self, outfiles: Dict[str, str], input_model: "AtomicInput") ->
+         }
+         output_data["extras"]["local_keywords"] = input_model.extras["info"]
+         output_data["extras"]["qcvars"] = calcinfo
+-        if input_model.keywords.get("save_pairwise_dispersion") is True:
+-            output_data["extras"]["qcvars"]["PAIRWISE DISPERSION CORRECTION ANALYSIS"] = D3pairs
++        if input_model.keywords.get("pair_resolved", False):
++            output_data["extras"]["qcvars"]["2-BODY PAIRWISE DISPERSION CORRECTION ANALYSIS"] = D3pairs
+         output_data["success"] = True
+ 
+         return AtomicResult(**{**input_model.dict(), **output_data})
+diff --git a/qcengine/programs/dftd4.py b/qcengine/programs/dftd4.py
+new file mode 100644
+index 000000000..0897239aa
+--- /dev/null
++++ b/qcengine/programs/dftd4.py
+@@ -0,0 +1,140 @@
++"""
++Harness for the DFT-D4 dispersion correction.
++This implementation interfaces with the dftd4 Python-API, which provides
++native support for QCSchema.
++
++Therefore, this harness only has to provide a thin wrapper to integrate dftd4.
++"""
++
++from typing import Dict
++
++from qcelemental.models import AtomicInput, AtomicResult
++from qcelemental.util import safe_version, which_import
++
++from ..config import TaskConfig
++from ..exceptions import InputError
++from .empirical_dispersion_resources import from_arrays, get_dispersion_aliases
++from .model import ProgramHarness
++
++
++class DFTD4Harness(ProgramHarness):
++    """Calculation harness for the DFT-D4 dispersion correction."""
++
++    _defaults = {
++        "name": "dftd4",
++        "scratch": False,
++        "thread_safe": True,
++        "thread_parallel": False,
++        "node_parallel": False,
++        "managed_memory": False,
++    }
++    version_cache: Dict[str, str] = {}
++
++    class Config(ProgramHarness.Config):
++        pass
++
++    @staticmethod
++    def found(raise_error: bool = False) -> bool:
++        """Check for the availability of the Python API of dftd4"""
++
++        return which_import(
++            "dftd4",
++            return_bool=True,
++            raise_error=raise_error,
++            raise_msg="Please install via a dftd4 version with enabled Python API",
++        )
++
++    def get_version(self) -> str:
++        """Return the currently used version of dftd4"""
++        self.found(raise_error=True)
++
++        which_prog = which_import("dftd4")
++        if which_prog not in self.version_cache:
++            import dftd4
++
++            self.version_cache[which_prog] = safe_version(dftd4.__version__)
++
++        return self.version_cache[which_prog]
++
++    def compute(self, input_model: AtomicInput, config: TaskConfig) -> AtomicResult:
++        """
++        Actual interface to the dftd4 package. The compute function is just a thin
++        wrapper around the native QCSchema interface of the dftd4 Python-API.
++        """
++
++        self.found(raise_error=True)
++
++        import dftd4
++        from dftd4.qcschema import run_qcschema
++
++        # strip engine hint
++        input_data = input_model.dict()
++        method = input_model.model.method
++        if method.startswith("d4-"):
++            method = method[3:]
++            input_data["model"]["method"] = method
++        qcvkey = method.upper() if method is not None else None
++
++        # send `from_arrays` the dftd4 behavior of functional specification overrides explicit parameters specification
++        # * differs from dftd3 harness behavior where parameters extend or override functional
++        # * stash the resolved plan in extras or, if errored, leave it for the proper dftd4 api to reject
++        param_tweaks = None if method else input_model.keywords.get("params_tweaks", None)
++        try:
++            planinfo = from_arrays(
++                verbose=1,
++                name_hint=method,
++                level_hint=input_model.keywords.get("level_hint", None),
++                param_tweaks=param_tweaks,
++                dashcoeff_supplement=input_model.keywords.get("dashcoeff_supplement", None),
++            )
++        except InputError:
++            pass
++        else:
++            input_data["extras"]["info"] = planinfo
++
++        # strip dispersion level from method
++        for alias, d4 in get_dispersion_aliases().items():
++            if d4 == "d4bjeeqatm" and method.lower().endswith(alias):
++                method = method[: -(len(alias) + 1)]
++                input_data["model"]["method"] = method
++
++        # consolidate dispersion level aliases
++        level_hint = input_model.keywords.get("level_hint", None)
++        if level_hint and get_dispersion_aliases()[level_hint.lower()] == "d4bjeeqatm":
++            level_hint = "d4"
++            input_data["keywords"]["level_hint"] = level_hint
++
++        input_model = AtomicInput(**input_data)
++
++        # Run the Harness
++        output = run_qcschema(input_model)
++
++        if "info" in output.extras:
++            qcvkey = output.extras["info"]["fctldash"].upper()
++
++        calcinfo = {}
++        energy = output.properties.return_energy
++        calcinfo["CURRENT ENERGY"] = energy
++        calcinfo["DISPERSION CORRECTION ENERGY"] = energy
++        if qcvkey:
++            calcinfo[f"{qcvkey} DISPERSION CORRECTION ENERGY"] = energy
++
++        if output.driver == "gradient":
++            gradient = output.return_result
++            calcinfo["CURRENT GRADIENT"] = gradient
++            calcinfo["DISPERSION CORRECTION GRADIENT"] = gradient
++            if qcvkey:
++                calcinfo[f"{qcvkey} DISPERSION CORRECTION GRADIENT"] = gradient
++
++        if output.keywords.get("pair_resolved", False):
++            pw2 = output.extras["dftd4"]["additive pairwise energy"]
++            pw3 = output.extras["dftd4"]["non-additive pairwise energy"]
++            assert abs(pw2.sum() + pw3.sum() - energy) < 1.0e-8, f"{pw2.sum()} + {pw3.sum()} != {energy}"
++            calcinfo["2-BODY DISPERSION CORRECTION ENERGY"] = pw2.sum()
++            calcinfo["3-BODY DISPERSION CORRECTION ENERGY"] = pw3.sum()
++            calcinfo["2-BODY PAIRWISE DISPERSION CORRECTION ANALYSIS"] = pw2
++            calcinfo["3-BODY PAIRWISE DISPERSION CORRECTION ANALYSIS"] = pw3
++
++        output.extras["qcvars"] = calcinfo
++
++        return output
+diff --git a/qcengine/programs/empirical_dispersion_resources.py b/qcengine/programs/empirical_dispersion_resources.py
+index 938dbea76..494e286eb 100644
+--- a/qcengine/programs/empirical_dispersion_resources.py
++++ b/qcengine/programs/empirical_dispersion_resources.py
+@@ -795,9 +795,92 @@
+             "mp2": {"params": {"s8": 1.187, "a1": 0.944, "a2": 0.480, "rcut": 0.72, "w": 0.20}}  # Rezac:2018:4711
+         },
+     },
++    "d4bjeeqatm": {
++        "formal": "D4(BJ,EEQ)ATM",
++        "alias": ["d4", "d4bj", "d4(bj)"],
++        "description": "    Grimme's -D4 (BJ-damping) Dispersion Correction with ATM",
++        "citation": "    Caldeweyher, E.; Ehlert, S.; Hansen, A.; Neugebauer, H.; Spicher, S.; Bannwarth, C.; Grimmme, S., J. Chem. Phys. 150, 154122 (2019)\n",
++        "bibtex": "Caldeweyher:2019:154122",
++        "doi": "10.1063/1.5090222150",
++        "default": collections.OrderedDict(
++            [("a1", 1.0), ("a2", 1.0), ("alp", 16.0), ("s6", 1.0), ("s8", 1.0), ("s9", 1.0)]
++        ),
++        "definitions": {
++            # D4 parameters loaded below from authoritative source below. Keep a couple for reference
++            # "b3lyp": {"params": {"a1": 0.40868035, "a2": 4.53807137, "alp": 16.0, "s6": 1.0, "s8": 2.02929367, "s9": 1.0}},
++            # "pbe":   {"params": {"a1": 0.38574991, "a2": 4.80688534, "alp": 16.0, "s6": 1.0, "s8": 0.95948085, "s9": 1.0}},
++        },
++    },
+ }
+ 
+ 
++def _get_d4bj_definitions() -> dict:
++    """DFTD4 provides access to damping parameters on per functional basis.
++    But we want all of them.
++
++    We let DFTD4 take care of finding and loading the parameter file,
++    but to get all parameters, we implement the logic to read those
++    parameters ourselves again.
++    """
++
++    try:
++        from dftd4.parameters import get_data_file_name, load_data_base
++    except ModuleNotFoundError:
++        return {}
++
++    def get_params(entry: dict, base: dict, defaults: list) -> dict:
++        """Retrive the parameters from the data base, make sure the default
++        values are applied correctly in the process. In case we have multiple
++        defaults search for the first of the list defined for this method."""
++
++        for default in defaults:
++            try:
++                params = base[default].copy()
++                params.update(**entry[default])
++                params.pop("mbd", None)
++                params.pop("damping", None)
++                return params
++            except KeyError:
++                continue
++
++        raise KeyError("No entry for " + method + " in parameter data base")
++
++    try:
++        _data_base = load_data_base(get_data_file_name())
++    except FileNotFoundError:
++        return {}
++
++    try:
++        _defaults = _data_base["default"]["d4"]
++        _base = _data_base["default"]["parameter"]["d4"]
++        _parameters = _data_base["parameter"]
++    except KeyError:
++        return {}
++
++    definitions = {}
++
++    for method in _parameters:
++        try:
++            _entry = _parameters[method]["d4"]
++            params = get_params(_entry, _base, _defaults)
++
++            citation = params.pop("doi", None)
++            # Make Psi4's citation style checker happy
++            if citation is not None:
++                citation = "    " + citation + "\n"
++            definitions[method] = dict(
++                params=params,
++                citation=citation,
++            )
++        except KeyError:
++            continue
++
++    return definitions
++
++
++dashcoeff["d4bjeeqatm"]["definitions"].update(_get_d4bj_definitions())
++
++
+ def get_dispersion_aliases():
+     """Returns dict where keys are all (lowercased) strings that are
+     interpretable as dashlevels, and values are the keys dealiased
+@@ -850,7 +933,7 @@ def from_arrays(name_hint=None, level_hint=None, param_tweaks=None, dashcoeff_su
+     dict
+         Metadata defining dispersion calculation.
+ 
+-        dashlevel : {'d1', 'd2', 'd3zero', 'd3bj', 'd3mzero', 'd3mbj', 'chg', 'das2009', 'das2010', 'nl'}
++        dashlevel : {'d1', 'd2', 'd3zero', 'd3bj', 'd3mzero', 'd3mbj', 'chg', 'das2009', 'das2010', 'nl', "d4bjeeqatm"}
+             Name (de-aliased, de-formalized, lowercase) of dispersion
+             correction -- atom data, dispersion model, damping functional
+             form -- to be applied. Resolved from `name_hint` and/or
+diff --git a/qcengine/programs/gcp.py b/qcengine/programs/gcp.py
+index 5848c9486..0a979bd88 100644
+--- a/qcengine/programs/gcp.py
++++ b/qcengine/programs/gcp.py
+@@ -242,11 +242,8 @@ def parse_output(self, outfiles: Dict[str, str], input_model: "AtomicInput") ->
+ 
+         calcinfo = {info.label: info.data for info in calcinfo}
+ 
+-        # got to even out who needs plump/flat/Decimal/float/ndarray/list
+         # Decimal --> str preserves precision
+-        calcinfo = {
+-            k.upper(): str(v) if isinstance(v, Decimal) else v for k, v in qcel.util.unnp(calcinfo, flat=True).items()
+-        }
++        calcinfo = {k.upper(): str(v) if isinstance(v, Decimal) else v for k, v in calcinfo.items()}
+ 
+         retres = calcinfo[f"CURRENT {input_model.driver.upper()}"]
+         if isinstance(retres, Decimal):
+diff --git a/qcengine/programs/mp2d.py b/qcengine/programs/mp2d.py
+index 98d47f593..11d42c573 100644
+--- a/qcengine/programs/mp2d.py
++++ b/qcengine/programs/mp2d.py
+@@ -201,9 +201,7 @@ def parse_output(self, outfiles: Dict[str, str], input_model: "AtomicInput") ->
+ 
+         # got to even out who needs plump/flat/Decimal/float/ndarray/list
+         # Decimal --> str preserves precision
+-        calcinfo = {
+-            k.upper(): str(v) if isinstance(v, Decimal) else v for k, v in qcel.util.unnp(calcinfo, flat=True).items()
+-        }
++        calcinfo = {k.upper(): str(v) if isinstance(v, Decimal) else v for k, v in calcinfo.items()}
+ 
+         # jobrec['properties'] = {"return_energy": ene}
+         # jobrec["molecule"]["real"] = list(jobrec["molecule"]["real"])
+diff --git a/qcengine/programs/tests/test_dftd3_mp2d.py b/qcengine/programs/tests/test_dftd3_mp2d.py
+index 41b77d9ef..1f1d7182c 100644
+--- a/qcengine/programs/tests/test_dftd3_mp2d.py
++++ b/qcengine/programs/tests/test_dftd3_mp2d.py
+@@ -4,6 +4,7 @@
+ import numpy as np
+ import pytest
+ import qcelemental as qcel
++from qcelemental.models import AtomicInput
+ from qcelemental.testing import compare, compare_recursive, compare_values, tnm
+ 
+ import qcengine as qcng
+@@ -74,12 +75,17 @@ def test_dftd3_error():
+ ref["eneyne"]["SAPT0-D3M(BJ)"] = dict(zip(dmm, [-0.06896506, -0.03995152, -0.02689133, -0.03995152, -0.02689133]))
+ ref["eneyne"]["SAPT0-D3M"] = dict(zip(dmm, [-0.04486853, -0.02659896, -0.01614236, -0.02659896, -0.01614236]))
+ ref["eneyne"]["GCP"] = dict(zip(dmm, [0.0159608596, -0.0018710542, 0.0012920388, 0.0049560054, 0.0103950441]))
++ref["eneyne"]["B3LYP-D4(BJ,EEQ)ATM"] = dict(zip(dmm, [-0.00625445, -0.00306407, -0.00176150, -0.00306407, -0.00176150]))
++ref["eneyne"]["PBE-D4(BJ,EEQ)ATM"] = dict(zip(dmm, [-0.00399176, -0.00190682, -0.00108739, -0.00190682, -0.00108739]))
++ref["eneyne"]["B3LYP-D4(BJ)-2BODY"] = dict(zip(dmm, [-0.00625366, -0.00306413, -0.00176146, -0.00306413, -0.00176146]))
+ 
+ ref["ne"] = {}
+ ref["ne"]["B3LYP-D3(BJ)"] = {"atom": 0.0}
+ ref["ne"]["MP2-DMP2"] = {"atom": 0.0}
+ ref["ne"]["ATM"] = {"atom": 0.0}
+ ref["ne"]["GCP"] = {"atom": 0.0}
++ref["ne"]["B3LYP-D4(BJ,EEQ)ATM"] = {"atom": 0.0}
++ref["ne"]["PBE-D4(BJ,EEQ)ATM"] = {"atom": 0.0}
+ 
+ gref = {}
+ gref["eneyne"] = {}
+@@ -824,12 +830,491 @@ def test_dftd3_error():
+     )
+ )
+ 
++gref["eneyne"]["B3LYP-D4(BJ,EEQ)ATM"] = dict(
++    zip(
++        dmm,
++        [
++            np.array(
++                [
++                    [-0.0, -0.000121388195, -0.000285720303],
++                    [0.0, 0.000121388195, -0.000285720303],
++                    [0.000013500589, -0.000035224119, -0.000051913946],
++                    [-0.000013500589, -0.000035224119, -0.000051913946],
++                    [-0.000013500589, 0.000035224119, -0.000051913946],
++                    [0.000013500589, 0.000035224119, -0.000051913946],
++                    [0.0, -0.0, 0.000162779428],
++                    [0.0, -0.0, 0.00042515118],
++                    [0.0, -0.0, 0.000180544011],
++                    [0.0, -0.0, 0.000010621775],
++                ]
++            ),
++            np.array(
++                [
++                    [-0.0, -0.000077703214, -0.000000117582],
++                    [0.0, 0.000077703214, -0.000000117582],
++                    [-0.000003720109, -0.000014373039, 0.000000058791],
++                    [0.000003720109, -0.000014373039, 0.000000058791],
++                    [0.000003720109, 0.000014373039, 0.000000058791],
++                    [-0.000003720109, 0.000014373039, 0.000000058791],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 0.0, 0.000044445504],
++                    [0.0, 0.0, -0.000044316404],
++                    [0.0, 0.0, -0.000011452466],
++                    [0.0, 0.0, 0.000011323366],
++                ]
++            ),
++            np.array(
++                [
++                    [-0.0, -0.000077703214, -0.000000117582],
++                    [0.0, 0.000077703214, -0.000000117582],
++                    [-0.000003720109, -0.000014373039, 0.000000058791],
++                    [0.000003720109, -0.000014373039, 0.000000058791],
++                    [0.000003720109, 0.000014373039, 0.000000058791],
++                    [-0.000003720109, 0.000014373039, 0.000000058791],
++                    [0.0, -0.0, 0.0],
++                    [0.0, -0.0, 0.0],
++                    [0.0, -0.0, 0.0],
++                    [0.0, -0.0, 0.0],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.000044445504],
++                    [0.0, 0.0, -0.000044316404],
++                    [0.0, 0.0, -0.000011452466],
++                    [0.0, 0.0, 0.000011323366],
++                ]
++            ),
++        ],
++    )
++)
++
++gref["eneyne"]["PBE-D4(BJ,EEQ)ATM"] = dict(
++    zip(
++        dmm,
++        [
++            np.array(
++                [
++                    [-0.0, -0.000075815381, -0.00017520537],
++                    [0.0, 0.000075815381, -0.00017520537],
++                    [0.000007491515, -0.000020129841, -0.000035107085],
++                    [-0.000007491515, -0.000020129841, -0.000035107085],
++                    [-0.000007491515, 0.000020129841, -0.000035107085],
++                    [0.000007491515, 0.000020129841, -0.000035107085],
++                    [0.0, -0.0, 0.000114234095],
++                    [0.0, -0.0, 0.000264656137],
++                    [0.0, -0.0, 0.00010600965],
++                    [0.0, -0.0, 0.000005939201],
++                ]
++            ),
++            np.array(
++                [
++                    [-0.0, -0.000048683304, -0.000000077468],
++                    [-0.0, 0.000048683304, -0.000000077468],
++                    [-0.000003585439, -0.000006613721, 0.000000038734],
++                    [0.000003585439, -0.000006613721, 0.000000038734],
++                    [0.000003585439, 0.000006613721, 0.000000038734],
++                    [-0.000003585439, 0.000006613721, 0.000000038734],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 0.0, 0.000027225998],
++                    [0.0, 0.0, -0.000027154133],
++                    [0.0, 0.0, -0.000005688871],
++                    [0.0, 0.0, 0.000005617006],
++                ]
++            ),
++            np.array(
++                [
++                    [-0.0, -0.000048683304, -0.000000077468],
++                    [-0.0, 0.000048683304, -0.000000077468],
++                    [-0.000003585439, -0.000006613721, 0.000000038734],
++                    [0.000003585439, -0.000006613721, 0.000000038734],
++                    [0.000003585439, 0.000006613721, 0.000000038734],
++                    [-0.000003585439, 0.000006613721, 0.000000038734],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.000027225998],
++                    [0.0, 0.0, -0.000027154133],
++                    [0.0, 0.0, -0.000005688871],
++                    [0.0, 0.0, 0.000005617006],
++                ]
++            ),
++        ],
++    )
++)
++
++gref["eneyne"]["B3LYP-D4(BJ)-2BODY"] = dict(
++    zip(
++        dmm,
++        [
++            np.array(
++                [
++                    [-2.37238242e-20, -1.20552026e-04, -2.85188070e-04],
++                    [1.77428629e-20, 1.20552026e-04, -2.85188070e-04],
++                    [1.29618968e-05, -3.48247508e-05, -5.24578644e-05],
++                    [-1.29618968e-05, -3.48247508e-05, -5.24578644e-05],
++                    [-1.29618968e-05, 3.48247508e-05, -5.24578644e-05],
++                    [1.29618968e-05, 3.48247508e-05, -5.24578644e-05],
++                    [1.52364928e-21, -2.22548925e-21, 1.64760284e-04],
++                    [9.68759086e-21, -1.90663898e-20, 4.23463450e-04],
++                    [5.52800316e-21, -1.28345778e-20, 1.79843750e-04],
++                    [3.79855004e-22, -4.55050785e-22, 1.21401127e-05],
++                ]
++            ),
++            np.array(
++                [
++                    [-1.49709758e-20, -7.76770859e-05, -1.17642905e-07],
++                    [6.65584060e-21, 7.76770859e-05, -1.17642905e-07],
++                    [-3.75026735e-06, -1.43576031e-05, 5.88214523e-08],
++                    [3.75026735e-06, -1.43576031e-05, 5.88214523e-08],
++                    [3.75026735e-06, 1.43576031e-05, 5.88214523e-08],
++                    [-3.75026735e-06, 1.43576031e-05, 5.88214523e-08],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 0.0, 4.44399748e-05],
++                    [0.0, 0.0, -4.43108715e-05],
++                    [0.0, 0.0, -1.14903043e-05],
++                    [0.0, 0.0, 1.13612010e-05],
++                ]
++            ),
++            np.array(
++                [
++                    [-1.49709758e-20, -7.76770859e-05, -1.17642905e-07],
++                    [6.65584060e-21, 7.76770859e-05, -1.17642905e-07],
++                    [-3.75026735e-06, -1.43576031e-05, 5.88214523e-08],
++                    [3.75026735e-06, -1.43576031e-05, 5.88214523e-08],
++                    [3.75026735e-06, 1.43576031e-05, 5.88214523e-08],
++                    [-3.75026735e-06, 1.43576031e-05, 5.88214523e-08],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                ]
++            ),
++            np.array(
++                [
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 0.0],
++                    [0.0, 0.0, 4.44399748e-05],
++                    [0.0, 0.0, -4.43108715e-05],
++                    [0.0, 0.0, -1.14903043e-05],
++                    [0.0, 0.0, 1.13612010e-05],
++                ]
++            ),
++        ],
++    )
++)
+ 
+ gref["ne"] = {}
+ gref["ne"]["B3LYP-D3(BJ)"] = {"atom": np.zeros((1, 3))}
+ gref["ne"]["MP2-DMP2"] = {"atom": np.zeros((1, 3))}
+ gref["ne"]["ATM"] = {"atom": np.zeros((1, 3))}
+ gref["ne"]["GCP"] = {"atom": np.zeros((1, 3))}
++gref["ne"]["B3LYP-D4(BJ,EEQ)ATM"] = {"atom": np.zeros((1, 3))}
++gref["ne"]["PBE-D4(BJ,EEQ)ATM"] = {"atom": np.zeros((1, 3))}
++
++
++pref = {}
++pref["eneyne"] = {}
++pref["eneyne"]["SAPT0-D3M"] = dict(
++    zip(
++        dmm,
++        [
++            np.array(
++                [
++                    [
++                        0.00000000e00,
++                        -7.85678891e-03,
++                        -1.95928495e-03,
++                        -1.95928495e-03,
++                        -2.01222438e-03,
++                        -2.01222438e-03,
++                        -4.53698281e-05,
++                        -2.51948360e-04,
++                        -4.60630446e-04,
++                        -4.15929931e-06,
++                    ],
++                    [
++                        -7.85678891e-03,
++                        0.00000000e00,
++                        -2.01222438e-03,
++                        -2.01222438e-03,
++                        -1.95928495e-03,
++                        -1.95928495e-03,
++                        -4.53698281e-05,
++                        -2.51948360e-04,
++                        -4.60630446e-04,
++                        -4.15929931e-06,
++                    ],
++                    [
++                        -1.95928495e-03,
++                        -2.01222438e-03,
++                        0.00000000e00,
++                        -1.04060569e-03,
++                        -9.67953410e-05,
++                        -2.90146983e-04,
++                        -1.15854812e-05,
++                        -5.42143151e-05,
++                        -8.42058910e-05,
++                        -1.19520095e-06,
++                    ],
++                    [
++                        -1.95928495e-03,
++                        -2.01222438e-03,
++                        -1.04060569e-03,
++                        0.00000000e00,
++                        -2.90146983e-04,
++                        -9.67953410e-05,
++                        -1.15854812e-05,
++                        -5.42143151e-05,
++                        -8.42058910e-05,
++                        -1.19520095e-06,
++                    ],
++                    [
++                        -2.01222438e-03,
++                        -1.95928495e-03,
++                        -9.67953410e-05,
++                        -2.90146983e-04,
++                        0.00000000e00,
++                        -1.04060569e-03,
++                        -1.15854812e-05,
++                        -5.42143151e-05,
++                        -8.42058910e-05,
++                        -1.19520095e-06,
++                    ],
++                    [
++                        -2.01222438e-03,
++                        -1.95928495e-03,
++                        -2.90146983e-04,
++                        -9.67953410e-05,
++                        -1.04060569e-03,
++                        0.00000000e00,
++                        -1.15854812e-05,
++                        -5.42143151e-05,
++                        -8.42058910e-05,
++                        -1.19520095e-06,
++                    ],
++                    [
++                        -4.53698281e-05,
++                        -4.53698281e-05,
++                        -1.15854812e-05,
++                        -1.15854812e-05,
++                        -1.15854812e-05,
++                        -1.15854812e-05,
++                        0.00000000e00,
++                        -8.94451739e-03,
++                        -1.49243946e-03,
++                        -2.06978526e-03,
++                    ],
++                    [
++                        -2.51948360e-04,
++                        -2.51948360e-04,
++                        -5.42143151e-05,
++                        -5.42143151e-05,
++                        -5.42143151e-05,
++                        -5.42143151e-05,
++                        -8.94451739e-03,
++                        0.00000000e00,
++                        -2.07365771e-03,
++                        -1.50094929e-03,
++                    ],
++                    [
++                        -4.60630446e-04,
++                        -4.60630446e-04,
++                        -8.42058910e-05,
++                        -8.42058910e-05,
++                        -8.42058910e-05,
++                        -8.42058910e-05,
++                        -1.49243946e-03,
++                        -2.07365771e-03,
++                        0.00000000e00,
++                        -6.02859360e-05,
++                    ],
++                    [
++                        -4.15929931e-06,
++                        -4.15929931e-06,
++                        -1.19520095e-06,
++                        -1.19520095e-06,
++                        -1.19520095e-06,
++                        -1.19520095e-06,
++                        -2.06978526e-03,
++                        -1.50094929e-03,
++                        -6.02859360e-05,
++                        0.00000000e00,
++                    ],
++                ]
++            ),
++            np.zeros((6, 6)),
++            np.zeros((4, 4)),
++            np.zeros((10, 10)),
++            np.zeros((10, 10)),
++        ],
++    )
++)
++pref["eneyne"]["PBE-D4(BJ,EEQ)ATM"] = dict(
++    zip(
++        dmm,
++        [
++            np.array(
++                [
++                    [
++                        0.00000000e00,
++                        -2.64744008e-04,
++                        -7.32623305e-05,
++                        -7.32623305e-05,
++                        -7.01934088e-05,
++                        -7.01934088e-05,
++                        -2.69705044e-05,
++                        -1.06309035e-04,
++                        -5.46185898e-05,
++                        -1.67640345e-06,
++                    ],
++                    [
++                        -2.64744008e-04,
++                        0.00000000e00,
++                        -7.01934088e-05,
++                        -7.01934088e-05,
++                        -7.32623305e-05,
++                        -7.32623305e-05,
++                        -2.69705044e-05,
++                        -1.06309035e-04,
++                        -5.46185898e-05,
++                        -1.67640345e-06,
++                    ],
++                    [
++                        -7.32623305e-05,
++                        -7.01934088e-05,
++                        0.00000000e00,
++                        -1.90214207e-05,
++                        -1.14919996e-05,
++                        -1.67283942e-05,
++                        -4.39710997e-06,
++                        -1.70897298e-05,
++                        -1.03017176e-05,
++                        -2.96551988e-07,
++                    ],
++                    [
++                        -7.32623305e-05,
++                        -7.01934088e-05,
++                        -1.90214207e-05,
++                        0.00000000e00,
++                        -1.67283942e-05,
++                        -1.14919996e-05,
++                        -4.39710997e-06,
++                        -1.70897298e-05,
++                        -1.03017176e-05,
++                        -2.96551988e-07,
++                    ],
++                    [
++                        -7.01934088e-05,
++                        -7.32623305e-05,
++                        -1.14919996e-05,
++                        -1.67283942e-05,
++                        0.00000000e00,
++                        -1.90214207e-05,
++                        -4.39710997e-06,
++                        -1.70897298e-05,
++                        -1.03017176e-05,
++                        -2.96551988e-07,
++                    ],
++                    [
++                        -7.01934088e-05,
++                        -7.32623305e-05,
++                        -1.67283942e-05,
++                        -1.14919996e-05,
++                        -1.90214207e-05,
++                        0.00000000e00,
++                        -4.39710997e-06,
++                        -1.70897298e-05,
++                        -1.03017176e-05,
++                        -2.96551988e-07,
++                    ],
++                    [
++                        -2.69705044e-05,
++                        -2.69705044e-05,
++                        -4.39710997e-06,
++                        -4.39710997e-06,
++                        -4.39710997e-06,
++                        -4.39710997e-06,
++                        0.00000000e00,
++                        -2.70797078e-04,
++                        -6.64000329e-05,
++                        -7.15900093e-05,
++                    ],
++                    [
++                        -1.06309035e-04,
++                        -1.06309035e-04,
++                        -1.70897298e-05,
++                        -1.70897298e-05,
++                        -1.70897298e-05,
++                        -1.70897298e-05,
++                        -2.70797078e-04,
++                        0.00000000e00,
++                        -7.10525707e-05,
++                        -6.69658005e-05,
++                    ],
++                    [
++                        -5.46185898e-05,
++                        -5.46185898e-05,
++                        -1.03017176e-05,
++                        -1.03017176e-05,
++                        -1.03017176e-05,
++                        -1.03017176e-05,
++                        -6.64000329e-05,
++                        -7.10525707e-05,
++                        0.00000000e00,
++                        -8.31720277e-06,
++                    ],
++                    [
++                        -1.67640345e-06,
++                        -1.67640345e-06,
++                        -2.96551988e-07,
++                        -2.96551988e-07,
++                        -2.96551988e-07,
++                        -2.96551988e-07,
++                        -7.15900093e-05,
++                        -6.69658005e-05,
++                        -8.31720277e-06,
++                        0.00000000e00,
++                    ],
++                ]
++            ),
++            np.zeros((6, 6)),
++            np.zeros((4, 4)),
++            np.zeros((10, 10)),
++            np.zeros((10, 10)),
++        ],
++    )
++)
+ 
+ seneyne = """
+ C   0.000000  -0.667578  -2.124659
+@@ -1151,7 +1636,7 @@ def test_qcdb__energy_d3():
+ def test_mp2d__run_mp2d__2body(inp, subjects, request):
+     subject = subjects()[inp["parent"]][inp["subject"]]
+     expected = ref[inp["parent"]][inp["lbl"]][inp["subject"]]
+-    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]].ravel()
++    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]]
+ 
+     if "qcmol" in request.node.name:
+         mol = subject
+@@ -1182,7 +1667,13 @@ def test_mp2d__run_mp2d__2body(inp, subjects, request):
+     )
+ 
+ 
+-@using("dftd3")
++_d3_b3lyp = {"s6": 1.0, "s8": 1.703, "sr6": 1.261, "alpha6": 14.0, "sr8": 1.000}
++_d3_pbe = {"s6": 1.0, "s8": 0.722, "sr6": 1.217, "alpha6": 14.0, "sr8": 1.000}
++_d4_b3lyp = {"s8": 2.02929367, "a1": 0.40868035, "a2": 4.53807137, "s9": 1.0, "s6": 1.0, "alp": 16.0}
++_d4_pbe = {"s8": 0.95948085, "a1": 0.38574991, "a2": 4.80688534, "s9": 1.0, "s6": 1.0, "alp": 16.0}
++_d4_b3lyp_2body = {"s8": 2.02929367, "a1": 0.40868035, "a2": 4.53807137, "s9": 0.0, "s6": 1.0, "alp": 16.0}
++
++
+ @pytest.mark.parametrize(
+     "subjects",
+     [
+@@ -1196,51 +1687,122 @@ def test_mp2d__run_mp2d__2body(inp, subjects, request):
+ )
+ @pytest.mark.parametrize(
+     "inp",
++    # fmt: off
+     [
+-        ({"parent": "eneyne", "name": "d3-b3lyp-d", "subject": "dimer", "lbl": "B3LYP-D2"}),
+-        ({"parent": "eneyne", "name": "d3-b3lyp-d3bj", "subject": "mA", "lbl": "B3LYP-D3(BJ)"}),
+-        ({"parent": "eneyne", "name": "d3-PBE-D3zero", "subject": "mB", "lbl": "PBE-D3"}),
+-        ({"parent": "eneyne", "name": "d3-PBE-D3zero", "subject": "gAmB", "lbl": "PBE-D3"}),
+-        ({"parent": "eneyne", "name": "d3-PBE-D2", "subject": "mAgB", "lbl": "PBE-D2"}),
+-        ({"parent": "ne", "name": "d3-b3lyp-d3bj", "subject": "atom", "lbl": "B3LYP-D3(BJ)"}),
+-        ({"parent": "eneyne", "name": "d3-SAPT0-D3M(BJ)", "subject": "dimer", "lbl": "SAPT0-D3M(BJ)"}),
+-        ({"parent": "eneyne", "name": "d3-SAPT0-D3M", "subject": "mA", "lbl": "SAPT0-D3M"}),
++        pytest.param({"parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "d3-b3lyp-d"}, "keywords": {}}, "lbl": "B3LYP-D2"}, marks=using("dftd3")),
++        pytest.param({"parent": "eneyne", "subject": "mA", "qcsk": {"model": {"method": "d3-b3lyp-d3bj"}, "keywords": {}}, "lbl": "B3LYP-D3(BJ)"}, marks=using("dftd3")),
++        pytest.param({"parent": "eneyne", "subject": "mB", "qcsk": {"model": { "method": "d3-PBE-D3zero"}, "keywords": {}}, "lbl": "PBE-D3"}, marks=using("dftd3")),
++        pytest.param({ "parent": "eneyne", "subject": "gAmB", "qcsk": { "model": { "method": "d3-PBE-D3zero"}, "keywords": {}}, "lbl": "PBE-D3"}, marks=using("dftd3")),
++        pytest.param({ "parent": "eneyne", "subject": "mAgB", "qcsk": { "model": { "method": "d3-PBE-D2"}, "keywords": {}}, "lbl": "PBE-D2"}, marks=using("dftd3")),
++        pytest.param({ "parent": "ne", "subject": "atom", "qcsk": { "model": { "method": "d3-b3lyp-d3bj"}, "keywords": {}}, "lbl": "B3LYP-D3(BJ)"}, marks=using("dftd3")),
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "d3-SAPT0-D3M(BJ)"}, "keywords": {}}, "lbl": "SAPT0-D3M(BJ)"}, marks=using("dftd3")),
++        pytest.param({ "parent": "eneyne", "subject": "mA", "qcsk": { "model": { "method": "d3-SAPT0-D3M"}, "keywords": {}}, "lbl": "SAPT0-D3M"}, marks=using("dftd3")),
++
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": { "model": { "method": "d4-b3lyp-d4"}, "keywords": {}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++        pytest.param({ "parent": "ne", "subject": "atom", "qcsk": { "model": { "method": "d4-b3lyp-d4"}, "keywords": {}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++        pytest.param({ "parent": "eneyne", "subject": "mA", "qcsk": { "model": { "method": "d4-b3lyp-d4"}, "keywords": {}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++        pytest.param({ "parent": "eneyne", "subject": "gAmB", "qcsk": { "model": { "method": "d4-b3lyp-d4"}, "keywords": {}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++        pytest.param({ "parent": "eneyne", "subject": "mB", "qcsk": { "model": { "method": "d4-PBE-D4"}, "keywords": {}}, "lbl": "PBE-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++        pytest.param({ "parent": "eneyne", "subject": "mAgB", "qcsk": { "model": { "method": "d4-PBE-D4"}, "keywords": {}}, "lbl": "PBE-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": ""}, "keywords": {"level_hint": "d3", "params_tweaks": _d3_b3lyp}}, "lbl": "B3LYP-D3"}, marks=using("dftd3")),  # params only
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "b3lyp-d3"}, "keywords": {"level_hint": "d3", "params_tweaks": _d3_b3lyp}}, "lbl": "B3LYP-D3"}, marks=using("dftd3")),  # method reinforcing params
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "pbe-d3"}, "keywords": {"level_hint": "d3", "params_tweaks": _d3_b3lyp}}, "lbl": "B3LYP-D3"}, marks=using("dftd3")),  # method contradicting params (D3: params win)
++
++        pytest.param({ "parent": "eneyne", "subject": "mAgB", "qcsk": {"model": {"method": ""}, "keywords": {"level_hint": "d4", "params_tweaks": _d4_b3lyp_2body}}, "lbl": "B3LYP-D4(BJ)-2BODY"}, marks=using("dftd4")),  # params only
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": ""}, "keywords": {"level_hint": "d4", "params_tweaks": _d4_b3lyp}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),  # params only
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "b3lyp-d4"}, "keywords": {"level_hint": "d4", "params_tweaks": _d4_b3lyp}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),  # method reinforcing params
++        pytest.param({ "parent": "eneyne", "subject": "dimer", "qcsk": { "model": {"method": "pbe-d4"}, "keywords": {"pair_resolved": True, "level_hint": "d4", "params_tweaks": _d4_b3lyp}}, "lbl": "PBE-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),  # method contradicting params (D4: method wins)
+     ],
++    # fmt: on
+ )
+ def test_dftd3__run_dftd3__2body(inp, subjects, request):
+     subject = subjects()[inp["parent"]][inp["subject"]]
+     expected = ref[inp["parent"]][inp["lbl"]][inp["subject"]]
+-    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]].ravel()
++    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]]
+ 
+     if "qcmol" in request.node.name:
+         mol = subject
+     else:
+         mol = subject.to_schema(dtype=2)
+ 
+-    resinp = {
+-        "schema_name": "qcschema_input",
+-        "schema_version": 1,
+-        "molecule": mol,
+-        "driver": "gradient",
+-        "model": {"method": inp["name"]},
+-        "keywords": {},
+-    }
+-    jrec = qcng.compute(resinp, "dftd3", raise_error=True)
+-    jrec = jrec.dict()
++    program = "dftd4" if ("D4(BJ" in inp["lbl"]) else "dftd3"
+ 
+-    assert len(jrec["extras"]["qcvars"]) == 8
++    atin = AtomicInput(
++        molecule=mol,
++        driver="gradient",
++        **inp["qcsk"],
++    )
++    jrec = qcng.compute(atin, program, raise_error=True)
++    jrec = jrec.dict()
++    pprint.pprint(jrec)
+ 
++    assert compare_values(expected, jrec["properties"]["return_energy"], atol=1.0e-7)
+     assert compare_values(expected, jrec["extras"]["qcvars"]["CURRENT ENERGY"], atol=1.0e-7)
+     assert compare_values(expected, jrec["extras"]["qcvars"]["DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
+-    assert compare_values(expected, jrec["extras"]["qcvars"]["2-BODY DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
+-    assert compare_values(expected, jrec["extras"]["qcvars"][inp["lbl"] + " DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
++    if program == "dftd3":
++        assert compare_values(expected, jrec["extras"]["qcvars"]["2-BODY DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
++    if atin.model.method:
++        assert compare_values(
++            expected, jrec["extras"]["qcvars"][inp["lbl"] + " DISPERSION CORRECTION ENERGY"], atol=1.0e-7
++        )
+ 
++    assert compare_values(gexpected, jrec["return_result"], atol=1.0e-7)
+     assert compare_values(gexpected, jrec["extras"]["qcvars"]["CURRENT GRADIENT"], atol=1.0e-7)
+     assert compare_values(gexpected, jrec["extras"]["qcvars"]["DISPERSION CORRECTION GRADIENT"], atol=1.0e-7)
+-    assert compare_values(gexpected, jrec["extras"]["qcvars"]["2-BODY DISPERSION CORRECTION GRADIENT"], atol=1.0e-7)
+-    assert compare_values(
+-        gexpected, jrec["extras"]["qcvars"][inp["lbl"] + " DISPERSION CORRECTION GRADIENT"], atol=1.0e-7
++    if program == "dftd3":
++        assert compare_values(gexpected, jrec["extras"]["qcvars"]["2-BODY DISPERSION CORRECTION GRADIENT"], atol=1.0e-7)
++    if atin.model.method:
++        assert compare_values(
++            gexpected, jrec["extras"]["qcvars"][inp["lbl"] + " DISPERSION CORRECTION GRADIENT"], atol=1.0e-7
++        )
++
++
++@pytest.mark.parametrize(
++    "subjects",
++    [
++        pytest.param(eneyne_ne_psi4mols, marks=using("psi4")),
++        pytest.param(
++            eneyne_ne_qcdbmols, marks=using("psi4")
++        ),  # needs qcdb.Molecule, presently more common in psi4 than in qcdb
++        pytest.param(eneyne_ne_qcschemamols),
++    ],
++    ids=["qmol", "pmol", "qcmol"],
++)
++@pytest.mark.parametrize(
++    "inp",
++    # fmt: off
++    [
++        pytest.param({"parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": ""}, "keywords": {"level_hint": "d3", "params_tweaks": _d3_b3lyp}}, "lbl": "PBE-D3"}, marks=using("dftd3")),  # wrong ref lbl
++        pytest.param({"parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "pbe-d3"}, "keywords": {"level_hint": "d3", "params_tweaks": _d3_b3lyp}}, "lbl": "PBE-D3"}, marks=using("dftd3")),  # method contradicting params (D3: params win -> fail)
++
++        pytest.param({"parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": ""}, "keywords": {"level_hint": "d4", "params_tweaks": _d4_b3lyp}}, "lbl": "PBE-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),  # wrong ref lbl
++        pytest.param({"parent": "eneyne", "subject": "dimer", "qcsk": {"model": {"method": "pbe-d4"}, "keywords": {"level_hint": "d4", "params_tweaks": _d4_b3lyp}}, "lbl": "B3LYP-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),  # method contradicting params (D4: method wins -> fail)
++    ],
++    # fmt: on
++)
++def test_dftd3__run_dftd3__2body_error(inp, subjects, request):
++    subject = subjects()[inp["parent"]][inp["subject"]]
++    expected = ref[inp["parent"]][inp["lbl"]][inp["subject"]]
++    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]]
++
++    if "qcmol" in request.node.name:
++        mol = subject
++    else:
++        mol = subject.to_schema(dtype=2)
++
++    program = "dftd4" if ("D4(BJ" in inp["lbl"]) else "dftd3"
++
++    atin = AtomicInput(
++        molecule=mol,
++        driver="gradient",
++        **inp["qcsk"],
+     )
++    jrec = qcng.compute(atin, program, raise_error=True)
++    jrec = jrec.dict()
++
++    with pytest.raises(AssertionError) as exc:
++        assert compare_values(expected, jrec["properties"]["return_energy"], atol=1.0e-7)
+ 
+ 
+ @using("dftd3_321")
+@@ -1269,7 +1831,7 @@ def test_dftd3__run_dftd3__2body(inp, subjects, request):
+ def test_dftd3__run_dftd3__3body(inp, subjects, request):
+     subject = subjects()[inp["parent"]][inp["subject"]]
+     expected = ref[inp["parent"]][inp["lbl"]][inp["subject"]]
+-    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]].ravel()
++    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]]
+ 
+     if "qcmol" in request.node.name:
+         mol = subject
+@@ -1304,7 +1866,6 @@ def test_dftd3__run_dftd3__3body(inp, subjects, request):
+     )
+ 
+ 
+-@using("dftd3")
+ @pytest.mark.parametrize(
+     "subjects",
+     [
+@@ -1316,159 +1877,42 @@ def test_dftd3__run_dftd3__3body(inp, subjects, request):
+     ],
+     ids=["qmol", "pmol", "qcmol"],
+ )
+-def test_dftd3_sapt_pairwise(request, subjects):
+-    subject = subjects()["eneyne"]["dimer"]
+-    expected = ref["eneyne"]["SAPT0-D3M"]["dimer"]
+-
+-    expected_pairwise = np.array(
+-        [
+-            [
+-                0.00000000e00,
+-                -7.85678891e-03,
+-                -1.95928495e-03,
+-                -1.95928495e-03,
+-                -2.01222438e-03,
+-                -2.01222438e-03,
+-                -4.53698281e-05,
+-                -2.51948360e-04,
+-                -4.60630446e-04,
+-                -4.15929931e-06,
+-            ],
+-            [
+-                -7.85678891e-03,
+-                0.00000000e00,
+-                -2.01222438e-03,
+-                -2.01222438e-03,
+-                -1.95928495e-03,
+-                -1.95928495e-03,
+-                -4.53698281e-05,
+-                -2.51948360e-04,
+-                -4.60630446e-04,
+-                -4.15929931e-06,
+-            ],
+-            [
+-                -1.95928495e-03,
+-                -2.01222438e-03,
+-                0.00000000e00,
+-                -1.04060569e-03,
+-                -9.67953410e-05,
+-                -2.90146983e-04,
+-                -1.15854812e-05,
+-                -5.42143151e-05,
+-                -8.42058910e-05,
+-                -1.19520095e-06,
+-            ],
+-            [
+-                -1.95928495e-03,
+-                -2.01222438e-03,
+-                -1.04060569e-03,
+-                0.00000000e00,
+-                -2.90146983e-04,
+-                -9.67953410e-05,
+-                -1.15854812e-05,
+-                -5.42143151e-05,
+-                -8.42058910e-05,
+-                -1.19520095e-06,
+-            ],
+-            [
+-                -2.01222438e-03,
+-                -1.95928495e-03,
+-                -9.67953410e-05,
+-                -2.90146983e-04,
+-                0.00000000e00,
+-                -1.04060569e-03,
+-                -1.15854812e-05,
+-                -5.42143151e-05,
+-                -8.42058910e-05,
+-                -1.19520095e-06,
+-            ],
+-            [
+-                -2.01222438e-03,
+-                -1.95928495e-03,
+-                -2.90146983e-04,
+-                -9.67953410e-05,
+-                -1.04060569e-03,
+-                0.00000000e00,
+-                -1.15854812e-05,
+-                -5.42143151e-05,
+-                -8.42058910e-05,
+-                -1.19520095e-06,
+-            ],
+-            [
+-                -4.53698281e-05,
+-                -4.53698281e-05,
+-                -1.15854812e-05,
+-                -1.15854812e-05,
+-                -1.15854812e-05,
+-                -1.15854812e-05,
+-                0.00000000e00,
+-                -8.94451739e-03,
+-                -1.49243946e-03,
+-                -2.06978526e-03,
+-            ],
+-            [
+-                -2.51948360e-04,
+-                -2.51948360e-04,
+-                -5.42143151e-05,
+-                -5.42143151e-05,
+-                -5.42143151e-05,
+-                -5.42143151e-05,
+-                -8.94451739e-03,
+-                0.00000000e00,
+-                -2.07365771e-03,
+-                -1.50094929e-03,
+-            ],
+-            [
+-                -4.60630446e-04,
+-                -4.60630446e-04,
+-                -8.42058910e-05,
+-                -8.42058910e-05,
+-                -8.42058910e-05,
+-                -8.42058910e-05,
+-                -1.49243946e-03,
+-                -2.07365771e-03,
+-                0.00000000e00,
+-                -6.02859360e-05,
+-            ],
+-            [
+-                -4.15929931e-06,
+-                -4.15929931e-06,
+-                -1.19520095e-06,
+-                -1.19520095e-06,
+-                -1.19520095e-06,
+-                -1.19520095e-06,
+-                -2.06978526e-03,
+-                -1.50094929e-03,
+-                -6.02859360e-05,
+-                0.00000000e00,
+-            ],
+-        ]
+-    )
++@pytest.mark.parametrize(
++    "inp",
++    [
++        pytest.param({"parent": "eneyne", "subject": "dimer", "lbl": "SAPT0-D3M"}, marks=using("dftd3")),
++        pytest.param({"parent": "eneyne", "subject": "dimer", "lbl": "PBE-D4(BJ,EEQ)ATM"}, marks=using("dftd4")),
++    ],
++)
++def test_sapt_pairwise(inp, subjects, request):
++    subject = subjects()[inp["parent"]][inp["subject"]]
++    expected = ref[inp["parent"]][inp["lbl"]][inp["subject"]]
++    expected_pairwise = pref[inp["parent"]][inp["lbl"]][inp["subject"]]
+ 
+     if "qcmol" in request.node.name:
+         mol = subject
+     else:
+         mol = subject.to_schema(dtype=2)
+ 
+-    json_data = {
+-        "molecule": mol,
+-        "driver": "energy",
+-        "model": {"method": "d3-sapt0-d3m"},
+-        "keywords": {"save_pairwise_dispersion": True},
+-    }
++    program = "dftd4" if ("D4(BJ" in inp["lbl"]) else "dftd3"
+ 
+-    # Test driver
+-    jrec = qcng.compute(json_data, "dftd3", raise_error=True)
++    atin = AtomicInput(
++        molecule=mol,
++        driver="energy",
++        model={"method": inp["lbl"]},
++        keywords={
++            "pair_resolved": True,
++        },
++    )
++    jrec = qcng.compute(atin, program, raise_error=True)
+     jrec = jrec.dict()
+ 
+-    assert len(jrec["extras"]["qcvars"]) == 5
+-
+     assert compare_values(expected, jrec["extras"]["qcvars"]["CURRENT ENERGY"], atol=1.0e-7)
+     assert compare_values(expected, jrec["extras"]["qcvars"]["DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
+-    assert compare_values(expected, jrec["extras"]["qcvars"]["2-BODY DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
+-    assert compare_values(expected, jrec["extras"]["qcvars"]["SAPT0-D3M DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
++    # assert compare_values(expected, jrec["extras"]["qcvars"]["2-BODY DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
++    assert compare_values(expected, jrec["extras"]["qcvars"][inp["lbl"] + " DISPERSION CORRECTION ENERGY"], atol=1.0e-7)
+     assert compare_values(
+-        expected_pairwise, jrec["extras"]["qcvars"]["PAIRWISE DISPERSION CORRECTION ANALYSIS"], atol=1.0e-7
++        expected_pairwise, jrec["extras"]["qcvars"]["2-BODY PAIRWISE DISPERSION CORRECTION ANALYSIS"], atol=1.0e-7
+     )
+ 
+ 
+@@ -1498,7 +1942,7 @@ def test_dftd3_sapt_pairwise(request, subjects):
+ def test_gcp(inp, subjects, request):
+     subject = subjects()[inp["parent"]][inp["subject"]]
+     expected = ref[inp["parent"]][inp["lbl"]][inp["subject"]]
+-    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]].ravel()
++    gexpected = gref[inp["parent"]][inp["lbl"]][inp["subject"]]
+ 
+     if "qcmol" in request.node.name:
+         mol = subject
+diff --git a/qcengine/programs/tests/test_dftd4.py b/qcengine/programs/tests/test_dftd4.py
+new file mode 100644
+index 000000000..fdd88d061
+--- /dev/null
++++ b/qcengine/programs/tests/test_dftd4.py
+@@ -0,0 +1,168 @@
++"""
++Testing for the DFT-D4 program harness.
++
++Most of the tests use mindless molecules for the diversity of element species
++to test as much different interactions as possible.
++"""
++
++import numpy as np
++import pytest
++import qcelemental as qcel
++
++import qcengine as qcng
++from qcengine.testing import using
++
++
++@using("dftd4")
++def test_dftd4_task_b97m_m01():
++
++    thr = 1.0e-8
++
++    return_result = -0.025024986301735823
++
++    atomic_input = qcel.models.AtomicInput(
++        molecule=qcng.get_molecule("mindless-01"),
++        model={"method": "b97m"},
++        driver="energy",
++    )
++
++    atomic_result = qcng.compute(atomic_input, "dftd4")
++
++    print(atomic_result.return_result)
++    assert atomic_result.success
++    assert pytest.approx(atomic_result.return_result, abs=thr) == return_result
++
++
++@using("dftd4")
++def test_dftd4_task_tpss_m02():
++
++    thr = 1.0e-8
++
++    return_result = np.array(
++        [
++            [-1.1006300442501966e-04, -1.9882677409412426e-04, +9.7969330873203453e-05],
++            [-9.0564826517969396e-04, -1.1221656220960802e-04, +7.4420608164684399e-04],
++            [-8.7360785425552928e-05, +2.8146769568946061e-04, +5.8528720048366145e-04],
++            [-1.7602264871464991e-04, -3.0981396137083546e-04, -1.1315671174001885e-03],
++            [+6.2854950429890028e-05, +3.1662886959557454e-04, +1.8192682295895164e-04],
++            [-1.2033574062747143e-04, -5.8117271931259600e-05, -2.4103707001727414e-04],
++            [-9.6727467530178130e-05, -1.2937750080676020e-04, -3.0565838265275271e-05],
++            [-1.2139762550383215e-05, +2.2334694600929773e-05, +6.7681766980205114e-05],
++            [+2.9131236664176958e-04, -2.3159856865643386e-04, +3.9334087528658355e-04],
++            [-8.9512907514913525e-05, +9.3857773376367446e-06, -2.6351331811570630e-04],
++            [+3.9621947274011518e-04, -5.8926113817768316e-04, +1.8422719633870202e-04],
++            [-1.6466329096860149e-04, +1.3720763821983788e-04, -8.3839852301748649e-05],
++            [-3.2173735474065368e-04, +7.2068238657310593e-04, -3.1811972689724591e-04],
++            [+2.1298820577529375e-04, -9.6810383911168402e-05, +1.0273702281858908e-04],
++            [-4.4599095547508355e-04, -1.8320769460464104e-04, +1.8653129262487302e-04],
++            [+1.5668271875651332e-03, +4.2152279374596904e-04, -4.7526466701417510e-04],
++        ]
++    )
++
++    atomic_input = qcel.models.AtomicInput(
++        molecule=qcng.get_molecule("mindless-02"),
++        model={"method": ""},
++        keywords={
++            "params_tweaks": {
++                "s8": 1.76596355,
++                "a1": 0.42822303,
++                "a2": 4.54257102,
++            },
++        },
++        driver="gradient",
++    )
++
++    atomic_result = qcng.compute(atomic_input, "dftd4")
++
++    assert atomic_result.success
++    assert pytest.approx(atomic_result.return_result, abs=thr) == return_result
++
++
++@using("dftd4")
++def test_dftd4_task_r2scan_m03():
++
++    thr = 1.0e-8
++
++    return_result = np.array(
++        [
++            [-1.0184389290110640e-05, -1.2902131714706869e-05, -4.7991389860088184e-05],
++            [+3.9008038585852290e-05, -8.6543337237836941e-05, +1.0086268708372256e-04],
++            [-2.1792111331028049e-05, +2.8414264003578678e-05, +1.8916279332120321e-05],
++            [-3.8847190487495055e-06, +6.4069296782535270e-06, -1.7362611928711208e-05],
++            [-1.5358378150451566e-05, -5.7611513737809471e-06, -1.9871764856476196e-05],
++            [-3.7225957329162548e-05, -1.5687552833166010e-06, -3.4717349142275990e-05],
++            [+3.2408291983641028e-07, -6.7683941908276048e-05, -6.1602680430568183e-05],
++            [-8.1819149671629329e-06, -9.5470867672313039e-06, -1.7007294079721094e-05],
++            [-1.7245516321582448e-05, +1.6416848978506148e-05, +1.6005589814916458e-05],
++            [-3.0116095523698349e-06, +7.3382310356380993e-07, -1.3652036487357768e-05],
++            [+1.0378663330288130e-04, +4.4180555120489236e-05, +3.2576724474326750e-05],
++            [-2.8021453980080289e-05, +3.9008636389849655e-05, -1.2083469461741150e-04],
++            [-3.0452136766248191e-05, +7.0712047105794630e-05, +8.3682948356528971e-05],
++            [+1.6902554427499383e-06, -2.9147110970219634e-05, +3.6402009185785855e-05],
++            [+4.6966237842630462e-05, -1.2554523547742754e-05, +3.0600183501647347e-05],
++            [-1.6417061357004406e-05, +1.9834934423075429e-05, +1.3993399653561848e-05],
++        ]
++    )
++
++    atomic_input = qcel.models.AtomicInput(
++        molecule=qcng.get_molecule("mindless-03"),
++        keywords={"level_hint": "D4"},
++        driver="gradient",
++        model={"method": "r2scan"},
++    )
++
++    atomic_result = qcng.compute(atomic_input, "dftd4")
++
++    print(atomic_result.return_result)
++    assert atomic_result.success
++    assert pytest.approx(atomic_result.return_result, abs=thr) == return_result
++
++
++@using("dftd4")
++def test_dftd4_task_unknown_method():
++
++    atomic_input = qcel.models.AtomicInput(
++        molecule=qcng.get_molecule("water"),
++        keywords={"level_hint": "D4"},
++        model={"method": "non-existent-method"},
++        driver="energy",
++    )
++    error = qcel.models.ComputeError(
++        error_type="input error", error_message="Functional 'non-existent-method' not known"
++    )
++
++    atomic_result = qcng.compute(atomic_input, "dftd4")
++
++    print(atomic_result.error)
++    assert not atomic_result.success
++    assert atomic_result.error == error
++
++
++@using("dftd4")
++def test_dftd4_task_cold_fusion():
++
++    atomic_input = qcel.models.AtomicInput(
++        molecule={
++            "symbols": ["Li", "Li", "Li", "Li"],
++            "geometry": [
++                [-1.58746019997201, +1.58746019997201, +1.58746019997201],
++                [-1.58746019997201, +1.58746019997201, +1.58746019997201],
++                [-1.58746019997201, -1.58746019997201, -1.58746019997201],
++                [+1.58746019997201, +1.58746019997201, -1.58746019997201],
++            ],
++            "validated": True,  # Force a nuclear fusion input, to make dftd4 fail
++        },
++        keywords={"level_hint": "D4"},
++        model={"method": "pbe"},
++        driver="energy",
++    )
++    error = qcel.models.ComputeError(
++        error_type="input error",
++        error_message="Too close interatomic distances found",
++    )
++
++    atomic_result = qcng.compute(atomic_input, "dftd4")
++
++    print(atomic_result.error)
++    assert not atomic_result.success
++    assert atomic_result.error == error
+diff --git a/qcengine/testing.py b/qcengine/testing.py
+index 164249e02..c2802e104 100644
+--- a/qcengine/testing.py
++++ b/qcengine/testing.py
+@@ -144,6 +144,7 @@ def get_job(self):
+     "cfour": which("xcfour", return_bool=True),
+     "dftd3": which("dftd3", return_bool=True),
+     "dftd3_321": is_program_new_enough("dftd3", "3.2.1"),
++    "dftd4": which_import("dftd4", return_bool=True),
+     "qcore": is_program_new_enough("qcore", "0.8.9"),
+     "gamess": which("rungms", return_bool=True),
+     "gcp": which("gcp", return_bool=True),
+diff --git a/qcengine/tests/test_cli.py b/qcengine/tests/test_cli.py
+index 83f786260..ad8884ab6 100644
+--- a/qcengine/tests/test_cli.py
++++ b/qcengine/tests/test_cli.py
+@@ -36,7 +36,7 @@ def run_qcengine_cli(args: List[str], stdin: str = None) -> str:
+ 
+ 
+ def test_no_args():
+-    """ Test for qcengine with no arguments """
++    """Test for qcengine with no arguments"""
+     try:
+         run_qcengine_cli([])
+     except subprocess.CalledProcessError as e:

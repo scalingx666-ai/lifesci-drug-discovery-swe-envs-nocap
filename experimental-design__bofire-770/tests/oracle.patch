@@ -1,0 +1,275 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 34eced53b..0daa06bfe 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -36,6 +36,7 @@ and this project adheres to [Pragmatic Versioning](https://github.com/experiment
+ 
+ ### Fixed
+ 
++- `Domain.aggregate_by_duplicates` now preserves and aggregates `CategoricalOutput`s by majority vote, breaking ties randomly; `cross_validate(..., aggregate=True)` passes through `random_state` to make tied categorical aggregation reproducible.
+ - `noise_prior` and `noise_constraint` set on `SingleTaskGP`, `MultiTaskGP`, `TanimotoGP`, and `RobustSingleTaskGP` surrogates now actually influence the GP fit. Previously they were assigned via attribute on `model.likelihood.noise_covar` after model construction, which did not populate gpytorch's `_priors` / `_constraints` registries — so the user-supplied prior was silently ignored by the marginal log-likelihood and the user-supplied constraint's bounds were silently not enforced. ([#762](https://github.com/experimental-design/bofire/issues/762), [#763](https://github.com/experimental-design/bofire/pull/763), [#766](https://github.com/experimental-design/bofire/pull/766))
+ - Flaky tests in the test pipeline
+ - Serialization tests now explicitly assert the expected `DeprecationWarning` for deprecated `FactorialStrategy` specs instead of treating it as an unhandled warning.
+diff --git a/bofire/data_models/domain/domain.py b/bofire/data_models/domain/domain.py
+index 1eb63aa52..47b190eee 100644
+--- a/bofire/data_models/domain/domain.py
++++ b/bofire/data_models/domain/domain.py
+@@ -19,6 +19,7 @@
+ from bofire.data_models.features.api import (
+     AnyInput,
+     AnyOutput,
++    CategoricalOutput,
+     ContinuousInput,
+     ContinuousOutput,
+     Input,
+@@ -180,13 +181,17 @@ def aggregate_by_duplicates(
+         prec: int,
+         delimiter: str = "-",
+         method: Literal["mean", "median"] = "mean",
++        random_state: Optional[int] = None,
+     ) -> Tuple[pd.DataFrame, list]:
+         """Aggregate the dataframe by duplicate experiments
+ 
+         Duplicates are identified based on the experiments with the same input
+         features. Continuous input features are rounded before identifying the
+-        duplicates. Aggregation is performed by taking the average of the
+-        involved output features.
++        duplicates. Continuous output features are aggregated by taking the
++        average (or median) of the involved values; categorical output
++        features are aggregated by majority vote. Ties in the majority vote
++        are broken by a random pick; pass ``random_state`` to make this
++        reproducible.
+ 
+         Args:
+             experiments (pd.DataFrame): Dataframe containing experimental data
+@@ -194,7 +199,12 @@ def aggregate_by_duplicates(
+             delimiter (str, optional): Delimiter used when combining the orig.
+                 labcodes to a new one. Defaults to "-".
+             method (Literal["mean", "median"], optional): Which aggregation
+-                method to use. Defaults to "mean".
++                method to use for continuous outputs. Defaults to "mean".
++                Categorical outputs always use majority vote regardless of
++                this argument.
++            random_state (int, optional): Seed used only when breaking ties in
++                the categorical majority vote. Defaults to None
++                (non-deterministic).
+ 
+         Returns:
+             Tuple[pd.DataFrame, list]: Dataframe holding the aggregated
+@@ -227,6 +237,25 @@ def aggregate_by_duplicates(
+         agg: Dict[str, Any] = dict.fromkeys(
+             self.outputs.get_keys(ContinuousOutput), method
+         )
++
++        seed = np.random.default_rng(random_state)
++
++        def _make_categorical_aggregator(feat: str):
++            def _aggregate(values: pd.Series):
++                non_na = values.dropna()
++                if len(non_na) == 0:
++                    return np.nan
++                counts = non_na.value_counts()
++                top_count = counts.iloc[0]
++                winners = counts[counts == top_count].index.tolist()
++                if len(winners) > 1:
++                    return seed.choice(winners)
++                return winners[0]
++
++            return _aggregate
++
++        for feat in self.outputs.get_keys(CategoricalOutput):
++            agg[feat] = _make_categorical_aggregator(feat)
+         agg["labcode"] = lambda x: delimiter.join(sorted(x.tolist()))
+         for feat in self.outputs.get_keys(Output):
+             agg[f"valid_{feat}"] = lambda x: 1
+diff --git a/bofire/surrogates/trainable.py b/bofire/surrogates/trainable.py
+index 494b3281e..0462cb7ac 100644
+--- a/bofire/surrogates/trainable.py
++++ b/bofire/surrogates/trainable.py
+@@ -196,6 +196,7 @@ def cross_validate(
+             experiments, _ = domain.aggregate_by_duplicates(
+                 experiments=experiments,
+                 prec=aggregate_prec,
++                random_state=random_state,
+             )
+ 
+         # first filter the experiments based on the model setting
+diff --git a/docs/tutorials/advanced_examples/index.qmd b/docs/tutorials/advanced_examples/index.qmd
+index 47ae0eb23..10782e9bb 100644
+--- a/docs/tutorials/advanced_examples/index.qmd
++++ b/docs/tutorials/advanced_examples/index.qmd
+@@ -37,3 +37,6 @@ Define input features that are conditionally active.
+ 
+ ### [LLM-driven Molecular Optimization](llm_molecular.qmd)
+ Propose candidates with an `LLMStrategy` that prompts a large language model with the optimization problem and prior experiments.
++
++### [Preference Learning with the Pairwise GP](pairwise_gp.qmd)
++Learn a latent utility function from pairwise comparison data using Pairwise Gaussian Processes.
+diff --git a/tests/bofire/data_models/domain/test_domain.py b/tests/bofire/data_models/domain/test_domain.py
+index d5d6d4d4a..8df93a82f 100644
+--- a/tests/bofire/data_models/domain/test_domain.py
++++ b/tests/bofire/data_models/domain/test_domain.py
+@@ -19,11 +19,16 @@
+ from bofire.data_models.domain.features import Inputs
+ from bofire.data_models.features.api import (
+     CategoricalInput,
++    CategoricalOutput,
+     ContinuousInput,
+     ContinuousOutput,
+     Feature,
+ )
+-from bofire.data_models.objectives.api import MaximizeObjective, TargetObjective
++from bofire.data_models.objectives.api import (
++    ConstrainedCategoricalObjective,
++    MaximizeObjective,
++    TargetObjective,
++)
+ from bofire.utils.subdomain import get_subdomain
+ 
+ 
+@@ -399,6 +404,145 @@ def test_aggregate_by_duplicates_error():
+         domain.aggregate_by_duplicates(full, prec=2, method="25")
+ 
+ 
++def _categorical_output(key: str, categories) -> CategoricalOutput:
++    return CategoricalOutput(
++        key=key,
++        categories=list(categories),
++        objective=ConstrainedCategoricalObjective(
++            categories=list(categories),
++            desirability=[True] + [False] * (len(categories) - 1),
++        ),
++    )
++
++
++def test_aggregate_by_duplicates_with_categorical_output_matching():
++    """Duplicates that agree on the categorical output merge cleanly.
++
++    The continuous output is averaged; the categorical output label is
++    preserved."""
++    full = pd.DataFrame.from_dict(
++        {
++            "x1": [1.0, 2.0, 3.0, 1.0],
++            "x2": [1.0, 2.0, 3.0, 1.0],
++            "out1": [4.0, 5.0, 6.0, 3.0],
++            "color": ["red", "blue", "blue", "red"],
++            "valid_out1": [1, 1, 1, 1],
++            "valid_color": [1, 1, 1, 1],
++        },
++    )
++    expected = pd.DataFrame.from_dict(
++        {
++            "labcode": ["1-4", "2", "3"],
++            "x1": [1.0, 2.0, 3.0],
++            "x2": [1.0, 2.0, 3.0],
++            "out1": [3.5, 5.0, 6.0],
++            "color": ["red", "blue", "blue"],
++            "valid_out1": [1, 1, 1],
++            "valid_color": [1, 1, 1],
++        },
++    )
++    domain = Domain(
++        inputs=Inputs(features=[if1, if2]),
++        outputs=Outputs(features=[of1, _categorical_output("color", ["red", "blue"])]),
++    )
++    aggregated, duplicated_labcodes = domain.aggregate_by_duplicates(
++        full,
++        prec=2,
++    )
++    assert duplicated_labcodes == [["1", "4"]]
++    assert_frame_equal(aggregated, expected, check_dtype=False, check_like=True)
++
++
++def test_aggregate_by_duplicates_with_categorical_output_conflict():
++    """Duplicates that disagree on the categorical output are resolved by
++    majority vote. Ties resolve randomly among the tied values."""
++    full = pd.DataFrame.from_dict(
++        {
++            # rows 0-2 share inputs (1.0, 1.0) with two reds and one blue
++            #   -> majority "red"
++            # rows 3-4 share inputs (2.0, 2.0) with one red and one blue
++            #   -> tie, random pick among the tied labels
++            # row 5 is a singleton
++            "x1": [1.0, 1.0, 1.0, 2.0, 2.0, 3.0],
++            "x2": [1.0, 1.0, 1.0, 2.0, 2.0, 3.0],
++            "out1": [4.0, 3.0, 5.0, 5.0, 6.0, 7.0],
++            "color": ["red", "red", "blue", "red", "blue", "blue"],
++            "valid_out1": [1, 1, 1, 1, 1, 1],
++            "valid_color": [1, 1, 1, 1, 1, 1],
++        },
++    )
++    domain = Domain(
++        inputs=Inputs(features=[if1, if2]),
++        outputs=Outputs(features=[of1, _categorical_output("color", ["red", "blue"])]),
++    )
++    aggregated, duplicated_labcodes = domain.aggregate_by_duplicates(
++        full,
++        prec=2,
++    )
++
++    expected_without_tie = pd.DataFrame.from_dict(
++        {
++            "labcode": ["1-2-3", "6"],
++            "x1": [1.0, 3.0],
++            "x2": [1.0, 3.0],
++            "out1": [4.0, 7.0],
++            "color": ["red", "blue"],
++            "valid_out1": [1, 1],
++            "valid_color": [1, 1],
++        },
++    )
++    assert duplicated_labcodes == [["1", "2", "3"], ["4", "5"]]
++    assert_frame_equal(
++        aggregated.loc[aggregated["labcode"].isin(["1-2-3", "6"])].reset_index(
++            drop=True
++        ),
++        expected_without_tie,
++        check_dtype=False,
++        check_like=True,
++    )
++
++    tie_row = aggregated.loc[aggregated["labcode"] == "4-5"].squeeze()
++    assert tie_row["x1"] == 2.0
++    assert tie_row["x2"] == 2.0
++    assert tie_row["out1"] == 5.5
++    assert tie_row["color"] in {"red", "blue"}
++    assert tie_row["valid_out1"] == 1
++    assert tie_row["valid_color"] == 1
++
++
++def test_aggregate_by_duplicates_prec_rounds_inputs():
++    """The `prec` argument actually rounds continuous inputs before grouping:
++    rows that differ only below the precision threshold collapse together;
++    rows that differ at or above it stay separate."""
++    full = pd.DataFrame.from_dict(
++        {
++            "x1": [1.0001, 1.0002, 1.01, 2.0],
++            "x2": [1.0, 1.0, 1.0, 2.0],
++            "out1": [10.0, 20.0, 30.0, 40.0],
++            "out2": [-10.0, -20.0, -30.0, -40.0],
++            "valid_out1": [1, 1, 1, 1],
++            "valid_out2": [1, 1, 1, 1],
++        },
++    )
++    domain = Domain(
++        inputs=Inputs(features=[if1, if2]),
++        outputs=Outputs(features=[of1, of2]),
++    )
++
++    # prec=3: 1.0001 and 1.0002 both round to 1.000 -> merged.
++    #         1.01 stays distinct.
++    aggregated, dup = domain.aggregate_by_duplicates(full, prec=3)
++    assert dup == [["1", "2"]]
++    assert len(aggregated) == 3
++    # rounded inputs are returned, not the originals
++    assert sorted(aggregated["x1"].tolist()) == [1.0, 1.01, 2.0]
++
++    # prec=4: 1.0001 and 1.0002 stay distinct -> nothing aggregates.
++    aggregated, dup = domain.aggregate_by_duplicates(full, prec=4)
++    assert dup == []
++    assert len(aggregated) == 4
++
++
+ domain = Domain(
+     inputs=Inputs(features=[if1, if2]),
+     outputs=Outputs(features=[of1, of2, of1_, of2_]),

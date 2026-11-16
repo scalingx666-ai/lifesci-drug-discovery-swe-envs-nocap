@@ -1,0 +1,263 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b30b18c9f..9a73a1e9e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -88,6 +88,7 @@ and this project adheres to [Pragmatic Versioning](https://github.com/experiment
+ - LLM field descriptions report descriptor data uniformly for every feature type: a prefix stating what the feature is and its range or options, then the data — `Categorical, allowed: [...] — descriptors per category: {...} — structure: [...]`, `Continuous, bounds [...] — descriptors: {...} — structure: CCO`. Previously the kind was announced in the prefix (`Categorical with descriptors`, `Continuous molecular (SMILES: CCO)`) and only the two descriptor-carrying classes emitted anything.
+ 
+ ### Fixed
++- Sigmoid and target-window objectives use stable sigmoid evaluations, preventing NaN acquisition gradients in saturated regions and preserving small rewards in decreasing tails. ([#853](https://github.com/experimental-design/bofire/issues/853))
+ - Surrogates now reject output types they can't model. Every surrogate's output check was always true (`isinstance(my_type, type(ContinuousOutput))`), so e.g. a `SingleTaskGPSurrogate` or `RandomForestSurrogate` accepted a categorical output, and a `ClassificationMLPEnsemble` a continuous one.
+ - Predictions of a model with both continuous and categorical outputs are labelled correctly. The prediction columns listed every categorical output before the continuous ones, while the models are stacked in output order (continuous first), so the values landed under the wrong column names.
+ - `training_specs` of the GP surrogates is passed on to the optimizer; it was silently ignored.
+diff --git a/bofire/data_models/objectives/sigmoid.py b/bofire/data_models/objectives/sigmoid.py
+index 1630cff87..e6efc5e07 100644
+--- a/bofire/data_models/objectives/sigmoid.py
++++ b/bofire/data_models/objectives/sigmoid.py
+@@ -3,6 +3,7 @@
+ import numpy as np
+ import pandas as pd
+ from pydantic import Field
++from scipy.special import expit
+ 
+ from bofire.data_models.objectives.objective import (
+     ConstrainedObjective,
+@@ -16,7 +17,8 @@ class SigmoidObjective(Objective, ConstrainedObjective):
+ 
+     A sigmoid objective expresses a threshold rather than a direction: the reward runs
+     from 0 to 1 across a transition centred on `tp`, and is flat on either side. Values
+-    far beyond the threshold therefore earn no additional credit.
++    far beyond the threshold therefore earn no additional credit. Evaluation remains
++    stable in the saturated tails.
+     """
+ 
+     steepness: TGt0 = Field(
+@@ -60,7 +62,7 @@ def __call__(
+             np.ndarray: A reward calculated with a sigmoid function. The stepness and the tipping point can be modified via passed arguments.
+ 
+         """
+-        return 1 / (1 + np.exp(-1 * self.steepness * (x - self.tp)))
++        return expit(self.steepness * (x - self.tp))
+ 
+ 
+ class MovingMaximizeSigmoidObjective(SigmoidObjective):
+@@ -107,9 +109,7 @@ def __call__(
+             np.ndarray: A reward calculated with a sigmoid function. The stepness and the tipping point can be modified via passed arguments.
+ 
+         """
+-        return 1 / (
+-            1 + np.exp(-1 * self.steepness * (x - self.get_adjusted_tp(x_adapt)))
+-        )
++        return expit(self.steepness * (x - self.get_adjusted_tp(x_adapt)))
+ 
+ 
+ class MinimizeSigmoidObjective(SigmoidObjective):
+@@ -143,4 +143,4 @@ def __call__(
+             np.ndarray: A reward calculated with a sigmoid function. The stepness and the tipping point can be modified via passed arguments.
+ 
+         """
+-        return 1 - 1 / (1 + np.exp(-1 * self.steepness * (x - self.tp)))
++        return expit(self.steepness * (self.tp - x))
+diff --git a/bofire/data_models/objectives/target.py b/bofire/data_models/objectives/target.py
+index f6a650500..cd58aff26 100644
+--- a/bofire/data_models/objectives/target.py
++++ b/bofire/data_models/objectives/target.py
+@@ -3,6 +3,7 @@
+ import numpy as np
+ import pandas as pd
+ from pydantic import Field
++from scipy.special import expit
+ 
+ from bofire.data_models.objectives.objective import (
+     ConstrainedObjective,
+@@ -46,7 +47,8 @@ class TargetObjective(Objective, ConstrainedObjective):
+ 
+     A constrained objective: the reward is the product of two sigmoids, forming a
+     plateau of width `tolerance` around the target. Use `CloseToTargetObjective` when
+-    no feasible window is intended.
++    no feasible window is intended. Both sigmoid factors are evaluated directly to
++    preserve small rewards outside the window.
+ 
+     Examples:
+         >>> TargetObjective(target_value=7.0, tolerance=0.5, steepness=10.0)
+@@ -81,24 +83,8 @@ def __call__(
+             np.array: An array of reward values calculated by the product of two sigmoidal shaped functions resulting in a maximum at the target value.
+ 
+         """
+-        return (
+-            1
+-            / (
+-                1
+-                + np.exp(
+-                    -1 * self.steepness * (x - (self.target_value - self.tolerance)),
+-                )
+-            )
+-            * (
+-                1
+-                - 1
+-                / (
+-                    1.0
+-                    + np.exp(
+-                        -1
+-                        * self.steepness
+-                        * (x - (self.target_value + self.tolerance)),
+-                    )
+-                )
+-            )
++        return expit(
++            self.steepness * (x - (self.target_value - self.tolerance)),
++        ) * expit(
++            self.steepness * ((self.target_value + self.tolerance) - x),
+         )
+diff --git a/bofire/utils/torch_tools.py b/bofire/utils/torch_tools.py
+index 55d0b46f9..f79b3ca38 100644
+--- a/bofire/utils/torch_tools.py
++++ b/bofire/utils/torch_tools.py
+@@ -502,52 +502,23 @@ def get_objective_callable(
+             * (torch.abs(y[..., idx] - objective.target_value) ** objective.exponent)
+         )
+     if isinstance(objective, MinimizeSigmoidObjective):
+-        return lambda y, X=None: (
+-            1.0
+-            - 1.0
+-            / (
+-                1.0
+-                + torch.exp(-1.0 * objective.steepness * (y[..., idx] - objective.tp))
+-            )
++        return lambda y, X=None: torch.sigmoid(
++            objective.steepness * (objective.tp - y[..., idx]),
+         )
+     if isinstance(objective, MaximizeSigmoidObjective):
+-        return lambda y, X=None: (
+-            1.0
+-            / (
+-                1.0
+-                + torch.exp(-1.0 * objective.steepness * (y[..., idx] - objective.tp))
+-            )
++        return lambda y, X=None: torch.sigmoid(
++            objective.steepness * (y[..., idx] - objective.tp),
+         )
+     if isinstance(objective, MovingMaximizeSigmoidObjective):
+         tp = x_adapt.max().item() + objective.tp
+-        return lambda y, X=None: (
+-            1.0 / (1.0 + torch.exp(-1.0 * objective.steepness * (y[..., idx] - tp)))
+-        )
++        return lambda y, X=None: torch.sigmoid(objective.steepness * (y[..., idx] - tp))
+     if isinstance(objective, TargetObjective):
+-        return lambda y, X=None: (
+-            1.0
+-            / (
+-                1.0
+-                + torch.exp(
+-                    -1
+-                    * objective.steepness
+-                    * (y[..., idx] - (objective.target_value - objective.tolerance)),
+-                )
+-            )
+-            * (
+-                1.0
+-                - 1.0
+-                / (
+-                    1.0
+-                    + torch.exp(
+-                        -1.0
+-                        * objective.steepness
+-                        * (
+-                            y[..., idx] - (objective.target_value + objective.tolerance)
+-                        ),
+-                    )
+-                )
+-            )
++        return lambda y, X=None: torch.sigmoid(
++            objective.steepness
++            * (y[..., idx] - (objective.target_value - objective.tolerance)),
++        ) * torch.sigmoid(
++            objective.steepness
++            * ((objective.target_value + objective.tolerance) - y[..., idx]),
+         )
+ 
+     if isinstance(objective, IncreasingDesirabilityObjective):
+diff --git a/tests/bofire/utils/test_torch_tools.py b/tests/bofire/utils/test_torch_tools.py
+index 451a8abc5..15cdb539b 100644
+--- a/tests/bofire/utils/test_torch_tools.py
++++ b/tests/bofire/utils/test_torch_tools.py
+@@ -1,4 +1,5 @@
+ import importlib
++import math
+ import random
+ 
+ import numpy as np
+@@ -151,6 +152,73 @@ def test_get_objective_callable(objective):
+     )
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
++@pytest.mark.parametrize(
++    "objective",
++    [
++        MaximizeSigmoidObjective(tp=2, steepness=2),
++        MinimizeSigmoidObjective(tp=2, steepness=2),
++        MovingMaximizeSigmoidObjective(tp=-1, steepness=2),
++        TargetObjective(target_value=2, tolerance=1, steepness=2),
++    ],
++)
++def test_sigmoid_objective_saturation(objective, dtype):
++    def sigmoid_and_derivative(logit):
++        tail = math.exp(-abs(logit))
++        value = 1 / (1 + tail) if logit >= 0 else tail / (1 + tail)
++        return value, tail / (1 + tail) ** 2
++
++    is_target = isinstance(objective, TargetObjective)
++    xs = [-1000, -19, 1, 2, 3, 23, 1000] if is_target else [-1000, -18, 2, 22, 1000]
++    expected_values, expected_gradients = [], []
++    for x in xs:
++        if is_target:
++            lower, lower_grad = sigmoid_and_derivative(2 * (x - 1))
++            upper, upper_grad = sigmoid_and_derivative(2 * (3 - x))
++            expected_values.append(lower * upper)
++            expected_gradients.append(2 * (lower_grad * upper - lower * upper_grad))
++        else:
++            sign = -1 if isinstance(objective, MinimizeSigmoidObjective) else 1
++            value, gradient = sigmoid_and_derivative(sign * 2 * (x - 2))
++            expected_values.append(value)
++            expected_gradients.append(sign * 2 * gradient)
++
++    samples = torch.tensor(
++        [[[17, x, -11] for x in xs]] * 2,
++        dtype=dtype,
++        requires_grad=True,
++    )
++    x_adapt = torch.tensor([1, 3], dtype=dtype)
++    values = get_objective_callable(1, objective, x_adapt)(samples)
++    gradients = torch.autograd.grad(values.sum(), samples)[0]
++    assert torch.isfinite(gradients).all()
++    eps = torch.finfo(dtype).eps
++    torch.testing.assert_close(
++        values,
++        torch.tensor(expected_values, dtype=dtype).expand_as(values),
++        rtol=8 * eps,
++        atol=0,
++    )
++    expected = torch.zeros_like(samples)
++    expected[..., 1] = torch.tensor(expected_gradients, dtype=dtype)
++    torch.testing.assert_close(gradients, expected, rtol=8 * eps, atol=16 * eps)
++    tail_idx = -2 if is_target or isinstance(objective, MinimizeSigmoidObjective) else 1
++    assert (values[..., tail_idx] > 0).all()
++    assert (gradients[..., tail_idx, 1].abs() > 0).all()
++
++    series = pd.Series(xs, index=[f"experiment-{i}" for i in range(len(xs))], name="y")
++    with np.errstate(over="raise", invalid="raise"):
++        rewards = objective(series, x_adapt=pd.Series([1, 3]))
++        array_rewards = objective(series.to_numpy(), x_adapt=np.array([1, 3]))
++    pd.testing.assert_series_equal(
++        rewards,
++        pd.Series(expected_values, index=series.index, name=series.name),
++        rtol=1e-14,
++        atol=0,
++    )
++    np.testing.assert_allclose(array_rewards, expected_values, rtol=1e-14, atol=0)
++
++
+ def test_moving_maximize_sigmoid_objective():
+     samples = (torch.rand(50, 3, requires_grad=True) * 5.0).to(**tkwargs)
+     a_samples = samples.detach().numpy()

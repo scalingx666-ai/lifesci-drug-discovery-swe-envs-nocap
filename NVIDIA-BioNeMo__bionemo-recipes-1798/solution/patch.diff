@@ -1,0 +1,320 @@
+diff --git a/models/esm2/export.py b/models/esm2/export.py
+index 748e467843..9189f51778 100644
+--- a/models/esm2/export.py
++++ b/models/esm2/export.py
+@@ -118,13 +118,21 @@ def export_hf_checkpoint(tag: str, export_path: Path):
+     gc.collect()
+     torch.cuda.empty_cache()
+ 
+-    # Smoke test that the model can be loaded.
++    # Smoke test that the exported model can be loaded and run with its bundled esm_nv.py.
+     model_te = AutoModelForMaskedLM.from_pretrained(
+         export_path / tag,
+         dtype=torch.bfloat16,
+         trust_remote_code=True,
+-    )
+-    del model_te
++    ).cuda()
++    model_te.eval()
++    tokenizer = AutoTokenizer.from_pretrained(export_path / tag)
++    inputs = tokenizer(["MKTAYIAKQRQISFVKSHFSRQ", "MLSRAVCGTSRQLAPVLGYLGSRQKHSLPD"], return_tensors="pt", padding=True)
++    inputs = {k: v.cuda() for k, v in inputs.items()}
++    with torch.no_grad():
++        outputs = model_te(**inputs)
++    if outputs.logits.shape[:2] != inputs["input_ids"].shape or not torch.isfinite(outputs.logits).all():
++        raise RuntimeError(f"Exported checkpoint {tag} failed the forward-pass smoke test.")
++    del model_te, tokenizer, inputs, outputs
+     gc.collect()
+     torch.cuda.empty_cache()
+ 
+diff --git a/models/esm2/modeling_esm_te.py b/models/esm2/modeling_esm_te.py
+index d9ed9341f2..63777f7b82 100644
+--- a/models/esm2/modeling_esm_te.py
++++ b/models/esm2/modeling_esm_te.py
+@@ -35,7 +35,6 @@
+ from torch.nn import CrossEntropyLoss
+ from transformer_engine.pytorch.attention.dot_product_attention import utils as te_attention_utils
+ from transformer_engine.pytorch.attention.rope import RotaryPositionEmbedding
+-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ from transformers.modeling_outputs import (
+     BaseModelOutput,
+     BaseModelOutputWithPooling,
+@@ -492,14 +491,9 @@ def forward(
+         if attention_mask is None:
+             attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+ 
+-        # Expand the [batch_size, seq_length] padding mask to a [batch_size, 1, 1, seq_length] additive mask
+-        # (0 for attended positions, dtype.min for masked positions) that broadcasts over heads and queries.
+-        extended_attention_mask: torch.Tensor = AttentionMaskConverter(is_causal=False).to_4d(
+-            attention_mask, query_length=1, dtype=self.dtype
+-        )
+-
+-        # TE expects a boolean attention mask, where True means masked and False means not masked
+-        extended_attention_mask = extended_attention_mask < -1
++        # TE expects a boolean [batch_size, 1, 1, seq_length] padding mask (broadcast over heads and queries),
++        # where True means masked and False means not masked.
++        extended_attention_mask = attention_mask[:, None, None, :] == 0
+ 
+         embedding_output = self.embeddings(
+             input_ids=input_ids,
+diff --git a/models/esm2/tests/test_export.py b/models/esm2/tests/test_export.py
+index 6e2dcef2ec..fd53dee77e 100644
+--- a/models/esm2/tests/test_export.py
++++ b/models/esm2/tests/test_export.py
+@@ -14,6 +14,7 @@
+ # limitations under the License.
+ 
+ import pytest
++import torch
+ from transformers import AutoModel, AutoModelForMaskedLM, AutoModelForTokenClassification, AutoTokenizer
+ 
+ from export import export_hf_checkpoint
+@@ -59,6 +60,24 @@ def test_auto_model_for_token_classification_loading(exported_8m_checkpoint):
+     assert not loading_info["error_msgs"]
+ 
+ 
++def test_exported_checkpoint_forward_pass(exported_8m_checkpoint):
++    """Test that the bundled esm_nv.py runs a padded forward pass, not just loads."""
++    model = AutoModelForMaskedLM.from_pretrained(
++        exported_8m_checkpoint, trust_remote_code=True, dtype=torch.bfloat16
++    ).cuda()
++    model.eval()
++    tokenizer = AutoTokenizer.from_pretrained(exported_8m_checkpoint)
++    inputs = tokenizer(["MKTAYIAKQRQISFVKSHFSRQ", "MLSRAVCGTSRQLAPVLGYLGSRQKHSLPD"], return_tensors="pt", padding=True)
++    inputs = {k: v.cuda() for k, v in inputs.items()}
++    assert not inputs["attention_mask"].all(), "Inputs should include padding to exercise the attention mask."
++
++    with torch.no_grad():
++        outputs = model(**inputs)
++
++    assert outputs.logits.shape[:2] == inputs["input_ids"].shape
++    assert torch.isfinite(outputs.logits).all()
++
++
+ def test_auto_tokenizer_loading(exported_8m_checkpoint):
+     tokenizer = AutoTokenizer.from_pretrained(exported_8m_checkpoint)
+     assert tokenizer is not None
+diff --git a/models/esm2/tests/test_hub_checkpoints.py b/models/esm2/tests/test_hub_checkpoints.py
+new file mode 100644
+index 0000000000..8fa30e2652
+--- /dev/null
++++ b/models/esm2/tests/test_hub_checkpoints.py
+@@ -0,0 +1,69 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Run the model code published to the `nvidia/esm2_*` Hugging Face Hub repos against the installed libraries.
++
++Each Hub repo bundles its own copy of the model code (`esm_nv.py`), which can break when transformers or Transformer
++Engine change even though the repo's `modeling_esm_te.py` is fine. These tests download only the config, remote
++code, and tokenizer (no weights), build a small randomly initialized model from the Hub config, and run a padded
++forward and backward pass.
++
++They run on the nightly scheduled CI, or locally with `ESM2_TEST_HUB_CHECKPOINTS=1`.
++"""
++
++import os
++
++import pytest
++import torch
++from transformers import AutoConfig, AutoModelForMaskedLM, AutoTokenizer, DataCollatorForLanguageModeling
++
++from export import ESM_TAGS
++
++
++pytestmark = pytest.mark.skipif(
++    os.environ.get("GITHUB_EVENT_NAME") != "schedule" and os.environ.get("ESM2_TEST_HUB_CHECKPOINTS") != "1",
++    reason="Hub checkpoint tests run on the nightly schedule or with ESM2_TEST_HUB_CHECKPOINTS=1.",
++)
++
++
++@pytest.mark.parametrize("tag", ESM_TAGS)
++def test_hub_remote_code_forward_backward(tag, test_proteins):
++    repo_id = f"nvidia/{tag}"
++    config = AutoConfig.from_pretrained(repo_id, trust_remote_code=True)
++    assert type(config).__name__ == "NVEsmConfig"
++
++    # Shrink the model so no weights need to be downloaded or materialized; the remote code path is unchanged.
++    config.num_hidden_layers = 2
++    config.hidden_size = 320
++    config.intermediate_size = 1280
++    config.num_attention_heads = 20
++
++    model = AutoModelForMaskedLM.from_config(config, trust_remote_code=True, dtype=torch.bfloat16).cuda()
++    assert type(model).__name__ == "NVEsmForMaskedLM"
++
++    tokenizer = AutoTokenizer.from_pretrained(repo_id)
++    collator = DataCollatorForLanguageModeling(
++        tokenizer=tokenizer, mlm_probability=0.15, pad_to_multiple_of=32, seed=42
++    )
++    batch = collator([tokenizer(p) for p in test_proteins])
++    batch = {k: v.cuda() for k, v in batch.items()}
++    assert not batch["attention_mask"].all(), "Inputs should include padding to exercise the attention mask."
++
++    outputs = model(**batch)
++    assert outputs.logits.shape[:2] == batch["input_ids"].shape
++    assert torch.isfinite(outputs.loss)
++
++    outputs.loss.backward()
++    assert all(p.grad is not None for p in model.parameters() if p.requires_grad)
+diff --git a/recipes/esm2_accelerate_te/example_8m_checkpoint/esm_nv.py b/recipes/esm2_accelerate_te/example_8m_checkpoint/esm_nv.py
+index e218652789..a542ca7993 100644
+--- a/recipes/esm2_accelerate_te/example_8m_checkpoint/esm_nv.py
++++ b/recipes/esm2_accelerate_te/example_8m_checkpoint/esm_nv.py
+@@ -41,7 +41,6 @@
+ from torch.nn import CrossEntropyLoss
+ from transformer_engine.pytorch.attention.dot_product_attention import utils as te_attention_utils
+ from transformer_engine.pytorch.attention.rope import RotaryPositionEmbedding
+-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ from transformers.modeling_outputs import (
+     BaseModelOutput,
+     BaseModelOutputWithPooling,
+@@ -498,14 +497,9 @@ def forward(
+         if attention_mask is None:
+             attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+ 
+-        # Expand the [batch_size, seq_length] padding mask to a [batch_size, 1, 1, seq_length] additive mask
+-        # (0 for attended positions, dtype.min for masked positions) that broadcasts over heads and queries.
+-        extended_attention_mask: torch.Tensor = AttentionMaskConverter(is_causal=False).to_4d(
+-            attention_mask, query_length=1, dtype=self.dtype
+-        )
+-
+-        # TE expects a boolean attention mask, where True means masked and False means not masked
+-        extended_attention_mask = extended_attention_mask < -1
++        # TE expects a boolean [batch_size, 1, 1, seq_length] padding mask (broadcast over heads and queries),
++        # where True means masked and False means not masked.
++        extended_attention_mask = attention_mask[:, None, None, :] == 0
+ 
+         embedding_output = self.embeddings(
+             input_ids=input_ids,
+diff --git a/recipes/esm2_native_te/modeling_esm_te.py b/recipes/esm2_native_te/modeling_esm_te.py
+index e218652789..a542ca7993 100644
+--- a/recipes/esm2_native_te/modeling_esm_te.py
++++ b/recipes/esm2_native_te/modeling_esm_te.py
+@@ -41,7 +41,6 @@
+ from torch.nn import CrossEntropyLoss
+ from transformer_engine.pytorch.attention.dot_product_attention import utils as te_attention_utils
+ from transformer_engine.pytorch.attention.rope import RotaryPositionEmbedding
+-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ from transformers.modeling_outputs import (
+     BaseModelOutput,
+     BaseModelOutputWithPooling,
+@@ -498,14 +497,9 @@ def forward(
+         if attention_mask is None:
+             attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+ 
+-        # Expand the [batch_size, seq_length] padding mask to a [batch_size, 1, 1, seq_length] additive mask
+-        # (0 for attended positions, dtype.min for masked positions) that broadcasts over heads and queries.
+-        extended_attention_mask: torch.Tensor = AttentionMaskConverter(is_causal=False).to_4d(
+-            attention_mask, query_length=1, dtype=self.dtype
+-        )
+-
+-        # TE expects a boolean attention mask, where True means masked and False means not masked
+-        extended_attention_mask = extended_attention_mask < -1
++        # TE expects a boolean [batch_size, 1, 1, seq_length] padding mask (broadcast over heads and queries),
++        # where True means masked and False means not masked.
++        extended_attention_mask = attention_mask[:, None, None, :] == 0
+ 
+         embedding_output = self.embeddings(
+             input_ids=input_ids,
+diff --git a/recipes/esm2_peft_te/example_8m_checkpoint/esm_nv.py b/recipes/esm2_peft_te/example_8m_checkpoint/esm_nv.py
+index e218652789..a542ca7993 100644
+--- a/recipes/esm2_peft_te/example_8m_checkpoint/esm_nv.py
++++ b/recipes/esm2_peft_te/example_8m_checkpoint/esm_nv.py
+@@ -41,7 +41,6 @@
+ from torch.nn import CrossEntropyLoss
+ from transformer_engine.pytorch.attention.dot_product_attention import utils as te_attention_utils
+ from transformer_engine.pytorch.attention.rope import RotaryPositionEmbedding
+-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ from transformers.modeling_outputs import (
+     BaseModelOutput,
+     BaseModelOutputWithPooling,
+@@ -498,14 +497,9 @@ def forward(
+         if attention_mask is None:
+             attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+ 
+-        # Expand the [batch_size, seq_length] padding mask to a [batch_size, 1, 1, seq_length] additive mask
+-        # (0 for attended positions, dtype.min for masked positions) that broadcasts over heads and queries.
+-        extended_attention_mask: torch.Tensor = AttentionMaskConverter(is_causal=False).to_4d(
+-            attention_mask, query_length=1, dtype=self.dtype
+-        )
+-
+-        # TE expects a boolean attention mask, where True means masked and False means not masked
+-        extended_attention_mask = extended_attention_mask < -1
++        # TE expects a boolean [batch_size, 1, 1, seq_length] padding mask (broadcast over heads and queries),
++        # where True means masked and False means not masked.
++        extended_attention_mask = attention_mask[:, None, None, :] == 0
+ 
+         embedding_output = self.embeddings(
+             input_ids=input_ids,
+diff --git a/recipes/vllm_inference/esm2/export.py b/recipes/vllm_inference/esm2/export.py
+index 2c141261a3..c42db112ae 100644
+--- a/recipes/vllm_inference/esm2/export.py
++++ b/recipes/vllm_inference/esm2/export.py
+@@ -124,13 +124,21 @@ def export_hf_checkpoint(tag: str, export_path: Path):
+     gc.collect()
+     torch.cuda.empty_cache()
+ 
+-    # Smoke test that the model can be loaded.
++    # Smoke test that the exported model can be loaded and run with its bundled esm_nv.py.
+     model_te = AutoModelForMaskedLM.from_pretrained(
+         export_path / tag,
+         dtype=torch.bfloat16,
+         trust_remote_code=True,
+-    )
+-    del model_te
++    ).cuda()
++    model_te.eval()
++    tokenizer = AutoTokenizer.from_pretrained(export_path / tag)
++    inputs = tokenizer(["MKTAYIAKQRQISFVKSHFSRQ", "MLSRAVCGTSRQLAPVLGYLGSRQKHSLPD"], return_tensors="pt", padding=True)
++    inputs = {k: v.cuda() for k, v in inputs.items()}
++    with torch.no_grad():
++        outputs = model_te(**inputs)
++    if outputs.logits.shape[:2] != inputs["input_ids"].shape or not torch.isfinite(outputs.logits).all():
++        raise RuntimeError(f"Exported checkpoint {tag} failed the forward-pass smoke test.")
++    del model_te, tokenizer, inputs, outputs
+     gc.collect()
+     torch.cuda.empty_cache()
+ 
+diff --git a/recipes/vllm_inference/esm2/modeling_esm_te.py b/recipes/vllm_inference/esm2/modeling_esm_te.py
+index e218652789..a542ca7993 100644
+--- a/recipes/vllm_inference/esm2/modeling_esm_te.py
++++ b/recipes/vllm_inference/esm2/modeling_esm_te.py
+@@ -41,7 +41,6 @@
+ from torch.nn import CrossEntropyLoss
+ from transformer_engine.pytorch.attention.dot_product_attention import utils as te_attention_utils
+ from transformer_engine.pytorch.attention.rope import RotaryPositionEmbedding
+-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+ from transformers.modeling_outputs import (
+     BaseModelOutput,
+     BaseModelOutputWithPooling,
+@@ -498,14 +497,9 @@ def forward(
+         if attention_mask is None:
+             attention_mask = torch.ones(((batch_size, seq_length)), device=device)
+ 
+-        # Expand the [batch_size, seq_length] padding mask to a [batch_size, 1, 1, seq_length] additive mask
+-        # (0 for attended positions, dtype.min for masked positions) that broadcasts over heads and queries.
+-        extended_attention_mask: torch.Tensor = AttentionMaskConverter(is_causal=False).to_4d(
+-            attention_mask, query_length=1, dtype=self.dtype
+-        )
+-
+-        # TE expects a boolean attention mask, where True means masked and False means not masked
+-        extended_attention_mask = extended_attention_mask < -1
++        # TE expects a boolean [batch_size, 1, 1, seq_length] padding mask (broadcast over heads and queries),
++        # where True means masked and False means not masked.
++        extended_attention_mask = attention_mask[:, None, None, :] == 0
+ 
+         embedding_output = self.embeddings(
+             input_ids=input_ids,

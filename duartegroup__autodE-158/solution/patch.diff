@@ -1,0 +1,455 @@
+diff --git a/autode/calculation.py b/autode/calculation.py
+index b3190f286..f85d38233 100644
+--- a/autode/calculation.py
++++ b/autode/calculation.py
+@@ -412,7 +412,8 @@ def get_hessian(self) -> Hessian:
+         try:
+             hessian = Hessian(self.method.get_hessian(self),
+                               atoms=self.get_final_atoms(),
+-                              units='Ha/ang^2')
++                              units='Ha/ang^2',
++                              functional=self.input.keywords.functional)
+ 
+             assert hessian.shape == (3*self.molecule.n_atoms,
+                                      3*self.molecule.n_atoms)
+diff --git a/autode/config.py b/autode/config.py
+index 7dcf4b2e7..dd0679fd4 100644
+--- a/autode/config.py
++++ b/autode/config.py
+@@ -158,6 +158,12 @@ class _ConfigClass:
+     # value before the entropy is calculated
+     vib_freq_shift = Frequency(100, units='cm-1')
+     # -------------------------------------------------------------------------
++    # Frequency scale factor, useful for DFT functions known to have a
++    # systematic error. This value must be between 0 and 1 inclusive. For
++    # example, PBEh-3c has a scale factor of 0.95.
++    #
++    freq_scale_factor = None
++    # -------------------------------------------------------------------------
+     # Minimum number of atoms that are removed for truncation to be used in
+     # locating TSs. Below this number any truncation is skipped
+     #
+@@ -368,6 +374,15 @@ def __setattr__(self, key, value):
+         if key == 'max_core':
+             value = Allocation(value).to('MB')
+ 
++        if key == 'freq_scale_factor':
++
++            if value is not None:
++                if not (0. < value <= 1.):
++                    raise ValueError("Cannot set the frequency scale factor "
++                                     "outside of (0, 1]")
++
++                value = float(value)
++
+         if key in ('max_atom_displacement', 'min_step_size', 'max_step_size'):
+             if float(value) < 0:
+                 raise ValueError(f'Distances cannot be negative. Had: {value}')
+diff --git a/autode/hessians.py b/autode/hessians.py
+index fb9e28eb7..4e40d4a1f 100644
+--- a/autode/hessians.py
++++ b/autode/hessians.py
+@@ -3,8 +3,9 @@
+ for mathematical background
+ """
+ import numpy as np
+-from typing import List, Tuple, Iterator, Optional, Sequence
++from typing import List, Tuple, Iterator, Optional, Sequence, Union
+ from multiprocessing import Pool
++from autode.wrappers.keywords import Functional
+ from autode.wrappers.keywords import GradientKeywords
+ from autode.log import logger
+ from autode.utils import cached_property
+@@ -13,7 +14,7 @@
+ from autode import methods
+ from autode.values import ValueArray, Frequency, Coordinates
+ from autode.utils import work_in, hashable
+-from autode.units import (wavenumber,
++from autode.units import (Unit, wavenumber,
+                           ha_per_ang_sq, ha_per_a0_sq, J_per_m_sq, J_per_ang_sq,
+                           J_per_ang_sq_kg)
+ 
+@@ -31,23 +32,23 @@ def __hash__(self):
+         return hash(str(self))
+ 
+     def __new__(cls,
+-                input_array,
+-                units=ha_per_ang_sq,
+-                atoms=None):
++                input_array: np.ndarray,
++                units:       Union[Unit, str] = ha_per_ang_sq,
++                atoms:       Optional['autode.atoms.Atoms'] = None,
++                functional:  Optional[Functional] = None):
+         """
+         Hessian matrix
+ 
+         -----------------------------------------------------------------------
+         Arguments:
+-            input_array (np.ndarray | autode.values.ValueArray):
+-            units (autode.units.Unit | str):
+-            atoms (list(autode.atoms.Atom) | None):
+-
+-        Returns:
+-            (autode.thermo.hessians.Hessian):
++            input_array: Hessian matrix
++            units: Units of the Hessian
++            atoms: Atoms on which the Hessian has been calculated
++            functional: Density functional used to derive the frequency scaling
++                        factor
+ 
+         Raises:
+-            (ValueError):
++            (ValueError): If the atoms are not the correct shape
+         """
+         arr = super().__new__(cls, input_array, units=units)
+ 
+@@ -55,7 +56,9 @@ def __new__(cls,
+             raise ValueError(f'Shape mismatch. Expecting '
+                              f'{input_array.shape[0]//3} atoms from the Hessian'
+                              f' shape, but had {len(atoms)}')
++
+         arr.atoms = atoms
++        arr.functional = functional
+ 
+         return arr
+ 
+@@ -273,11 +276,23 @@ def normal_modes_proj(self) -> List[Coordinates]:
+ 
+         return modes
+ 
+-    @staticmethod
+-    def _eigenvalues_to_freqs(lambdas) -> List[Frequency]:
++    @property
++    def _freq_scale_factor(self) -> float:
++        """Determine the correct frequency scale factor"""
++
++        if Config.freq_scale_factor is not None:
++            return Config.freq_scale_factor
++
++        if self.functional is not None:
++            return self.functional.freq_scale_factor
++
++        return 1.0
++
++    def _eigenvalues_to_freqs(self, lambdas) -> List[Frequency]:
+         """
+         Convert eigenvalues of the Hessian matrix (SI units) to
+-        frequencies in wavenumber units
++        frequencies in wavenumber units. Will use ade.Config.freq_scale_factor
++        to scale the frequencies.
+ 
+         -----------------------------------------------------------------------
+         Arguments:
+@@ -289,10 +304,12 @@ def _eigenvalues_to_freqs(lambdas) -> List[Frequency]:
+ 
+         nus = (np.sqrt(np.complex_(lambdas))
+                / (2.0 * np.pi * Constants.ang_to_m * Constants.c_in_cm))
++        nus *= self._freq_scale_factor
+ 
+         # Cast the purely complex eigenvalues to negative real numbers, as is
+         # usual in quantum chemistry codes
+-        nus[np.iscomplex(nus)] = -np.abs(nus[np.iscomplex(nus)])
++        idx_to_alter = np.iscomplex(nus)
++        nus[idx_to_alter] = -np.abs(nus[idx_to_alter])
+ 
+         return [Frequency(np.real(nu), units=wavenumber) for nu in nus]
+ 
+diff --git a/autode/wrappers/ORCA.py b/autode/wrappers/ORCA.py
+index bd838df34..ef4a6d300 100644
+--- a/autode/wrappers/ORCA.py
++++ b/autode/wrappers/ORCA.py
+@@ -467,6 +467,13 @@ def get_keywords(self, calc_input, molecule):
+         new_keywords = kwds_cls()
+ 
+         for keyword in calc_input.keywords:
++
++            if 'scalfreq' in keyword.lower():
++                raise UnsupportedCalculationInput(
++                    "Frequency scaling within ORCA will not alter the "
++                    "calculated frequencies. Use ade.Config.freq_scale_factor"
++                )
++
+             if 'opt' in keyword.lower() and molecule.n_atoms == 1:
+                 logger.warning('Can\'t optimise a single atom')
+                 continue
+diff --git a/autode/wrappers/functionals.py b/autode/wrappers/functionals.py
+index 93d4c74d0..a79c1209c 100644
+--- a/autode/wrappers/functionals.py
++++ b/autode/wrappers/functionals.py
+@@ -1,3 +1,8 @@
++"""
++Functional instances. Frequency scale factors have been obtained from
++https://cccbdb.nist.gov/vibscalejust.asp and the basis set dependence assumed
++to be negligible at least double zetas (i.e. >6-31G)
++"""
+ from autode.wrappers.keywords import Functional
+ 
+ pbe0 = Functional(name='pbe0',
+@@ -5,11 +10,15 @@
+                   orca='PBE0',
+                   g09='PBE1PBE',
+                   nwchem='pbe0',
+-                  qchem='pbe0')
++                  qchem='pbe0',
++                  freq_scale_factor=0.96
++                  )
+ 
+ pbe = Functional(name='pbe',
+                  doi_list=['10.1103/PhysRevLett.77.3865'],
+                  orca='PBE',
+                  g09='PBEPBE',
+                  nwchem='xpbe96 cpbe96',
+-                 qchem='pbe')
++                 qchem='pbe',
++                 freq_scale_factor=0.99
++                 )
+diff --git a/autode/wrappers/keywords.py b/autode/wrappers/keywords.py
+index d6e1faa8e..df1f3a1e7 100644
+--- a/autode/wrappers/keywords.py
++++ b/autode/wrappers/keywords.py
+@@ -502,11 +502,13 @@ def doi_str(self):
+ 
+     @property
+     def has_only_name(self):
+-        """Determine if only a name has been set, in which case it will
++        """
++        Determine if only a name has been set, in which case it will
+         be printed verbatim into an input file, otherwise needs keyword.method
+-        to be set, where method is e.g. orca"""
++        to be set, where method is e.g. orca
++        """
+ 
+-        excl_attrs = ('name', 'doi_list')
++        excl_attrs = ('name', 'doi_list', 'freq_scale_factor')
+         for attr in self.__dict__:
+             if attr in excl_attrs:
+                 continue
+@@ -532,9 +534,24 @@ def __repr__(self):
+ class Functional(Keyword):
+     """Functional for a DFT method"""
+ 
++    def __init__(self, name,
++                 doi=None,
++                 doi_list=None,
++                 freq_scale_factor: float = 1.0,
++                 **kwargs):
++        super().__init__(name, doi=doi, doi_list=doi_list, **kwargs)
++
++        self.freq_scale_factor = freq_scale_factor
++
+     def __repr__(self):
+         return f'Functional({self.name})'
+ 
++    def __eq__(self, other):
++        return isinstance(other, Functional) and self.name == other.name
++
++    def __hash__(self):
++        return hash(self.name)
++    
+ 
+ class ImplicitSolventType(Keyword):
+     """
+diff --git a/doc/changelog.rst b/doc/changelog.rst
+index 28e9fb951..2d323360d 100644
+--- a/doc/changelog.rst
++++ b/doc/changelog.rst
+@@ -19,6 +19,7 @@ Functionality improvements
+ **************************
+ - Adds a :code:`autode.atoms.Atom.covalent_radius` property
+ - Adds a :code:`autode.atoms.Atoms.eqm_bond_distance` method for the equilibrium bonded distance between two atoms
++- Adds vibrational frequency scaling through both :code:`autode.Config.freq_scale_factor` and a default value in wrapped functional keywords
+ 
+ 
+ Bug Fixes
+diff --git a/doc/examples/thermochem.rst b/doc/examples/thermochem.rst
+index b5351558a..1eb2d60d2 100644
+--- a/doc/examples/thermochem.rst
++++ b/doc/examples/thermochem.rst
+@@ -145,6 +145,22 @@ which differs from the Gaussian-calculated value (0.104216 Ha) by ~0.01 kcal mol
+     Gaussian 09 has very tight tolerances on symmetry and uses a pure
+     harmonic oscillator treatment of low frequency modes.
+ 
++*****************
++
++Frequency scaling
++-----------------
++
++Default methods use frequency scaling automatically to generate the most accurate
++thermochemistry possible. Unscaled frequencies can be obtained by setting
++
++.. code-block:: Python
++
++    ade.Config.freq_scale_factor = 1.0
++
++.. note::
++
++    The above examples were generated using unscaled frequencies.
++
+ 
+ References
+ ----------
+diff --git a/tests/test_config.py b/tests/test_config.py
+index 2d731d350..de646e74f 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -46,6 +46,13 @@ def test_maxcore_setter():
+     assert int(_config.max_core.to('MB')) == 1000
+ 
+ 
++@pytest.mark.parametrize("factor", (-0.1, 1.1, "a string"))
++def test_invalid_freq_scale_factor(factor):
++
++    with pytest.raises(Exception):
++        Config.freq_scale_factor = factor
++
++
+ def test_unknown_attr():
+ 
+     # Attributes not already present should raise an exception e.g. for
+diff --git a/tests/test_hessian.py b/tests/test_hessian.py
+index 3450a7b2e..54736e7e9 100644
+--- a/tests/test_hessian.py
++++ b/tests/test_hessian.py
+@@ -3,14 +3,16 @@
+ import numpy as np
+ import autode as ade
+ from . import testutils
++from autode.config import Config
+ from autode.atoms import Atom, Atoms
+ from autode.methods import ORCA, XTB
+ from autode.calculation import Calculation
+ from autode.species import Molecule
+-from autode.values import Frequency, Distance
++from autode.values import Frequency
+ from autode.geom import calc_rmsd
+ from autode.units import wavenumber
+ from autode.exceptions import CalculationException
++from autode.wrappers.functionals import pbe0
+ from autode.transition_states.base import displaced_species_along_mode
+ from autode.values import Distance
+ from autode.wrappers.keywords import HessianKeywords, GradientKeywords
+@@ -19,7 +21,7 @@
+                              HybridHessianCalculator)
+ 
+ here = os.path.dirname(os.path.abspath(__file__))
+-
++Config.freq_scale_factor = 1.0
+ 
+ # Ha/Å-2
+ h2o_hessian_arr = np.array([[2.31423829e+00,  1.56166837e-02,  8.61890193e-09,
+@@ -166,6 +168,46 @@ def test_hessian_freqs():
+     assert np.isclose(nu_3, 3651.462209, atol=1.0)
+ 
+ 
++def test_hessian_scaled_freqs():
++
++    h2o = Molecule(smiles='O')
++    h2o.hessian = h2o_hessian_arr
++
++    nu_no_scaling = h2o.hessian.frequencies_proj[-1]
++
++    Config.freq_scale_factor = 0.9
++    h2o.hessian = h2o_hessian_arr
++
++    assert np.isclose(0.9 * nu_no_scaling,
++                      h2o.hessian.frequencies_proj[-1]
++                      )
++
++    Config.freq_scale_factor = None
++
++
++def test_hessian_scale_factor():
++
++    h2o = Molecule(smiles='O')
++    hessian = Hessian(h2o_hessian_arr, atoms=h2o.atoms, functional=pbe0)
++
++    # 0.96 is the appropriate scale factor for PBE0, also known as PBE1PBE in
++    # Gaussian
++    assert np.isclose(hessian._freq_scale_factor, 0.96)
++
++    Config.freq_scale_factor = 0.9
++    assert np.isclose(hessian._freq_scale_factor, 0.9)
++
++    Config.freq_scale_factor = 1.0
++    hessian.functional = None
++    assert np.isclose(hessian._freq_scale_factor, 1.0)
++
++    Config.freq_scale_factor = None
++    hessian.functional = None
++    assert np.isclose(hessian._freq_scale_factor, 1.0)
++
++    Config.freq_scale_factor = 1.0
++
++
+ @testutils.work_in_zipped_dir(os.path.join(here, 'data', 'hessians.zip'))
+ def test_hessian_modes():
+     """Ensure the translational, rotational and vibrational modes are close
+diff --git a/tests/test_keywords.py b/tests/test_keywords.py
+index 65078f784..ab7e721c9 100644
+--- a/tests/test_keywords.py
++++ b/tests/test_keywords.py
+@@ -213,3 +213,9 @@ def test_keywords_contain():
+     assert kwds.contain_any_of('opt')
+ 
+     assert not kwds.contain_any_of('PBE0')
++
++
++def test_functional_equality():
++
++    assert Functional("PBE0") == Functional("PBE0")
++    assert Functional("PBE0") != 1
+diff --git a/tests/test_orca_calc.py b/tests/test_orca_calc.py
+index f0e2626ff..a77909f33 100644
+--- a/tests/test_orca_calc.py
++++ b/tests/test_orca_calc.py
+@@ -7,10 +7,10 @@
+ from autode.calculation import execute_calc
+ from autode.species.molecule import Molecule
+ from autode.input_output import xyz_file_to_atoms
+-from autode.wrappers.keywords import SinglePointKeywords, OptKeywords
++from autode.wrappers.keywords import SinglePointKeywords, OptKeywords, HessianKeywords
+ from autode.wrappers.keywords import Functional, WFMethod, BasisSet
+ from autode.wrappers.implicit_solvent_types import cpcm
+-from autode.exceptions import CouldNotGetProperty
++from autode.exceptions import CouldNotGetProperty, UnsupportedCalculationInput
+ from autode.solvent.solvents import ImplicitSolvent
+ from autode.transition_states.transition_state import TransitionState
+ from autode.transition_states.ts_guess import TSguess
+@@ -259,15 +259,16 @@ def test_mp2_numerical_gradients():
+ def test_keyword_setting():
+ 
+     orca = ORCA()
+-    orca.keywords.sp.functional = 'B3LYP'
++    kwds = orca.keywords.sp
++    kwds.functional = 'B3LYP'
+ 
+     # Setter should generate a Functional from the keyword string
+-    assert isinstance(orca.keywords.sp.functional, Functional)
++    assert isinstance(kwds.functional, Functional)
+ 
+     calc = Calculation(name='tmp',
+                        molecule=test_mol.copy(),
+                        method=orca,
+-                       keywords=orca.keywords.sp)
++                       keywords=kwds)
+     calc.generate_input()
+     assert calc.input.exists
+ 
+@@ -366,3 +367,17 @@ def test_charges_from_v5_output_file():
+ 
+     #                                       q_O        q_H       q_H
+     assert calc.get_atomic_charges() == [-0.313189, 0.156594, 0.156594]
++
++
++def test_unsupported_freq_scaling():
++
++    kwds = HessianKeywords(['Freq', 'PBE0', 'def2-SVP',
++                            '%freq\nscalfreq 0.95\nend'])
++
++    calc = Calculation(name='opt',
++                       molecule=test_mol,
++                       method=method,
++                       keywords=kwds)
++
++    with pytest.raises(UnsupportedCalculationInput):
++        calc.generate_input()

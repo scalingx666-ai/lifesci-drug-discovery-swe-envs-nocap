@@ -1,0 +1,408 @@
+diff --git a/polaris/benchmark/_base.py b/polaris/benchmark/_base.py
+index af97fb91..d3adbd66 100644
+--- a/polaris/benchmark/_base.py
++++ b/polaris/benchmark/_base.py
+@@ -1,9 +1,11 @@
+ import json
++import os
+ from hashlib import md5
+ from typing import Any, Optional, Union
+ 
+ import fsspec
+ import numpy as np
++import pandas as pd
+ from pydantic import (
+     ConfigDict,
+     FieldValidationInfo,
+@@ -15,6 +17,7 @@
+ from polaris._artifact import BaseArtifactModel
+ from polaris.dataset import Dataset, Subset
+ from polaris.evaluate import BenchmarkResults, Metric, ResultsType
++from polaris.hub.settings import PolarisHubSettings
+ from polaris.utils import fs
+ from polaris.utils.context import tmp_attribute_change
+ from polaris.utils.dict2html import dict2html
+@@ -333,40 +336,59 @@ def evaluate(self, y_pred: PredictionsType) -> BenchmarkResults:
+ 
+         if not isinstance(y_pred, dict) or all(k in self.target_cols for k in y_pred):
+             y_pred = {"test": y_pred}
++
+         if any(k not in y_pred for k in test.keys()):
+             raise KeyError(
+                 f"Missing keys for at least one of the test sets. Expecting: {sorted(test.keys())}"
+             )
+ 
+-        scores: ResultsType = {}
++        # Results are saved in a tabular format. For more info, see the BenchmarkResults docs.
++        scores: ResultsType = pd.DataFrame(columns=BenchmarkResults.RESULTS_COLUMNS)
+ 
+         # For every test set...
+         for test_label, y_true_subset in y_true.items():
+-            scores[test_label] = {}
+-
+             # For every metric...
+             for metric in self.metrics:
+-                if metric.is_multitask or not isinstance(y_true_subset, dict):
+-                    # Either single-task or multi-task but with a metric across targets
+-                    scores[test_label][metric] = metric(y_true=y_true_subset, y_pred=y_pred[test_label])
++                if metric.is_multitask:
++                    # Multi-task but with a metric across targets
++                    score = metric(y_true=y_true_subset, y_pred=y_pred[test_label])
++                    scores.loc[len(scores)] = (test_label, "all", metric, score)
++                    continue
++
++                if not isinstance(y_true_subset, dict):
++                    # Single task
++                    score = metric(y_true=y_true_subset, y_pred=y_pred[test_label])
++                    scores.loc[len(scores)] = (test_label, self.target_cols[0], metric, score)
+                     continue
+ 
+                 # Otherwise, for every target...
+                 for target_label, y_true_target in y_true_subset.items():
+-                    if target_label not in scores[test_label]:
+-                        scores[test_label][target_label] = {}
+-
+                     # Single-task metrics for a multi-task benchmark
+                     # In such a setting, there can be NaN values, which we thus have to filter out.
+                     mask = ~np.isnan(y_true_target)
+                     score = metric(y_true=y_true_target[mask], y_pred=y_pred[test_label][target_label][mask])
+-                    scores[test_label][target_label][metric] = score
+-
+-        if len(scores) == 1:
+-            scores = scores["test"]
++                    scores.loc[len(scores)] = (test_label, target_label, metric, score)
+ 
+         return BenchmarkResults(results=scores, benchmark_name=self.name, benchmark_owner=self.owner)
+ 
++    def upload_to_hub(
++        self,
++        env_file: Optional[Union[str, os.PathLike]] = None,
++        settings: Optional[PolarisHubSettings] = None,
++        cache_auth_token: bool = True,
++        **kwargs: dict,
++    ):
++        """
++        Very light, convenient wrapper around the
++        [`PolarisHubClient.upload_benchmark`][polaris.hub.client.PolarisHubClient.upload_benchmark] method.
++        """
++        from polaris.hub.client import PolarisHubClient
++
++        with PolarisHubClient(
++            env_file=env_file, settings=settings, cache_auth_token=cache_auth_token, **kwargs
++        ) as client:
++            return client.upload_benchmark(self)
++
+     def to_json(self, destination: str) -> str:
+         """Save the benchmark to a destination directory as a JSON file.
+ 
+diff --git a/polaris/dataset/_dataset.py b/polaris/dataset/_dataset.py
+index 448a751a..7ba79405 100644
+--- a/polaris/dataset/_dataset.py
++++ b/polaris/dataset/_dataset.py
+@@ -18,6 +18,7 @@
+ 
+ from polaris._artifact import BaseArtifactModel
+ from polaris.dataset._column import ColumnAnnotation
++from polaris.hub.settings import PolarisHubSettings
+ from polaris.utils import fs
+ from polaris.utils.constants import DEFAULT_CACHE_DIR
+ from polaris.utils.dict2html import dict2html
+@@ -201,6 +202,24 @@ def _load(p: str, index: Optional[int]) -> np.ndarray:
+             self._has_been_warned = True
+         return _load(value, index)
+ 
++    def upload_to_hub(
++        self,
++        env_file: Optional[Union[str, os.PathLike]] = None,
++        settings: Optional[PolarisHubSettings] = None,
++        cache_auth_token: bool = True,
++        **kwargs: dict,
++    ):
++        """
++        Very light, convenient wrapper around the
++        [`PolarisHubClient.upload_dataset`][polaris.hub.client.PolarisHubClient.upload_dataset] method.
++        """
++        from polaris.hub.client import PolarisHubClient
++
++        with PolarisHubClient(
++            env_file=env_file, settings=settings, cache_auth_token=cache_auth_token, **kwargs
++        ) as client:
++            return client.upload_dataset(self)
++
+     @classmethod
+     def from_zarr(cls, path: str) -> "Dataset":
+         """Parse a [.zarr](https://zarr.readthedocs.io/en/stable/index.html) hierarchy into a Polaris `Dataset`.
+diff --git a/polaris/evaluate/_results.py b/polaris/evaluate/_results.py
+index d5a47a26..df2ee34a 100644
+--- a/polaris/evaluate/_results.py
++++ b/polaris/evaluate/_results.py
+@@ -1,22 +1,23 @@
+ import json
++import os
+ from datetime import datetime
+-from typing import Optional, Union
++from typing import ClassVar, Optional, Union
+ 
+-from pydantic import ConfigDict, Field, PrivateAttr, field_serializer
++import pandas as pd
++from pydantic import ConfigDict, Field, PrivateAttr, field_serializer, field_validator
+ 
+ from polaris._artifact import BaseArtifactModel
+-from polaris.evaluate._metric import Metric
++from polaris.evaluate import Metric
++from polaris.hub.settings import PolarisHubSettings
+ from polaris.utils.dict2html import dict2html
++from polaris.utils.errors import InvalidResultError
+ from polaris.utils.misc import to_lower_camel
+ from polaris.utils.types import HttpUrlString, HubOwner, HubUser
+ 
+ # Define some helpful type aliases
+ TestLabelType = str
+ TargetLabelType = str
+-MetricScoresType = dict[Union[str, Metric], float]
+-ResultsType = Union[
+-    MetricScoresType, dict[TestLabelType, Union[MetricScoresType, dict[TargetLabelType, MetricScoresType]]]
+-]
++ResultsType = Union[pd.DataFrame, dict]
+ 
+ 
+ class BenchmarkResults(BaseArtifactModel):
+@@ -26,13 +27,23 @@ class BenchmarkResults(BaseArtifactModel):
+     In addition to the metrics on the test set, it contains additional meta-data and logic to integrate
+     the results with the Polaris Hub.
+ 
++    The actual results are saved in the `results` field using the following tabular format:
++
++    | Test set | Target label | Metric | Score |
++    | -------- | ------------ | ------ | ----- |
++    | test_iid | EGFR_WT      | AUC    | 0.9   |
++    | test_ood | EGFR_WT      | AUC    | 0.75  |
++    |    ...   |      ...     |  ...   |  ...  |
++    | test_ood | EGFR_L858R   | AUC    | 0.79  |
++
+     question: Categorizing methods
+         An open question is how to best categorize a methodology (e.g. a model).
+         This is needed since we would like to be able to aggregate results across benchmarks too,
+         to say something about which (type of) methods performs best _in general_.
+ 
+     Attributes:
+-        results: Benchmark results are stored as a dictionary
++        results: Benchmark results are stored directly in a dataframe or in a serialized, JSON compatible dict
++            with the split orientation that can be decoded into the associated tabular format.
+         benchmark_name: The name of the benchmark for which these results were generated.
+             Together with the benchmark owner, this uniquely identifies the benchmark on the Hub.
+         benchmark_owner: The owner of the benchmark for which these results were generated.
+@@ -44,6 +55,9 @@ class BenchmarkResults(BaseArtifactModel):
+     For additional meta-data attributes, see the [`BaseArtifactModel`][polaris._artifact.BaseArtifactModel] class.
+     """
+ 
++    # Define the columns of the results table
++    RESULTS_COLUMNS: ClassVar[list[str]] = ["Test set", "Target label", "Metric", "Score"]
++
+     # Data
+     results: ResultsType
+     benchmark_name: str = Field(..., frozen=True)
+@@ -57,23 +71,75 @@ class BenchmarkResults(BaseArtifactModel):
+     # Private attributes
+     _created_at: datetime = PrivateAttr(default_factory=datetime.now)
+ 
+-    model_config = ConfigDict(alias_generator=to_lower_camel, populate_by_name=True)
++    # Model config
++    model_config = ConfigDict(
++        alias_generator=to_lower_camel, populate_by_name=True, arbitrary_types_allowed=True
++    )
++
++    @field_validator("results")
++    def _validate_results(cls, v):
++        """Ensure the results are a valid dataframe and have the expected columns"""
++
++        # If not a dataframe, assume it is a JSON-serialized, split-oriented export of a dataframe.
++        if not isinstance(v, pd.DataFrame):
++            try:
++                v = pd.read_json(json.dumps(v), orient="split")
++            except (ValueError, UnicodeDecodeError) as error:
++                print(error)
++                raise InvalidResultError(
++                    "The provided dictionary is not a valid, split-oriented JSON export of a Pandas dataframe"
++                ) from error
++
++        # Check if the dataframe contains _only_ the expected columns
++        if set(v.columns) != set(cls.RESULTS_COLUMNS):
++            raise InvalidResultError(
++                f"The results dataframe should have the following columns: {cls.RESULTS_COLUMNS}"
++            )
++
++        # Check if the results are not empty
++        if v.empty:
++            raise InvalidResultError("The results dataframe is empty")
++
++        # NOTE (cwognum): Since we have a reference to the benchmark, I considered validating the values in the
++        #  columns as well (e.g. are all metrics, targets and test sets actually part of the benchmark).
++        #  However, to keep this class light-weight, I did not want to add a strict dependency on the full benchmark class.
++        #  Especially because validation will happen on the Hub as well before it is shown there.
++        return v
+ 
+     @field_serializer("results")
+-    def serialize_results(self, value: ResultsType):
++    def _serialize_results(self, value: ResultsType):
+         """Change from the Metric enum to a string representation"""
+-
+-        def _recursive_enum_to_str(d: dict):
+-            """Utility function to easily traverse the nested dictionary"""
+-            if not isinstance(d, dict):
+-                return d
+-            return {k.name if isinstance(k, Metric) else k: _recursive_enum_to_str(v) for k, v in d.items()}
+-
+-        return _recursive_enum_to_str(value)
++        self.results["Metric"] = self.results["Metric"].apply(
++            lambda x: x.name if isinstance(x, Metric) else x
++        )
++        return json.loads(value.to_json(orient="split", index=False))
++
++    def upload_to_hub(
++        self,
++        env_file: Optional[Union[str, os.PathLike]] = None,
++        settings: Optional[PolarisHubSettings] = None,
++        cache_auth_token: bool = True,
++        **kwargs: dict,
++    ):
++        """
++        Very light, convenient wrapper around the
++        [`PolarisHubClient.upload_results`][polaris.hub.client.PolarisHubClient.upload_results] method.
++        """
++        from polaris.hub.client import PolarisHubClient
++
++        with PolarisHubClient(
++            env_file=env_file, settings=settings, cache_auth_token=cache_auth_token, **kwargs
++        ) as client:
++            return client.upload_results(self)
+ 
+     def _repr_dict_(self) -> dict:
+         """Utility function for pretty-printing to the command line and jupyter notebooks"""
+-        repr_dict = self.model_dump()
++        repr_dict = self.model_dump(exclude=["results"])
++
++        df = self.results.copy(deep=True)
++        df["Metric"] = df["Metric"].apply(lambda x: x.name if isinstance(x, Metric) else x)
++        repr_dict["results"] = json.loads(df.to_json(orient="records"))
++
+         return repr_dict
+ 
+     def _repr_html_(self):
+diff --git a/polaris/hub/client.py b/polaris/hub/client.py
+index de9b5c28..a48543b3 100644
+--- a/polaris/hub/client.py
++++ b/polaris/hub/client.py
+@@ -205,10 +205,7 @@ def request(self, method, url, withhold_token=False, auth=httpx.USE_CLIENT_DEFAU
+         except (MissingTokenError, InvalidTokenError, httpx.HTTPStatusError, OAuthError) as error:
+             if isinstance(error, httpx.HTTPStatusError) and error.response.status_code != 401:
+                 raise
+-            raise PolarisUnauthorizedError(
+-                "You are not logged in to Polaris or your login has expired. "
+-                "You can use the Polaris CLI to easily authenticate yourself again, see `polaris login --help`."
+-            ) from error
++            raise PolarisUnauthorizedError from error
+         return response
+ 
+     # =========================
+@@ -224,7 +221,10 @@ def user_info(self) -> dict:
+         #  Because of this, we also have to copy some code from the base `request` method to
+         #  make auto-refresh a token if needed. For more info, see: https://stackoverflow.com/a/62687390
+ 
+-        if self.token is None or not self.ensure_active_token(self.token):
++        try:
++            if self.token is None or not self.ensure_active_token(self.token):
++                raise PolarisUnauthorizedError
++        except OAuthError:
+             raise PolarisUnauthorizedError
+ 
+         if self._user_info is None:
+@@ -257,12 +257,15 @@ def login(self, overwrite: bool = False, auto_open_browser: bool = True):
+ 
+         # Check if the user is already logged in
+         if self.token is not None and not overwrite:
+-            info = self.user_info
+-            logger.info(
+-                f"You are already logged in to the Polaris Hub as {info['username']} ({info['email']}). "
+-                "Set `overwrite=True` to force re-authentication."
+-            )
+-            return
++            try:
++                info = self.user_info
++                logger.info(
++                    f"You are already logged in to the Polaris Hub as {info['username']} ({info['email']}). "
++                    "Set `overwrite=True` to force re-authentication."
++                )
++                return
++            except PolarisUnauthorizedError:
++                pass
+ 
+         # Step 1: Redirect user to the authorization URL
+         authorization_url, _ = self.create_authorization_url()
+diff --git a/polaris/loader/__init__.py b/polaris/loader/__init__.py
+index bc897fc0..61162261 100644
+--- a/polaris/loader/__init__.py
++++ b/polaris/loader/__init__.py
+@@ -22,9 +22,6 @@ def load_dataset(path: str):
+     if not is_file:
+         # Load from the Hub
+         client = PolarisHubClient()
+-        options = client.list_datasets()
+-        if path not in options:
+-            raise InvalidDatasetError(f"{path} is not a valid dataset.")
+         return client.get_dataset(*path.split("/"))
+ 
+     if extension == "zarr":
+@@ -45,9 +42,6 @@ def load_benchmark(path: str):
+     if not is_file:
+         # Load from the Hub
+         client = PolarisHubClient()
+-        options = client.list_benchmarks()
+-        if path not in options:
+-            raise InvalidBenchmarkError(f"{path} is not a valid benchmark. Make sure it exists!")
+         return client.get_benchmark(*path.split("/"))
+ 
+     with fsspec.open(path, "r") as fd:
+diff --git a/polaris/utils/errors.py b/polaris/utils/errors.py
+index c6408604..1cb46581 100644
+--- a/polaris/utils/errors.py
++++ b/polaris/utils/errors.py
+@@ -20,8 +20,8 @@ class PolarisHubError(Exception):
+ 
+ class PolarisUnauthorizedError(PolarisHubError):
+     DEFAULT_ERROR_MSG = (
+-        "You are not logged in to the Polaris Hub. Please use the Polaris CLI to login. "
+-        "Use `polaris --help` for more information."
++        "You are not logged in to Polaris or your login has expired. "
++        "You can use the Polaris CLI to easily authenticate yourself again, see `polaris login --help`."
+     )
+ 
+     def __init__(self, message: str = DEFAULT_ERROR_MSG):
+diff --git a/tests/test_evaluate.py b/tests/test_evaluate.py
+index 68a3a145..427d6604 100644
+--- a/tests/test_evaluate.py
++++ b/tests/test_evaluate.py
+@@ -1,18 +1,21 @@
+ import os
+ 
+-from polaris.evaluate._metric import Metric
++import pandas as pd
++
+ from polaris.evaluate._results import BenchmarkResults
+ from polaris.utils.types import HubOwner
+ 
+ 
+ def test_result_to_json(tmpdir: str, test_user_owner: HubOwner):
++    scores = pd.DataFrame({"Test set": ["A"], "Target label": "B", "Metric": "C", "Score": 0.1})
++
+     result = BenchmarkResults(
+         name="test",
+         description="Lorem ipsum!",
+         tags=["test"],
+         user_attributes={"key": "value"},
+         owner=test_user_owner,
+-        results={"test": {Metric.mean_absolute_error: 1.0}},
++        results=scores,
+         benchmark_name="my-benchmark",
+         benchmark_owner=test_user_owner,
+         github_url="https://github.com/",

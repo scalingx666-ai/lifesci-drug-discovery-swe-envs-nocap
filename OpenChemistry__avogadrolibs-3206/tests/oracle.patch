@@ -1,0 +1,805 @@
+diff --git a/avogadro/qtopengl/glwidget.cpp b/avogadro/qtopengl/glwidget.cpp
+index e977a070b08..1883a587b49 100644
+--- a/avogadro/qtopengl/glwidget.cpp
++++ b/avogadro/qtopengl/glwidget.cpp
+@@ -89,36 +89,58 @@ void GLWidget::updateMolecule()
+ 
+ void GLWidget::updateScene()
+ {
+-  // Build up the scene with the scene plugins, creating the appropriate nodes.
+-  QtGui::Molecule* mol = m_molecule;
+-  if (!mol)
+-    mol = new QtGui::Molecule(this);
+-  if (mol) {
+-    Rendering::GroupNode& node = m_renderer.scene().rootNode();
+-    node.clear();
+-    auto* moleculeNode = new Rendering::GroupNode(&node);
+-
+-    foreach (QtGui::ScenePlugin* scenePlugin,
+-             m_scenePlugins.activeScenePlugins()) {
+-      auto* engineNode = new Rendering::GroupNode(moleculeNode);
+-      scenePlugin->process(*mol, *engineNode);
+-    }
++  // A scene plugin or tool can spin a nested event loop while it builds the
++  // scene (e.g. waiting on an external process), which may deliver another
++  // change to this widget. Rebuilding then would free the nodes the outer
++  // pass is still filling, so defer: remember the request and rebuild once
++  // the current pass has finished.
++  if (m_updatingScene) {
++    m_sceneUpdatePending = true;
++    return;
++  }
+ 
+-    // Let the tools perform any drawing they need to do.
+-    foreach (QtGui::ToolPlugin* tool, m_tools) {
+-      auto* toolNode = new Rendering::GroupNode(moleculeNode);
+-      tool->draw(*toolNode);
++  m_updatingScene = true;
++  do {
++    m_sceneUpdatePending = false;
++
++    // Build up the scene with the scene plugins, creating the appropriate
++    // nodes. m_molecule is a QPointer and may change between passes.
++    QtGui::Molecule* mol = m_molecule;
++    if (!mol)
++      mol = new QtGui::Molecule(this);
++    if (mol) {
++      Rendering::GroupNode& node = m_renderer.scene().rootNode();
++      node.clear();
++      auto* moleculeNode = new Rendering::GroupNode(&node);
++
++      foreach (QtGui::ScenePlugin* scenePlugin,
++               m_scenePlugins.activeScenePlugins()) {
++        auto* engineNode = new Rendering::GroupNode(moleculeNode);
++        scenePlugin->process(*mol, *engineNode);
++      }
++
++      // Let the tools perform any drawing they need to do.
++      foreach (QtGui::ToolPlugin* tool, m_tools) {
++        auto* toolNode = new Rendering::GroupNode(moleculeNode);
++        tool->draw(*toolNode);
++      }
+     }
++    if (mol != m_molecule)
++      delete mol;
++  } while (m_sceneUpdatePending);
++  m_updatingScene = false;
+ 
+-    m_renderer.resetGeometry();
+-    update();
+-  }
+-  if (mol != m_molecule)
+-    delete mol;
++  m_renderer.resetGeometry();
++  update();
+ }
+ 
+ void GLWidget::clearScene()
+ {
++  // Clearing now would free nodes the running build is still using
++  if (m_updatingScene) {
++    m_sceneUpdatePending = true;
++    return;
++  }
+   m_renderer.scene().clear();
+ }
+ 
+diff --git a/avogadro/qtopengl/glwidget.h b/avogadro/qtopengl/glwidget.h
+index 5a53490e992..bc3d4094b8f 100644
+--- a/avogadro/qtopengl/glwidget.h
++++ b/avogadro/qtopengl/glwidget.h
+@@ -210,6 +210,10 @@ public slots:
+ 
+   Qt::KeyboardModifiers m_navigationModifier;
+   bool m_navigationDrag = false;
++  /** True while updateScene() is building; guards against re-entry. */
++  bool m_updatingScene = false;
++  /** A change arrived mid-build; the scene must be rebuilt afterwards. */
++  bool m_sceneUpdatePending = false;
+ };
+ 
+ } // namespace QtOpenGL
+diff --git a/avogadro/qtplugins/label/label.cpp b/avogadro/qtplugins/label/label.cpp
+index 012c2900121..76e0635c409 100644
+--- a/avogadro/qtplugins/label/label.cpp
++++ b/avogadro/qtplugins/label/label.cpp
+@@ -11,6 +11,7 @@
+ #include <iostream>
+ #include <limits>
+ #include <locale>
++#include <set>
+ #include <sstream>
+ 
+ // for partial charges
+@@ -27,6 +28,7 @@
+ #include <avogadro/rendering/textlabel3d.h>
+ 
+ #include <QtCore/QSettings>
++#include <QtCore/QTimer>
+ #include <QtWidgets/QCheckBox>
+ #include <QtWidgets/QComboBox>
+ #include <QtWidgets/QDoubleSpinBox>
+@@ -392,47 +394,94 @@ void Label::processResidue(const Core::Molecule& molecule,
+   }
+ }
+ 
+-QString partialCharge(Molecule* molecule, int atom)
++namespace {
++// Choose a charge type: GFN2 or AM1BCC, then MMFF94, then Gasteiger, else
++// whatever comes first. Returns an empty string for an empty set.
++std::string preferredChargeType(const std::set<std::string>& types)
++{
++  if (types.empty())
++    return std::string();
++  for (const char* preferred : { "GFN2", "am1bcc", "mmff94", "gasteiger" }) {
++    if (types.find(preferred) != types.end())
++      return preferred;
++  }
++  return *types.begin();
++}
++} // namespace
++
++void Label::requestPartialCharges(const QtGui::Molecule& molecule)
++{
++  auto* mol = const_cast<QtGui::Molecule*>(&molecule);
++  if (m_chargePending || molecule.atomCount() == 0)
++    return;
++  // Don't retry a calculation that already failed for this molecule
++  if (m_lastChargeMolecule == mol &&
++      m_lastChargeAtomCount == molecule.atomCount())
++    return;
++
++  m_chargeMolecule = mol;
++  m_chargePending = true;
++  QTimer::singleShot(0, this, &Label::calculatePartialCharges);
++}
++
++void Label::calculatePartialCharges()
+ {
+-  // TODO: we need to track type and/or calling the charge calculator
+-  float charge = 0.0;
+-  std::set<std::string> types = molecule->partialChargeTypes();
+-  if (types.size() > 0) {
+-    auto first = types.cbegin();
+-    MatrixX charges = molecule->partialCharges((*first));
+-    charge = charges(atom, 0);
++  m_chargePending = false;
++  QtGui::Molecule* molecule = m_chargeMolecule;
++  m_chargeMolecule.clear();
++  if (molecule == nullptr || !molecule->partialChargeTypes().empty())
++    return;
++
++  const QPointer<QtGui::Molecule> guard(molecule);
++  const Index atomCount = molecule->atomCount();
++
++  // Remember only failed attempts: charges are cleared by edits, and a
++  // successful calculation must run again after an edit that returns to the
++  // same atom count (remove a bond, undo/redo).
++  const auto recordFailure = [&]() {
++    m_lastChargeMolecule = guard;
++    m_lastChargeAtomCount = atomCount;
++  };
++
++  const std::string type = preferredChargeType(
++    Calc::ChargeManager::instance().identifiersForMolecule(*molecule));
++  if (type.empty()) {
++    recordFailure();
++    return;
++  }
++
++  // This can run a nested event loop (Open Babel), so check afterwards that
++  // the molecule is still there and still the same size.
++  MatrixX charges =
++    Calc::ChargeManager::instance().partialCharges(type, *molecule);
++  if (!guard.isNull() && static_cast<Index>(charges.rows()) == atomCount &&
++      molecule->atomCount() == atomCount) {
++    molecule->setPartialCharges(type, charges);
++    m_lastChargeMolecule.clear();
++    emit drawablesChanged();
+   } else {
+-    // find something
+-    const auto options =
+-      Calc::ChargeManager::instance().identifiersForMolecule(*molecule);
+-    if (options.size() > 0) {
+-      // look for GFN2 or AM1BCC, then MMFF94 then Gasteiger
+-      std::string type;
+-      if (options.find("GFN2") != options.end())
+-        type = "GFN2";
+-      else if (options.find("am1bcc") != options.end())
+-        type = "am1bcc";
+-      else if (options.find("mmff94") != options.end())
+-        type = "mmff94";
+-      else if (options.find("gasteiger") != options.end())
+-        type = "gasteiger";
+-      else
+-        type = *options.begin();
+-
+-      MatrixX charges =
+-        Calc::ChargeManager::instance().partialCharges(type, *molecule);
+-      charge = charges(atom, 0);
+-    }
++    recordFailure();
+   }
+-  // e.g. '-0.12' => 5 characters
+-  return QString("%L1").arg(charge, 5, 'f', 2);
+ }
+ 
+-void Label::processAtom(const Core::Molecule& molecule,
++void Label::processAtom(const QtGui::Molecule& molecule,
+                         Rendering::GroupNode& node, size_t layer)
+ {
+   auto* geometry = new GeometryNode;
+   node.addChild(geometry);
++
++  // Use only the charges the molecule already has. Calculating them here can
++  // run an external program and a nested event loop in the middle of a scene
++  // rebuild, so that is deferred instead (see requestPartialCharges()).
++  MatrixX charges;
++  if (m_layerManager.getSetting<LayerLabel>(layer)->atomOptions &
++      LayerLabel::LabelOptions::PartialCharge) {
++    const std::string type = preferredChargeType(molecule.partialChargeTypes());
++    if (type.empty())
++      requestPartialCharges(molecule);
++    else
++      charges = molecule.partialCharges(type);
++  }
+   std::map<unsigned char, size_t> atomCount;
+   for (Index i = 0; i < molecule.atomCount(); ++i) {
+     Core::Atom atom = molecule.atom(i);
+@@ -452,8 +501,11 @@ void Label::processAtom(const Core::Molecule& molecule,
+     std::string text = atom.label();
+ 
+     if (interface->atomOptions & LayerLabel::LabelOptions::PartialCharge) {
+-      QString charge = partialCharge(const_cast<Molecule*>(&molecule), i);
+-      text += charge.toStdString();
++      // Stored charges can be shorter than the atom list after an edit
++      if (static_cast<Index>(charges.rows()) > i && charges.cols() > 0) {
++        // e.g. '-0.12' => 5 characters
++        text += QString("%L1").arg(charges(i, 0), 5, 'f', 2).toStdString();
++      }
+     }
+     if (interface->atomOptions & LayerLabel::LabelOptions::Custom) {
+       // already set
+diff --git a/avogadro/qtplugins/label/label.h b/avogadro/qtplugins/label/label.h
+index 7d61b3b9a4b..83bd9b028be 100644
+--- a/avogadro/qtplugins/label/label.h
++++ b/avogadro/qtplugins/label/label.h
+@@ -8,6 +8,10 @@
+ 
+ #include <avogadro/core/vector.h>
+ #include <avogadro/qtgui/sceneplugin.h>
++
++#include <QtCore/QPointer>
++
++#include <string>
+ namespace Avogadro {
+ namespace QtPlugins {
+ 
+@@ -47,9 +51,18 @@ public slots:
+   void setLabelScale(double scale);
+   void setColor(const QColor& color);
+ 
++private slots:
++  /**
++   * Compute partial charges for the pending molecule, from the top-level
++   * event loop rather than while the scene is being built, then request a
++   * scene rebuild so the labels show them.
++   */
++  void calculatePartialCharges();
++
+ private:
+-  void processAtom(const Core::Molecule& molecule, Rendering::GroupNode& node,
++  void processAtom(const QtGui::Molecule& molecule, Rendering::GroupNode& node,
+                    size_t layer);
++  void requestPartialCharges(const QtGui::Molecule& molecule);
+   void processBond(const Core::Molecule& molecule, Rendering::GroupNode& node,
+                    size_t layer);
+   void processResidue(const Core::Molecule& molecule,
+@@ -58,6 +71,16 @@ public slots:
+   Rendering::GroupNode* m_group;
+   std::string m_name = "Labels";
+   Vector3ub m_color;
++
++  // At most one deferred charge calculation is queued at a time.
++  QPointer<QtGui::Molecule> m_chargeMolecule;
++  bool m_chargePending = false;
++  // The molecule and size of the last FAILED calculation attempt, so a model
++  // that fails or returns nothing is not retried on every scene rebuild.
++  // Cleared on success: edits clear the stored charges, and they must be
++  // recalculated even when the atom count returns to an earlier value.
++  QPointer<QtGui::Molecule> m_lastChargeMolecule;
++  Index m_lastChargeAtomCount = 0;
+ };
+ 
+ } // end namespace QtPlugins
+diff --git a/avogadro/qtplugins/openbabel/obcharges.cpp b/avogadro/qtplugins/openbabel/obcharges.cpp
+index 41bc1e79db0..240d6a6dd04 100644
+--- a/avogadro/qtplugins/openbabel/obcharges.cpp
++++ b/avogadro/qtplugins/openbabel/obcharges.cpp
+@@ -52,7 +52,7 @@ public slots:
+     timer.start(msTimeout);
+ 
+     while (timer.isActive() && !m_finished)
+-      qApp->processEvents(QEventLoop::AllEvents, 500);
++      qApp->processEvents(QEventLoop::ExcludeUserInputEvents, 500);
+ 
+     return m_finished;
+   }
+diff --git a/avogadro/qtplugins/openbabel/obfileformat.cpp b/avogadro/qtplugins/openbabel/obfileformat.cpp
+index 5b085fce690..d8d4bb5717b 100644
+--- a/avogadro/qtplugins/openbabel/obfileformat.cpp
++++ b/avogadro/qtplugins/openbabel/obfileformat.cpp
+@@ -140,7 +140,7 @@ public slots:
+     timer.start(msTimeout);
+ 
+     while (timer.isActive() && !m_finished)
+-      qApp->processEvents(QEventLoop::AllEvents, 500);
++      qApp->processEvents(QEventLoop::ExcludeUserInputEvents, 500);
+ 
+     return m_finished;
+   }
+diff --git a/tests/qtplugins/CMakeLists.txt b/tests/qtplugins/CMakeLists.txt
+index c697a29ecbc..7f149f4de68 100644
+--- a/tests/qtplugins/CMakeLists.txt
++++ b/tests/qtplugins/CMakeLists.txt
+@@ -64,7 +64,7 @@ foreach(plugin ${scenePlugins})
+ endforeach()
+ if(haveScenePlugins)
+   message(STATUS "Adding scene plugin serialize test.")
+-  list(APPEND testSrcs scenepluginserializetest.cpp)
++  list(APPEND testSrcs scenepluginserializetest.cpp labelchargetest.cpp)
+   foreach(plugin ${scenePlugins})
+     list(APPEND pluginTargets ${plugin})
+     get_target_property(pluginDir ${plugin} SOURCE_DIR)
+@@ -72,6 +72,13 @@ if(haveScenePlugins)
+   endforeach()
+ endif()
+ 
++# GLWidget re-entrancy regression test (needs the QtOpenGL library).
++set(haveGLWidgetTest OFF)
++if(TARGET Avogadro::QtOpenGL)
++  set(haveGLWidgetTest ON)
++  list(APPEND testSrcs glwidgetreentrytest.cpp)
++endif()
++
+ if(NOT testSrcs)
+   return()
+ endif()
+@@ -90,6 +97,10 @@ target_link_libraries(AvogadroQtPluginsTests
+   ${GTEST_LIBRARIES} ${EXTRA_LINK_LIB}
+   Qt${QT_VERSION}::Widgets Qt${QT_VERSION}::Test)
+ 
++if(haveGLWidgetTest)
++  target_link_libraries(AvogadroQtPluginsTests Avogadro::QtOpenGL)
++endif()
++
+ # Plugin headers include rendering headers, and the Focus test builds a
+ # Camera and Scene of its own.
+ if(TARGET Avogadro::Rendering)
+@@ -126,6 +137,30 @@ foreach(plugin ${testNames})
+     TIMEOUT 120)
+ endforeach()
+ 
++if(haveGLWidgetTest)
++  add_test(NAME "QtPlugins-GLWidgetReentry"
++    COMMAND AvogadroQtPluginsTests "--gtest_filter=GLWidgetReentryTest.*")
++  set_tests_properties("QtPlugins-GLWidgetReentry" PROPERTIES
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
++    TIMEOUT 120)
++endif()
++
++# Label's text labels make OpenGL calls, which the offscreen platform cannot
++# provide; macOS has a real (headless-capable) platform plugin for it. Elsewhere
++# the tests skip themselves when no context can be created.
++if(haveScenePlugins)
++  if(APPLE)
++    set(labelChargePlatform "cocoa")
++  else()
++    set(labelChargePlatform "offscreen")
++  endif()
++  add_test(NAME "QtPlugins-LabelCharge"
++    COMMAND AvogadroQtPluginsTests "--gtest_filter=LabelChargeTest.*")
++  set_tests_properties("QtPlugins-LabelCharge" PROPERTIES
++    ENVIRONMENT "QT_QPA_PLATFORM=${labelChargePlatform}"
++    TIMEOUT 120)
++endif()
++
+ # fuzz_qtplugin_commands: libFuzzer drives random command sequences through
+ # CommandTestHarness, in-process (2.1 release plan, section 4.2). Same plugins
+ # as the tests above, minus Surfaces: every Surfaces command starts a worker
+diff --git a/tests/qtplugins/glwidgetreentrytest.cpp b/tests/qtplugins/glwidgetreentrytest.cpp
+new file mode 100644
+index 00000000000..7ac23e42717
+--- /dev/null
++++ b/tests/qtplugins/glwidgetreentrytest.cpp
+@@ -0,0 +1,121 @@
++/******************************************************************************
++  This source file is part of the Avogadro project.
++  This source code is released under the 3-Clause BSD License, (see "LICENSE").
++******************************************************************************/
++
++// Regression tests: a scene plugin that spins a nested event loop while it is
++// building the scene (the OpenBabel charge calculation does) can cause
++// GLWidget::updateScene() to be re-entered. The nested call used to clear the
++// scene nodes the outer pass was still filling, a use-after-free. The nested
++// request must now be deferred until the running pass has finished.
++
++#include <avogadro/qtgui/molecule.h>
++#include <avogadro/qtgui/sceneplugin.h>
++#include <avogadro/qtgui/scenepluginmodel.h>
++#include <avogadro/qtopengl/glwidget.h>
++#include <avogadro/rendering/geometrynode.h>
++#include <avogadro/rendering/groupnode.h>
++#include <avogadro/rendering/scene.h>
++
++#include <gtest/gtest.h>
++
++using Avogadro::QtOpenGL::GLWidget;
++using Avogadro::Rendering::GeometryNode;
++using Avogadro::Rendering::GroupNode;
++
++namespace {
++
++class ReentrantPlugin : public Avogadro::QtGui::ScenePlugin
++{
++public:
++  enum class Mode
++  {
++    UpdateScene,
++    ClearScene
++  };
++
++  QString name() const override { return "Reentrant"; }
++  QString description() const override { return "Test plugin"; }
++  // The layer manager needs a registered active molecule; skip it.
++  bool isEnabled() const override { return true; }
++
++  void process(const Avogadro::QtGui::Molecule&, GroupNode& node) override
++  {
++    ++calls;
++    ++depth;
++    if (depth > maxDepth)
++      maxDepth = depth;
++    node.addChild(new GeometryNode);
++    if (calls == 1) {
++      // what a nested event loop delivering a molecule change would do
++      if (mode == Mode::UpdateScene)
++        widget->updateScene();
++      else
++        widget->clearScene();
++      callsAfterNested = calls;
++    }
++    // keep using the node after the nested request
++    node.addChild(new GeometryNode);
++    --depth;
++  }
++
++  GLWidget* widget = nullptr;
++  Mode mode = Mode::UpdateScene;
++  int calls = 0;
++  int callsAfterNested = 0;
++  int depth = 0;
++  int maxDepth = 0;
++};
++
++// Root -> molecule node -> one engine node with two geometry children.
++void expectFinalStructure(GLWidget& widget)
++{
++  auto& root = widget.renderer().scene().rootNode();
++  ASSERT_EQ(root.children().size(), 1u);
++  auto* molNode = dynamic_cast<GroupNode*>(root.children().front().node);
++  ASSERT_NE(molNode, nullptr);
++  ASSERT_EQ(molNode->children().size(), 1u);
++  auto* engine = dynamic_cast<GroupNode*>(molNode->children().front().node);
++  ASSERT_NE(engine, nullptr);
++  EXPECT_EQ(engine->children().size(), 2u);
++}
++
++void runCase(ReentrantPlugin::Mode mode)
++{
++  GLWidget widget;
++  auto* molecule = new Avogadro::QtGui::Molecule(&widget);
++  widget.setMolecule(molecule);
++
++  auto* plugin = new ReentrantPlugin;
++  plugin->widget = &widget;
++  plugin->mode = mode;
++  widget.sceneModel().addItem(plugin);
++
++  widget.updateScene();
++
++  // The nested request did not run inside the first pass (it saw no second
++  // process() call), but the scene was rebuilt once afterwards.
++  EXPECT_EQ(plugin->callsAfterNested, 1);
++  EXPECT_EQ(plugin->calls, 2);
++  EXPECT_EQ(plugin->maxDepth, 1);
++  expectFinalStructure(widget);
++
++  // And the widget is usable afterwards.
++  plugin->mode = ReentrantPlugin::Mode::ClearScene;
++  plugin->calls = 5; // no further nested request
++  widget.updateScene();
++  EXPECT_EQ(plugin->calls, 6);
++  expectFinalStructure(widget);
++}
++
++} // namespace
++
++TEST(GLWidgetReentryTest, nestedUpdateSceneIsDeferred)
++{
++  runCase(ReentrantPlugin::Mode::UpdateScene);
++}
++
++TEST(GLWidgetReentryTest, clearSceneDuringBuildIsDeferred)
++{
++  runCase(ReentrantPlugin::Mode::ClearScene);
++}
+diff --git a/tests/qtplugins/labelchargetest.cpp b/tests/qtplugins/labelchargetest.cpp
+new file mode 100644
+index 00000000000..4e4b915ef84
+--- /dev/null
++++ b/tests/qtplugins/labelchargetest.cpp
+@@ -0,0 +1,263 @@
++/******************************************************************************
++  This source file is part of the Avogadro project.
++  This source code is released under the 3-Clause BSD License, (see "LICENSE").
++******************************************************************************/
++
++// Label must not compute partial charges while the scene is being built: the
++// Open Babel charge models run a nested event loop, which delivered queued
++// mouse moves and rebuilt (and freed) the scene mid-build. Charges are now
++// calculated from a queued call after the pass, then the scene is rebuilt.
++//
++// TextLabel3D's constructor makes OpenGL calls, so these tests need a current
++// GL context; they skip when the platform cannot provide one.
++
++#include "commandtestharness.h"
++
++#include "label.h"
++
++#include <avogadro/calc/chargemanager.h>
++#include <avogadro/calc/chargemodel.h>
++#include <avogadro/qtgui/molecule.h>
++#include <avogadro/rendering/geometrynode.h>
++#include <avogadro/rendering/groupnode.h>
++
++#include <QtCore/QCoreApplication>
++#include <QtCore/QSettings>
++#include <QtCore/QTemporaryDir>
++#include <QtGui/QOffscreenSurface>
++#include <QtGui/QOpenGLContext>
++#include <QtGui/QSurfaceFormat>
++#include <QtTest/QSignalSpy>
++
++#include <gtest/gtest.h>
++
++#include <string>
++
++using Avogadro::Index;
++using Avogadro::MatrixX;
++using Avogadro::Vector3;
++using Avogadro::QtPlugins::Label;
++using Avogadro::QtPluginsTests::CommandTestHarness;
++namespace R = Avogadro::Rendering;
++
++namespace {
++
++constexpr int kPartialCharge = 32; // LayerLabel::LabelOptions::PartialCharge
++const char* kModelId = "labeltestcharges";
++
++// Counts how often it is asked for charges.
++class CountingModel : public Avogadro::Calc::ChargeModel
++{
++public:
++  static int calls;
++
++  ChargeModel* newInstance() const override { return new CountingModel; }
++  std::string identifier() const override { return kModelId; }
++  std::string name() const override { return "Label test charges"; }
++  Avogadro::Core::Molecule::ElementMask elements() const override
++  {
++    Avogadro::Core::Molecule::ElementMask mask;
++    mask.set();
++    return mask;
++  }
++  MatrixX partialCharges(Avogadro::Core::Molecule& mol) const override
++  {
++    return compute(mol);
++  }
++  MatrixX partialCharges(const Avogadro::Core::Molecule& mol) const override
++  {
++    return compute(mol);
++  }
++
++private:
++  static MatrixX compute(const Avogadro::Core::Molecule& mol)
++  {
++    ++calls;
++    MatrixX charges(mol.atomCount(), 1);
++    charges.setConstant(0.25);
++    return charges;
++  }
++};
++int CountingModel::calls = 0;
++
++struct GLContext
++{
++  QOffscreenSurface surface;
++  QOpenGLContext context;
++  bool ok = false;
++
++  GLContext()
++  {
++    QSurfaceFormat format;
++    format.setVersion(4, 1);
++    format.setProfile(QSurfaceFormat::CoreProfile);
++    context.setFormat(format);
++    if (!context.create())
++      return;
++    surface.setFormat(context.format());
++    surface.create();
++    ok = context.makeCurrent(&surface);
++  }
++  ~GLContext()
++  {
++    if (ok)
++      context.doneCurrent();
++  }
++};
++
++size_t countDrawables(R::Node* node)
++{
++  size_t count = 0;
++  if (auto* geometry = dynamic_cast<R::GeometryNode*>(node))
++    count += geometry->drawables().size();
++  if (auto* group = dynamic_cast<R::GroupNode*>(node)) {
++    for (const auto& child : group->children())
++      count += countDrawables(child.node);
++  }
++  return count;
++}
++
++class LabelChargeTest : public testing::Test
++{
++protected:
++  void SetUp() override
++  {
++    // Use scratch settings so the user's label options are untouched.
++    m_previousFormat = QSettings::defaultFormat();
++    QSettings::setDefaultFormat(QSettings::IniFormat);
++    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
++                       m_settingsDir.path());
++    QSettings settings;
++    settings.setValue("label/atomOptions", kPartialCharge);
++    settings.setValue("label/bondOptions", 0);
++    settings.setValue("label/residueOptions", 0);
++    settings.sync();
++
++    if (!m_gl.ok)
++      GTEST_SKIP() << "no OpenGL context available";
++
++    CountingModel::calls = 0;
++    Avogadro::Calc::ChargeManager::registerModel(new CountingModel);
++    m_registered = true;
++
++    m_harness.buildEmpty();
++    m_harness.molecule()->addAtom(6, Vector3(0, 0, 0));
++    m_harness.molecule()->addAtom(8, Vector3(1.4, 0, 0));
++    m_harness.molecule()->addAtom(1, Vector3(-0.6, 0.9, 0));
++  }
++
++  void TearDown() override
++  {
++    QSettings::setDefaultFormat(m_previousFormat);
++    if (m_registered)
++      Avogadro::Calc::ChargeManager::unregisterModel(kModelId);
++  }
++
++  size_t process(Label& label)
++  {
++    R::GroupNode root;
++    auto* node = new R::GroupNode(&root);
++    label.process(*m_harness.molecule(), *node);
++    return countDrawables(node);
++  }
++
++  QTemporaryDir m_settingsDir;
++  GLContext m_gl;
++  CommandTestHarness m_harness;
++  bool m_registered = false;
++  QSettings::Format m_previousFormat = QSettings::NativeFormat;
++};
++
++} // namespace
++
++TEST_F(LabelChargeTest, processDoesNotCalculateCharges)
++{
++  Label label;
++  label.setEnabled(true);
++  QSignalSpy changed(&label, &Label::drawablesChanged);
++
++  // No charges are stored, so the first pass has none to show, and must not
++  // call the model itself.
++  process(label);
++  EXPECT_EQ(CountingModel::calls, 0);
++  EXPECT_TRUE(m_harness.molecule()->partialChargeTypes().empty());
++
++  // A second pass before the event loop runs queues nothing more.
++  process(label);
++  EXPECT_EQ(CountingModel::calls, 0);
++
++  // From the event loop the charges are calculated once and stored, and a
++  // scene rebuild is requested.
++  QCoreApplication::processEvents();
++  EXPECT_EQ(CountingModel::calls, 1);
++  EXPECT_EQ(changed.count(), 1);
++  const auto types = m_harness.molecule()->partialChargeTypes();
++  ASSERT_EQ(types.size(), 1u);
++  const MatrixX charges = m_harness.molecule()->partialCharges(*types.begin());
++  EXPECT_EQ(static_cast<Index>(charges.rows()), 3);
++
++  // The rebuild finds them and does not ask again.
++  EXPECT_GT(process(label), 0u);
++  QCoreApplication::processEvents();
++  EXPECT_EQ(CountingModel::calls, 1);
++  EXPECT_EQ(changed.count(), 1);
++}
++
++TEST_F(LabelChargeTest, chargesAreRecalculatedAfterAnEditKeepingAtomCount)
++{
++  Label label;
++  label.setEnabled(true);
++  auto* mol = m_harness.molecule();
++
++  process(label);
++  QCoreApplication::processEvents();
++  ASSERT_EQ(CountingModel::calls, 1);
++  ASSERT_FALSE(mol->partialChargeTypes().empty());
++
++  // Adding and removing a bond clears the charges but keeps the atom count.
++  mol->addBond(0, 1, 1);
++  ASSERT_EQ(mol->atomCount(), 3u);
++  mol->removeBond(0, 1);
++  ASSERT_TRUE(mol->partialChargeTypes().empty());
++  ASSERT_EQ(mol->atomCount(), 3u);
++
++  process(label);
++  QCoreApplication::processEvents();
++  EXPECT_EQ(CountingModel::calls, 2);
++  EXPECT_FALSE(mol->partialChargeTypes().empty());
++}
++
++TEST_F(LabelChargeTest, failedCalculationIsNotRetried)
++{
++  // An unregistered model: nothing can calculate charges.
++  Avogadro::Calc::ChargeManager::unregisterModel(kModelId);
++  m_registered = false;
++
++  Label label;
++  label.setEnabled(true);
++  QSignalSpy changed(&label, &Label::drawablesChanged);
++  for (int i = 0; i < 3; ++i) {
++    process(label);
++    QCoreApplication::processEvents();
++  }
++  EXPECT_EQ(CountingModel::calls, 0);
++  EXPECT_EQ(changed.count(), 0);
++}
++
++TEST_F(LabelChargeTest, shortStoredChargesAreSafe)
++{
++  // setPartialCharges() only checks the matrix size, so a 1x3 matrix is
++  // accepted for three atoms but has fewer rows than atoms; reading
++  // charges(atom, 0) for the later atoms used to run past the end.
++  MatrixX charges(1, 3);
++  charges.setConstant(-0.5);
++  m_harness.molecule()->setPartialCharges("mmff94", charges);
++  ASSERT_EQ(m_harness.molecule()->atomCount(), 3u);
++  ASSERT_FALSE(m_harness.molecule()->partialChargeTypes().empty());
++
++  Label label;
++  label.setEnabled(true);
++  EXPECT_GT(process(label), 0u);
++  QCoreApplication::processEvents();
++  EXPECT_EQ(CountingModel::calls, 0);
++}

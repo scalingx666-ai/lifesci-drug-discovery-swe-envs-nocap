@@ -1,0 +1,510 @@
+diff --git a/src/xtbml/interaction/list.py b/src/xtbml/interaction/list.py
+index df8428a76..bb5152f89 100644
+--- a/src/xtbml/interaction/list.py
++++ b/src/xtbml/interaction/list.py
+@@ -18,9 +18,11 @@ class Cache(Interaction.Cache, dict):
+ 
+         __slots__ = ()
+ 
+-    def __init__(self, interactions: list[Interaction]):
++    def __init__(self, *interactions):
+         Interaction.__init__(self)
+-        self.interactions = interactions
++        self.interactions = [
++            interaction for interaction in interactions if interaction is not None
++        ]
+ 
+     def get_cache(
+         self, numbers: Tensor, positions: Tensor, ihelp: IndexHelper
+diff --git a/src/xtbml/solvation/alpb.py b/src/xtbml/solvation/alpb.py
+new file mode 100644
+index 000000000..1f883573f
+--- /dev/null
++++ b/src/xtbml/solvation/alpb.py
+@@ -0,0 +1,220 @@
++"""
++Analytical linearized Poisson-Boltzmann model
++=============================================
++
++This module implements implicit solvation models of the generalized Born type.
++
++Example
++-------
++>>> import torch
++>>> from xtbml.solvation.alpb import GeneralizedBorn
++>>> numbers = torch.tensor([14, 1, 1, 1, 1])
++>>> positions = torch.tensor(
++...     [
++...         [+0.00000000000000, -0.00000000000000, +0.00000000000000],
++...         [+1.61768389755830, +1.61768389755830, -1.61768389755830],
++...         [-1.61768389755830, -1.61768389755830, -1.61768389755830],
++...         [+1.61768389755830, -1.61768389755830, +1.61768389755830],
++...         [-1.61768389755830, +1.61768389755830, +1.61768389755830],
++...     ],
++... )
++>>> charges = torch.tensor(
++...     [
++...         -8.41282505804719e-2,
++...         +2.10320626451180e-2,
++...         +2.10320626451178e-2,
++...         +2.10320626451179e-2,
++...         +2.10320626451179e-2,
++...     ]
++... )
++>>> ihelp = None
++>>> gb = GeneralizedBorn(numbers, torch.tensor(78.9), kernel="still")
++>>> cache = gb.get_cache(numbers, positions, ihelp)
++>>> energy = gb.get_atom_energy(charges, ihelp, cache)
++>>> energy.sum(-1)
++tensor(-5.0762e-05)
++"""
++
++from __future__ import annotations
++import torch
++
++from .born import get_born_radii
++from .data import vdw_rad_d3
++from ..basis import IndexHelper
++from ..interaction import Interaction
++from ..typing import Tensor, Any
++from ..utils.utils import real_atoms, real_pairs
++
++
++alpha = 0.571412
++
++
++@torch.jit.script
++def p16_kernel(r1: Tensor, ab: Tensor) -> Tensor:
++    """
++    Evaluate P16 interaction kernel: 1 / (R + √ab / (1 + ζR/(16·√ab))¹⁶)
++
++    Parameters
++    ----------
++    r1 : Tensor
++        Distance between all atom pairs
++    ab : Tensor
++        Product of Born radii
++
++    Returns
++    -------
++    Tensor
++        Interaction kernel between all atom pairs
++    """
++
++    ab = torch.sqrt(ab)
++    arg = torch.pow(ab / (ab + r1 * 1.028 / 16), 16)
++
++    return 1.0 / (r1 + ab * arg)
++
++
++@torch.jit.script
++def still_kernel(r1: Tensor, ab: Tensor) -> Tensor:
++    """
++    Evaluate Still interaction kernel: 1 / √(R² + ab · exp[R²/(4·ab)])
++
++    Parameters
++    ----------
++    r1 : Tensor
++        Distance between all atom pairs
++    ab : Tensor
++        Product of Born radii
++
++    Returns
++    -------
++    Tensor
++        Interaction kernel between all atom pairs
++    """
++
++    r2 = torch.pow(r1, 2)
++    arg = torch.exp(-0.25 * r2 / ab)
++
++    return 1.0 / torch.sqrt(r2 + ab * arg)
++
++
++born_kernel = {"p16": p16_kernel, "still": still_kernel}
++
++
++def get_adet(positions: Tensor, rad: Tensor) -> Tensor:
++    """
++    Calculate electrostatic shape function based on the moments of inertia of solid spheres.
++
++    Parameters
++    ----------
++    positions : Tensor
++        Cartesian coordinates of all atoms
++    rad : Tensor
++        Radii of all atoms
++
++    Returns
++    -------
++    Tensor
++        Electrostatic shape function
++    """
++
++    vol = torch.pow(rad, 3)
++    center = (positions * vol.unsqueeze(-1)).sum(-2) / vol.sum(-1)
++
++    displ = positions - center.unsqueeze(-2)
++    diag = torch.pow(displ, 2).sum(-1) + 2*torch.pow(rad, 2)/5
++    inertia = (
++        vol.unsqueeze(-1).unsqueeze(-2) * (
++            - displ.unsqueeze(-1) * displ.unsqueeze(-2)
++            + torch.diag_embed(diag.unsqueeze(-1).expand(*positions.shape))
++        )
++    ).sum(-3)
++
++    adet = (
++        + inertia[..., 0, 0] * inertia[..., 1, 1] * inertia[..., 2, 2]
++        - inertia[..., 0, 0] * inertia[..., 1, 2] * inertia[..., 2, 1]
++        - inertia[..., 0, 1] * inertia[..., 1, 0] * inertia[..., 2, 2]
++        + inertia[..., 0, 1] * inertia[..., 1, 2] * inertia[..., 2, 0]
++        + inertia[..., 0, 2] * inertia[..., 1, 0] * inertia[..., 2, 1]
++        - inertia[..., 0, 2] * inertia[..., 1, 1] * inertia[..., 2, 0]
++    )
++
++    return torch.sqrt(5*torch.pow(adet, 1/3) / (2*vol.sum(-1)))
++
++
++class GeneralizedBorn(Interaction):
++    """
++    Implicit solvation model for describing the interaction with a dielectric continuum.
++    """
++
++    kernel: str
++    """Interaction kernel"""
++
++    alpbet: Tensor
++    """Finite dielectric constant correction"""
++
++    keps: Tensor
++    """Dielectric function"""
++
++    born_kwargs: dict[str, Any]
++    """Parameters for Born radii integration"""
++
++    def __init__(
++        self,
++        numbers: Tensor,
++        dielectric_constant: Tensor,
++        alpb: bool = True,
++        kernel: str = "p16",
++        **kwargs,
++    ):
++        Interaction.__init__(self)
++        dtype = dielectric_constant.dtype
++
++        self.alpbet = alpha / dielectric_constant if alpb else 0
++        self.keps = (1 / dielectric_constant - 1) / (1 + self.alpbet)
++        self.kernel = kernel
++
++        if "rvdw" not in kwargs:
++            kwargs["rvdw"] = vdw_rad_d3[numbers].type(dtype)
++        self.born_kwargs = kwargs
++
++    class Cache(Interaction.Cache):
++        """
++        Restart data for the generalized Born solvation model.
++        """
++
++        mat: Tensor
++        """Born screening matrix"""
++
++        def __init__(self, mat):
++            self.mat = mat
++
++    def get_cache(
++        self, numbers: Tensor, positions: Tensor, ihelp: IndexHelper
++    ) -> Interaction.Cache:
++        born = get_born_radii(numbers, positions, **self.born_kwargs)
++        eps = positions.new_tensor(torch.finfo(positions.dtype).eps)
++
++        real = real_atoms(numbers)
++        mask = real_pairs(numbers)
++
++        dist = torch.where(mask, torch.cdist(positions, positions, p=2), eps)
++        ab = torch.where(mask, born.unsqueeze(-1) * born.unsqueeze(-2), eps)
++        ab = born.unsqueeze(-1) * born.unsqueeze(-2)
++
++        mat = self.keps * born_kernel[self.kernel](dist, ab)
++
++        if self.alpbet > 0:
++            adet = get_adet(positions, self.born_kwargs["rvdw"])
++            mat += self.keps * self.alpbet * adet.unsqueeze(-1).unsqueeze(-2)
++
++        return self.Cache(mat)
++
++    def get_atom_energy(
++        self, charges: Tensor, ihelp: IndexHelper, cache: Interaction.Cache
++    ) -> Tensor:
++        return 0.5 * charges * self.get_atom_potential(charges, ihelp, cache)
++
++    def get_atom_potential(
++        self, charges: Tensor, ihelp: IndexHelper, cache: Interaction.Cache
++    ) -> Tensor:
++        return torch.einsum("...ik,...k->...i", cache.mat, charges)
+diff --git a/src/xtbml/utils/utils.py b/src/xtbml/utils/utils.py
+index 7cd9e74b8..c1e4f2446 100644
+--- a/src/xtbml/utils/utils.py
++++ b/src/xtbml/utils/utils.py
+@@ -28,3 +28,19 @@ def wrap(*args, **kwargs):
+         return result
+ 
+     return wrap
++
++
++@torch.jit.script
++def real_atoms(numbers: Tensor) -> Tensor:
++    return numbers != 0
++
++
++@torch.jit.script
++def real_pairs(numbers: Tensor, diagonal: bool = False) -> Tensor:
++    real = real_atoms(numbers)
++    mask = real.unsqueeze(-2) * real.unsqueeze(-1)
++    if not diagonal:
++        mask *= ~torch.diag_embed(torch.ones_like(real))
++    return mask
++
++
+diff --git a/src/xtbml/xtb/calculator.py b/src/xtbml/xtb/calculator.py
+index b199ca454..be97cfd58 100644
+--- a/src/xtbml/xtb/calculator.py
++++ b/src/xtbml/xtb/calculator.py
+@@ -37,7 +37,13 @@ class Calculator:
+     ihelp: IndexHelper
+     """Helper class for indexing."""
+ 
+-    def __init__(self, numbers: Tensor, positions: Tensor, par: Param) -> None:
++    def __init__(
++        self,
++        numbers: Tensor,
++        positions: Tensor,
++        par: Param,
++        interaction: Interaction | None = None,
++    ) -> None:
+         self.ihelp = IndexHelper.from_numbers(numbers, get_elem_angular(par.element))
+         self.hamiltonian = Hamiltonian(numbers, positions, par, self.ihelp)
+ 
+@@ -72,7 +78,7 @@ def __init__(self, numbers: Tensor, positions: Tensor, par: Param) -> None:
+             ),
+         )
+ 
+-        self.interaction = InteractionList([es2, es3])
++        self.interaction = InteractionList(es2, es3, interaction)
+ 
+     def singlepoint(
+         self,
+diff --git a/test/test_solvation/samples.py b/test/test_solvation/samples.py
+index c1c8823ae..3527c524d 100644
+--- a/test/test_solvation/samples.py
++++ b/test/test_solvation/samples.py
+@@ -91,6 +91,86 @@ class Record(Molecule):
+                 0.48455055461782,
+             ],
+         ).reshape((-1, 3)),
++        "gradient": torch.tensor(
++            [
++                [-0.00153255497571, +0.00297789159231, -0.00025223451667],
++                [+0.04018865153193, -0.00417188368738, -0.01862835511565],
++                [+0.00837368890643, +0.11240474134684, -0.06477533280849],
++                [-0.02703781053424, +0.01822604984045, -0.02073055319488],
++                [-0.00798136088997, -0.01197965722531, +0.01962486468256],
++                [-0.06074409186840, -0.04618510603905, -0.03181952610612],
++                [+0.00332407513633, +0.00899094715714, +0.02887662686408],
++                [-0.05291913077235, -0.02901019901037, +0.03983597084880],
++                [+0.00134278449696, -0.01168669387698, -0.02276383154094],
++                [+0.07952973246574, +0.02427736669779, -0.02449656277895],
++                [-0.00452421233058, +0.00195662444457, +0.08199722319841],
++                [-0.00408392306417, -0.01433996297419, -0.01897890307009],
++                [-0.01418318692595, -0.01913838088512, +0.01145836710930],
++                [-0.02751979418099, -0.05575989186764, +0.07116948813200],
++                [+0.05555135011673, +0.03116076625884, -0.04667171090841],
++                [+0.01221577543765, -0.00772261759266, -0.00384555035271],
++            ]
++        ),
++        "gsolv": torch.tensor(
++            [
++                +0.04128841437037,
++                -0.00796504045094,
++                -0.06934136258348,
++                +0.01172341550515,
++                -0.04708187587279,
++                +0.01231754324294,
++                +0.00545026229412,
++                -0.04903004745543,
++                -0.00028009456411,
++                +0.01686767488525,
++                +0.00184300201445,
++                +0.00324689730305,
++                +0.00753672930741,
++                +0.01133325448597,
++                -0.00439295951184,
++                +0.00222600674975,
++            ]
++        ),
++        "energies": torch.tensor(
++            [
++                -0.02200339637451,
++                -0.00053846697630,
++                -0.00735719826976,
++                -0.00083292867427,
++                -0.00634305452328,
++                +0.00029193446230,
++                -0.00044835889449,
++                -0.01256188445466,
++                -0.00245665657834,
++                +0.00148111264143,
++                +0.00245520681858,
++                -0.00016245618639,
++                +0.00153900498885,
++                +0.00087715042795,
++                -0.00626537040940,
++                +0.00325295650828,
++            ]
++        ),
++        "charges": torch.tensor(
++            [
++                +7.73347900345264e-1,
++                +1.07626888948184e-1,
++                -3.66999593831010e-1,
++                +4.92833325937897e-2,
++                -1.83332156197733e-1,
++                +2.33302086605469e-1,
++                +6.61837152062315e-2,
++                -5.43944165050002e-1,
++                -2.70264356583716e-1,
++                +2.66618968841682e-1,
++                +2.62725033202480e-1,
++                -7.15315510172571e-2,
++                -3.73300777019193e-1,
++                +3.84585237785621e-2,
++                -5.05851088366940e-1,
++                +5.17677238544189e-1,
++            ]
++        ),
+         "born": torch.tensor(
+             [
+                 4.0733179853143833,
+@@ -205,6 +285,46 @@ class Record(Molecule):
+                 -1.39117477789609,
+             ],
+         ).reshape((-1, 3)),
++        "energies": torch.tensor(
++            [
++                +1.47620109527236e-4,
++                -7.33095645702693e-4,
++                -1.70970515572092e-3,
++                -1.14366193957396e-2,
++                -1.10697907913040e-2,
++                +1.37024255683766e-3,
++                +5.72539772886035e-4,
++                +2.02660059874183e-4,
++                +7.99504833236006e-5,
++                +1.74901876175837e-3,
++                -2.33115471046013e-3,
++                -7.75582667617163e-3,
++                -2.41207902979325e-3,
++                -9.34384898116227e-5,
++                +4.41237944616590e-4,
++                -3.16940603695238e-3,
++            ]
++        ),
++        "charges": torch.tensor(
++            [
++                +7.38394711236234e-2,
++                -1.68354976558608e-1,
++                -3.47642833746823e-1,
++                -7.05489267186003e-1,
++                +7.73548301641266e-1,
++                +2.30207581365386e-1,
++                +1.02748501676354e-1,
++                +9.47818107467040e-2,
++                +2.44260351729187e-2,
++                +2.34984927037408e-1,
++                -3.17839896393030e-1,
++                +6.67112994818879e-1,
++                -4.78119977010488e-1,
++                +6.57536027459275e-2,
++                +1.08259054549882e-1,
++                -3.58215329983396e-1,
++            ]
++        ),
+         "born": torch.tensor(
+             [
+                 2.80167922633069e0,
+diff --git a/test/test_solvation/test_alpb.py b/test/test_solvation/test_alpb.py
+new file mode 100644
+index 000000000..9f24df2b5
+--- /dev/null
++++ b/test/test_solvation/test_alpb.py
+@@ -0,0 +1,70 @@
++import pytest
++import torch
++import math
++
++from xtbml.solvation import alpb
++from xtbml.param import GFN1_XTB as par
++from xtbml.xtb.calculator import Calculator
++
++from .samples import mb16_43
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
++@pytest.mark.parametrize("sample", [mb16_43["01"], mb16_43["02"]])
++def test_gb_single(dtype: torch.dtype, sample, dielectric_constant=78.9):
++
++    dielectric_constant = torch.tensor(dielectric_constant, dtype=dtype)
++
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++    charges = sample["charges"].type(dtype)
++
++    ihelp = "IndexHelper"
++    gb = alpb.GeneralizedBorn(numbers, dielectric_constant)
++    cache = gb.get_cache(numbers, positions, ihelp)
++    energies = gb.get_atom_energy(charges, ihelp, cache)
++    assert torch.allclose(energies, sample["energies"].type(dtype))
++
++
++def test_gb_scf(dtype=torch.float, sample=mb16_43["01"], dielectric_constant=78.9):
++    tol = math.sqrt(torch.finfo(dtype).eps) * 10
++
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype)
++    ref = sample["gsolv"]
++    charges = torch.tensor(0.0).type(dtype)
++
++    dielectric_constant = torch.tensor(dielectric_constant, dtype=dtype)
++    gb = alpb.GeneralizedBorn(numbers, dielectric_constant)
++
++    calc_vac = Calculator(numbers, positions, par)
++    calc_sol = Calculator(numbers, positions, par, interaction=gb)
++
++    results_vac = calc_vac.singlepoint(numbers, positions, charges, verbosity=0)
++    results_sol = calc_sol.singlepoint(numbers, positions, charges, verbosity=0)
++
++    gsolv = results_sol["energy"] - results_vac["energy"]
++
++    assert pytest.approx(ref, abs=tol) == gsolv
++
++
++def test_gb_scf_grad(dtype=torch.float, sample=mb16_43["01"], dielectric_constant=78.9):
++    tol = math.sqrt(torch.finfo(dtype).eps) * 10
++
++    numbers = sample["numbers"]
++    positions = sample["positions"].type(dtype).requires_grad_(True)
++    ref = sample["gradient"]
++    charges = torch.tensor(0.0).type(dtype)
++
++    dielectric_constant = torch.tensor(dielectric_constant, dtype=dtype)
++    gb = alpb.GeneralizedBorn(numbers, dielectric_constant)
++
++    calc = Calculator(numbers, positions, par, interaction=gb)
++
++    results = calc.singlepoint(numbers, positions, charges, verbosity=0)
++
++    energy = results["energy"].sum(-1)
++    energy.backward()
++    gradient = positions.grad.clone()
++
++    assert pytest.approx(ref, abs=tol) == gradient

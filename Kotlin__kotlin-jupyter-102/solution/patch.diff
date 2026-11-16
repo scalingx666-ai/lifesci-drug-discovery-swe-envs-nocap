@@ -1,0 +1,209 @@
+diff --git a/src/main/kotlin/org/jetbrains/kotlin/jupyter/config.kt b/src/main/kotlin/org/jetbrains/kotlin/jupyter/config.kt
+index c0dab5dcf..efb350ca9 100644
+--- a/src/main/kotlin/org/jetbrains/kotlin/jupyter/config.kt
++++ b/src/main/kotlin/org/jetbrains/kotlin/jupyter/config.kt
+@@ -83,6 +83,26 @@ class RuntimeKernelProperties(val map: Map<String, String>): ReplRuntimeProperti
+     }
+ }
+ 
++data class KernelJupyterParams(
++        val sigScheme: String?,
++        val key: String?,
++        val ports: List<Int>,
++        val transport: String?) {
++    companion object {
++        fun fromFile(cfgFile: File): KernelJupyterParams {
++            val cfgJson = Parser.default().parse(cfgFile.canonicalPath) as JsonObject
++            fun JsonObject.getInt(field: String): Int = int(field)
++                    ?: throw RuntimeException("Cannot find $field in $cfgFile")
++
++            val sigScheme = cfgJson.string("signature_scheme")
++            val key = cfgJson.string("key")
++            val ports = JupyterSockets.values().map { cfgJson.getInt("${it.name}_port") }
++            val transport = cfgJson.string("transport") ?: "tcp"
++            return KernelJupyterParams(sigScheme, key, ports, transport)
++        }
++    }
++}
++
+ data class KernelConfig(
+         val ports: List<Int>,
+         val transport: String,
+@@ -93,6 +113,7 @@ data class KernelConfig(
+         val homeDir: File?,
+         val resolverConfig: ResolverConfig?,
+         val libraryFactory: LibraryFactory,
++        val embedded: Boolean = false,
+ ) {
+     fun toArgs(prefix: String = ""): KernelArgs {
+         val cfgJson = jsonObject(
+@@ -113,21 +134,22 @@ data class KernelConfig(
+     companion object {
+         fun fromArgs(args: KernelArgs, libraryFactory: LibraryFactory): KernelConfig {
+             val (cfgFile, scriptClasspath, homeDir) = args
+-            val cfgJson = Parser.default().parse(cfgFile.canonicalPath) as JsonObject
+-            fun JsonObject.getInt(field: String): Int = int(field) ?: throw RuntimeException("Cannot find $field in $cfgFile")
++            val cfg = KernelJupyterParams.fromFile(cfgFile)
++            return fromConfig(cfg, libraryFactory, scriptClasspath, homeDir)
++        }
+ 
+-            val sigScheme = cfgJson.string("signature_scheme")
+-            val key = cfgJson.string("key")
++        fun fromConfig(cfg: KernelJupyterParams, libraryFactory: LibraryFactory, scriptClasspath: List<File>, homeDir: File?, embedded: Boolean = false): KernelConfig {
+ 
+             return KernelConfig(
+-                    ports = JupyterSockets.values().map { cfgJson.getInt("${it.name}_port") },
+-                    transport = cfgJson.string("transport") ?: "tcp",
+-                    signatureScheme = sigScheme ?: "hmac1-sha256",
+-                    signatureKey = if (sigScheme == null || key == null) "" else key,
++                    ports = cfg.ports,
++                    transport = cfg.transport ?: "tcp",
++                    signatureScheme = cfg.sigScheme ?: "hmac1-sha256",
++                    signatureKey = if (cfg.sigScheme == null || cfg.key == null) "" else cfg.key,
+                     scriptClasspath = scriptClasspath,
+                     homeDir = homeDir,
+                     resolverConfig = homeDir?.let { loadResolverConfig(it.toString(), libraryFactory) },
+                     libraryFactory = libraryFactory,
++                    embedded = embedded,
+             )
+         }
+     }
+diff --git a/src/main/kotlin/org/jetbrains/kotlin/jupyter/ikotlin.kt b/src/main/kotlin/org/jetbrains/kotlin/jupyter/ikotlin.kt
+index a757912ac..10e7a3d1c 100644
+--- a/src/main/kotlin/org/jetbrains/kotlin/jupyter/ikotlin.kt
++++ b/src/main/kotlin/org/jetbrains/kotlin/jupyter/ikotlin.kt
+@@ -66,17 +66,30 @@ fun main(vararg args: String) {
+     try {
+         log.info("Kernel args: "+ args.joinToString { it })
+         val kernelArgs = parseCommandLine(*args)
+-        val runtimeProperties = defaultRuntimeProperties
+         val libraryPath = (kernelArgs.homeDir ?: File("")).resolve(LibrariesDir)
+         val libraryFactory = LibraryFactory.withDefaultDirectoryResolution(libraryPath)
+         val kernelConfig = KernelConfig.fromArgs(kernelArgs, libraryFactory)
+-        kernelServer(kernelConfig, runtimeProperties)
++        kernelServer(kernelConfig)
+     } catch (e: Exception) {
+         log.error("exception running kernel with args: \"${args.joinToString()}\"", e)
+     }
+ }
+ 
+-fun kernelServer(config: KernelConfig, runtimeProperties: ReplRuntimeProperties) {
++/**
++ * This function is to be run in projects which use kernel as a library,
++ * so we don't have a big need in covering it with tests
++ */
++@Suppress("unused")
++fun embedKernel(cfgFile: File, libraryFactory: LibraryFactory?, scriptReceivers: List<Any>?) {
++    val cp = System.getProperty("java.class.path").split(File.pathSeparator).toTypedArray().map { File(it) }
++    val config = KernelConfig.fromConfig(
++            KernelJupyterParams.fromFile(cfgFile),
++            libraryFactory ?: LibraryFactory.EMPTY,
++            cp, null, true)
++    kernelServer(config, scriptReceivers = scriptReceivers ?: emptyList())
++}
++
++fun kernelServer(config: KernelConfig, runtimeProperties: ReplRuntimeProperties = defaultRuntimeProperties, scriptReceivers: List<Any> = emptyList()) {
+     log.info("Starting server with config: $config")
+ 
+     JupyterConnection(config).use { conn ->
+@@ -87,7 +100,7 @@ fun kernelServer(config: KernelConfig, runtimeProperties: ReplRuntimeProperties)
+ 
+         val executionCount = AtomicLong(1)
+ 
+-        val repl = ReplForJupyterImpl(config, runtimeProperties)
++        val repl = ReplForJupyterImpl(config, runtimeProperties, scriptReceivers)
+ 
+         val mainThread = Thread.currentThread()
+ 
+diff --git a/src/main/kotlin/org/jetbrains/kotlin/jupyter/repl.kt b/src/main/kotlin/org/jetbrains/kotlin/jupyter/repl.kt
+index 584d8b37d..1ab85b081 100644
+--- a/src/main/kotlin/org/jetbrains/kotlin/jupyter/repl.kt
++++ b/src/main/kotlin/org/jetbrains/kotlin/jupyter/repl.kt
+@@ -135,10 +135,11 @@ class ReplForJupyterImpl(
+         override val resolverConfig: ResolverConfig? = null,
+         override val runtimeProperties: ReplRuntimeProperties = defaultRuntimeProperties,
+         private val scriptReceivers: List<Any> = emptyList(),
++        private val embedded: Boolean = false,
+ ) : ReplForJupyter, ReplOptions, KotlinKernelHost {
+ 
+     constructor(config: KernelConfig, runtimeProperties: ReplRuntimeProperties, scriptReceivers: List<Any> = emptyList()):
+-            this(config.libraryFactory, config.scriptClasspath, config.homeDir, config.resolverConfig, runtimeProperties, scriptReceivers)
++            this(config.libraryFactory, config.scriptClasspath, config.homeDir, config.resolverConfig, runtimeProperties, scriptReceivers, config.embedded)
+ 
+     override val currentBranch: String
+         get() = runtimeProperties.currentBranch
+@@ -316,12 +317,14 @@ class ReplForJupyterImpl(
+ 
+     private val evaluatorConfiguration = ScriptEvaluationConfiguration {
+         implicitReceivers.invoke(v = scriptReceivers)
+-        jvm {
+-            val filteringClassLoader = FilteringClassLoader(ClassLoader.getSystemClassLoader()) {
+-                it.startsWith("jupyter.kotlin.") || it.startsWith("kotlin.") || (it.startsWith("org.jetbrains.kotlin.") && !it.startsWith("org.jetbrains.kotlin.jupyter."))
++        if (!embedded) {
++            jvm {
++                val filteringClassLoader = FilteringClassLoader(ClassLoader.getSystemClassLoader()) {
++                    it.startsWith("jupyter.kotlin.") || it.startsWith("kotlin.") || (it.startsWith("org.jetbrains.kotlin.") && !it.startsWith("org.jetbrains.kotlin.jupyter."))
++                }
++                val scriptClassloader = URLClassLoader(scriptClasspath.map { it.toURI().toURL() }.toTypedArray(), filteringClassLoader)
++                baseClassLoader(scriptClassloader)
+             }
+-            val scriptClassloader = URLClassLoader(scriptClasspath.map { it.toURI().toURL() }.toTypedArray(), filteringClassLoader)
+-            baseClassLoader(scriptClassloader)
+         }
+         constructorArgs(this@ReplForJupyterImpl as KotlinKernelHost)
+     }
+diff --git a/src/test/kotlin/org/jetbrains/kotlin/jupyter/test/embeddingTest.kt b/src/test/kotlin/org/jetbrains/kotlin/jupyter/test/embeddingTest.kt
+new file mode 100644
+index 000000000..215f0c26b
+--- /dev/null
++++ b/src/test/kotlin/org/jetbrains/kotlin/jupyter/test/embeddingTest.kt
+@@ -0,0 +1,49 @@
++package org.jetbrains.kotlin.jupyter.test
++
++
++import org.jetbrains.kotlin.jupyter.ReplForJupyterImpl
++import org.jetbrains.kotlin.jupyter.ResolverConfig
++import org.jetbrains.kotlin.jupyter.libraries.LibraryFactory
++import org.jetbrains.kotlin.jupyter.test.ReplWithResolverTest.Companion.resolverConfig
++import org.junit.jupiter.api.Test
++import java.io.File
++import kotlin.test.assertEquals
++
++
++class SomeSingleton {
++    companion object {
++        var initialized: Boolean = false
++    }
++}
++
++
++class EmbedReplTest : AbstractReplTest() {
++
++    @Test
++    fun testSharedStaticVariables() {
++        val embeddedClasspath: List<File> = System.getProperty("java.class.path").split(File.pathSeparator).map(::File)
++        val repl = ReplForJupyterImpl(libraryFactory, embeddedClasspath, embedded=true)
++
++        var res = repl.eval("org.jetbrains.kotlin.jupyter.test.SomeSingleton.initialized")
++        assertEquals(false, res.resultValue)
++
++        SomeSingleton.initialized = true
++
++        res = repl.eval("org.jetbrains.kotlin.jupyter.test.SomeSingleton.initialized")
++        assertEquals(true, res.resultValue)
++
++    }
++
++    @Test
++    fun testCustomClasses() {
++        val embeddedClasspath: List<File> = System.getProperty("java.class.path").split(File.pathSeparator).map(::File)
++        val repl = ReplForJupyterImpl(libraryFactory, embeddedClasspath, embedded=true)
++
++        repl.eval("class Point(val x: Int, val y: Int)")
++
++        repl.eval("val p = Point(1,1)")
++
++        val res = repl.eval("p.x")
++        assertEquals(1, res.resultValue)
++    }
++}

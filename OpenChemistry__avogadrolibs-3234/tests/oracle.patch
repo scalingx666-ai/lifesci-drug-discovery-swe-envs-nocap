@@ -1,0 +1,857 @@
+diff --git a/avogadro/core/bondorderperception.h b/avogadro/core/bondorderperception.h
+index 0590ac73f42..b50fe657166 100644
+--- a/avogadro/core/bondorderperception.h
++++ b/avogadro/core/bondorderperception.h
+@@ -19,19 +19,24 @@ struct BondOrderOptions
+ {
+   /**
+    * Use the 3D coordinates, when the molecule has them, to decide which of
+-   * several equally valid assignments to try first (see
+-   * Molecule::perceiveBondOrders()). Never changes whether a valid assignment
+-   * is found.
++   * several equally valid assignments to try first, and to rule out a second
++   * pi bond on a bent two-coordinate period-2 atom (see
++   * Molecule::perceiveBondOrders()). The second use can change whether a
++   * valid assignment is found: a bare C6 ring has an all-double cumulene
++   * solution that geometry excludes.
+    */
+   bool useGeometry = true;
+ 
+   /**
+    * How many branching steps the search may spend on each connected group of
+-   * unsaturated atoms before giving that group up. Isolated double and triple
+-   * bonds are settled by propagation alone, but rings and other conjugated
+-   * systems need branching: benzene and naphthalene take one step, biphenyl
+-   * two, coronene five. A budget of zero therefore fails every group that
+-   * propagation cannot settle.
++   * unsaturated atoms before falling back to a best-effort completion. Isolated
++   * double and triple bonds are settled by propagation alone, but rings and
++   * other conjugated systems need branching: benzene and naphthalene take one
++   * step, biphenyl two, coronene five. A group the exact search cannot settle
++   * within the budget is completed on a best-effort basis (see
++   * Molecule::perceiveBondOrders()), and is reported as failed only if some
++   * atom is still unsatisfied. A budget of zero sends every group that
++   * propagation cannot settle straight to best effort.
+    */
+   std::size_t stepBudgetPerComponent = 100000;
+ };
+@@ -39,10 +44,14 @@ struct BondOrderOptions
+ /** What Molecule::perceiveBondOrders() did. */
+ struct BondOrderResult
+ {
+-  /** True if every atom's valence was satisfied. */
++  /**
++   * True if every atom's valence was satisfied. When false, the bonds of each
++   * group of atoms that could not be solved exactly still hold a best-effort
++   * partial assignment; @a failedAtoms are the atoms left short.
++   */
+   bool success = true;
+ 
+-  /** The atoms left unsatisfied, in increasing order. */
++  /** The atoms still unsatisfied after the best effort, in increasing order. */
+   std::vector<Index> failedAtoms;
+ 
+   /** A human-readable explanation when @a success is false; empty otherwise. */
+diff --git a/avogadro/core/bondordersolver_p.cpp b/avogadro/core/bondordersolver_p.cpp
+index 8b2611b5a3c..6bddd559cf9 100644
+--- a/avogadro/core/bondordersolver_p.cpp
++++ b/avogadro/core/bondordersolver_p.cpp
+@@ -56,7 +56,7 @@ class Solver
+     }
+   }
+ 
+-  BondOrderSolution solve(std::size_t stepBudget)
++  BondOrderSolution solve(std::size_t stepBudget, bool bestEffort)
+   {
+     BondOrderSolution solution;
+     solution.extra.assign(m_problem.edges.size(), 0);
+@@ -65,6 +65,7 @@ class Solver
+     std::vector<std::vector<std::size_t>> componentEdges;
+     findComponents(componentVertices, componentEdges);
+ 
++    BestEffortScratch scratch;
+     for (std::size_t c = 0; c < componentVertices.size(); ++c) {
+       ComponentFailure failure;
+       if (solveComponent(componentVertices[c], stepBudget, failure.culprit,
+@@ -72,17 +73,50 @@ class Solver
+         for (std::size_t e : componentEdges[c])
+           solution.extra[e] = m_lo[e];
+       } else {
++        if (bestEffort) {
++          // Sized on the first failure, so a molecule that solves pays nothing.
++          if (scratch.residual.empty())
++            scratch.resize(m_vertexCount);
++          completeBestEffort(componentVertices[c], componentEdges[c],
++                             solution.extra, scratch);
++        }
+         for (Index v : componentVertices[c]) {
+-          if (m_problem.demand[v] > 0)
++          const int unmet =
++            bestEffort ? scratch.residual[v] : m_problem.demand[v];
++          if (unmet > 0)
+             failure.vertices.push_back(v);
+         }
+-        solution.failures.push_back(std::move(failure));
++        // The best effort may have satisfied everything after all.
++        if (!failure.vertices.empty())
++          solution.failures.push_back(std::move(failure));
+       }
+     }
+     return solution;
+   }
+ 
+ private:
++  // Work arrays for completeBestEffort(), indexed by vertex and reused across
++  // components so each failed component costs only its own size.
++  struct BestEffortScratch
++  {
++    std::vector<int> residual;
++    std::vector<char> retired;
++    std::vector<char> visited; //!< All zero between searches.
++    std::vector<std::size_t> viaEdge;
++    std::vector<Index> parent;
++    std::vector<Index> touched, queue;
++    std::vector<char> odd;
++
++    void resize(std::size_t vertexCount)
++    {
++      residual.assign(vertexCount, 0);
++      retired.assign(vertexCount, 0);
++      visited.assign(vertexCount, 0);
++      viaEdge.assign(vertexCount, 0);
++      parent.assign(vertexCount, 0);
++    }
++  };
++
+   // ------------------------------------------------------------------
+   // Components: union-find over the edge endpoints. A vertex that wants
+   // order but has no edge at all is a component of its own, and fails.
+@@ -421,6 +455,124 @@ class Solver
+     }
+   }
+ 
++  /**
++   * Fills @a extra for one component that has no exact solution, treating
++   * each demand as an upper bound. On return @a scratch.residual holds the
++   * demand still unmet at each of the component's vertices; no other entry is
++   * set by this call, so only the component's entries are meaningful.
++   *
++   * A greedy pass seeds the assignment, then augmenting paths improve it:
++   * an alternating path v0, e1, v1, ..., ek, vk (k odd) between two distinct
++   * vertices that still have residual demand, raising the odd edges and
++   * lowering the even ones, adds one to the total assigned order and leaves
++   * every interior vertex unchanged. On a bipartite graph (benzenoids,
++   * graphene, any all-even-ring system) this finds a maximum assignment. On a
++   * graph with odd rings it is only a heuristic, because blossoms are not
++   * contracted, and it may stop short of the optimum. The search is
++   * iterative, so a large fused system cannot overflow the stack.
++   */
++  void completeBestEffort(const std::vector<Index>& vertices,
++                          const std::vector<std::size_t>& edges,
++                          std::vector<unsigned char>& extra,
++                          BestEffortScratch& scratch) const
++  {
++    std::vector<int>& residual = scratch.residual;
++    std::vector<char>& retired = scratch.retired;
++    std::vector<char>& visited = scratch.visited;
++    std::vector<std::size_t>& viaEdge = scratch.viaEdge;
++    std::vector<Index>& parent = scratch.parent;
++    std::vector<Index>& touched = scratch.touched;
++    std::vector<Index>& queue = scratch.queue;
++    std::vector<char>& odd = scratch.odd;
++
++    // Only this component's entries are reset; viaEdge and parent are always
++    // written before they are read, and visited is cleared after each search.
++    for (Index v : vertices) {
++      residual[v] = m_problem.demand[v];
++      retired[v] = 0;
++    }
++
++    // Pass 1 gives each edge the order the caller preferred, pass 2 fills
++    // whatever room is left; both visit the most double-looking bonds first.
++    std::vector<std::size_t> order(edges);
++    std::stable_sort(
++      order.begin(), order.end(), [this](std::size_t x, std::size_t y) {
++        return m_problem.edges[x].score > m_problem.edges[y].score;
++      });
++    for (int pass = 0; pass < 2; ++pass) {
++      for (std::size_t e : order) {
++        const BondOrderProblem::Edge& edge = m_problem.edges[e];
++        const int limit = pass == 0 ? edge.preferred : edge.capacity;
++        const int room = limit - extra[e];
++        const int give = std::min({ room, residual[edge.a], residual[edge.b] });
++        if (give > 0) {
++          extra[e] = static_cast<unsigned char>(extra[e] + give);
++          residual[edge.a] -= give;
++          residual[edge.b] -= give;
++        }
++      }
++    }
++
++    // Augmenting paths, found by a breadth-first search from each vertex
++    // that still wants order. A vertex with no path now never gets one later
++    // (the assignment only grows), so it is tried once and then retired.
++    for (Index root : vertices) {
++      while (residual[root] > 0 && !retired[root]) {
++        // The parity of a vertex is its depth in the search tree. From an
++        // even vertex leave along an edge that can be raised, from an odd
++        // one along an edge that can be lowered.
++        touched.assign(1, root);
++        queue.assign(1, root);
++        odd.assign(1, 0);
++        visited[root] = 1;
++        Index target = MaxIndex;
++        for (std::size_t head = 0; head < queue.size() && target == MaxIndex;
++             ++head) {
++          const Index v = queue[head];
++          const bool atOdd = odd[head] != 0;
++          for (std::size_t i = m_incidentStart[v]; i < m_incidentStart[v + 1];
++               ++i) {
++            const std::size_t e = m_incidentEdges[i];
++            const BondOrderProblem::Edge& edge = m_problem.edges[e];
++            const bool usable = atOdd ? extra[e] > 0 : extra[e] < edge.capacity;
++            if (!usable)
++              continue;
++            const Index w = edge.a == v ? edge.b : edge.a;
++            if (visited[w])
++              continue;
++            visited[w] = 1;
++            touched.push_back(w);
++            parent[w] = v;
++            viaEdge[w] = e;
++            if (!atOdd && residual[w] > 0) {
++              target = w;
++              break;
++            }
++            queue.push_back(w);
++            odd.push_back(atOdd ? 0 : 1);
++          }
++        }
++
++        if (target == MaxIndex) {
++          retired[root] = 1;
++        } else {
++          // Walk back to the root: the edge arriving at the target is
++          // raised, and the edges before it alternate.
++          bool raise = true;
++          for (Index v = target; v != root; v = parent[v]) {
++            const std::size_t e = viaEdge[v];
++            extra[e] = static_cast<unsigned char>(extra[e] + (raise ? 1 : -1));
++            raise = !raise;
++          }
++          --residual[root];
++          --residual[target];
++        }
++        for (Index v : touched)
++          visited[v] = 0;
++      }
++    }
++  }
++
+   const BondOrderProblem& m_problem;
+   std::size_t m_vertexCount;
+ 
+@@ -438,10 +590,10 @@ class Solver
+ } // namespace
+ 
+ BondOrderSolution solveBondOrders(const BondOrderProblem& problem,
+-                                  std::size_t stepBudget)
++                                  std::size_t stepBudget, bool bestEffort)
+ {
+   Solver solver(problem);
+-  return solver.solve(stepBudget);
++  return solver.solve(stepBudget, bestEffort);
+ }
+ 
+ } // namespace Avogadro::Core
+diff --git a/avogadro/core/bondordersolver_p.h b/avogadro/core/bondordersolver_p.h
+index a76fbfbdf3c..02363cdc139 100644
+--- a/avogadro/core/bondordersolver_p.h
++++ b/avogadro/core/bondordersolver_p.h
+@@ -63,14 +63,17 @@ struct ComponentFailure
+   Index culprit = MaxIndex;
+   BondOrderFailure reason = BondOrderFailure::Contradiction;
+ 
+-  /** The component's vertices that still have demand, in increasing order. */
++  /** The component's vertices that still have demand, in increasing order.
++   * With best-effort completion, only those left unsatisfied by it. */
+   std::vector<Index> vertices;
+ };
+ 
+ struct BondOrderSolution
+ {
+-  /** One entry per edge: the extra order assigned, valid where the edge's
+-   * component was solved and zero otherwise. */
++  /** One entry per edge: the extra order assigned. Exact where the edge's
++   * component was solved, a best-effort partial assignment (demand treated as
++   * an upper bound) where it was not and best-effort completion was
++   * requested, and zero otherwise. */
+   std::vector<unsigned char> extra;
+ 
+   /** One entry per failed component, in component order (by first vertex). */
+@@ -91,9 +94,18 @@ struct BondOrderSolution
+  * vertex. Isolated multiple bonds resolve by propagation alone; rings and
+  * other conjugated systems need a few branching steps (benzene one, biphenyl
+  * two, coronene five), which then propagate to settle the rest.
++ *
++ * If @a bestEffort is true, a component that cannot be solved exactly (for
++ * any reason) is completed as far as possible instead of being left empty:
++ * demand becomes an upper bound and the assignment is grown greedily and then
++ * by augmenting paths (optimal on bipartite graphs, a heuristic otherwise).
++ * If that satisfies every vertex the component counts as solved; otherwise
++ * it is still reported as a failure, listing only the vertices left over.
++ * Kekulization leaves this off, since a partial Kekule structure is not one.
+  */
+ BondOrderSolution solveBondOrders(const BondOrderProblem& problem,
+-                                  std::size_t stepBudget);
++                                  std::size_t stepBudget,
++                                  bool bestEffort = false);
+ 
+ } // namespace Avogadro::Core
+ 
+diff --git a/avogadro/core/molecule.cpp b/avogadro/core/molecule.cpp
+index ff4b31dc3b6..1114a7e8df4 100644
+--- a/avogadro/core/molecule.cpp
++++ b/avogadro/core/molecule.cpp
+@@ -2039,6 +2039,12 @@ GeometricPreference geometricPreference(Real distance,
+   return { static_cast<unsigned char>(bestOrder - 1), costSingle - costDouble };
+ }
+ 
++/**
++ * Neighbors of a two-coordinate atom that make a smaller angle than this are
++ * bent (sp2 or sp3), and cannot be linear (sp) as two double bonds require.
++ */
++constexpr Real MaxBentAngleDegrees = 150.0;
++
+ /** Worded like kekulizeFailureMessage(). */
+ std::string bondOrderFailureMessage(Index culprit, std::size_t failedAtoms,
+                                     bool oddUnsaturation)
+@@ -2136,8 +2142,51 @@ BondOrderResult Molecule::perceiveBondOrders(const BondOrderOptions& options)
+ 
+     // If we have unsaturation, there's a demand (i.e., this atom needs more
+     // bonds)
+-    problem.demand[atom] = static_cast<unsigned char>(
+-      std::min(unsaturation, static_cast<unsigned int>(MaxPerceivedOrder)));
++    unsigned int demand =
++      std::min(unsaturation, static_cast<unsigned int>(MaxPerceivedOrder));
++
++    // Hybridization from geometry. A period-2 atom with exactly two
++    // neighbors and a demand of two or more could be sp (two pi bonds,
++    // cumulene-like, linear) or sp2 (one pi bond and a lone pair or radical,
++    // bent). Connectivity cannot tell them apart, and without this a bare
++    // C6 ring (no hydrogens) is handed six double bonds, an all-cumulene
++    // ring. A bent atom has at most one pi bond, so its demand is capped at
++    // one; only a near-linear atom keeps its full demand. This is not applied
++    // beyond period 2, where S in SO2 is bent with two double bonds, and it
++    // needs coordinates, so it only applies when the geometry is in use.
++    //
++    // The exception is a bent atom with a bond that measures closer to a
++    // triple bond than to a double one (an aryne such as o-benzyne, or a
++    // reconstructed armchair edge): the length shows it is not a radical, so
++    // it keeps its full demand.
++    if (haveGeometry && demand >= 2) {
++      const unsigned char z = m_atomicNumbers[atom];
++      if (z >= 3 && z <= 10 && m_graph.degree(atom) == 2) {
++        const std::vector<size_t> neighbors = m_graph.neighbors(atom);
++        bool looksTriple = false;
++        for (size_t neighbor : neighbors) {
++          const unsigned char zn = m_atomicNumbers[neighbor];
++          if (Elements::isMetal(zn))
++            continue;
++          const Real length =
++            (m_positions3d[neighbor] - m_positions3d[atom]).norm();
++          const Real toDouble =
++            std::abs(length - AtomUtilities::idealBondLength(z, zn, 2));
++          const Real toTriple =
++            std::abs(length - AtomUtilities::idealBondLength(z, zn, 3));
++          looksTriple = looksTriple || toTriple < toDouble;
++        }
++        const Vector3 u = m_positions3d[neighbors[0]] - m_positions3d[atom];
++        const Vector3 w = m_positions3d[neighbors[1]] - m_positions3d[atom];
++        const Real lengths = u.norm() * w.norm();
++        if (!looksTriple && lengths > 0.0) {
++          const Real cosine = u.dot(w) / lengths;
++          if (cosine > std::cos(MaxBentAngleDegrees * DEG_TO_RAD))
++            demand = 1;
++        }
++      }
++    }
++    problem.demand[atom] = static_cast<unsigned char>(demand);
+     anyDemand = anyDemand || problem.demand[atom] != 0;
+   }
+ 
+@@ -2185,10 +2234,11 @@ BondOrderResult Molecule::perceiveBondOrders(const BondOrderOptions& options)
+ 
+   // Step 3: solve each connected component of candidates on its own.
+   const BondOrderSolution solution =
+-    solveBondOrders(problem, options.stepBudgetPerComponent);
++    solveBondOrders(problem, options.stepBudgetPerComponent, true);
+ 
+-  // Step 4: commit what was solved. A component that failed keeps its bonds
+-  // as they were, and its atoms are reported.
++  // Step 4: commit what was found. A component that failed still gets the
++  // best-effort partial assignment (see solveBondOrders()), and the atoms it
++  // could not satisfy are reported.
+   for (std::size_t edge = 0; edge < bondOfEdge.size(); ++edge) {
+     if (solution.extra[edge] > 0) {
+       m_bondOrders[bondOfEdge[edge]] = static_cast<unsigned char>(
+diff --git a/avogadro/core/molecule.h b/avogadro/core/molecule.h
+index dcace73aaf1..a1a8b38dcec 100644
+--- a/avogadro/core/molecule.h
++++ b/avogadro/core/molecule.h
+@@ -801,8 +801,13 @@ class AVOGADROCORE_EXPORT Molecule
+    * atom add up to exactly its unsaturation. This is a degree-constrained
+    * subgraph problem; it is solved exactly by constraint propagation with
+    * bounded backtracking, separately for each connected group of candidate
+-   * bonds. A group that can be solved is written back; a group that cannot is
+-   * left exactly as it was, and its unsaturated atoms are reported.
++   * bonds. A group that can be solved is written back. For a group that cannot
++   * (an unpaired electron, missing hydrogens, a dangling edge atom) the
++   * demands are treated as upper bounds and a best-effort Kekule-like pattern
++   * is written back instead: a greedy assignment improved by augmenting
++   * paths, optimal for bipartite systems such as benzenoids and graphene and
++   * a heuristic otherwise. Only the atoms it still could not satisfy are
++   * reported, and success is false.
+    *
+    * Rules, all of them chemistry judgements for a reviewer to check:
+    *  - No bond ends up above order 3, and a bond to hydrogen or a halogen
+@@ -812,6 +817,15 @@ class AVOGADROCORE_EXPORT Molecule
+    *  - Metal atoms (see Elements::isMetal()) are never given bond orders, and
+    *    their bonds do not count toward their ligands' valence: a pyridine
+    *    nitrogen bound to zinc is still a pyridine nitrogen.
++   *  - With 3D coordinates in use, a period-2 atom with exactly two neighbors
++   *    whose bond angle is below 150 degrees is sp2 and can carry at most one
++   *    pi bond, so it is not offered a second one (a bare C6 ring becomes
++   *    benzene, not a cumulene). A near-linear atom, and any atom of period 3
++   *    or later, is not limited. The cap is also waived if at least one of
++   *    the atom's bonds to a non-metal neighbor is closer to its ideal
++   *    triple-bond length than to its ideal double-bond length
++   *    (AtomUtilities::idealBondLength()), as in an aryne such as
++   *    o-benzyne.
+    *  - If the molecule has 3D coordinates and @p options asks for it, bond
+    *    lengths decide which of several valid assignments is tried first. For
+    *    a bond of length d the order k nearest to d, among the
+diff --git a/tests/core/bondorderperceptiontest.cpp b/tests/core/bondorderperceptiontest.cpp
+index 0b6f01034c9..23d8f82fe32 100644
+--- a/tests/core/bondorderperceptiontest.cpp
++++ b/tests/core/bondorderperceptiontest.cpp
+@@ -339,7 +339,8 @@ TEST(BondOrderPerceptionTest, noOrderAboveThree)
+   // Heavy atoms only: each carbon is three valence units short, which the
+   // single C-C bond could only supply as order 4. Phase 1 cannot add
+   // hydrogens, so it reports the failure; what matters is that no bond ever
+-  // leaves the 1 to 3 range, and that nothing is changed on failure.
++  // leaves the 1 to 3 range. The best effort raises the bond as far as it may
++  // go, a triple bond, which leaves each carbon one unit short.
+   for (int order : { 2, 3 }) {
+     Molecule mol;
+     mol.addAtom(6);
+@@ -348,11 +349,10 @@ TEST(BondOrderPerceptionTest, noOrderAboveThree)
+     mol.setAtomPosition3d(1, Vector3(order == 2 ? 1.34 : 1.20, 0, 0));
+     mol.addBond(0, 1, 1);
+     const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
+-    EXPECT_LE(mol.bond(0).order(), 3);
+     EXPECT_FALSE(result.success);
+     EXPECT_EQ(result.failedAtoms, (std::vector<Index>{ 0, 1 }));
+     EXPECT_FALSE(result.message.empty());
+-    EXPECT_EQ(mol.bond(0).order(), 1);
++    EXPECT_EQ(mol.bond(0).order(), 3);
+   }
+ }
+ 
+@@ -400,8 +400,9 @@ TEST(BondOrderPerceptionTest, unsatisfiableComponentLeavesOthersAlone)
+   const BondOrderResult combinedResult =
+     combined.perceiveBondOrders(BondOrderOptions());
+   EXPECT_FALSE(combinedResult.success);
+-  EXPECT_EQ(combinedResult.failedAtoms,
+-            (std::vector<Index>{ shift, shift + 1, shift + 2 }));
++  ASSERT_EQ(combinedResult.failedAtoms.size(), 1u);
++  EXPECT_GE(combinedResult.failedAtoms[0], shift);
++  EXPECT_LE(combinedResult.failedAtoms[0], shift + 2);
+   EXPECT_NE(combinedResult.message.find("atom"), std::string::npos);
+ 
+   // The ring got its three double bonds ...
+@@ -409,9 +410,12 @@ TEST(BondOrderPerceptionTest, unsatisfiableComponentLeavesOthersAlone)
+   for (Index b = 0; b < ringBonds; ++b)
+     doubles += (combined.bond(b).order() == 2) ? 1 : 0;
+   EXPECT_EQ(doubles, 3u);
+-  // ... and the radical's bonds are as they were.
++  // ... and the radical gets a best-effort double bond, one of its two
++  // carbon-carbon bonds, with the odd carbon out reported.
++  std::size_t radicalDoubles = 0;
+   for (Index b = ringBonds; b < combined.bondCount(); ++b)
+-    EXPECT_EQ(combined.bond(b).order(), 1);
++    radicalDoubles += (combined.bond(b).order() == 2) ? 1 : 0;
++  EXPECT_EQ(radicalDoubles, 1u);
+ }
+ 
+ TEST(BondOrderPerceptionTest, presetMultipleBondIsKept)
+@@ -457,15 +461,16 @@ TEST(BondOrderPerceptionTest, metalLigandStaysAromatic)
+ 
+ TEST(BondOrderPerceptionTest, metalCarbonylFailsGracefully)
+ {
+-  // Fe(CO) alone: the carbon has three units of valence for one oxygen that
+-  // can give it two at most, so perception reports the failure rather than
+-  // looping, and leaves every bond as it was.
++  // Fe(CO) alone: the carbon wants three more units of valence from an
++  // oxygen that can give one, so perception reports the failure rather than
++  // looping. The best effort makes C=O, and the metal bond is never touched.
+   Parsed carbonyl = parse("[Fe]C#O");
+   const BondOrderResult result =
+     carbonyl.mol.perceiveBondOrders(BondOrderOptions());
+   EXPECT_FALSE(result.success);
+-  for (Index b = 0; b < carbonyl.mol.bondCount(); ++b)
+-    EXPECT_EQ(carbonyl.mol.bond(b).order(), 1);
++  EXPECT_EQ(result.failedAtoms, (std::vector<Index>{ 1 }));
++  EXPECT_EQ(carbonyl.mol.bond(0, 1).order(), 1);
++  EXPECT_EQ(carbonyl.mol.bond(1, 2).order(), 2);
+ }
+ 
+ TEST(BondOrderPerceptionTest, geometryChoosesBetweenKekuleStructures)
+@@ -650,31 +655,33 @@ TEST(BondOrderPerceptionTest, oddUnsaturationFailsImmediately)
+   // A flake with a vacancy has an odd number of sp2 carbons: no pairing of
+   // their valences exists. That is decided before any search (the old
+   // behaviour spent its whole step budget), so the message names the cause
+-  // rather than the step limit.
++  // rather than the step limit. The rest of the flake still gets a best-
++  // effort Kekule structure, leaving exactly one carbon over.
+   std::size_t carbons = 0;
+   Molecule mol = graphene(true, carbons);
+   ASSERT_EQ(carbons % 2, 1u);
+ 
+   const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
+   EXPECT_FALSE(result.success);
+-  EXPECT_EQ(result.failedAtoms.size(), carbons);
++  EXPECT_EQ(result.failedAtoms.size(), 1u);
+   EXPECT_NE(result.message.find("odd number of unpaired"), std::string::npos)
+     << result.message;
+   EXPECT_EQ(result.message.find("step"), std::string::npos) << result.message;
+-  EXPECT_EQ(histogram(mol).count(2), 0u);
++  EXPECT_EQ(histogram(mol)[2], (carbons - 1) / 2);
+ }
+ 
+ TEST(BondOrderPerceptionTest, oddUnsaturationIsAnotherComponentsBusiness)
+ {
+   // The allyl radical is odd, which is named as the cause; the benzene beside
+-  // it is not, and is not reported.
++  // it is not, and is not reported. One radical carbon is left over.
+   Index shift = 0;
+   Molecule mol = benzeneBesideAllylRadical(shift);
+   const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
+   EXPECT_FALSE(result.success);
+   EXPECT_NE(result.message.find("odd number"), std::string::npos);
+-  EXPECT_EQ(result.failedAtoms,
+-            (std::vector<Index>{ shift, shift + 1, shift + 2 }));
++  ASSERT_EQ(result.failedAtoms.size(), 1u);
++  EXPECT_GE(result.failedAtoms[0], shift);
++  EXPECT_LE(result.failedAtoms[0], shift + 2);
+ }
+ 
+ TEST(BondOrderPerceptionTest, atomsBondedOnlyToMetalsAreSatisfied)
+@@ -724,17 +731,234 @@ TEST(BondOrderPerceptionTest, metalAndNonMetalBondsStillHeldToValence)
+             loneResult.failedAtoms.end());
+ }
+ 
+-TEST(BondOrderPerceptionTest, stepBudgetIsReported)
++TEST(BondOrderPerceptionTest, stepBudgetDoesNotStopBestEffort)
+ {
+-  // With no budget at all, anything that needs a guess is given up. Benzene
+-  // without a starting double bond needs one.
++  // With no budget at all, anything that needs a guess is given up by the
++  // exact search. Benzene without a starting double bond needs one, but the
++  // best-effort completion that follows finds the Kekule structure anyway
++  // (a ring is bipartite), so the group counts as solved.
+   Parsed benzene = parse("c1ccccc1");
+   BondOrderOptions options;
+   options.useGeometry = false;
+   options.stepBudgetPerComponent = 0;
+   const BondOrderResult result = benzene.mol.perceiveBondOrders(options);
++  EXPECT_TRUE(result.success) << result.message;
++  EXPECT_TRUE(result.failedAtoms.empty());
++  EXPECT_EQ(histogram(benzene.mol)[2], 3u);
++}
++
++/** Bare carbon atoms at @a positions, bonded along @a bonds, all single. */
++Molecule bareCarbons(const std::vector<Vector3>& positions,
++                     const std::vector<std::pair<Index, Index>>& bonds)
++{
++  Molecule mol;
++  for (const Vector3& position : positions)
++    mol.addAtom(6).setPosition3d(position);
++  for (const auto& bond : bonds)
++    mol.addBond(bond.first, bond.second, 1);
++  return mol;
++}
++
++/** How many double bonds each atom is in. */
++std::vector<unsigned int> doubleBondCounts(const Molecule& mol)
++{
++  std::vector<unsigned int> counts(mol.atomCount(), 0);
++  for (Index b = 0; b < mol.bondCount(); ++b) {
++    if (mol.bondOrders()[b] == 2) {
++      ++counts[mol.bondPairs()[b].first];
++      ++counts[mol.bondPairs()[b].second];
++    }
++  }
++  return counts;
++}
++
++Molecule bareHexagon()
++{
++  std::vector<Vector3> positions;
++  for (int i = 0; i < 6; ++i) {
++    const double angle = i * 3.14159265358979 / 3.0;
++    positions.emplace_back(1.39 * std::cos(angle), 1.39 * std::sin(angle), 0.0);
++  }
++  std::vector<std::pair<Index, Index>> bonds;
++  for (Index i = 0; i < 6; ++i)
++    bonds.emplace_back(i, (i + 1) % 6);
++  return bareCarbons(positions, bonds);
++}
++
++TEST(BondOrderPerceptionTest, bareBenzeneRingIsNotACumulene)
++{
++  // Six carbons and no hydrogens: each has two neighbors and wants two more
++  // bonds, which connectivity alone satisfies with six double bonds. A bent
++  // period-2 atom is sp2 and carries one pi bond, so the geometry gives three.
++  Molecule mol = bareHexagon();
++  const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
++  EXPECT_TRUE(result.success) << result.message;
++  EXPECT_EQ(histogram(mol)[2], 3u);
++  EXPECT_EQ(histogram(mol)[1], 3u);
++  for (unsigned int count : doubleBondCounts(mol))
++    EXPECT_EQ(count, 1u);
++}
++
++TEST(BondOrderPerceptionTest, bareBenzeneRingWithoutGeometry)
++{
++  // Without geometry nothing says the carbons are bent, so whatever comes
++  // out is only required to be an exact assignment.
++  Molecule mol = bareHexagon();
++  BondOrderOptions options;
++  options.useGeometry = false;
++  const BondOrderResult result = mol.perceiveBondOrders(options);
++  EXPECT_TRUE(result.success) << result.message;
++  for (unsigned int sum : orderSums(mol))
++    EXPECT_EQ(sum, 4u);
++}
++
++TEST(BondOrderPerceptionTest, linearAtomKeepsTwoDoubleBonds)
++{
++  // Allene, H2C=C=CH2 with explicit hydrogens: the central carbon has two
++  // neighbors at 180 degrees, so it is sp and the bent-atom cap must not
++  // apply to it.
++  Molecule mol;
++  mol.addAtom(6).setPosition3d(Vector3(-1.31, 0.0, 0.0));
++  mol.addAtom(6).setPosition3d(Vector3(0.0, 0.0, 0.0));
++  mol.addAtom(6).setPosition3d(Vector3(1.31, 0.0, 0.0));
++  mol.addBond(0, 1, 1);
++  mol.addBond(1, 2, 1);
++  const double sign[2] = { -1.0, 1.0 };
++  for (int end = 0; end < 2; ++end) {
++    for (int h = 0; h < 2; ++h) {
++      auto hydrogen = mol.addAtom(1);
++      hydrogen.setPosition3d(Vector3(sign[end] * 1.88, 0.0, 0.0) +
++                             Vector3(0.0, 0.94 * sign[h], 0.0));
++      mol.addBond(end == 0 ? 0 : 2, hydrogen.index(), 1);
++    }
++  }
++  const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
++  EXPECT_TRUE(result.success) << result.message;
++  EXPECT_EQ(mol.bond(0, 1).order(), 2);
++  EXPECT_EQ(mol.bond(1, 2).order(), 2);
++}
++
++TEST(BondOrderPerceptionTest, benzyneKeepsItsBentTriple)
++{
++  // o-Benzyne: the bare carbons are bent but the 1.26 A bond is a triple
++  // bond, so the length exception must keep their full demand.
++  static const double coordinates[10][3] = {
++    { 1.3575, 0.0563, 0.0 },   { 0.7275, 1.1475, 0.0 },
++    { -0.6950, 1.2038, 0.0 },  { -1.3900, 0.0000, 0.0 },
++    { -0.6950, -1.2038, 0.0 }, { 0.6950, -1.2038, 0.0 },
++    { -1.2350, 2.1391, 0.0 },  { -2.4700, 0.0000, 0.0 },
++    { -1.2350, -2.1391, 0.0 }, { 1.2350, -2.1391, 0.0 }
++  };
++  Molecule mol;
++  for (int i = 0; i < 10; ++i) {
++    mol.addAtom(i < 6 ? 6 : 1)
++      .setPosition3d(
++        Vector3(coordinates[i][0], coordinates[i][1], coordinates[i][2]));
++  }
++  mol.perceiveBondsSimple();
++  const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
++  EXPECT_TRUE(result.success) << result.message;
++  EXPECT_EQ(mol.bond(0, 1).order(), 3);
++  EXPECT_EQ(histogram(mol)[3], 1u);
++  EXPECT_EQ(histogram(mol)[2], 2u);
++}
++
++TEST(BondOrderPerceptionTest, oddSystemGetsBestEffort)
++{
++  // Allyl radical, CH2-CH-CH2 with explicit hydrogens: no exact answer, but
++  // one carbon-carbon double bond is committed and one carbon reported.
++  Index shift = 0;
++  Molecule mol;
++  shift = mol.addAtom(6).index();
++  mol.addAtom(6);
++  mol.addAtom(6);
++  mol.addBond(0, 1, 1);
++  mol.addBond(1, 2, 1);
++  const int hydrogens[] = { 2, 1, 2 };
++  for (Index c = 0; c < 3; ++c) {
++    for (int h = 0; h < hydrogens[c]; ++h)
++      mol.addBond(shift + c, mol.addAtom(1).index(), 1);
++  }
++  const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
++  EXPECT_FALSE(result.success);
++  EXPECT_EQ(result.failedAtoms.size(), 1u);
++  EXPECT_FALSE(result.message.empty());
++  EXPECT_EQ(histogram(mol)[2], 1u);
++  for (unsigned int sum : orderSums(mol))
++    EXPECT_LE(sum, 4u);
++}
++
++TEST(BondOrderPerceptionTest, bentChainKeepsAlternatingDoubleBonds)
++{
++  // A bare zigzag C4 with 120 degree angles. The interior carbons are sp2
++  // and take one double bond each; the terminal carbons are left with
++  // dangling valence. The best effort is C=C-C=C and the ends are reported.
++  const Vector3 step(1.4, 0.0, 0.0);
++  const Vector3 up(0.7, 1.2124, 0.0);
++  std::vector<Vector3> positions = { Vector3(0.0, 0.0, 0.0) };
++  positions.push_back(positions.back() + step);
++  positions.push_back(positions.back() + up);
++  positions.push_back(positions.back() + step);
++  Molecule mol = bareCarbons(positions, { { 0, 1 }, { 1, 2 }, { 2, 3 } });
++
++  const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
+   EXPECT_FALSE(result.success);
+-  EXPECT_EQ(result.failedAtoms.size(), 6u);
+-  for (Index b = 0; b < benzene.mol.bondCount(); ++b)
+-    EXPECT_EQ(benzene.mol.bond(b).order(), 1);
++  EXPECT_EQ(mol.bond(0, 1).order(), 2);
++  EXPECT_EQ(mol.bond(1, 2).order(), 1);
++  EXPECT_EQ(mol.bond(2, 3).order(), 2);
++  EXPECT_EQ(result.failedAtoms, (std::vector<Index>{ 0, 3 }));
++}
++
++TEST(BondOrderPerceptionTest, hydrogenFreeNanoribbon)
++{
++  // A bare armchair graphene nanoribbon as ASE writes it (48 carbons, no
++  // hydrogens, cut where the periodic cell was). The dangling end atoms
++  // cannot be satisfied, but the rest should still be a Kekule pattern.
++  static const double coordinates[48][3] = {
++    { 7.37854, 0.00000, 0.00000 },  { 8.60829, 0.00000, 0.71000 },
++    { 8.60829, 0.00000, 2.13000 },  { 7.37854, 0.00000, 2.84000 },
++    { 7.37854, 0.00000, 4.26000 },  { 8.60829, 0.00000, 4.97000 },
++    { 8.60829, 0.00000, 6.39000 },  { 7.37854, 0.00000, 7.10000 },
++    { 7.37854, 0.00000, 8.52000 },  { 8.60829, 0.00000, 9.23000 },
++    { 8.60829, 0.00000, 10.65000 }, { 7.37854, 0.00000, 11.36000 },
++    { 4.91902, 0.00000, 0.00000 },  { 6.14878, 0.00000, 0.71000 },
++    { 6.14878, 0.00000, 2.13000 },  { 4.91902, 0.00000, 2.84000 },
++    { 4.91902, 0.00000, 4.26000 },  { 6.14878, 0.00000, 4.97000 },
++    { 6.14878, 0.00000, 6.39000 },  { 4.91902, 0.00000, 7.10000 },
++    { 4.91902, 0.00000, 8.52000 },  { 6.14878, 0.00000, 9.23000 },
++    { 6.14878, 0.00000, 10.65000 }, { 4.91902, 0.00000, 11.36000 },
++    { 2.45951, 0.00000, 0.00000 },  { 3.68927, 0.00000, 0.71000 },
++    { 3.68927, 0.00000, 2.13000 },  { 2.45951, 0.00000, 2.84000 },
++    { 2.45951, 0.00000, 4.26000 },  { 3.68927, 0.00000, 4.97000 },
++    { 3.68927, 0.00000, 6.39000 },  { 2.45951, 0.00000, 7.10000 },
++    { 2.45951, 0.00000, 8.52000 },  { 3.68927, 0.00000, 9.23000 },
++    { 3.68927, 0.00000, 10.65000 }, { 2.45951, 0.00000, 11.36000 },
++    { 0.00000, 0.00000, 0.00000 },  { 1.22976, 0.00000, 0.71000 },
++    { 1.22976, 0.00000, 2.13000 },  { 0.00000, 0.00000, 2.84000 },
++    { 0.00000, 0.00000, 4.26000 },  { 1.22976, 0.00000, 4.97000 },
++    { 1.22976, 0.00000, 6.39000 },  { 0.00000, 0.00000, 7.10000 },
++    { 0.00000, 0.00000, 8.52000 },  { 1.22976, 0.00000, 9.23000 },
++    { 1.22976, 0.00000, 10.65000 }, { 0.00000, 0.00000, 11.36000 }
++  };
++  Molecule mol;
++  for (const auto& c : coordinates)
++    mol.addAtom(6).setPosition3d(Vector3(c[0], c[1], c[2]));
++  mol.perceiveBondsSimple();
++
++  const BondOrderResult result = mol.perceiveBondOrders(BondOrderOptions());
++  EXPECT_FALSE(result.success);
++
++  // Every carbon is in exactly one double bond (a perfect matching exists)
++  // and none is over its valence.
++  for (unsigned int count : doubleBondCounts(mol))
++    EXPECT_EQ(count, 1u);
++  for (unsigned int sum : orderSums(mol))
++    EXPECT_LE(sum, 4u);
++  EXPECT_EQ(histogram(mol)[2], 24u);
++
++  // Only the end atoms, which have fewer than three neighbors and so cannot
++  // be saturated, are reported; here that is two of them.
++  EXPECT_EQ(result.failedAtoms.size(), 2u);
++  for (Index atom : result.failedAtoms)
++    EXPECT_LT(mol.bonds(atom).size(), 3u);
+ }
+diff --git a/tests/io/bondorderscorpustest.cpp b/tests/io/bondorderscorpustest.cpp
+index 56268516cd0..199867f9234 100644
+--- a/tests/io/bondorderscorpustest.cpp
++++ b/tests/io/bondorderscorpustest.cpp
+@@ -244,39 +244,41 @@ Evaluation evaluate(const std::string& fullPath, bool stripCharges)
+       eval.detail += (eval.detail.empty() ? "" : ",") + e;
+     eval.detail += " x" + std::to_string(result.failedAtoms.size());
+ 
+-    // A clean failure: failedAtoms is not empty, and the failed component --
+-    // which failedAtoms lists in full, since an atom is only listed when it
+-    // still wanted bond order -- kept every bond at order 1, while the atoms
+-    // outside it have the valence they should have.
+-    std::vector<bool> region(mol.atomCount(), false);
+-    for (Index a : result.failedAtoms)
+-      region[a] = true;
++    // A clean failure: failedAtoms is not empty and has a message, no bond
++    // order is above 3, and every connected piece of the molecule that has
++    // no failed atom has the valence it should. A failed group is completed
++    // as far as it can be (see solveBondOrders()), so its bonds are not left
++    // at order 1 any more, and the rest of its molecule can be short of the
++    // reference too: in a heavy-atom-only structure the missing hydrogens
++    // change every valence, and the atoms that did get satisfied are
++    // satisfied against the wrong target. Sulfonyl sulfur is another case:
++    // it stays at valence 4 while its oxygens are the failed atoms.
+     eval.cleanFailure = !result.failedAtoms.empty() && !result.message.empty();
+     if (!eval.cleanFailure)
+       eval.cleanDetail = "no failed atoms or message";
+     for (Index b = 0; b < mol.bondCount() && eval.cleanFailure; ++b) {
+-      const auto pair = mol.bondPairs()[b];
+-      if (region[pair.first] && region[pair.second] &&
+-          mol.bondOrders()[b] != 1) {
++      if (mol.bondOrders()[b] > 3) {
+         eval.cleanFailure = false;
+-        eval.cleanDetail = "bond changed inside the failed component";
++        eval.cleanDetail = "bond order above 3";
+       }
+     }
+-    // An atom outside the failed component can still be short of its
+-    // reference valence when the atom causing the failure is its neighbour:
+-    // sulfonyl sulfur, for instance, stays at valence 4 while its oxygens
+-    // are the failed atoms. Anything further away must be right.
+-    std::vector<bool> nearFailure = region;
++    std::vector<Index> piece(mol.atomCount());
++    std::iota(piece.begin(), piece.end(), 0);
++    auto findPiece = [&piece](Index a) {
++      while (piece[a] != a)
++        a = piece[a] = piece[piece[a]];
++      return a;
++    };
+     for (Index b = 0; b < mol.bondCount(); ++b) {
+       const auto pair = mol.bondPairs()[b];
+-      if (region[pair.first])
+-        nearFailure[pair.second] = true;
+-      if (region[pair.second])
+-        nearFailure[pair.first] = true;
++      piece[findPiece(pair.first)] = findPiece(pair.second);
+     }
++    std::vector<bool> failedPiece(mol.atomCount(), false);
++    for (Index a : result.failedAtoms)
++      failedPiece[findPiece(a)] = true;
+     const std::vector<unsigned int> got = orderSums(mol, true);
+     for (Index a = 0; a < mol.atomCount() && eval.cleanFailure; ++a) {
+-      if (!nearFailure[a] && got[a] != wanted[a]) {
++      if (!failedPiece[findPiece(a)] && got[a] != wanted[a]) {
+         eval.cleanFailure = false;
+         eval.cleanDetail =
+           "atom " + std::to_string(a) + " outside the failure is wrong";

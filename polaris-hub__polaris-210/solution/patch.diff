@@ -1,0 +1,321 @@
+diff --git a/polaris/dataset/_base.py b/polaris/dataset/_base.py
+index d246ecfa..071f3068 100644
+--- a/polaris/dataset/_base.py
++++ b/polaris/dataset/_base.py
+@@ -163,7 +163,6 @@ def zarr_root(self) -> zarr.Group | None:
+             See also [`Dataset.load_to_memory`][polaris.dataset.Dataset.load_to_memory].
+         """
+ 
+-        from polaris.hub.client import PolarisHubClient
+         from polaris.hub.storage import StorageSession
+ 
+         if self._zarr_root is not None:
+@@ -175,31 +174,48 @@ def zarr_root(self) -> zarr.Group | None:
+         saved_on_hub = self.zarr_root_path.startswith(StorageSession.polaris_protocol)
+ 
+         if self._warn_about_remote_zarr:
+-            saved_remote = saved_on_hub or not Path(self.zarr_root_path).exists()
+-
+-            if saved_remote:
++            if saved_on_hub:
++                # TODO (cwognum): The user now has no easy way of knowing whether the dataset is "small enough".
+                 logger.warning(
+                     f"You're loading data from a remote location. "
+-                    f"To speed up this process, consider caching the dataset first "
+-                    f"using {self.__class__.__name__}.cache()"
++                    f"If the dataset is small enough, consider caching the dataset first "
++                    f"using {self.__class__.__name__}.cache() for more performant data access."
+                 )
+                 self._warn_about_remote_zarr = False
+ 
+         try:
+             if saved_on_hub:
+-                with PolarisHubClient() as client:
+-                    with StorageSession(client, "read", self.urn) as storage:
+-                        self._zarr_root = zarr.open_consolidated(storage.extension_store)
++                self._zarr_root = self.load_zarr_root_from_hub()
+             else:
+-                # We use memory mapping by default because our experiments show that it's consistently faster
+-                store = MemoryMappedDirectoryStore(self.zarr_root_path)
+-                self._zarr_root = zarr.open_consolidated(store, mode="r+")
++                self._zarr_root = self.load_zarr_root_from_local()
++
+         except KeyError as error:
+             raise InvalidDatasetError(
+                 "A Zarr archive associated with a Polaris dataset has to be consolidated."
+             ) from error
+         return self._zarr_root
+ 
++    @abc.abstractmethod
++    def load_zarr_root_from_hub(self):
++        """
++        Loads a Zarr archive from the Polaris Hub.
++        """
++        raise NotImplementedError
++
++    def load_zarr_root_from_local(self):
++        """
++        Loads a locally stored Zarr archive.
++
++        We use memory mapping by default because our experiments show that it's consistently faster
++        """
++        if not Path(self.zarr_root_path).exists():
++            raise FileNotFoundError(
++                f"The Zarr archive at {self.zarr_root_path} does not exist. "
++                "If the data is not stored on the Polaris Hub, it needs to be stored locally."
++            )
++        store = MemoryMappedDirectoryStore(self.zarr_root_path)
++        return zarr.open_consolidated(store, mode="r+")
++
+     @computed_field
+     @property
+     def n_rows(self) -> int:
+diff --git a/polaris/dataset/_dataset.py b/polaris/dataset/_dataset.py
+index 4a9dfb4a..146d9fa1 100644
+--- a/polaris/dataset/_dataset.py
++++ b/polaris/dataset/_dataset.py
+@@ -132,6 +132,17 @@ def _compute_checksum(self) -> str:
+         checksum = hash_fn.hexdigest()
+         return checksum
+ 
++    def load_zarr_root_from_hub(self):
++        """
++        Loads a Zarr archive from the Hub.
++        """
++        from polaris.hub.client import PolarisHubClient
++        from polaris.hub.storage import StorageSession
++
++        with PolarisHubClient() as client:
++            with StorageSession(client, "read", self.urn) as storage:
++                return zarr.open_consolidated(store=storage.extension_store)
++
+     @computed_field
+     @property
+     def zarr_md5sum_manifest(self) -> List[ZarrFileChecksum]:
+@@ -311,7 +322,7 @@ def _split_index_from_path(self, path: str) -> tuple[str, int | None]:
+ 
+     def _repr_dict_(self) -> dict:
+         """Utility function for pretty-printing to the command line and jupyter notebooks"""
+-        repr_dict = self.model_dump(exclude={"table", "zarr_md5sum_manifest"})
++        repr_dict = self.model_dump(exclude={"table", "zarr_md5sum_manifest", "md5sum"})
+         return repr_dict
+ 
+     def __eq__(self, other):
+diff --git a/polaris/experimental/_dataset_v2.py b/polaris/experimental/_dataset_v2.py
+index 74e8ba8a..986a0b0f 100644
+--- a/polaris/experimental/_dataset_v2.py
++++ b/polaris/experimental/_dataset_v2.py
+@@ -113,6 +113,17 @@ def dtypes(self) -> dict[str, np.dtype]:
+             dtypes[group] = np.dtype(object)
+         return dtypes
+ 
++    def load_zarr_root_from_hub(self):
++        """
++        Loads a Zarr archive from the Hub.
++        """
++        from polaris.hub.client import PolarisHubClient
++        from polaris.hub.storage import StorageSession
++
++        with PolarisHubClient() as client:
++            with StorageSession(client, "read", self.urn) as storage:
++                return zarr.open_consolidated(store=storage.root_store)
++
+     @property
+     def zarr_manifest_path(self) -> str:
+         if self._zarr_manifest_path is None:
+@@ -263,7 +274,7 @@ def cache(self) -> str:
+ 
+     def _repr_dict_(self) -> dict:
+         """Utility function for pretty-printing to the command line and jupyter notebooks"""
+-        repr_dict = self.model_dump()
++        repr_dict = self.model_dump(exclude={"zarr_manifest_path", "zarr_manifest_md5sum"})
+         return repr_dict
+ 
+     def should_verify_checksum(self, strategy: ChecksumStrategy) -> bool:
+diff --git a/polaris/hub/client.py b/polaris/hub/client.py
+index 2235c114..d2278452 100644
+--- a/polaris/hub/client.py
++++ b/polaris/hub/client.py
+@@ -143,6 +143,12 @@ def ensure_active_token(self, token: OAuth2Token | None = None) -> bool:
+         """
+         Override the active check to trigger a refetch of the token if it is not active.
+         """
++        if token is None:
++            # This won't be needed with if we set a lower bound for authlib: >=1.3.2
++            # See https://github.com/lepture/authlib/pull/625
++            # As of now, this latest version is not available on Conda though.
++            token = self.token
++
+         is_active = super().ensure_active_token(token)
+         if is_active:
+             return True
+@@ -292,7 +298,7 @@ def get_dataset(
+         owner: str | HubOwner,
+         name: str,
+         verify_checksum: ChecksumStrategy = "verify_unless_zarr",
+-    ) -> DatasetV1:
++    ) -> DatasetV1 | DatasetV2:
+         """Load a standard dataset from the Polaris Hub.
+ 
+         Args:
+@@ -304,9 +310,18 @@ def get_dataset(
+         Returns:
+             A `Dataset` instance, if it exists.
+         """
+-        return self._get_dataset(owner, name, ArtifactSubtype.STANDARD.value, verify_checksum)
++        with ProgressIndicator(
++            start_msg="Fetching dataset...",
++            success_msg="Fetched dataset.",
++            error_msg="Failed to fetch dataset.",
++        ):
++            try:
++                return self._get_v1_dataset(owner, name, ArtifactSubtype.STANDARD.value, verify_checksum)
++            except PolarisRetrieveArtifactError:
++                # If the v1 dataset is not found, try to load a v2 dataset
++                return self._get_v2_dataset(owner, name)
+ 
+-    def _get_dataset(
++    def _get_v1_dataset(
+         self,
+         owner: str | HubOwner,
+         name: str,
+@@ -324,39 +339,54 @@ def _get_dataset(
+         Returns:
+             A `Dataset` instance, if it exists.
+         """
+-        with ProgressIndicator(
+-            start_msg="Fetching artifact...",
+-            success_msg="Fetched artifact.",
+-            error_msg="Failed to fetch dataset.",
+-        ):
+-            url = (
+-                f"/v1/dataset/{owner}/{name}"
+-                if artifact_type == ArtifactSubtype.STANDARD.value
+-                else f"/v2/competition/dataset/{owner}/{name}"
+-            )
+-            response = self._base_request_to_hub(url=url, method="GET")
++        url = (
++            f"/v1/dataset/{owner}/{name}"
++            if artifact_type == ArtifactSubtype.STANDARD.value
++            else f"/v2/competition/dataset/{owner}/{name}"
++        )
++        response = self._base_request_to_hub(url=url, method="GET")
+ 
+-            # Disregard the Zarr root in the response. We'll get it from the storage token instead.
+-            response.pop("zarrRootPath", None)
++        # Disregard the Zarr root in the response. We'll get it from the storage token instead.
++        response.pop("zarrRootPath", None)
+ 
+-            # Load the dataset table and optional Zarr archive
+-            with StorageSession(self, "read", Dataset.urn_for(owner, name)) as storage:
+-                table = pd.read_parquet(storage.get_root())
+-                zarr_root_path = str(storage.paths.extension)
++        # Load the dataset table and optional Zarr archive
++        with StorageSession(self, "read", Dataset.urn_for(owner, name)) as storage:
++            table = pd.read_parquet(storage.get_root())
++            zarr_root_path = storage.paths.extension
+ 
+-            if artifact_type == ArtifactSubtype.COMPETITION:
+-                dataset = CompetitionDataset(table=table, zarr_root_path=zarr_root_path, **response)
+-                md5sum = response["maskedMd5Sum"]
+-            else:
+-                dataset = DatasetV1(table=table, zarr_root_path=zarr_root_path, **response)
+-                md5sum = response["md5Sum"]
++            if zarr_root_path is not None:
++                # For V1 datasets, the Zarr Root is optional.
++                # It should be None if the dataset does not use pointer columns
++                zarr_root_path = str(zarr_root_path)
+ 
+-            if dataset.should_verify_checksum(verify_checksum):
+-                dataset.verify_checksum(md5sum)
+-            else:
+-                dataset.md5sum = md5sum
++        if artifact_type == ArtifactSubtype.COMPETITION:
++            dataset = CompetitionDataset(table=table, zarr_root_path=zarr_root_path, **response)
++            md5sum = response["maskedMd5Sum"]
++        else:
++            dataset = DatasetV1(table=table, zarr_root_path=zarr_root_path, **response)
++            md5sum = response["md5Sum"]
++
++        if dataset.should_verify_checksum(verify_checksum):
++            dataset.verify_checksum(md5sum)
++        else:
++            dataset.md5sum = md5sum
++
++        return dataset
++
++    def _get_v2_dataset(self, owner: str | HubOwner, name: str) -> DatasetV2:
++        """"""
++        url = f"/v2/dataset/{owner}/{name}"
++        response = self._base_request_to_hub(url=url, method="GET")
++
++        # Disregard the Zarr root in the response. We'll get it from the storage token instead.
++        response.pop("zarrRootPath", None)
++
++        # Load the Zarr archive
++        with StorageSession(self, "read", Dataset.urn_for(owner, name)) as storage:
++            zarr_root_path = str(storage.paths.root)
+ 
+-            return dataset
++        dataset = DatasetV2(zarr_root_path=zarr_root_path, **response)
++        return dataset
+ 
+     def list_benchmarks(self, limit: int = 100, offset: int = 0) -> list[str]:
+         """List all available benchmarks on the Polaris Hub.
+@@ -802,7 +832,7 @@ def get_competition(
+ 
+         # TODO (jstlaurent): response["dataset"]["artifactId"] is the owner/name unique identifier,
+         #  but we'd need to change the signature of get_dataset to use it
+-        response["dataset"] = self._get_dataset(
++        response["dataset"] = self._get_v1_dataset(
+             response["dataset"]["owner"]["slug"],
+             response["dataset"]["name"],
+             ArtifactSubtype.COMPETITION,
+diff --git a/polaris/hub/external_client.py b/polaris/hub/external_client.py
+index 35829186..2d7ab72b 100644
+--- a/polaris/hub/external_client.py
++++ b/polaris/hub/external_client.py
+@@ -78,6 +78,11 @@ def fetch_token(self, **kwargs) -> dict:
+             ) from error
+ 
+     def ensure_active_token(self, token: OAuth2Token | None = None) -> bool:
++        if token is None:
++            # This won't be needed with if we set a lower bound for authlib: >=1.3.2
++            # See https://github.com/lepture/authlib/pull/625
++            # As of now, this latest version is not available on Conda though.
++            token = self.token
+         try:
+             return super().ensure_active_token(token) or False
+         except OAuthError:
+diff --git a/polaris/hub/storage.py b/polaris/hub/storage.py
+index 70fb11c2..5320a358 100644
+--- a/polaris/hub/storage.py
++++ b/polaris/hub/storage.py
+@@ -7,7 +7,7 @@
+ from typing import Any, Generator, Literal, Mapping, Sequence, TypeAlias
+ 
+ import boto3
+-from authlib.integrations.httpx_client import OAuth2Client
++from authlib.integrations.httpx_client import OAuth2Client, OAuthError
+ from authlib.oauth2 import OAuth2Error
+ from authlib.oauth2.rfc6749 import OAuth2Token
+ from botocore.exceptions import BotoCoreError, ClientError
+@@ -346,7 +346,7 @@ def fetch_token(self, **kwargs) -> dict[str, Any]:
+         """
+         try:
+             return super().fetch_token()
+-        except OAuth2Error as error:
++        except (OAuthError, OAuth2Error) as error:
+             raise PolarisHubError(
+                 message=f"Could not obtain a token to access the storage backend. Error was: {error.error} - {error.description}"
+             ) from error
+@@ -356,6 +356,9 @@ def ensure_active_token(self, token: OAuth2Token | None = None) -> bool:
+         Override the active check to trigger a re-fetch of the token if it is not active.
+         """
+         if token is None:
++            # This won't be needed with if we set a lower bound for authlib: >=1.3.2
++            # See https://github.com/lepture/authlib/pull/625
++            # As of now, this latest version is not available on Conda though.
+             token = self.token
+ 
+         if token and super().ensure_active_token(token):

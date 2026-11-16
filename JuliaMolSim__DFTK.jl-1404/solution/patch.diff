@@ -1,0 +1,312 @@
+diff --git a/examples/exact_exchange.jl b/examples/exact_exchange.jl
+index a25b1f509c..e62b913e4f 100644
+--- a/examples/exact_exchange.jl
++++ b/examples/exact_exchange.jl
+@@ -4,7 +4,9 @@
+ #
+ # !!! warning "Preliminary implementation"
+ #     Hybrid-DFT in DFTK is still in its early stages. MPI parallelisation does not work
+-#     and all treatment of ``k``-point symmetry is disabled when using exact exchange terms.
++#     and ``k``-point symmetry cannot yet be used to reduce the ``k``-point grid when
++#     using exact exchange terms, hence the `use_symmetries_for_kpoint_reduction=false`
++#     argument below.
+ #     We appreciate any issues, bug reports or PRs.
+ #
+ using AtomsBuilder
+@@ -15,14 +17,16 @@ pseudopotentials = PseudoFamily("dojo.nc.sr.pbe.v0_5.stringent.upf")
+ system = bulk(:Si)
+ 
+ # First perform a PBE calculation to get a good starting point.
+-model  = model_DFT(system; pseudopotentials, functionals=PBE(), symmetries=false)
+-basis  = PlaneWaveBasis(model; Ecut=15, kgrid=[2, 2, 2])
++model  = model_DFT(system; pseudopotentials, functionals=PBE())
++basis  = PlaneWaveBasis(model; Ecut=15, kgrid=[2, 2, 2],
++                        use_symmetries_for_kpoint_reduction=false)
+ scfres = self_consistent_field(basis; tol=1e-6);
+ nothing  # hide
+ 
+ # Then run PBE0, see also [`PBE0`](@ref) and [`HybridFunctional`](@ref) for more documentation.
+ model  = model_DFT(system; pseudopotentials, functionals=PBE0())
+-basis  = PlaneWaveBasis(model; basis.Ecut, basis.kgrid)
++basis  = PlaneWaveBasis(model; basis.Ecut, basis.kgrid,
++                        use_symmetries_for_kpoint_reduction=false)
+ scfres = self_consistent_field(basis; tol=1e-4, scfres.ρ, scfres.ψ, scfres.occupation,
+                                scfres.eigenvalues, solver=DFTK.scf_damping_solver());
+ nothing  # hide
+diff --git a/examples/hybrid_bands.jl b/examples/hybrid_bands.jl
+index 5c0b11aafc..0b6bcd94de 100644
+--- a/examples/hybrid_bands.jl
++++ b/examples/hybrid_bands.jl
+@@ -22,8 +22,11 @@ system = bulk(:Si)
+ # ## SCF calculation
+ # We first perform a PBE calculation to get a good starting point. Since we will later Wannierise
+ # we make sure to converge 16 orbitals throughout the computational procedure.
+-model_PBE = model_DFT(system; pseudopotentials, functionals=PBE(), symmetries=false)
+-basis_PBE  = PlaneWaveBasis(model_PBE; Ecut=10, kgrid=[3, 3, 3])  # Not converged !
++# Exact exchange does not yet support symmetry-reduced k-point grids,
++# hence we use the full grid already for PBE.
++model_PBE = model_DFT(system; pseudopotentials, functionals=PBE())
++basis_PBE  = PlaneWaveBasis(model_PBE; Ecut=10, kgrid=[3, 3, 3],  # Not converged !
++                            use_symmetries_for_kpoint_reduction=false)
+ 
+ nbandsalg  = AdaptiveBands(model_PBE; n_bands_converge=16)
+ scfres_PBE = self_consistent_field(basis_PBE; tol=1e-4, nbandsalg)
+@@ -33,7 +36,8 @@ nothing  # hide
+ # First using a more aggressive ACE compression techniques that is more memory efficient and
+ # slightly faster (by ignoring all unoccupied orbitals), but that gives the wrong unoccupied bands.
+ model  = model_DFT(system; pseudopotentials, functionals=HSE())
+-basis  = PlaneWaveBasis(model; basis_PBE.Ecut, basis_PBE.kgrid)
++basis  = PlaneWaveBasis(model; basis_PBE.Ecut, basis_PBE.kgrid,
++                        use_symmetries_for_kpoint_reduction=false)
+ 
+ exxalg = AceExx(; sketch_with_extra_orbitals=false)
+ scfres = self_consistent_field(basis; tol=1e-6, scfres_PBE.ρ, scfres_PBE.ψ, scfres_PBE.occupation, exxalg,
+diff --git a/src/gpu/linalg.jl b/src/gpu/linalg.jl
+index a14bedceb6..a0901b85ba 100644
+--- a/src/gpu/linalg.jl
++++ b/src/gpu/linalg.jl
+@@ -39,5 +39,22 @@ function mul!(Y::AbstractGPUArray{T}, P::PreconditionerTPA, R::AbstractGPUArray{
+     Y
+ end
+ 
+-# https://github.com/JuliaGPU/CUDA.jl/issues/1565
+-LinearAlgebra.dot(x::AbstractGPUArray, D::Diagonal, y::AbstractGPUArray) = x' * (D * y)
++# GPU-aware `svd` for Hermitian matrices backed by GPU arrays.
++# Upstream issue: https://github.com/JuliaGPU/CUDA.jl/issues/3495
++function LinearAlgebra.svd(A::Union{Hermitian{T, <:AbstractGPUArray{T}},
++                                    Hermitian{Complex{T}, <:AbstractGPUArray{Complex{T}}}};
++                           full::Bool=false) where {T<:Real}
++    E = eigen(A)
++    λ, U = E.values, E.vectors
++
++    # Sort the eigenvalues
++    σ = abs.(λ)
++    p = sortperm(σ; rev=true)
++    S = σ[p]
++    Up = U[:, p]
++    signs = sign.(λ[p])  # sign of the eigenvalues (not of σ!)
++
++    # Vt[i, j] = signᵢ * conj(Up[j, i]), i.e. Vt = (Up * Diagonal(signs))†
++    Vt = adjoint(Up) .* permutedims(signs)
++    SVD(Up, S, Vt)
++end
+diff --git a/src/terms/exact_exchange.jl b/src/terms/exact_exchange.jl
+index 994d05c616..0df02d71a5 100644
+--- a/src/terms/exact_exchange.jl
++++ b/src/terms/exact_exchange.jl
+@@ -21,7 +21,6 @@ where the `kernel` keyword argument is an [`InteractionKernel`](@ref) , typicall
+     kernel = ProbeCharge(BareCoulomb())
+ end
+ (ex::ExactExchange)(basis) = TermExactExchange(basis, ex.scaling_factor, ex.kernel)
+-breaks_symmetries(::ExactExchange) = true  # TODO: make ExactExchange fit for symmetries 
+ 
+ struct TermExactExchange{T, Tkernel, Tq} <: Term
+     scaling_factor::T             # scaling factor, absorbed into interaction_kernels
+@@ -32,8 +31,14 @@ function TermExactExchange(basis::PlaneWaveBasis{T}, scaling_factor, kernel) whe
+     if mpi_nprocs(basis.comm_kpts) > 1
+         error("ExactExchange currently does not support MPI parallelization over k-points.")
+     end
+-    if !(basis.kgrid isa MonkhorstPack) || basis.n_irreducible_kpoints != length(basis.kgrid)
+-        error("ExactExchange requires a full (non-symmetry-reduced) Monkhorst-Pack grid.")
++    if !(basis.kgrid isa MonkhorstPack)
++        error("ExactExchange requires a Monkhorst-Pack k-point grid.")
++    end
++    if basis.n_irreducible_kpoints != length(basis.kgrid)
++        # TODO: make ExactExchange fit for symmetry-reduced k-point grids
++        error("ExactExchange does not yet support symmetry-reduced k-point grids. " *
++              "Pass `use_symmetries_for_kpoint_reduction=false` when constructing " *
++              "the PlaneWaveBasis to use the full Monkhorst-Pack grid.")
+     end
+     fac::T = scaling_factor 
+ 
+@@ -83,7 +88,7 @@ Plain vanilla Fock exchange implementation without any tricks.
+ struct VanillaExx <: ExxAlgorithm end
+ function exx_operator(::VanillaExx, basis::PlaneWaveBasis{T}, interaction_kernels, q_points,
+                       ψ, occupation, mask_occ) where {T}
+-    occ_occ    = [occupation[ik][mask_occ[ik]] for ik in 1:length(basis.kpoints)]
++    occ_occ    = [to_cpu(occupation[ik][mask_occ[ik]]) for ik in 1:length(basis.kpoints)]
+     ψ_occ_real = _orbitals_real(basis, ψ, mask_occ)
+ 
+     E = sum(1:length(basis.kpoints)) do ik
+@@ -107,7 +112,7 @@ end
+     end
+ 
+     mask_occ   = occupied_empty_masks(occupation, occupation_threshold).mask_occ
+-    occ_occ    = [occupation[ik][mask_occ[ik]] for ik in 1:length(basis.kpoints)]
++    occ_occ    = [to_cpu(occupation[ik][mask_occ[ik]]) for ik in 1:length(basis.kpoints)]
+     ψ_occ_real = _orbitals_real(basis, ψ, mask_occ)
+     sum(1:length(basis.kpoints)) do ik
+         basis.kweights[ik] * exx_energy_only(basis, ik, term.interaction_kernels,
+@@ -117,7 +122,7 @@ end
+ 
+ # Naive algorithm for computing the exact exchange energy only.
+ function exx_energy_only(basis::PlaneWaveBasis{T}, ik, interaction_kernels, q_points,
+-                         ψ_occ_real, occ_occ) where {T}
++                         ψ_occ_real, occ_occ::Vector{<:Vector}) where {T}
+ 
+     # get occupied orbitals at k
+     kpt = basis.kpoints[ik]
+@@ -183,7 +188,7 @@ end
+ function exx_operator(ace::AceExx, basis::PlaneWaveBasis{T}, interaction_kernels, q_points,
+                       ψ, occupation, mask_occ) where {T}
+     mask_sketch = ace.sketch_with_extra_orbitals ? [1:size(ψk, 2) for ψk in ψ] : mask_occ
+-    occ_occ = [occupation[ik][mask_occ[ik]] for ik in 1:length(basis.kpoints)]
++    occ_occ     = [to_cpu(occupation[ik][mask_occ[ik]]) for ik in 1:length(basis.kpoints)]
+ 
+     # FFT the sketch orbitals once. They include the occupied orbitals, which are the
+     # leading columns (mask_occ[ik] = 1:n_occ), so the latter can be taken as views.
+@@ -236,8 +241,8 @@ function compress_exchange(Vxk::ExchangeOperator, ψk::AbstractMatrix,
+     # possibly indefinite and nearly singular, so we use its pseudo-inverse. For a Hermitian
+     # matrix pinv works via an eigendecomposition and drops eigenvalues below its default
+     # tolerance, size(Mk, 1) * eps relative to the largest one.
+-    Mk = Hermitian(ψk' * Wk)
+-    Mk_pinv = pinv(Mk)
++    Mk = ψk' * Wk
++    Mk_pinv = pinv(Hermitian(Mk))
+     opk = NonlocalOperator(basis, kpt, Wk, Mk_pinv)
+     (; opk, Mk, Mk_pinv, Wk)
+ end
+diff --git a/src/terms/operators.jl b/src/terms/operators.jl
+index 051f482400..d524ce4a8c 100644
+--- a/src/terms/operators.jl
++++ b/src/terms/operators.jl
+@@ -181,13 +181,13 @@ function apply!(Hψ, op::DivAgradOperator, ψ;
+ end
+ # TODO Implement  Base.Matrix(op::DivAgradOperator)
+ 
+-struct ExchangeOperator{T <: Real,Tkernel,Tq,Tocc,Tpsi} <: RealFourierOperator
++struct ExchangeOperator{T <: Real,Tkernel,Tq,Tpsi,Tocc <: Vector{<:Vector}} <: RealFourierOperator
+     basis::PlaneWaveBasis{T}
+     kpoint::Kpoint{T}
+     interaction_kernels::Tkernel  # Vector{Array{T,3}}: kernel on the FFT cube, one per q
+     q_points::Tq                  # Vector{Vec3{T}}: momentum transfers (reduced coords)
+     ψ_occ_real::Tpsi              # Store precomputed real-space orbitals
+-    occ_occ::Tocc
++    occ_occ::Tocc                 # occupied occupations (cannot be on the GPU)
+ end
+ function apply!(Hψ, op::ExchangeOperator, ψ)
+     basis = op.basis
+diff --git a/test/exact_exchange.jl b/test/exact_exchange.jl
+index 4bd74cec6f..1420a6175a 100644
+--- a/test/exact_exchange.jl
++++ b/test/exact_exchange.jl
+@@ -9,7 +9,8 @@
+         Si = ElementPsp(14, load_psp(silicon.psp_upf))
+         model = Model(silicon.lattice, [Si, Si], silicon.positions;
+                       spin_polarization, symmetries=true, terms=[ExactExchange(; kernel)])
+-        basis = PlaneWaveBasis(model; Ecut, kgrid=MonkhorstPack(kgrid; kshift))
++        basis = PlaneWaveBasis(model; Ecut, kgrid=MonkhorstPack(kgrid; kshift),
++                               use_symmetries_for_kpoint_reduction=false)
+ 
+         n_bands = div(silicon.n_electrons, 2, RoundUp)
+         filled_occ = DFTK.filled_occupation(model)
+@@ -65,7 +66,7 @@ end
+                    SphericallyTruncatedCoulomb(), WignerSeitzTruncatedCoulomb())
+         model = Model(silicon.lattice, [Si, Si], silicon.positions;
+                       terms=[ExactExchange(; kernel)])
+-        basis = PlaneWaveBasis(model; Ecut=5, kgrid)
++        basis = PlaneWaveBasis(model; Ecut=5, kgrid, use_symmetries_for_kpoint_reduction=false)
+         basis_supercell = cell_to_supercell(basis)
+ 
+         ψ = [Matrix(qr(randn(ComplexF64, length(G_vectors(basis, kpt)), n_bands)).Q)
+diff --git a/test/gpu.jl b/test/gpu.jl
+index 1950bea8b9..7e2085023a 100644
+--- a/test/gpu.jl
++++ b/test/gpu.jl
+@@ -163,3 +163,63 @@ end
+     end
+     end
+ end
++
++@testitem "GPU silicon HSE test" tags=[:gpu] setup=[TestCases] begin
++    using DFTK
++    using CUDA
++    using AMDGPU
++    using LinearAlgebra
++    silicon = TestCases.silicon
++
++    function run_problem(; architecture, exxalg)
++        model = model_DFT(silicon.lattice, silicon.atoms, silicon.positions;
++                          functionals=HSE())
++        basis = PlaneWaveBasis(model; Ecut=15, kgrid=(1, 1, 1), architecture,
++                               use_symmetries_for_kpoint_reduction=false)
++        self_consistent_field(basis; tol=1e-9, exxalg, solver=scf_damping_solver(),)
++    end
++
++    # Vanilla Exx
++    scfres_cpu = run_problem(; architecture=DFTK.CPU(), exxalg=VanillaExx())
++    @testset "CUDA Vanilla Exx" begin
++    if CUDA.has_cuda() && CUDA.has_cuda_gpu()
++        scfres_cuda = run_problem(; architecture=DFTK.GPU(CuArray), exxalg=VanillaExx())
++        @test scfres_cuda.ρ isa CuArray
++        @test abs(scfres_cpu.energies.total - scfres_cuda.energies.total) < 1e-8
++        @test norm(scfres_cpu.ρ - Array(scfres_cuda.ρ)) < 1e-8
++        @test norm(compute_forces(scfres_cuda)) < 1e-6  # Symmetric structure
++    end
++    end
++
++    @testset "AMDGPU Vanilla Exx" begin
++    if AMDGPU.has_rocm_gpu()
++        scfres_rocm = run_problem(; architecture=DFTK.GPU(ROCArray), exxalg=VanillaExx())
++        @test scfres_rocm.ρ isa ROCArray
++        @test abs(scfres_cpu.energies.total - scfres_rocm.energies.total) < 1e-8
++        @test norm(scfres_cpu.ρ - Array(scfres_rocm.ρ)) < 1e-8
++        @test norm(compute_forces(scfres_rocm)) < 1e-6  # Symmetric structure
++    end
++    end
++
++    # ACE Exx
++    scfres_cpu = run_problem(; architecture=DFTK.CPU(), exxalg=AceExx())
++    @testset "CUDA ACE Exx" begin
++    if CUDA.has_cuda() && CUDA.has_cuda_gpu()
++        scfres_cuda = run_problem(; architecture=DFTK.GPU(CuArray), exxalg=AceExx())
++        @test scfres_cuda.ρ isa CuArray
++        @test abs(scfres_cpu.energies.total - scfres_cuda.energies.total) < 1e-8
++        @test norm(scfres_cpu.ρ - Array(scfres_cuda.ρ)) < 1e-8
++        @test norm(compute_forces(scfres_cuda)) < 1e-6  # Symmetric structure
++    end
++    end
++
++    @testset "AMDGPU ACE Exx" begin
++    if AMDGPU.has_rocm_gpu()
++        scfres_rocm = run_problem(; architecture=DFTK.GPU(ROCArray), exxalg=AceExx())
++        @test scfres_rocm.ρ isa ROCArray
++        @test abs(scfres_cpu.energies.total - scfres_rocm.energies.total) < 1e-8
++        @test norm(scfres_cpu.ρ - Array(scfres_rocm.ρ)) < 1e-8
++        @test norm(compute_forces(scfres_rocm)) < 1e-6  # Symmetric structure
++    end
++    end
++end
+diff --git a/test/hartree_fock.jl b/test/hartree_fock.jl
+index 4c95ca7b9a..191d0034dc 100644
+--- a/test/hartree_fock.jl
++++ b/test/hartree_fock.jl
+@@ -69,7 +69,7 @@ end
+     model = model_HF(silicon.lattice, [Si, Si], silicon.positions;
+                      exx_kernel=ProbeCharge(BareCoulomb()),
+                      temperature=1e-3, smearing=DFTK.Smearing.Gaussian())
+-    basis = PlaneWaveBasis(model; Ecut, kgrid)
++    basis = PlaneWaveBasis(model; Ecut, kgrid, use_symmetries_for_kpoint_reduction=false)
+ 
+     # 1. Unit cell calculation
+     scfres = self_consistent_field(basis; is_converged=ScfConvergenceEnergy(1e-10), 
+@@ -103,7 +103,7 @@ end
+     function make_basis(spin_polarization)
+         model = Model(silicon.lattice, [Si, Si], silicon.positions; spin_polarization,
+                       terms=[ExactExchange(; kernel=ProbeCharge(BareCoulomb()))])
+-        PlaneWaveBasis(model; Ecut, kgrid)
++        PlaneWaveBasis(model; Ecut, kgrid, use_symmetries_for_kpoint_reduction=false)
+     end
+     basis     = make_basis(:none)
+     basis_col = make_basis(:collinear)
+@@ -157,8 +157,8 @@ end
+                           functionals=PBE())
+     model_hf  = model_HF(system; pseudopotentials, magnetic_moments, temperature=0.01,
+                          exx_kernel=ProbeCharge(BareCoulomb()))
+-    basis_pbe = PlaneWaveBasis(model_pbe; Ecut, kgrid)
+-    basis_hf  = PlaneWaveBasis(model_hf;  Ecut, kgrid)
++    basis_pbe = PlaneWaveBasis(model_pbe; Ecut, kgrid, use_symmetries_for_kpoint_reduction=false)
++    basis_hf  = PlaneWaveBasis(model_hf;  Ecut, kgrid, use_symmetries_for_kpoint_reduction=false)
+ 
+     # Start Hartree-Fock from a converged PBE state, such that the unit cell and the
+     # supercell calculation converge to the same antiferromagnetic solution.

@@ -1,0 +1,416 @@
+diff --git a/bofire/data_models/kernels/aggregation.py b/bofire/data_models/kernels/aggregation.py
+index bcc92525d..46b319cb8 100644
+--- a/bofire/data_models/kernels/aggregation.py
++++ b/bofire/data_models/kernels/aggregation.py
+@@ -2,7 +2,13 @@
+ from typing import Literal, Optional, Union
+ 
+ from bofire.data_models.kernels.categorical import HammingDistanceKernel
+-from bofire.data_models.kernels.continuous import LinearKernel, MaternKernel, RBFKernel
++from bofire.data_models.kernels.continuous import (
++    InfiniteWidthBNNKernel,
++    LinearKernel,
++    MaternKernel,
++    PolynomialKernel,
++    RBFKernel,
++)
+ from bofire.data_models.kernels.kernel import AggregationKernel
+ from bofire.data_models.kernels.molecular import TanimotoKernel
+ from bofire.data_models.kernels.shape import WassersteinKernel
+@@ -58,5 +64,68 @@ class ScaleKernel(AggregationKernel):
+     outputscale_prior: Optional[AnyGeneralPrior] = None
+ 
+ 
++class PolynomialFeatureInteractionKernel(AggregationKernel):
++    """
++    This kernel efficiently computes degree-n interactions between different
++    kernels, possibly including self-interactions. This is most useful when
++    there are different kernels for different feature types (e.g. continuous,
++    and categorical) and we want to compute interactions between them.
++
++    For example, given three input kernels k1, k2, and k3, this kernel with
++    `max_degree=2` and `include_self_interactions=True` would be equivalent
++    to the following kernel, but much faster to compute:
++
++    ```
++    k = AdditiveKernel(kernels=[
++        # constant (degree-0)
++        ConstantKernel(),
++
++        # individual kernels (degree-1)
++        ScaleKernel(base_kernel=k1),
++        ScaleKernel(base_kernel=k2),
++        ScaleKernel(base_kernel=k3),
++
++        # interactions (degree-2)
++        ScaleKernel(base_kernel=MultiplicativeKernel(kernels=[k1, k2])),
++        ScaleKernel(base_kernel=MultiplicativeKernel(kernels=[k1, k3])),
++        ScaleKernel(base_kernel=MultiplicativeKernel(kernels=[k2, k3])),
++
++        # self-interactions (degree-2)
++        ScaleKernel(base_kernel=MultiplicativeKernel(kernels=[k1, k1])),
++        ScaleKernel(base_kernel=MultiplicativeKernel(kernels=[k2, k2])),
++        ScaleKernel(base_kernel=MultiplicativeKernel(kernels=[k3, k3])),
++    ])
++    ```
++
++    Attributes:
++        kernels: The base kernels that should interact.
++        max_degree: Maximum degree of interactions computed.
++        include_self_interactions: Whether a kernel is allowed to interact with itself.
++        outputscale_prior: The prior used to scale each interaction term before summing.
++    """
++
++    type: Literal["PolynomialFeatureInteractionKernel"] = (
++        "PolynomialFeatureInteractionKernel"
++    )
++    kernels: Sequence[
++        Union[
++            AdditiveKernel,
++            MultiplicativeKernel,
++            ScaleKernel,
++            HammingDistanceKernel,
++            LinearKernel,
++            PolynomialKernel,
++            MaternKernel,
++            RBFKernel,
++            TanimotoKernel,
++            InfiniteWidthBNNKernel,
++            WassersteinKernel,
++        ]
++    ]
++    max_degree: int
++    include_self_interactions: bool
++    outputscale_prior: Optional[AnyGeneralPrior] = None
++
++
+ AdditiveKernel.model_rebuild()
+ MultiplicativeKernel.model_rebuild()
+diff --git a/bofire/data_models/kernels/api.py b/bofire/data_models/kernels/api.py
+index 0fffbaa5f..f32e99b47 100644
+--- a/bofire/data_models/kernels/api.py
++++ b/bofire/data_models/kernels/api.py
+@@ -3,6 +3,7 @@
+ from bofire.data_models.kernels.aggregation import (
+     AdditiveKernel,
+     MultiplicativeKernel,
++    PolynomialFeatureInteractionKernel,
+     ScaleKernel,
+ )
+ from bofire.data_models.kernels.categorical import (
+@@ -50,6 +51,7 @@
+ AnyKernel = Union[
+     AdditiveKernel,
+     MultiplicativeKernel,
++    PolynomialFeatureInteractionKernel,
+     ScaleKernel,
+     HammingDistanceKernel,
+     LinearKernel,
+diff --git a/bofire/kernels/aggregation.py b/bofire/kernels/aggregation.py
+new file mode 100644
+index 000000000..003b1ce9f
+--- /dev/null
++++ b/bofire/kernels/aggregation.py
+@@ -0,0 +1,108 @@
++import itertools
++from typing import Any, Optional
++
++import gpytorch
++import gpytorch.constraints
++import torch
++from torch import Tensor
++
++
++class PolynomialFeatureInteractionKernel(gpytorch.kernels.Kernel):
++    def __init__(
++        self,
++        kernels: list[gpytorch.kernels.Kernel],
++        max_degree: int,
++        include_self_interactions: bool,
++        outputscale_prior: Optional[gpytorch.priors.Prior] = None,
++        outputscale_constraint: Optional[gpytorch.constraints.Interval] = None,
++        *args: Any,
++        **kwargs: Any,
++    ) -> None:
++        super().__init__(*args, **kwargs)
++
++        self.kernels = kernels
++        self.max_degree = max_degree
++
++        # each item corresponds to a different interaction term
++        # and contains the indices of the kernels that interact
++        self.indices: list[tuple[int, ...]] = [
++            idx
++            for n in range(1, self.max_degree + 1)
++            for idx in (
++                itertools.combinations_with_replacement(range(len(kernels)), n)
++                if include_self_interactions
++                else itertools.combinations(range(len(kernels)), n)
++            )
++        ]
++
++        outputscale = (
++            torch.zeros(*self.batch_shape, len(self.indices) + 1)
++            if len(self.batch_shape)
++            else torch.zeros(len(self.indices) + 1)
++        )
++        self.register_parameter(
++            name="raw_outputscale", parameter=torch.nn.Parameter(outputscale)
++        )
++        if outputscale_prior is not None:
++            if not isinstance(outputscale_prior, gpytorch.priors.Prior):
++                raise TypeError(
++                    "Expected gpytorch.priors.Prior but got "
++                    + type(outputscale_prior).__name__
++                )
++            self.register_prior(
++                "outputscale_prior",
++                outputscale_prior,
++                self._outputscale_param,
++                self._outputscale_closure,
++            )
++        if outputscale_constraint is None:
++            outputscale_constraint = gpytorch.constraints.Positive()
++        self.register_constraint("raw_outputscale", outputscale_constraint)
++
++    def _outputscale_param(self, m):
++        return m.outputscale
++
++    def _outputscale_closure(self, m, v):
++        m._set_outputscale(v)
++
++    @property
++    def outputscale(self):
++        return self.raw_outputscale_constraint.transform(self.raw_outputscale)
++
++    @outputscale.setter
++    def outputscale(self, value):
++        self._set_outputscale(value)
++
++    def _set_outputscale(self, value):
++        if not torch.is_tensor(value):
++            value = torch.as_tensor(value).to(self.raw_outputscale)
++        self.initialize(
++            raw_outputscale=self.raw_outputscale_constraint.inverse_transform(value)
++        )
++
++    def forward(
++        self,
++        x1: Tensor,
++        x2: Tensor,
++        diag: bool = False,
++        last_dim_is_batch: bool = False,
++    ) -> Tensor:
++        base_kernels = torch.stack(
++            [
++                k(x1, x2, diag=diag, last_dim_is_batch=last_dim_is_batch).to_dense()
++                for k in self.kernels
++            ],
++            dim=0,
++        )
++
++        os = self.outputscale
++        result = os[0] * torch.ones_like(base_kernels[0])  # constant term
++        i = 1
++        for idx in self.indices:
++            # compute each interaction term between specified kernels,
++            # that is, the product of the individual kernels scaled
++            # by the outputscale of the interaction
++            result += os[i] * base_kernels[idx, ...].prod(dim=0)
++            i += 1
++
++        return result
+diff --git a/bofire/kernels/mapper.py b/bofire/kernels/mapper.py
+index 8f96224f4..b6ee0a317 100644
+--- a/bofire/kernels/mapper.py
++++ b/bofire/kernels/mapper.py
+@@ -9,6 +9,7 @@
+ 
+ import bofire.data_models.kernels.api as data_models
+ import bofire.priors.api as priors
++from bofire.kernels.aggregation import PolynomialFeatureInteractionKernel
+ from bofire.kernels.categorical import HammingKernelWithOneHots
+ from bofire.kernels.fingerprint_kernels.tanimoto_kernel import TanimotoKernel
+ from bofire.kernels.shape import WassersteinKernel
+@@ -271,6 +272,36 @@ def map_WassersteinKernel(
+     )
+ 
+ 
++def map_PolynomialFeatureInteractionKernel(
++    data_model: data_models.PolynomialFeatureInteractionKernel,
++    batch_shape: torch.Size,
++    ard_num_dims: int,
++    active_dims: List[int],
++    features_to_idx_mapper: Optional[Callable[[List[str]], List[int]]],
++) -> PolynomialFeatureInteractionKernel:
++    ks = [
++        map(
++            k,  # type: ignore
++            active_dims=active_dims,
++            ard_num_dims=ard_num_dims,
++            batch_shape=batch_shape,
++            features_to_idx_mapper=features_to_idx_mapper,
++        )
++        for k in data_model.kernels
++    ]
++
++    return PolynomialFeatureInteractionKernel(
++        ks,
++        max_degree=data_model.max_degree,
++        include_self_interactions=data_model.include_self_interactions,
++        outputscale_prior=(
++            priors.map(data_model.outputscale_prior, d=len(active_dims))
++            if data_model.outputscale_prior is not None
++            else None
++        ),
++    )
++
++
+ KERNEL_MAP = {
+     data_models.WassersteinKernel: map_WassersteinKernel,
+     data_models.RBFKernel: map_RBFKernel,
+@@ -283,6 +314,7 @@ def map_WassersteinKernel(
+     data_models.TanimotoKernel: map_TanimotoKernel,
+     data_models.HammingDistanceKernel: map_HammingDistanceKernel,
+     data_models.InfiniteWidthBNNKernel: map_InfiniteWidthBNNKernel,
++    data_models.PolynomialFeatureInteractionKernel: map_PolynomialFeatureInteractionKernel,
+ }
+ 
+ 
+diff --git a/tests/bofire/data_models/specs/kernels.py b/tests/bofire/data_models/specs/kernels.py
+index c75e4ed21..96926466c 100644
+--- a/tests/bofire/data_models/specs/kernels.py
++++ b/tests/bofire/data_models/specs/kernels.py
+@@ -102,3 +102,15 @@
+         "features": None,
+     },
+ )
++specs.add_valid(
++    kernels.PolynomialFeatureInteractionKernel,
++    lambda: {
++        "max_degree": 2,
++        "include_self_interactions": False,
++        "kernels": [
++            specs.valid(kernels.LinearKernel).obj().model_dump(),
++            specs.valid(kernels.MaternKernel).obj().model_dump(),
++        ],
++        "outputscale_prior": priors.valid(LogNormalPrior).obj().model_dump(),
++    },
++)
+diff --git a/tests/bofire/kernels/test_aggregation.py b/tests/bofire/kernels/test_aggregation.py
+new file mode 100644
+index 000000000..ec58d388e
+--- /dev/null
++++ b/tests/bofire/kernels/test_aggregation.py
+@@ -0,0 +1,51 @@
++import itertools
++
++import pytest
++import torch
++from gpytorch.kernels import (
++    ConstantKernel,
++    CosineKernel,
++    MaternKernel,
++    RBFKernel,
++    ScaleKernel,
++)
++
++from bofire.kernels.aggregation import PolynomialFeatureInteractionKernel
++
++
++@pytest.mark.parametrize(
++    "include_self_interactions, diag, last_dim_is_batch",
++    list(itertools.product([True, False], repeat=3)),
++)
++def test_PolynomialFeatureInteractionKernel(
++    include_self_interactions, diag, last_dim_is_batch
++):
++    k1 = RBFKernel()
++    k2 = MaternKernel()
++    k3 = CosineKernel()
++
++    k_orig = (
++        ConstantKernel()
++        + ScaleKernel(k1)
++        + ScaleKernel(k2)
++        + ScaleKernel(k3)
++        + ScaleKernel(k1 * k2)
++        + ScaleKernel(k1 * k3)
++        + ScaleKernel(k2 * k3)
++    )
++    if include_self_interactions:
++        k_orig += ScaleKernel(k1 * k1) + ScaleKernel(k2 * k2) + ScaleKernel(k3 * k3)
++
++    k = PolynomialFeatureInteractionKernel(
++        [k1, k2, k3], max_degree=2, include_self_interactions=include_self_interactions
++    )
++
++    torch.manual_seed(0)
++    x1 = torch.randn(5, 10, 3)
++    x2 = torch.randn(5, 10, 3)
++
++    z1 = k_orig(x1, x2, diag=diag, last_dim_is_batch=last_dim_is_batch).to_dense()
++    z2 = k(x1, x2, diag=diag, last_dim_is_batch=last_dim_is_batch).to_dense()
++
++    assert z1.shape == z2.shape
++    assert torch.allclose(z1, z2, atol=1e-6)
+diff --git a/tests/bofire/kernels/test_mapper.py b/tests/bofire/kernels/test_mapper.py
+index 01eddcc1a..16e843f51 100644
+--- a/tests/bofire/kernels/test_mapper.py
++++ b/tests/bofire/kernels/test_mapper.py
+@@ -6,6 +6,7 @@
+ from botorch.models.kernels.categorical import CategoricalKernel
+ 
+ import bofire
++import bofire.kernels.aggregation as aggregationKernels
+ import bofire.kernels.api as kernels
+ import bofire.kernels.shape as shapeKernels
+ from bofire.data_models.kernels.api import (
+@@ -16,6 +17,7 @@
+     LinearKernel,
+     MaternKernel,
+     MultiplicativeKernel,
++    PolynomialFeatureInteractionKernel,
+     PolynomialKernel,
+     RBFKernel,
+     ScaleKernel,
+@@ -39,6 +41,7 @@
+     HammingDistanceKernel: CategoricalKernel,
+     WassersteinKernel: shapeKernels.WassersteinKernel,
+     InfiniteWidthBNNKernel: BNNKernel,
++    PolynomialFeatureInteractionKernel: aggregationKernels.PolynomialFeatureInteractionKernel,
+ }
+ 
+ 
+@@ -432,3 +435,31 @@ def test_compute_active_dims_fails_with_features_without_mapper():
+             active_dims=[1, 2, 3],
+             features_to_idx_mapper=None,
+         )
++
++
++def test_map_PolynomialFeatureInteractionKernel():
++    k = kernels.map(
++        PolynomialFeatureInteractionKernel(
++            kernels=[
++                RBFKernel(features=["x1", "x2"]),
++                MaternKernel(features=["x2", "x3"]),
++            ],
++            max_degree=2,
++            include_self_interactions=False,
++            outputscale_prior=THREESIX_SCALE_PRIOR(),
++        ),
++        active_dims=[],
++        ard_num_dims=1,
++        batch_shape=torch.Size(),
++        features_to_idx_mapper=lambda ks: [int(k[1:]) for k in ks],
++    )
++
++    assert isinstance(k, aggregationKernels.PolynomialFeatureInteractionKernel)
++    assert k.indices == [(0,), (1,), (0, 1)]
++    assert k.outputscale.shape == (4,)
++
++    assert isinstance(k.kernels[0], gpytorch.kernels.RBFKernel)
++    assert k.kernels[0].active_dims.tolist() == [1, 2]
++
++    assert isinstance(k.kernels[1], gpytorch.kernels.MaternKernel)
++    assert k.kernels[1].active_dims.tolist() == [2, 3]

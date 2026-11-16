@@ -1,0 +1,149 @@
+diff --git a/opendde/model/modules/confidence.py b/opendde/model/modules/confidence.py
+index e595953..4de7db4 100644
+--- a/opendde/model/modules/confidence.py
++++ b/opendde/model/modules/confidence.py
+@@ -306,6 +306,7 @@ def forward(
+         pde_preds = [] if compute_pde else None
+         resolved_preds = [] if compute_resolved else None
+         single_sample = N_sample == 1
++        foldcp_non_output_rank = self._foldcp_is_non_output_rank()
+         for i in range(N_sample):
+             if use_foldcp_confidence:
+                 assert foldcp_mesh is not None
+@@ -347,11 +348,11 @@ def forward(
+                         compute_resolved=compute_resolved,
+                     )
+                 )
+-            if self._foldcp_is_non_output_rank() and all(
++            if foldcp_non_output_rank and all(
+                 pred is None
+                 for pred in (plddt_pred, pae_pred, pde_pred, resolved_pred)
+             ):
+-                return None, None, None, None
++                continue
+             if plddt_preds is not None:
+                 plddt_preds.append(plddt_pred)
+             if pae_preds is not None:
+@@ -360,6 +361,8 @@ def forward(
+                 pde_preds.append(pde_pred)
+             if resolved_preds is not None:
+                 resolved_preds.append(resolved_pred)
++        if foldcp_non_output_rank:
++            return None, None, None, None
+         plddt_preds = (
+             torch.stack(plddt_preds, dim=-3) if plddt_preds is not None else None
+         )  # [..., N_sample, N_atom, plddt_bins]
+diff --git a/opendde/model/opendde.py b/opendde/model/opendde.py
+index 66af9e4..85e732a 100644
+--- a/opendde/model/opendde.py
++++ b/opendde/model/opendde.py
+@@ -1393,6 +1393,13 @@ def main_inference_loop(
+                 log_dicts.append(log_dict)
+                 time_trackers.append(time_tracker)
+ 
++            if self._foldcp_is_non_output_rank():
++                return (
++                    pred_dicts[-1],
++                    simple_merge_dict_list(log_dicts),
++                    simple_merge_dict_list(time_trackers),
++                )
++
+             # Combine outputs of multiple models
+             def _cat(dict_list, key):
+                 return torch.cat([x[key] for x in dict_list], dim=0)
+diff --git a/tests/test_foldcp_confidence_launch_policy.py b/tests/test_foldcp_confidence_launch_policy.py
+new file mode 100644
+index 0000000..4b690bf
+--- /dev/null
++++ b/tests/test_foldcp_confidence_launch_policy.py
+@@ -0,0 +1,90 @@
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import torch
++
++from opendde.distributed.foldcp.pair_sharding import FoldCPPairShardSpec
++from opendde.model.modules.confidence import ConfidenceHead
++from opendde.model.opendde import OpenDDE
++
++
++def test_foldcp_confidence_non_output_rank_processes_every_sample(monkeypatch):
++    head = ConfidenceHead.__new__(ConfidenceHead)
++    torch.nn.Module.__init__(head)
++    head.input_strunk_ln = torch.nn.Identity()
++    head.pairformer_stack = SimpleNamespace(blocks=[SimpleNamespace(c_s=1)])
++    mesh = SimpleNamespace()
++    spec = FoldCPPairShardSpec(
++        original_shape=(4, 4, 1),
++        padded_shape=(4, 4, 1),
++        pair_dims=(0, 1),
++        row_range=(0, 2),
++        col_range=(0, 2),
++        mesh_shape=(2, 2),
++        mesh_coord=(0, 0),
++    )
++
++    monkeypatch.setattr(head, "_maybe_create_foldcp_mesh", lambda: mesh)
++    monkeypatch.setattr(head, "_foldcp_is_non_output_rank", lambda: True)
++    monkeypatch.setattr(
++        head,
++        "_build_confidence_z_init_local",
++        lambda **kwargs: torch.zeros_like(kwargs["reference"]),
++    )
++    monkeypatch.setattr(
++        head,
++        "_select_distogram_rep_atom_mask",
++        lambda input_feature_dict, n_token: torch.ones(n_token, dtype=torch.bool),
++    )
++
++    calls = []
++
++    def fake_foldcp_local(**kwargs):
++        calls.append(tuple(kwargs["x_pred_rep_coords"].shape))
++        return None, None, None, None
++
++    monkeypatch.setattr(head, "memory_efficient_forward_foldcp_local", fake_foldcp_local)
++
++    result = head.forward(
++        input_feature_dict={},
++        s_inputs=torch.zeros(4, 1),
++        s_trunk=torch.zeros(4, 1),
++        z_trunk=torch.zeros(2, 2, 1),
++        pair_mask=torch.ones(4, 4),
++        x_pred_coords=torch.zeros(3, 4, 3),
++        z_trunk_spec=spec,
++    )
++
++    assert result == (None, None, None, None)
++    assert calls == [(4, 3), (4, 3), (4, 3)]
++
++
++def test_foldcp_model_seed_non_output_rank_skips_rank0_output_merge(monkeypatch):
++    model = OpenDDE.__new__(OpenDDE)
++    torch.nn.Module.__init__(model)
++    monkeypatch.setattr(model, "_foldcp_is_non_output_rank", lambda: True)
++
++    calls = []
++
++    def fake_main_inference_loop(**_kwargs):
++        calls.append(len(calls) + 1)
++        value = calls[-1]
++        return (
++            {"coordinate": torch.tensor([[value]], dtype=torch.float32)},
++            {"call": value},
++            {"elapsed": float(value)},
++        )
++
++    monkeypatch.setattr(model, "_main_inference_loop", fake_main_inference_loop)
++
++    pred_dict, log_dict, time_tracker = model.main_inference_loop(
++        input_feature_dict={},
++        N_cycle=1,
++        N_model_seed=3,
++    )
++
++    assert calls == [1, 2, 3]
++    assert pred_dict["coordinate"].item() == 3
++    assert log_dict["call"].tolist() == [1, 2, 3]
++    assert time_tracker["elapsed"].tolist() == [1.0, 2.0, 3.0]

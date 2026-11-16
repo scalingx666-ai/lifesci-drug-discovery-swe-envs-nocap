@@ -1,0 +1,152 @@
+diff --git a/Piru/Views/Journal/Mechanistic/MechanisticSessionModel.swift b/Piru/Views/Journal/Mechanistic/MechanisticSessionModel.swift
+index 0b2bcbd3..1cfe1b29 100644
+--- a/Piru/Views/Journal/Mechanistic/MechanisticSessionModel.swift
++++ b/Piru/Views/Journal/Mechanistic/MechanisticSessionModel.swift
+@@ -17,7 +17,7 @@ nonisolated enum MechanisticSessionModel {
+     /// (dose marks get their color at the render site instead).
+     struct DoseInput: Hashable {
+         let name: String
+-        let amount: Double
++        let amount: Double // milligrams, converted from the logged unit before simulation
+         let route: RouteOfAdministration
+         /// Hours since the session start (the engine's `t = 0`).
+         let hours: Double
+@@ -127,32 +127,7 @@ nonisolated enum MechanisticSessionModel {
+     /// per-substance PK + binding (keyed by normalized name), resolved on the main
+     /// actor by the caller and handed to this off-main compute.
+     static func compute(doses: [DoseInput], pharmacology: [String: PharmacologyParameters], tMax: Double) -> Result? {
+-        // Group by (substance, route): one agent per distinct substance-route,
+-        // carrying all of its doses — different routes of the same drug become
+-        // separate agents (different ka/kR), summed inside the simulation.
+-        struct GroupKey: Hashable { let name: String; let route: RouteOfAdministration }
+-        var groups: [GroupKey: [DoseInput]] = [:]
+-        var order: [GroupKey] = []
+-        for dose in doses {
+-            let key = GroupKey(name: SubstanceModelDatabase.normalize(dose.name), route: dose.route)
+-            if groups[key] == nil { order.append(key) }
+-            groups[key, default: []].append(dose)
+-        }
+-
+-        var agents: [EffectAgent] = []
+-        for key in order {
+-            guard let members = groups[key], let first = members.first,
+-                  let params = modelParams(for: first.name, in: pharmacology)
+-            else { continue }
+-            let (kaMul, kR) = roaFactors(key.route)
+-            let doseTuples = members.map { (t: $0.hours, amt: $0.amount / params.refUnit) }
+-            agents.append(EffectAgent(
+-                params: params,
+-                doses: doseTuples,
+-                ka: kaMul != 1 ? params.ka * kaMul : nil,
+-                kR: kR,
+-            ))
+-        }
++        let agents = effectAgents(doses: doses, pharmacology: pharmacology)
+         guard !agents.isEmpty else { return nil }
+ 
+         let timeline = EffectEngine.simulate(EffectParams(), agents: agents, tMax: tMax)
+@@ -203,6 +178,37 @@ nonisolated enum MechanisticSessionModel {
+ 
+         return Result(timeline: timeline, ranges: ranges, contentSpan: contentSpan, activeLenses: activeLenses)
+     }
++
++    /// Build the exact agent inputs used by the simulation, including route and dose scaling.
++    static func effectAgents(doses: [DoseInput], pharmacology: [String: PharmacologyParameters]) -> [EffectAgent] {
++        // Group by (substance, route): one agent per distinct substance-route,
++        // carrying all of its doses — different routes of the same drug become
++        // separate agents (different ka/kR), summed inside the simulation.
++        struct GroupKey: Hashable { let name: String; let route: RouteOfAdministration }
++        var groups: [GroupKey: [DoseInput]] = [:]
++        var order: [GroupKey] = []
++        for dose in doses {
++            let key = GroupKey(name: SubstanceModelDatabase.normalize(dose.name), route: dose.route)
++            if groups[key] == nil { order.append(key) }
++            groups[key, default: []].append(dose)
++        }
++
++        var agents: [EffectAgent] = []
++        for key in order {
++            guard let members = groups[key], let first = members.first,
++                  let params = modelParams(for: first.name, in: pharmacology)
++            else { continue }
++            let (kaMul, kR) = roaFactors(key.route)
++            let doseTuples = members.map { (t: $0.hours, amt: $0.amount / params.refUnit) }
++            agents.append(EffectAgent(
++                params: params,
++                doses: doseTuples,
++                ka: kaMul != 1 ? params.ka * kaMul : nil,
++                kR: kR,
++            ))
++        }
++        return agents
++    }
+ }
+ 
+ // MARK: - Off-main memoization
+diff --git a/Piru/Views/Journal/Session/SessionResolveModel.swift b/Piru/Views/Journal/Session/SessionResolveModel.swift
+index 2e914b22..1530e50d 100644
+--- a/Piru/Views/Journal/Session/SessionResolveModel.swift
++++ b/Piru/Views/Journal/Session/SessionResolveModel.swift
+@@ -93,7 +93,7 @@ enum SessionResolveModel {
+     /// `body` (support gate, task signature) must never pay a store lookup.
+     /// Doses whose substance isn't in the library are dropped — they can't be
+     /// modeled anyway.
+-    private static func computeMechanisticDoses(_ entries: [DoseEntry], startDate: Date) -> [MechanisticSessionModel.DoseInput] {
++    static func computeMechanisticDoses(_ entries: [DoseEntry], startDate: Date) -> [MechanisticSessionModel.DoseInput] {
+         var inLibraryCache: [String: Bool] = [:]
+         func inLibrary(_ name: String) -> Bool {
+             let key = name.lowercased()
+@@ -112,9 +112,11 @@ enum SessionResolveModel {
+             guard !entry.namesUnmodeledForm else { return nil }
+             // No amount, no simulated dose.
+             guard !entry.isUnknownDose else { return nil }
++            // Match tolerance replay: units without a mass conversion cannot drive the model.
++            guard let amountMg = DoseUnit.convert(entry.amount, from: entry.unit, to: "mg") else { return nil }
+             return MechanisticSessionModel.DoseInput(
+                 name: entry.substance,
+-                amount: entry.amount,
++                amount: amountMg,
+                 route: entry.route,
+                 hours: entry.timestamp.timeIntervalSince(startDate) / 3_600,
+             )
+diff --git a/PiruTests/SubstanceModelDatabaseTests.swift b/PiruTests/SubstanceModelDatabaseTests.swift
+index e35d130c..220b89ed 100644
+--- a/PiruTests/SubstanceModelDatabaseTests.swift
++++ b/PiruTests/SubstanceModelDatabaseTests.swift
+@@ -176,4 +176,36 @@ struct SubstanceModelDatabaseTests {
+         #expect(supports(["amphetamine"]))
+         #expect(supports(["methamphetamine", "3-MMC"]))
+     }
++
++    @Test
++    func `Effect Estimates converts logged mass units and omits volume doses`() async throws {
++        await SubstanceStore.shared.ensureAllLoaded()
++        let start = Date(timeIntervalSince1970: 0)
++        let pharmacology = ["3-mmc": SubstanceStore.shared.pharmacologyParameters(forSubstanceName: "3-MMC")]
++
++        func modeled(_ amount: Double, unit: String) throws -> (agent: EffectAgent, feeling: [Double]) {
++            let entry = DoseEntry(substance: "3-MMC", amount: amount, unit: unit, route: .oral, timestamp: start)
++            let doses = SessionResolveModel.computeMechanisticDoses([entry], startDate: start)
++            let agent = try #require(MechanisticSessionModel.effectAgents(doses: doses, pharmacology: pharmacology).first)
++            let result = try #require(MechanisticSessionModel.compute(doses: doses, pharmacology: pharmacology, tMax: 12))
++            return (agent, result.timeline.eu)
++        }
++
++        let mg = try modeled(80, unit: "mg")
++        let grams = try modeled(0.08, unit: "g")
++        let micrograms = try modeled(80_000, unit: "µg")
++        for candidate in [grams, micrograms] {
++            #expect(candidate.agent.doses.count == 1)
++            #expect(candidate.agent.doses[0].t == mg.agent.doses[0].t)
++            #expect(candidate.agent.doses[0].amt == mg.agent.doses[0].amt)
++            #expect(candidate.feeling == mg.feeling)
++        }
++        #expect(mg.agent.doses[0].amt == 1)
++
++        let volume = DoseEntry(substance: "3-MMC", amount: 80, unit: "mL", route: .oral, timestamp: start)
++        let volumeDoses = SessionResolveModel.computeMechanisticDoses([volume], startDate: start)
++        #expect(volumeDoses.isEmpty)
++        #expect(MechanisticSessionModel.effectAgents(doses: volumeDoses, pharmacology: pharmacology).isEmpty)
++        #expect(MechanisticSessionModel.compute(doses: volumeDoses, pharmacology: pharmacology, tMax: 12) == nil)
++    }
+ }

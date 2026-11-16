@@ -1,0 +1,174 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index bb2f27471..9a34d3f26 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -46,3 +46,11 @@ each user's own memory, not here.
+ ## Review gates (default human-in-the-loop)
+ - Don't auto-submit a freshly built workflow/campaign; show inputs, confirm, then submit.
+   Skip only on explicit user opt-in ("go as you set" / "yolo" / "always skip").
++
++## Agent Bridge Notes
++
++### [2026-06-23] Claude settings env fallback
++**Category**: bug
++**Context**: Desktop CatBot Claude Code provider returned blank replies when users configured proxy env only in `~/.claude/settings.json`.
++**Discovery**: The sidecar disabled Claude global setting sources and inherited only OS env, so `ANTHROPIC_BASE_URL` / auth env in Claude settings were invisible.
++**Solution/Note**: Claude adapter now loads only the `env` map from `settings.json` / `settings.local.json` as fallback, without enabling global MCP/settings loading.
+diff --git a/src/lib/server/agent-bridge/adapters/__tests__/claude.test.ts b/src/lib/server/agent-bridge/adapters/__tests__/claude.test.ts
+index 0fdb93c18..55692488c 100644
+--- a/src/lib/server/agent-bridge/adapters/__tests__/claude.test.ts
++++ b/src/lib/server/agent-bridge/adapters/__tests__/claude.test.ts
+@@ -1,5 +1,12 @@
+ import { describe, expect, it } from 'vitest'
+-import { assistant_text_fallback } from '../claude.js'
++import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import {
++  apply_claude_settings_env,
++  assistant_text_fallback,
++  read_claude_settings_env,
++} from '../claude.js'
+ 
+ const assistant = (blocks: unknown[]) => ({ type: 'assistant', message: { content: blocks } })
+ 
+@@ -40,3 +47,51 @@ describe('assistant_text_fallback — text-loss guard for cold-start turns', ()
+     expect(assistant_text_fallback(assistant([{ type: 'text', text: '' }]), 0)).toEqual([])
+   })
+ })
++
++describe('Claude settings env fallback', () => {
++  function writeSettings(home: string, name: string, env: Record<string, string>): void {
++    const dir = join(home, '.claude')
++    mkdirSync(dir, { recursive: true })
++    writeFileSync(join(dir, name), JSON.stringify({ env }), 'utf8')
++  }
++
++  it('reads env from ~/.claude/settings.json', () => {
++    const home = mkdtempSync(join(tmpdir(), 'catgo-claude-env-'))
++    writeSettings(home, 'settings.json', {
++      ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
++      ANTHROPIC_AUTH_TOKEN: 'PROXY_MANAGED',
++    })
++
++    expect(read_claude_settings_env(home)).toEqual({
++      ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
++      ANTHROPIC_AUTH_TOKEN: 'PROXY_MANAGED',
++    })
++  })
++
++  it('lets settings.local.json override settings.json', () => {
++    const home = mkdtempSync(join(tmpdir(), 'catgo-claude-env-'))
++    writeSettings(home, 'settings.json', {
++      ANTHROPIC_BASE_URL: 'http://old-proxy',
++    })
++    writeSettings(home, 'settings.local.json', {
++      ANTHROPIC_BASE_URL: 'http://new-proxy',
++    })
++
++    expect(read_claude_settings_env(home).ANTHROPIC_BASE_URL).toBe('http://new-proxy')
++  })
++
++  it('fills missing process env without overriding explicit env', () => {
++    const home = mkdtempSync(join(tmpdir(), 'catgo-claude-env-'))
++    writeSettings(home, 'settings.json', {
++      ANTHROPIC_BASE_URL: 'http://settings-proxy',
++      ANTHROPIC_AUTH_TOKEN: 'PROXY_MANAGED',
++    })
++    const env: NodeJS.ProcessEnv = {
++      ANTHROPIC_BASE_URL: 'http://explicit-proxy',
++    }
++
++    expect(apply_claude_settings_env(env, home)).toEqual(['ANTHROPIC_AUTH_TOKEN'])
++    expect(env.ANTHROPIC_BASE_URL).toBe('http://explicit-proxy')
++    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('PROXY_MANAGED')
++  })
++})
+diff --git a/src/lib/server/agent-bridge/adapters/claude.ts b/src/lib/server/agent-bridge/adapters/claude.ts
+index 66f6cb461..4071ef3f1 100644
+--- a/src/lib/server/agent-bridge/adapters/claude.ts
++++ b/src/lib/server/agent-bridge/adapters/claude.ts
+@@ -1,6 +1,6 @@
+ import { query, listSessions as sdkListSessions } from '@anthropic-ai/claude-agent-sdk'
+ import { execSync } from 'node:child_process'
+-import { existsSync } from 'node:fs'
++import { existsSync, readFileSync } from 'node:fs'
+ import { homedir } from 'node:os'
+ import { dirname, join } from 'node:path'
+ import type { AgentAdapter } from '../adapter.js'
+@@ -31,6 +31,9 @@ import type { AgentEvent, PermissionRequest, SessionInfo, StreamParams } from '.
+ // ---------------------------------------------------------------------------
+ 
+ let _claudePath: string | null | undefined
++let _claudeEnvLoaded = false
++
++type ClaudeEnvMap = Record<string, string>
+ 
+ // Given any resolved `claude` path (possibly an npm `.cmd`/`.ps1`/sh shim),
+ // prefer the real vendored native binary the shim ultimately execs.
+@@ -106,6 +109,57 @@ function resolveClaudeExecutable(): string | undefined {
+   return undefined
+ }
+ 
++function readJsonEnv(file: string): ClaudeEnvMap {
++  if (!existsSync(file)) return {}
++  try {
++    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
++    if (!parsed || typeof parsed !== 'object') return {}
++    const env = (parsed as { env?: unknown }).env
++    if (!env || typeof env !== 'object' || Array.isArray(env)) return {}
++    const out: ClaudeEnvMap = {}
++    for (const [key, value] of Object.entries(env)) {
++      if (!key || typeof value !== 'string') continue
++      out[key] = value
++    }
++    return out
++  } catch {
++    return {}
++  }
++}
++
++export function read_claude_settings_env(home: string = homedir()): ClaudeEnvMap {
++  return {
++    ...readJsonEnv(join(home, '.claude', 'settings.json')),
++    ...readJsonEnv(join(home, '.claude', 'settings.local.json')),
++  }
++}
++
++export function apply_claude_settings_env(
++  target: NodeJS.ProcessEnv = process.env,
++  home: string = homedir(),
++): string[] {
++  const env = read_claude_settings_env(home)
++  const applied: string[] = []
++  for (const [key, value] of Object.entries(env)) {
++    // Keep explicit system/user environment variables authoritative. The
++    // settings.json fallback only fills gaps for desktop sidecars launched
++    // outside an interactive shell.
++    if (target[key]) continue
++    target[key] = value
++    applied.push(key)
++  }
++  return applied
++}
++
++function ensureClaudeSettingsEnv(): void {
++  if (_claudeEnvLoaded) return
++  _claudeEnvLoaded = true
++  const applied = apply_claude_settings_env()
++  if (applied.length > 0) {
++    console.info(`[agent-bridge] loaded Claude settings env: ${applied.join(', ')}`)
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Helper: translate a single SDK message to zero or more AgentEvents
+ // ---------------------------------------------------------------------------
+@@ -343,6 +397,7 @@ export function createClaudeAdapter(): AgentAdapter {
+         }
+       }
+ 
++      ensureClaudeSettingsEnv()
+       const claudeExe = resolveClaudeExecutable()
+ 
+       const q = query({

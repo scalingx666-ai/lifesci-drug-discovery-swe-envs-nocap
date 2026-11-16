@@ -1,0 +1,652 @@
+diff --git a/.gitignore b/.gitignore
+index 2761988..9303f1d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,6 +10,9 @@ pretrained_models/*
+ git-lfs-folders/*
+ cpa_binaries.tar
+ 
++# embeddings
++*.parquet
++
+ # Byte-compiled / optimized / DLL files
+ __pycache__/
+ *.py[cod]
+diff --git a/compert/data.py b/compert/data.py
+index 2af992d..601c10d 100644
+--- a/compert/data.py
++++ b/compert/data.py
+@@ -10,7 +10,7 @@
+ import pandas as pd
+ 
+ from sklearn.preprocessing import OneHotEncoder
+-from compert.helper import graph_from_smiles
++from compert.helper import graph_from_smiles, canonicalize_smiles
+ from typing import Union, Optional, List
+ 
+ 
+@@ -38,6 +38,24 @@ def ranks_to_df(data, key="rank_genes_groups"):
+     return pd.concat(dfs, axis=1)
+ 
+ 
++def drug_names_to_smiles(
++    drug_names: List[str], dataset: sc.AnnData, perturbation_key: str, smiles_key: str
++):
++    """
++    Converts a list of drug names to a list of SMILES. The ordering is of the list is preserved.
++
++    TODO: This function will need to be rewritten to handle datasets with combinations.
++    This is not difficult to do, mainly we need to standardize how combinations of SMILES are stored in anndata.
++    """
++    name_to_smiles_map = {
++        drug: canonicalize_smiles(smiles)
++        for drug, smiles in dataset.obs.groupby(
++            [perturbation_key, smiles_key]
++        ).groups.keys()
++    }
++    return [name_to_smiles_map[name] for name in drug_names]
++
++
+ indx = lambda a, i: a[i] if a is not None else None
+ 
+ 
+@@ -100,7 +118,11 @@ def __init__(
+             drugs_names_unique = set()
+             for d in self.drugs_names:
+                 [drugs_names_unique.add(i) for i in d.split("+")]
++
+             self.drugs_names_unique_sorted = np.array(sorted(drugs_names_unique))
++            self.smiles_unique_sorted = drug_names_to_smiles(
++                list(self.drugs_names_unique_sorted), data, perturbation_key, smiles_key
++            )
+             self.max_num_perturbations = max(
+                 len(name.split("+")) for name in self.drugs_names
+             )
+diff --git a/compert/embedding.py b/compert/embedding.py
+new file mode 100644
+index 0000000..7c85217
+--- /dev/null
++++ b/compert/embedding.py
+@@ -0,0 +1,30 @@
++import pandas as pd
++import numpy as np
++import torch
++from typing import List
++from pathlib import Path
++
++
++def get_chemical_representation(
++    smiles: List[str],
++    embedding_model: str,
++    data_dir="embeddings/",
++    device="cuda",
++):
++    """
++    Given a list of SMILES strings, returns the embeddings produced by the embedding model.
++    The embeddings are loaded from disk without ever running the embedding model.
++
++    :return: torch.nn.Embedding, shape [len(smiles), dim_embedding]. Embeddings are ordered as in `smiles`-list.
++    """
++    assert embedding_model in ("grover_base",)
++    assert Path(data_dir).exists()
++
++    if embedding_model == "grover_base":
++        df = pd.read_parquet(
++            Path(data_dir) / "grover" / "data" / "embeddings" / "grover_base.parquet"
++        )
++
++    emb = torch.tensor(df.loc[smiles].values, dtype=torch.float32, device=device)
++    assert emb.shape[0] == len(smiles)
++    return torch.nn.Embedding.from_pretrained(emb, freeze=True)
+diff --git a/compert/helper.py b/compert/helper.py
+index f9c11c6..c3f2d40 100644
+--- a/compert/helper.py
++++ b/compert/helper.py
+@@ -1,3 +1,5 @@
++from typing import Optional
++
+ import scanpy as sc
+ import pandas as pd
+ import dgl
+@@ -213,3 +215,10 @@ def get_featurisers(mol_featurizer: str = "canonical", return_shape: bool = True
+     if return_shape:
+         return (node_feats, edge_feats), graph_feats_shape
+     return node_feats, edge_feats
++
++
++def canonicalize_smiles(smiles: Optional[str]):
++    if smiles:
++        return Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=True)
++    else:
++        return None
+diff --git a/compert/model.py b/compert/model.py
+index 93d6a0f..58ddbdb 100644
+--- a/compert/model.py
++++ b/compert/model.py
+@@ -6,8 +6,6 @@
+ import numpy as np
+ import torch
+ 
+-from compert.graph_model.graph_model import Drugemb
+-
+ 
+ def _move_inputs(*inputs, device="cuda"):
+     def mv_input(x):
+@@ -203,7 +201,7 @@ def __init__(
+         doser_type="logsigm",
+         decoder_activation="linear",
+         hparams="",
+-        drug_embeddings: Union[None, Drugemb] = None,
++        drug_embeddings: Union[None, torch.nn.Embedding] = None,
+         use_drugs_idx=False,
+     ):
+         super(ComPert, self).__init__()
+@@ -251,8 +249,18 @@ def __init__(
+                         self.num_drugs, self.hparams["dim"]
+                     )
+                 )
++                embedding_requires_grad = True
+             else:
+                 self.drug_embeddings = drug_embeddings
++                embedding_requires_grad = False
++
++            self.drug_embedding_encoder = MLP(
++                [self.drug_embeddings.embedding_dim]
++                + [self.hparams["embedding_encoder_width"]]
++                * self.hparams["embedding_encoder_depth"]
++                + [self.hparams["dim"]],
++                last_layer_act="linear",
++            )
+ 
+             if use_drugs_idx:
+                 # there will only ever be a single drug, so no binary cross entropy needed
+@@ -320,7 +328,8 @@ def __init__(
+         _parameters = (
+             get_params(self.encoder, True)
+             + get_params(self.decoder, True)
+-            + get_params(self.drug_embeddings, has_drugs)
++            + get_params(self.drug_embeddings, has_drugs and embedding_requires_grad)
++            + get_params(self.drug_embedding_encoder, True)
+         )
+         for emb in self.covariates_embeddings:
+             _parameters.extend(get_params(emb, has_covariates))
+@@ -405,6 +414,8 @@ def set_hparams_(self, seed, hparams):
+             if default
+             else int(np.random.choice([64, 128, 256, 512])),
+             "step_size_lr": 45 if default else int(np.random.choice([15, 25, 45])),
++            "embedding_encoder_width": 512,
++            "embedding_encoder_depth": 0,
+         }
+ 
+         # the user may fix some hparams
+@@ -429,11 +440,7 @@ def compute_drug_embeddings_(self, drugs=None, drugs_idx=None, dosages=None):
+             drugs, drugs_idx, dosages, device=self.device
+         )
+ 
+-        if isinstance(self.drug_embeddings, Drugemb):
+-            # drug embedding matrix
+-            latent_drugs = self.drug_embeddings()
+-        else:
+-            latent_drugs = self.drug_embeddings.weight
++        latent_drugs = self.drug_embeddings.weight
+ 
+         if drugs_idx is not None:
+             assert drugs_idx.shape == dosages.shape and len(drugs_idx.shape) == 1
+@@ -489,9 +496,12 @@ def predict(
+         latent_treated = latent_basal
+ 
+         if self.num_drugs > 0:
+-            latent_treated = latent_treated + self.compute_drug_embeddings_(
++            drug_embedding = self.compute_drug_embeddings_(
+                 drugs=drugs, drugs_idx=drugs_idx, dosages=dosages
+             )
++            latent_treated = latent_treated + self.drug_embedding_encoder(
++                drug_embedding
++            )
+         if self.num_covariates[0] > 0:
+             for cov_type, emb_cov in enumerate(self.covariates_embeddings):
+                 emb_cov = emb_cov.to(self.device)
+diff --git a/compert/seml_sweep_icb.py b/compert/seml_sweep_icb.py
+index 27d6977..4f2ba9a 100644
+--- a/compert/seml_sweep_icb.py
++++ b/compert/seml_sweep_icb.py
+@@ -61,30 +61,20 @@ def init_dataset(self, dataset_type: str, data_params: dict):
+             )
+ 
+     @ex.capture(prefix="model")
+-    def init_drug_embedding(self, gnn_model: dict, hparams: dict):
+-        from compert.graph_model.graph_model import Drugemb
++    def init_drug_embedding(self, embedding: dict):
++        from compert.embedding import get_chemical_representation
+ 
+         device = "cuda" if torch.cuda.is_available() else "cpu"
+-        model_type = gnn_model["model_type"]
+-        dim = hparams["dim"]
+-        params = gnn_model["hparams"].copy()
+-        if model_type in list(gnn_model):
+-            for key, value in gnn_model[model_type]["hparams"].items():
+-                params[key] = value
+-        print(f"\nGNN params: {params}\n")
+-        if model_type is not None:
+-            self.drug_embeddings = Drugemb(
+-                dim=dim,  # TODO: This is set only in Compert model
+-                gnn_model=model_type,
+-                graph_feats_shape=self.datasets["training"].graph_feats_shape,
+-                idx_wo_smiles=self.datasets["training"].idx_wo_smiles,
+-                batched_graph_collection=self.datasets[
+-                    "training"
+-                ].batched_graph_collection,
+-                hparams=params,
++        if embedding["model"] is not None:
++            # ComPert will use the provided embedding, which is frozen during training
++            self.drug_embeddings = get_chemical_representation(
++                smiles=self.dataset.smiles_unique_sorted,
++                embedding_model=embedding["model"],
++                data_dir=embedding["directory"],
+                 device=device,
+             )
+         else:
++            # ComPert will initialize a new embedding, which is updated during training
+             self.drug_embeddings = None
+ 
+     @ex.capture(prefix="model")
+@@ -189,6 +179,17 @@ def train(
+                 self.autoencoder.history[key].append(val)
+             self.autoencoder.history["epoch"].append(epoch)
+ 
++            # print some stats for each epoch
++            print(
++                f"{epoch:4}",
++                ", ".join(
++                    [
++                        f"{key}: {value:7.5f}"
++                        for key, value in epoch_training_stats.items()
++                    ]
++                ),
++            )
++
+             ellapsed_minutes = (time.time() - start_time) / 60
+             self.autoencoder.history["elapsed_time_min"] = ellapsed_minutes
+ 
+diff --git a/embeddings/grover/generate_embeddings.ipynb b/embeddings/grover/generate_embeddings.ipynb
+index a15b150..d4ec5c7 100644
+--- a/embeddings/grover/generate_embeddings.ipynb
++++ b/embeddings/grover/generate_embeddings.ipynb
+@@ -250,6 +250,7 @@
+     "\n",
+     "embeddings_fpath = Path(\"data/embeddings\")\n",
+     "for file in embeddings_fpath.iterdir():\n",
++    "    final_dfs = []\n",
+     "    if str(file).endswith(\"csv\"):\n",
+     "        # read original SMILES list\n",
+     "        df = pd.read_csv(file)\n",
+@@ -258,7 +259,12 @@
+     "        assert len(df) == emb.shape[0]\n",
+     "        # generate a DataFrame with SMILES and Embedding in each row\n",
+     "        final_df = pd.DataFrame(emb, index=df[\"smiles\"].values, columns=[f\"latent_{i+1}\" for i in range(emb.shape[1])])\n",
+-    "        final_df.to_parquet(str(file).replace(\".csv\", \".parquet\"))"
++    "        final_dfs.append(final_df)\n",
++    "    # join into one dataframe\n",
++    "    final_df = pd.concat(final_dfs)\n",
++    "    # remove duplicates indices (=SMILES)\n",
++    "    final_df = final_df[~final_df.index.duplicated(keep=\"first\")]\n",
++    "    final_df.to_parquet(embeddings_fpath / \"grover_base.parquet\")"
+    ]
+   },
+   {
+@@ -268,7 +274,7 @@
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "df = pd.read_parquet(\"data/embeddings/trapnell_cpa_subset.parquet\")"
++    "df = pd.read_parquet(\"data/embeddings/grover_base.parquet\")"
+    ]
+   },
+   {
+diff --git a/environment.yml b/environment.yml
+index 5a8f271..3b51272 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -22,6 +22,7 @@ dependencies:
+   - dglteam::dgllife
+   - rdkit
+   - pytest
++  - pyarrow
+   - pip
+   - pip:
+     - seml
+diff --git a/simon/config_sciplex3.yaml b/simon/config_sciplex3.yaml
+index 61d1fb0..1c2ac85 100644
+--- a/simon/config_sciplex3.yaml
++++ b/simon/config_sciplex3.yaml
+@@ -1,169 +1,79 @@
+ # Config for hyperparameter-tuning CPA on SciPlex 3 with pretrained (and frozen) HierVAE drug embeddings.
+-
+ seml:
+   executable: compert/seml_sweep_icb.py
+-  name: cpa_graphs_sciplex3
++  name: cpa_sciplex3_grover
+   output_dir: sweeps/logs
+   conda_environment: chemical_CPA
+   project_root_dir: ..
+ 
+ slurm:
+   experiments_per_job: 1
+-  max_jobs_per_batch: 4
+   sbatch_options_template: GPU
+   sbatch_options:
+     gres: gpu:1       # num GPUs
+-    mem: 32G          # memory
++    mem: 20G          # memory
+     cpus-per-task: 6  # num cores
+-    time: 0-01:01     # max time, D-HH:MM
+-
++    time: 0-04:01     # max time, D-HH:MM
+ ###### BEGIN PARAMETER CONFIGURATION ######
+ 
+ fixed:
+   training.checkpoint_freq: 50 # checkpoint frequency to save intermediate results
+-  training.num_epochs: 100 # maximum epochs for training
++  training.num_epochs: 500 # maximum epochs for training
+   training.max_minutes: 300 # maximum computation time
+   training.ignore_evaluation: False
+   training.save_checkpoints: True
+-  training.save_dir: sweeps/checkpoints
++  training.save_dir: sweeps/checkpoints/trapnell_logsigm_grover
+   
+-  model.additional_params.seed: 0 # random seed
++  model.additional_params.seed: 30 # random seed
+   model.additional_params.loss_ae: gauss # loss (currently only gaussian loss is supported)
+   model.additional_params.patience: 20 # patience for early stopping
+   model.additional_params.decoder_activation: linear # last layer of the decoder
+-  model.additional_params.doser_type: sigm # non-linearity for doser function
+- 
++  model.additional_params.doser_type: logsigm # non-linearity for doser function
++
+   dataset.dataset_type: trapnell
+   dataset.data_params.dataset_path: datasets/trapnell_cpa.h5ad # full path to the anndata dataset
+-  dataset.data_params.perturbation_key: condition
+-  dataset.data_params.dose_key: dose
++  dataset.data_params.perturbation_key: condition # stores name of the drug
++  dataset.data_params.pert_category: cov_drug_dose_name # stores celltype_drugname_drugdose
++  dataset.data_params.dose_key: dose # stores drug dose as a float
+   dataset.data_params.covariate_keys: cell_type # necessary field for cell types. Fill it with a dummy variable if no celltypes present.
+   dataset.data_params.smiles_key: SMILES
+-  dataset.data_params.split_key: split # necessary field for train, test, ood splits. 
+-  
+-grid:
+-  dataset.data_params.mol_featurizer: # determines the initial node & edge features that are input into the GNN
+-    type: choice 
+-    options: 
+-      - canonical # this featurizes each node and edge using a collection of features generated by RDKit
+-      # - AttentiveFP
+-      # - Pretrain
++  dataset.data_params.split_key: split # necessary field for train, test, ood splits.
++  dataset.data_params.mol_featurizer: canonical
++  dataset.data_params.use_drugs_idx: False
+ 
+-gnn_model: # configures the GNN used in end-to-end training of the embedding (not used anymore)
+-  fixed:
+-    model.gnn_model.hparams.n_layers: 2
+-    model.gnn_model.GCN.hparams.n_layers: 3
+-  grid:
+-    model.gnn_model.model_type:
+-      type: choice
+-      options:
+-        # - AttentiveFP
+-        # - GAT
+-        # - GCN
+-        # - MPNN
+-        # - weave
+-        - null
++  model.hparams.adversary_depth: 4
++  model.hparams.adversary_lr: 6.5e-05
++  model.hparams.adversary_wd: 4.2e-05
++  model.hparams.adversary_width: 128
++  model.hparams.adversary_steps: 5
+ 
++  model.hparams.autoencoder_depth: 4
++  model.hparams.autoencoder_lr: 0.00148
++  model.hparams.autoencoder_wd: 3.5e-08
++  model.hparams.autoencoder_width: 256
+ 
+-random:
+-  samples: 1
+-  seed: 42
+-  model.hparams.dropout:
+-    type: uniform
+-    min: 0.0
+-    max: 0.5
+-  model.hparams.dim: 
+-    type: choice 
+-    options: 
+-      - 128
+-      - 256 
+-      - 512
+-  model.hparams.dosers_width: 
+-    type: choice 
+-    options: 
+-      - 32
+-      - 64 
+-      - 128
+-  model.hparams.dosers_depth: 
+-    type: choice 
+-    options: 
+-      - 1
+-      - 2 
+-      - 3
+-  model.hparams.dosers_lr: 
+-    type: loguniform 
+-    min: 1e-4
+-    max: 1e-2
+-  model.hparams.dosers_wd: 
+-    type: loguniform 
+-    min: 1e-8
+-    max: 1e-5
+-  model.hparams.autoencoder_width: 
+-    type: choice 
+-    options: 
+-      - 256
+-      - 512
+-      - 1024
+-  model.hparams.autoencoder_depth: 
+-    type: choice 
+-    options: 
+-      - 3
+-      - 4 
+-      - 5
+-  model.hparams.autoencoder_lr: 
+-    type: loguniform 
+-    min: 1e-4
+-    max: 1e-2
+-  model.hparams.autoencoder_wd: 
+-    type: loguniform 
+-    min: 1e-8
+-    max: 1e-5
+-  model.hparams.adversary_width: 
+-    type: choice 
+-    options: 
+-      - 64
+-      - 128
+-      - 256
+-  model.hparams.adversary_depth: 
+-    type: choice 
+-    options: 
+-      - 2
+-      - 3 
+-      - 4
+-  model.hparams.adversary_lr: 
+-    type: loguniform 
+-    min: 1e-5
+-    max: 1e-3
+-  model.hparams.adversary_wd: 
+-    type: loguniform 
+-    min: 1e-6
+-    max: 1e-3
+-  model.hparams.adversary_steps: 
+-    type: choice 
+-    options: 
++  model.hparams.batch_size: 256
++  model.hparams.dim: 256
++  model.hparams.dosers_depth: 2
++  model.hparams.dosers_lr: 0.00027322
++  model.hparams.dosers_wd: 1.69e-07
++  model.hparams.dosers_width: 64
++  model.hparams.penalty_adversary: 0.050719
++  model.hparams.reg_adversary: 92.6838
++  model.hparams.step_size_lr: 15
++  model.hparams.dropout: 0.1
++  model.hparams.embedding_encoder_width: 512
++
++  model.embedding.directory: embeddings
++
++grid:
++  model.hparams.embedding_encoder_depth:
++    type: choice
++    options:
++      - 0
+       - 1
+-      - 2 
+-      - 3
+-      - 4
+-      - 5
+-  model.hparams.reg_adversary: 
+-    type: loguniform
+-    min: 1e-2 
+-    max: 1e2
+-  model.hparams.penalty_adversary: 
+-    type: loguniform
+-    min: 1e-2
+-    max: 1e1
+-  model.hparams.batch_size: 
+-    type: choice 
+-    options: 
+-      - 64
+-      - 128 
+-      - 256 
+-      - 512
+-  model.hparams.step_size_lr: 
+-    type: choice 
+-    options: 
+-      - 15
+-      - 25
+-      - 45
++  model.embedding.model:
++    type: choice
++    options:
++      - grover_base
++      - None
+diff --git a/simon/config_sciplex3_interactive.yaml b/simon/config_sciplex3_interactive.yaml
+index 4e9f1cc..3eb0e25 100644
+--- a/simon/config_sciplex3_interactive.yaml
++++ b/simon/config_sciplex3_interactive.yaml
+@@ -8,7 +8,6 @@ seml:
+ 
+ slurm:
+   experiments_per_job: 1
+-  max_jobs_per_batch: 4
+   sbatch_options_template: GPU
+   sbatch_options:
+     gres: gpu:1       # num GPUs
+@@ -61,10 +60,8 @@ fixed:
+   model.hparams.penalty_adversary: 1e-2
+   model.hparams.batch_size: 128
+   model.hparams.step_size_lr: 15
++  model.hparams.embedding_encoder_width: 512
++  model.hparams.embedding_encoder_depth: 0  # just a single linear layer for now
+ 
+-
+-gnn_model: # configures the GNN used in end-to-end training of the embedding (not used anymore)
+-  fixed:
+-    model.gnn_model.hparams.n_layers: 2
+-    model.gnn_model.GCN.hparams.n_layers: 3
+-    model.gnn_model.model_type: null
++  model.embedding.model: grover_base
++  model.embedding.directory: embeddings
+diff --git a/simon/manual_seml_sweep_icb.py b/simon/manual_seml_sweep_icb.py
+index 652d185..fbe3994 100644
+--- a/simon/manual_seml_sweep_icb.py
++++ b/simon/manual_seml_sweep_icb.py
+@@ -23,9 +23,7 @@
+     # loads the dataset splits
+     exp.init_dataset(**args["dataset"])
+ 
+-    exp.init_drug_embedding(
+-        gnn_model=args["model"]["gnn_model"], hparams=args["model"]["hparams"]
+-    )
++    exp.init_drug_embedding(embedding=args["model"]["embedding"])
+     exp.init_model(
+         hparams=args["model"]["hparams"],
+         additional_params=args["model"]["additional_params"],
+diff --git a/tests/test_embedding.py b/tests/test_embedding.py
+new file mode 100644
+index 0000000..7c53862
+--- /dev/null
++++ b/tests/test_embedding.py
+@@ -0,0 +1,66 @@
++import numpy
++import pandas as pd
++import torch.testing
++
++from compert.data import Dataset
++from compert.embedding import get_chemical_representation
++from compert.model import ComPert
++
++
++def test_embedding_idx_roundtrip():
++    # test to make sure that the same drug embeddings are computed for all drugs
++    # in trapnell_subset, independent of whether we use indices or one-hot-encodings
++    kwargs = {
++        "perturbation_key": "condition",
++        "pert_category": "cov_drug_dose_name",
++        "dose_key": "dose",
++        "covariate_keys": "cell_type",
++        "smiles_key": "SMILES",
++        "mol_featurizer": "canonical",
++        "split_key": "split",
++    }
++
++    # load the embedding of DSMO
++    control_emb = torch.tensor(
++        pd.read_parquet("embeddings/grover/data/embeddings/grover_base.parquet")
++        .loc["CS(C)=O"]
++        .values
++    )
++
++    for use_drugs_idx in [True, False]:
++        dataset = Dataset(
++            fname="datasets/trapnell_cpa_subset.h5ad",
++            **kwargs,
++            use_drugs_idx=use_drugs_idx
++        )
++        embedding = get_chemical_representation(
++            smiles=dataset.smiles_unique_sorted,
++            embedding_model="grover_base",
++        )
++        device = embedding.weight.device
++
++        # make sure "control" is correctly encoded as the all zero vector
++        control = torch.tensor(
++            list(dataset.drugs_names_unique_sorted).index("control"),
++            device=device,
++        )
++        torch.testing.assert_equal(embedding(control), control_emb.to(device))
++
++        model = ComPert(
++            dataset.num_genes,
++            dataset.num_drugs,
++            dataset.num_covariates,
++            device=device,
++            doser_type="sigm",
++            drug_embeddings=embedding,
++            use_drugs_idx=use_drugs_idx,
++        )
++        if use_drugs_idx:
++            genes, idx, dosages, covariates = dataset[:]
++            idx_emb = model.compute_drug_embeddings_(drugs_idx=idx, dosages=dosages)
++        else:
++            genes, drugs, covariates = dataset[:]
++            ohe_emb = model.compute_drug_embeddings_(drugs=drugs)
++
++    # assert both model return the same embedding for the drugs in the dataset
++    torch.testing.assert_close(idx_emb, ohe_emb)

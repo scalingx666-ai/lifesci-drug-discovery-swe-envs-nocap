@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Make ersilia report docker issues better
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `1c6e7d35870b`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

@@ -1,0 +1,179 @@
+diff --git a/bblean/bitbirch.py b/bblean/bitbirch.py
+index 007168a5..13f81309 100644
+--- a/bblean/bitbirch.py
++++ b/bblean/bitbirch.py
+@@ -982,6 +982,21 @@ def delete_internal_nodes(self) -> None:
+     def _only_has_leaves(self) -> bool:
+         return (self._root is None) and (self._dummy_leaf._next_leaf is not None)
+ 
++    def recluster_inplace(self) -> tpx.Self:
++        r"""Re-fit all clusters in the tree.
++
++        Similar to `BitBirch.refine_inplace`, but doesn't break any clusters"""
++
++        if not self.is_init:
++            raise ValueError("The model has not been fitted yet.")
++        # Release the memory held by non-leaf nodes
++        self.delete_internal_nodes()
++        fps_bfs, mols_bfs = self._bf_to_np()
++        self.reset()
++        for bufs, mol_idxs in zip(fps_bfs.values(), mols_bfs.values()):
++            self._fit_np(bufs, reinsert_index_seqs=mol_idxs)
++        return self
++
+     def refine_inplace(
+         self,
+         X: _Input | Path | str | tp.Sequence[Path],
+@@ -1035,6 +1050,9 @@ def _bf_to_np_refine(
+         The split is only performed for the returned 'np' buffers, the clusters in the
+         tree itself are not modified
+         """
++        if n_largest == 0:
++            return self._bf_to_np()
++
+         if n_largest < 1:
+             raise ValueError("n_largest must be >= 1")
+ 
+diff --git a/bblean/cli.py b/bblean/cli.py
+index c64286b9..88c4c9df 100644
+--- a/bblean/cli.py
++++ b/bblean/cli.py
+@@ -684,6 +684,14 @@ def _run(
+             "--refine-threshold-increase", help="Threshold for refinement criterion"
+         ),
+     ] = DEFAULTS.refine_threshold_increase,
++    save_tree: Annotated[
++        bool,
++        Option("--save-tree/--no-save-tree", rich_help_panel="Advanced"),
++    ] = False,
++    save_centroids: Annotated[
++        bool,
++        Option("--save-centroids/--no-save-centroids", rich_help_panel="Advanced"),
++    ] = True,
+     merge_criterion: Annotated[
+         str,
+         Option("--set-merge", "-m", help="Merge criterion for initial clustsering"),
+@@ -849,16 +857,31 @@ def _run(
+                 input_files, input_is_packed=input_is_packed, n_largest=refine_num
+             )
+         # TODO: Fix peak memory stats
+-        cluster_mol_ids = tree.get_cluster_mol_ids()
+     timer.end_timing("total", console, indent=False)
+     stats = get_peak_memory(1)
+     if stats is None:
+         console.print("[Peak memory stats not tracked for non-Unix systems]")
+     else:
+         console.print_peak_mem_raw(stats, indent=False)
++    if save_tree:
++        # TODO: BitBIRCH is highly recursive. pickling may crash python,
++        # an alternative solution would be better
++        _old_limit = sys.getrecursionlimit()
++        sys.setrecursionlimit(100_000)
++        with open(out_dir / "bitbirch.pkl", mode="wb") as f:
++            pickle.dump(tree, f)
++        sys.setrecursionlimit(_old_limit)
++    tree.delete_internal_nodes()
+     # Dump outputs (peak memory, timings, config, cluster ids)
+-    with open(out_dir / "clusters.pkl", mode="wb") as f:
+-        pickle.dump(cluster_mol_ids, f)
++    if save_centroids:
++        output = tree.get_centroids_mol_ids()
++        with open(out_dir / "clusters.pkl", mode="wb") as f:
++            pickle.dump(output["mol_ids"], f)
++        with open(out_dir / "cluster-centroids-packed.pkl", mode="wb") as f:
++            pickle.dump(output["centroids"], f)
++    else:
++        with open(out_dir / "clusters.pkl", mode="wb") as f:
++            pickle.dump(tree.get_cluster_mol_ids(), f)
+ 
+     collect_system_specs_and_dump_config(ctx.params)
+     timer.dump(out_dir / "timings.json")
+@@ -936,6 +959,14 @@ def _multiround(
+             help="Initial merge criterion for round 1. ('diameter' recommended)",
+         ),
+     ] = DEFAULTS.merge_criterion,
++    save_tree: Annotated[
++        bool,
++        Option("--save-tree/--no-save-tree", rich_help_panel="Advanced"),
++    ] = False,
++    save_centroids: Annotated[
++        bool,
++        Option("--save-centroids/--no-save-centroids", rich_help_panel="Advanced"),
++    ] = True,
+     mid_merge_criterion: Annotated[
+         str,
+         Option(
+@@ -1128,6 +1159,8 @@ def _multiround(
+         midsection_threshold_increase=mid_threshold_increase,
+         tolerance=tolerance,
+         # Advanced
++        save_tree=save_tree,
++        save_centroids=save_centroids,
+         bin_size=bin_size,
+         max_tasks_per_process=max_tasks_per_process,
+         full_refinement_before_midsection=full_refinement_before_midsection,
+diff --git a/bblean/multiround.py b/bblean/multiround.py
+index 5062d2ae..02596c0b 100644
+--- a/bblean/multiround.py
++++ b/bblean/multiround.py
+@@ -266,10 +266,14 @@ def __init__(
+         tolerance: float,
+         criterion: str,
+         out_dir: Path | str,
++        save_tree: bool,
++        save_centroids: bool,
+     ) -> None:
+         super().__init__(
+             branching_factor, threshold, tolerance, -1, out_dir, False, criterion, ()
+         )
++        self.save_tree = save_tree
++        self.save_centroids = save_centroids
+ 
+     def __call__(self, batch_info: tuple[str, tp.Sequence[tuple[Path, Path]]]) -> None:
+         batch_path_pairs = batch_info[1]
+@@ -287,10 +291,24 @@ def __call__(self, batch_info: tuple[str, tp.Sequence[tuple[Path, Path]]]) -> No
+             del mol_idxs
+ 
+         # Save clusters and exit
++        if self.save_tree:
++            # TODO: BitBIRCH is highly recursive. pickling may crash python,
++            # an alternative solution would be better
++            _old_limit = sys.getrecursionlimit()
++            sys.setrecursionlimit(100_000)
++            with open(self.out_dir / "bitbirch.pkl", mode="wb") as f:
++                pickle.dump(tree, f)
++            sys.setrecursionlimit(_old_limit)
+         tree.delete_internal_nodes()
+-        cluster_mol_ids = tree.get_cluster_mol_ids()
+-        with open(self.out_dir / "clusters.pkl", mode="wb") as f:
+-            pickle.dump(cluster_mol_ids, f)
++        if self.save_centroids:
++            output = tree.get_centroids_mol_ids()
++            with open(self.out_dir / "clusters.pkl", mode="wb") as f:
++                pickle.dump(output["mol_ids"], f)
++            with open(self.out_dir / "cluster-centroids-packed.pkl", mode="wb") as f:
++                pickle.dump(output["centroids"], f)
++        else:
++            with open(self.out_dir / "clusters.pkl", mode="wb") as f:
++                pickle.dump(tree.get_cluster_mol_ids(), f)
+ 
+ 
+ # Create a list of tuples of labels, file paths and start-end idxs
+@@ -332,6 +350,8 @@ def run_multiround_bitbirch(
+     midsection_merge_criterion: str = DEFAULTS.refine_merge_criterion,
+     final_merge_criterion: str | None = None,
+     mp_context: tp.Any = None,
++    save_tree: bool = False,
++    save_centroids: bool = True,
+     # Debug
+     max_fps: int | None = None,
+     verbose: bool = False,
+@@ -441,6 +461,8 @@ def run_multiround_bitbirch(
+     file_pairs = _get_prev_round_buf_and_mol_idxs_files(out_dir, round_idx, console)
+ 
+     final_fn = _FinalTreeMergingRound(
++        save_tree=save_tree,
++        save_centroids=save_centroids,
+         criterion=final_merge_criterion,
+         threshold=threshold + midsection_threshold_increase,
+         **common_kwargs,

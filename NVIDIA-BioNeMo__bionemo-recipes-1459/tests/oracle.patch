@@ -1,0 +1,458 @@
+diff --git a/bionemo-recipes/models/esm2/tests/common/__init__.py b/bionemo-recipes/models/esm2/tests/common/__init__.py
+index 29159ea93b..dee29e4297 100644
+--- a/bionemo-recipes/models/esm2/tests/common/__init__.py
++++ b/bionemo-recipes/models/esm2/tests/common/__init__.py
+@@ -51,10 +51,11 @@ def get_model_class(self):
+     ```
+ """
+ 
+-from .test_modeling_common import BaseModelTest, TestTolerances
++from .test_modeling_common import HAS_DATA_CENTER_GPU, BaseModelTest, TestTolerances
+ 
+ 
+ __all__ = [
++    "HAS_DATA_CENTER_GPU",
+     "BaseModelTest",
+     "TestTolerances",
+ ]
+diff --git a/bionemo-recipes/models/esm2/tests/common/test_modeling_common.py b/bionemo-recipes/models/esm2/tests/common/test_modeling_common.py
+index bf15310c8d..d7541c4d28 100644
+--- a/bionemo-recipes/models/esm2/tests/common/test_modeling_common.py
++++ b/bionemo-recipes/models/esm2/tests/common/test_modeling_common.py
+@@ -15,6 +15,7 @@
+ 
+ """Common test class for BioNeMo models, following HuggingFace transformers patterns."""
+ 
++import gc
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -409,6 +410,15 @@ def compare_outputs(
+                     msg=lambda x: f"Hidden states mismatch at layer {i}: {x}",
+                 )
+ 
++    @pytest.fixture(autouse=True, scope="function")
++    def clear_gpu_memory(self):
++        """Clear GPU memory before and after each test to prevent OOM from fragmentation."""
++        gc.collect()
++        torch.cuda.empty_cache()
++        yield
++        gc.collect()
++        torch.cuda.empty_cache()
++
+     @pytest.fixture(autouse=True, scope="function")
+     def set_seed(self):
+         set_seed(42)
+@@ -611,13 +621,32 @@ def _set_tmpdir(self, tmp_path_factory):
+         type(self)._tmp_dir = tmp_path_factory.mktemp(self.__class__.__name__)
+ 
+     def get_converted_te_model_checkpoint(self) -> Path:
+-        """Get the path to the converted TE model checkpoint."""
++        """Get the path to the converted TE model checkpoint.
++
++        This method manages GPU memory carefully to support large models:
++        1. Load and convert the HF model
++        2. Free the HF model before saving
++        3. Move TE model to CPU before saving (save_pretrained clones state dict internally)
++        """
+         model_hf = self.get_reference_model()
+         convert_fn = self.get_hf_to_te_converter()
+         model_te = convert_fn(model_hf)
+-        model_te.to("cuda")
+-        checkpoint_path = self._tmp_dir / "converted_te_model"
++
++        # Free source model to reduce peak GPU memory
++        del model_hf
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        # Move to CPU before saving - save_pretrained internally clones the state dict,
++        # which would double GPU memory usage and OOM for large models.
++        model_te.to("cpu")
++
++        checkpoint_path: Path = self._tmp_dir / "converted_te_model"
+         model_te.save_pretrained(checkpoint_path)
++
++        del model_te
++        gc.collect()
++
+         return checkpoint_path
+ 
+     def get_converted_te_model(self, **kwargs) -> PreTrainedModel:
+@@ -633,25 +662,37 @@ def get_converted_te_model(self, **kwargs) -> PreTrainedModel:
+     # ==================== Golden Value Tests ====================
+ 
+     def test_golden_values(self):
+-        """Test that TE model outputs match HF reference model."""
+-        model_hf = self.get_reference_model(dtype=torch.bfloat16)
+-        model_te = self.get_converted_te_model(dtype=torch.bfloat16)
+-
+-        model_hf.eval()
+-        model_te.eval()
++        """Test that TE model outputs match HF reference model.
+ 
+-        # Prepare input data
++        Models are run sequentially and freed between runs to support large models
++        that cannot fit two copies on a single GPU simultaneously.
++        """
+         input_data = self.get_test_input_data("bshd")
+ 
+-        # Run forward pass
++        # Run HF model first, then free it
++        model_hf = self.get_reference_model(dtype=torch.bfloat16)
++        model_hf.eval()
+         with torch.no_grad():
+-            te_outputs = model_te(**input_data)
+             hf_outputs = model_hf(**input_data)
++        hf_loss = hf_outputs.loss.detach().clone()
++        hf_logits = hf_outputs.logits.detach().clone()
++        del model_hf, hf_outputs
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        # Load and run TE model
++        model_te = self.get_converted_te_model(dtype=torch.bfloat16)
++        model_te.eval()
++        with torch.no_grad():
++            te_outputs = model_te(**input_data)
++        del model_te
++        gc.collect()
++        torch.cuda.empty_cache()
+ 
+         # Compare outputs
+         self.compare_outputs(
+             te_outputs,
+-            hf_outputs,
++            type("HFOutputs", (), {"loss": hf_loss, "logits": hf_logits})(),
+             input_data,
+             compare_loss=True,
+             compare_logits=True,
+@@ -680,18 +721,23 @@ def test_golden_values_thd(self, te_attn_backend):
+         labels_thd = input_data_thd["labels"].flatten(0)
+         torch.testing.assert_close(labels_bshd[labels_thd != -100], labels_thd[labels_thd != -100])
+ 
++        # Run models sequentially to support large models that cannot fit two copies on GPU
+         model_bshd = self.get_converted_te_model(attn_input_format="bshd", dtype=torch.bfloat16)
+-        model_thd = self.get_converted_te_model(attn_input_format="thd", dtype=torch.bfloat16)
+-
+         model_bshd.eval()
+-        model_thd.eval()
+-
+         with torch.inference_mode():
+             outputs_bshd = model_bshd(**input_data_bshd)
++        bshd_loss = outputs_bshd.loss.detach().clone()
++        bshd_logits = outputs_bshd.logits[input_data_bshd["attention_mask"].to(bool)].detach().clone()
++        del model_bshd, outputs_bshd
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        model_thd = self.get_converted_te_model(attn_input_format="thd", dtype=torch.bfloat16)
++        model_thd.eval()
++        with torch.inference_mode():
+             outputs_thd = model_thd(**input_data_thd)
+ 
+         # Compare logits
+-        bshd_logits = outputs_bshd.logits[input_data_bshd["attention_mask"].to(bool)]
+         torch.testing.assert_close(
+             bshd_logits,
+             outputs_thd.logits,
+@@ -701,7 +747,7 @@ def test_golden_values_thd(self, te_attn_backend):
+ 
+         # Compare losses
+         torch.testing.assert_close(
+-            outputs_bshd.loss,
++            bshd_loss,
+             outputs_thd.loss,
+             atol=tolerances.golden_value_loss_atol,
+             rtol=tolerances.golden_value_loss_rtol,
+diff --git a/bionemo-recipes/models/llama3/modeling_llama_te.py b/bionemo-recipes/models/llama3/modeling_llama_te.py
+index 708572f1d0..d4821be1f7 100644
+--- a/bionemo-recipes/models/llama3/modeling_llama_te.py
++++ b/bionemo-recipes/models/llama3/modeling_llama_te.py
+@@ -279,14 +279,15 @@ def __init__(self, config):
+         super().__init__(config)
+         self.model = NVLlamaModel(config)
+         self.vocab_size = config.vocab_size
+-        self.lm_head = transformer_engine.pytorch.Linear(
+-            config.hidden_size,
+-            config.vocab_size,
+-            bias=False,
+-            params_dtype=config.dtype,
+-            device="meta" if torch.get_default_device() == torch.device("meta") else "cuda",
+-            init_method=lambda x: torch.nn.init.normal_(x, mean=0.0, std=config.initializer_range),
+-        )
++        with transformer_engine.pytorch.quantized_model_init(enabled=False):
++            self.lm_head = transformer_engine.pytorch.Linear(
++                config.hidden_size,
++                config.vocab_size,
++                bias=False,
++                params_dtype=config.dtype,
++                device="meta" if torch.get_default_device() == torch.device("meta") else "cuda",
++                init_method=lambda x: torch.nn.init.normal_(x, mean=0.0, std=config.initializer_range),
++            )
+ 
+         # Initialize weights and apply final processing
+         self.post_init()
+diff --git a/bionemo-recipes/models/llama3/tests/common/__init__.py b/bionemo-recipes/models/llama3/tests/common/__init__.py
+index 29159ea93b..dee29e4297 100644
+--- a/bionemo-recipes/models/llama3/tests/common/__init__.py
++++ b/bionemo-recipes/models/llama3/tests/common/__init__.py
+@@ -51,10 +51,11 @@ def get_model_class(self):
+     ```
+ """
+ 
+-from .test_modeling_common import BaseModelTest, TestTolerances
++from .test_modeling_common import HAS_DATA_CENTER_GPU, BaseModelTest, TestTolerances
+ 
+ 
+ __all__ = [
++    "HAS_DATA_CENTER_GPU",
+     "BaseModelTest",
+     "TestTolerances",
+ ]
+diff --git a/bionemo-recipes/models/llama3/tests/common/test_modeling_common.py b/bionemo-recipes/models/llama3/tests/common/test_modeling_common.py
+index bf15310c8d..d7541c4d28 100644
+--- a/bionemo-recipes/models/llama3/tests/common/test_modeling_common.py
++++ b/bionemo-recipes/models/llama3/tests/common/test_modeling_common.py
+@@ -15,6 +15,7 @@
+ 
+ """Common test class for BioNeMo models, following HuggingFace transformers patterns."""
+ 
++import gc
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -409,6 +410,15 @@ def compare_outputs(
+                     msg=lambda x: f"Hidden states mismatch at layer {i}: {x}",
+                 )
+ 
++    @pytest.fixture(autouse=True, scope="function")
++    def clear_gpu_memory(self):
++        """Clear GPU memory before and after each test to prevent OOM from fragmentation."""
++        gc.collect()
++        torch.cuda.empty_cache()
++        yield
++        gc.collect()
++        torch.cuda.empty_cache()
++
+     @pytest.fixture(autouse=True, scope="function")
+     def set_seed(self):
+         set_seed(42)
+@@ -611,13 +621,32 @@ def _set_tmpdir(self, tmp_path_factory):
+         type(self)._tmp_dir = tmp_path_factory.mktemp(self.__class__.__name__)
+ 
+     def get_converted_te_model_checkpoint(self) -> Path:
+-        """Get the path to the converted TE model checkpoint."""
++        """Get the path to the converted TE model checkpoint.
++
++        This method manages GPU memory carefully to support large models:
++        1. Load and convert the HF model
++        2. Free the HF model before saving
++        3. Move TE model to CPU before saving (save_pretrained clones state dict internally)
++        """
+         model_hf = self.get_reference_model()
+         convert_fn = self.get_hf_to_te_converter()
+         model_te = convert_fn(model_hf)
+-        model_te.to("cuda")
+-        checkpoint_path = self._tmp_dir / "converted_te_model"
++
++        # Free source model to reduce peak GPU memory
++        del model_hf
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        # Move to CPU before saving - save_pretrained internally clones the state dict,
++        # which would double GPU memory usage and OOM for large models.
++        model_te.to("cpu")
++
++        checkpoint_path: Path = self._tmp_dir / "converted_te_model"
+         model_te.save_pretrained(checkpoint_path)
++
++        del model_te
++        gc.collect()
++
+         return checkpoint_path
+ 
+     def get_converted_te_model(self, **kwargs) -> PreTrainedModel:
+@@ -633,25 +662,37 @@ def get_converted_te_model(self, **kwargs) -> PreTrainedModel:
+     # ==================== Golden Value Tests ====================
+ 
+     def test_golden_values(self):
+-        """Test that TE model outputs match HF reference model."""
+-        model_hf = self.get_reference_model(dtype=torch.bfloat16)
+-        model_te = self.get_converted_te_model(dtype=torch.bfloat16)
+-
+-        model_hf.eval()
+-        model_te.eval()
++        """Test that TE model outputs match HF reference model.
+ 
+-        # Prepare input data
++        Models are run sequentially and freed between runs to support large models
++        that cannot fit two copies on a single GPU simultaneously.
++        """
+         input_data = self.get_test_input_data("bshd")
+ 
+-        # Run forward pass
++        # Run HF model first, then free it
++        model_hf = self.get_reference_model(dtype=torch.bfloat16)
++        model_hf.eval()
+         with torch.no_grad():
+-            te_outputs = model_te(**input_data)
+             hf_outputs = model_hf(**input_data)
++        hf_loss = hf_outputs.loss.detach().clone()
++        hf_logits = hf_outputs.logits.detach().clone()
++        del model_hf, hf_outputs
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        # Load and run TE model
++        model_te = self.get_converted_te_model(dtype=torch.bfloat16)
++        model_te.eval()
++        with torch.no_grad():
++            te_outputs = model_te(**input_data)
++        del model_te
++        gc.collect()
++        torch.cuda.empty_cache()
+ 
+         # Compare outputs
+         self.compare_outputs(
+             te_outputs,
+-            hf_outputs,
++            type("HFOutputs", (), {"loss": hf_loss, "logits": hf_logits})(),
+             input_data,
+             compare_loss=True,
+             compare_logits=True,
+@@ -680,18 +721,23 @@ def test_golden_values_thd(self, te_attn_backend):
+         labels_thd = input_data_thd["labels"].flatten(0)
+         torch.testing.assert_close(labels_bshd[labels_thd != -100], labels_thd[labels_thd != -100])
+ 
++        # Run models sequentially to support large models that cannot fit two copies on GPU
+         model_bshd = self.get_converted_te_model(attn_input_format="bshd", dtype=torch.bfloat16)
+-        model_thd = self.get_converted_te_model(attn_input_format="thd", dtype=torch.bfloat16)
+-
+         model_bshd.eval()
+-        model_thd.eval()
+-
+         with torch.inference_mode():
+             outputs_bshd = model_bshd(**input_data_bshd)
++        bshd_loss = outputs_bshd.loss.detach().clone()
++        bshd_logits = outputs_bshd.logits[input_data_bshd["attention_mask"].to(bool)].detach().clone()
++        del model_bshd, outputs_bshd
++        gc.collect()
++        torch.cuda.empty_cache()
++
++        model_thd = self.get_converted_te_model(attn_input_format="thd", dtype=torch.bfloat16)
++        model_thd.eval()
++        with torch.inference_mode():
+             outputs_thd = model_thd(**input_data_thd)
+ 
+         # Compare logits
+-        bshd_logits = outputs_bshd.logits[input_data_bshd["attention_mask"].to(bool)]
+         torch.testing.assert_close(
+             bshd_logits,
+             outputs_thd.logits,
+@@ -701,7 +747,7 @@ def test_golden_values_thd(self, te_attn_backend):
+ 
+         # Compare losses
+         torch.testing.assert_close(
+-            outputs_bshd.loss,
++            bshd_loss,
+             outputs_thd.loss,
+             atol=tolerances.golden_value_loss_atol,
+             rtol=tolerances.golden_value_loss_rtol,
+diff --git a/bionemo-recipes/models/llama3/tests/test_modeling_llama_te.py b/bionemo-recipes/models/llama3/tests/test_modeling_llama_te.py
+index 19177adeb8..cd4998c17b 100644
+--- a/bionemo-recipes/models/llama3/tests/test_modeling_llama_te.py
++++ b/bionemo-recipes/models/llama3/tests/test_modeling_llama_te.py
+@@ -26,6 +26,7 @@
+ 
+ import pytest
+ import torch
++import transformer_engine.pytorch
+ import transformers
+ from torch import nn
+ from transformers import (
+@@ -40,7 +41,7 @@
+ from collator import DataCollatorWithFlattening
+ from convert import convert_llama_hf_to_te, convert_llama_te_to_hf
+ from modeling_llama_te import HFInferenceParams, NVLlamaConfig, NVLlamaForCausalLM
+-from tests.common import BaseModelTest, TestTolerances
++from tests.common import HAS_DATA_CENTER_GPU, BaseModelTest, TestTolerances
+ 
+ 
+ class TestLlama3Model(BaseModelTest):
+@@ -162,6 +163,46 @@ def test_golden_values(self, input_format):  # pyright: ignore[reportIncompatibl
+             compare_hidden_states=False,
+         )
+ 
++    @pytest.mark.parametrize("tie_word_embeddings", [True, False])
++    def test_quantized_model_init_forward_and_backward(self, fp8_recipe, input_format, tie_word_embeddings):  # pyright: ignore[reportIncompatibleMethodOverride]
++        """There was a weird bug in BIO-217 on tied weights with quantized model init, so we test both cases."""
++        if input_format == "thd" and not HAS_DATA_CENTER_GPU:
++            pytest.xfail("Padded sequences are not supported on non-datacenter hardware for THD.")
++
++        model_class = self.get_model_class()
++        config = self.create_test_config(
++            attn_input_format=input_format,
++            self_attn_mask_type="padding_causal",
++            tie_word_embeddings=tie_word_embeddings,
++        )
++
++        # Initialize with FP8
++        with transformer_engine.pytorch.quantized_model_init(recipe=fp8_recipe):
++            model = model_class(config)
++
++        model.to("cuda")
++        model.eval()
++
++        # Prepare input data
++        input_data = self.get_test_input_data(input_format, pad_to_multiple_of=32)
++        if "labels" not in input_data:
++            input_data["labels"] = input_data["input_ids"].clone()
++
++        # Forward and backward pass with FP8
++        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
++            with transformer_engine.pytorch.autocast(recipe=fp8_recipe):
++                outputs = model(**input_data)
++
++        loss = outputs.loss
++        assert torch.isfinite(loss)
++
++        loss.backward()
++
++        # Verify gradients exist
++        for name, param in model.named_parameters():
++            if param.requires_grad:
++                assert param.grad is not None, f"Parameter {name} has no gradient after FP8 backward pass"
++
+ 
+ # NOTE: Keeping remaining LLaMA-specific tests (inference, generation, etc.) unchanged
+ # These tests are specific to causal LM functionality and don't have ESM2 equivalents
+diff --git a/bionemo-recipes/recipes/llama3_native_te/modeling_llama_te.py b/bionemo-recipes/recipes/llama3_native_te/modeling_llama_te.py
+index 708572f1d0..d4821be1f7 100644
+--- a/bionemo-recipes/recipes/llama3_native_te/modeling_llama_te.py
++++ b/bionemo-recipes/recipes/llama3_native_te/modeling_llama_te.py
+@@ -279,14 +279,15 @@ def __init__(self, config):
+         super().__init__(config)
+         self.model = NVLlamaModel(config)
+         self.vocab_size = config.vocab_size
+-        self.lm_head = transformer_engine.pytorch.Linear(
+-            config.hidden_size,
+-            config.vocab_size,
+-            bias=False,
+-            params_dtype=config.dtype,
+-            device="meta" if torch.get_default_device() == torch.device("meta") else "cuda",
+-            init_method=lambda x: torch.nn.init.normal_(x, mean=0.0, std=config.initializer_range),
+-        )
++        with transformer_engine.pytorch.quantized_model_init(enabled=False):
++            self.lm_head = transformer_engine.pytorch.Linear(
++                config.hidden_size,
++                config.vocab_size,
++                bias=False,
++                params_dtype=config.dtype,
++                device="meta" if torch.get_default_device() == torch.device("meta") else "cuda",
++                init_method=lambda x: torch.nn.init.normal_(x, mean=0.0, std=config.initializer_range),
++            )
+ 
+         # Initialize weights and apply final processing
+         self.post_init()

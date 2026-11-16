@@ -1,0 +1,469 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d9931d0d0e..3ab1fa1c52 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - `SHAPInsight` breaking with `numpy>=2.4` due to no longer accepted implicit array to 
+   scalar conversion
+ 
++### Changed
++- The `Campaign.allow_*` flag mechanism is now based on `AutoBool` logic, providing
++  well-defined Boolean values at query time while exposing the `AUTO` option to the user
++
++### Fixed
++- Broken cache validation for certain `Campaign.recommend` cases
++
+ ### Removed
+ - `parallel_runs` argument from `simulate_scenarios`, since parallelization
+   can now be conveniently controlled via the new `Settings` mechanism
+diff --git a/baybe/campaign.py b/baybe/campaign.py
+index dc4136289c..278d9812d0 100644
+--- a/baybe/campaign.py
++++ b/baybe/campaign.py
+@@ -5,14 +5,14 @@
+ import gc
+ import json
+ import warnings
+-from collections.abc import Callable, Collection, Sequence
++from collections.abc import Collection, Sequence
+ from functools import reduce
+ from typing import TYPE_CHECKING, Any, TypeVar
+ 
+ import cattrs
+ import numpy as np
+ import pandas as pd
+-from attrs import Attribute, Factory, define, evolve, field, fields
++from attrs import Attribute, define, evolve, field, fields, setters
+ from attrs.converters import optional
+ from attrs.validators import instance_of
+ from typing_extensions import override
+@@ -42,8 +42,8 @@
+ from baybe.settings import Settings, active_settings
+ from baybe.surrogates.base import PosteriorStatistic, SurrogateProtocol
+ from baybe.targets.base import Target
+-from baybe.utils.basic import UNSPECIFIED, UnspecifiedType, is_all_instance
+-from baybe.utils.boolean import eq_dataframe
++from baybe.utils.basic import is_all_instance
++from baybe.utils.boolean import AutoBool, eq_dataframe
+ from baybe.utils.conversion import to_string
+ from baybe.utils.dataframe import filter_df, fuzzy_row_match
+ from baybe.utils.validation import (
+@@ -67,20 +67,6 @@
+ _METADATA_COLUMNS = [_RECOMMENDED, _MEASURED, _EXCLUDED]
+ 
+ 
+-def _make_allow_flag_default_factory(
+-    default: bool,
+-) -> Callable[[Campaign], bool | UnspecifiedType]:
+-    """Make a default factory for allow_* flags."""
+-
+-    def default_allow_flag(campaign: Campaign) -> bool | UnspecifiedType:
+-        """Attrs-compatible default factory for allow_* flags."""
+-        if campaign.searchspace.type is SearchSpaceType.DISCRETE:
+-            return default
+-        return UNSPECIFIED
+-
+-    return default_allow_flag
+-
+-
+ def _set_with_cache_cleared(instance: Campaign, attribute: Attribute, value: _T) -> _T:
+     """Attrs-compatible hook to clear the cache when changing an attribute."""
+     if value != getattr(instance, attribute.name):
+@@ -88,22 +74,26 @@ def _set_with_cache_cleared(instance: Campaign, attribute: Attribute, value: _T)
+     return value
+ 
+ 
+-def _validate_allow_flag(campaign: Campaign, attribute: Attribute, value: Any) -> None:
++_convert_validate_and_clear_cache = setters.pipe(
++    setters.convert, setters.validate, _set_with_cache_cleared
++)
++"""Attrs on_setattr hook that converts, validates, and clears the cache on changes."""
++
++
++def _validate_allow_flag(
++    campaign: Campaign, attribute: Attribute, value: AutoBool
++) -> None:
+     """Attrs-compatible validator for context-aware validation of allow_* flags."""
+-    match campaign.searchspace.type:
+-        case SearchSpaceType.DISCRETE:
+-            if not isinstance(value, bool):
+-                raise ValueError(
+-                    f"For search spaces of '{SearchSpaceType.DISCRETE}', "
+-                    f"'{attribute.name}' must be a Boolean."
+-                )
+-        case _:
+-            if value is not UNSPECIFIED:
+-                raise ValueError(
+-                    f"For search spaces of type other than "
+-                    f"'{SearchSpaceType.DISCRETE}', '{attribute.name}' cannot be set "
+-                    f"since the flag is meaningless in such contexts.",
+-                )
++    if campaign.searchspace.type is SearchSpaceType.DISCRETE:
++        return
++
++    if value is AutoBool.FALSE:
++        raise IncompatibilityError(
++            f"For search spaces involving a continuous subspace, the flag "
++            f"'{attribute.alias}' cannot be set to 'False' for algorithmic reasons. "
++            f"Either let the value be automatically determined by not setting it "
++            f"explicitly / setting it to 'auto' or explicitly set it to 'True'."
++        )
+ 
+ 
+ @define
+@@ -147,42 +137,39 @@ def _validate_objective(  # noqa: DOC101, DOC103
+     recommender: RecommenderProtocol = field(
+         factory=TwoPhaseMetaRecommender,
+         validator=instance_of(RecommenderProtocol),
+-        on_setattr=_set_with_cache_cleared,
++        on_setattr=_convert_validate_and_clear_cache,
+     )
+     """The employed recommender"""
+ 
+-    allow_recommending_already_measured: bool | UnspecifiedType = field(
+-        default=Factory(
+-            _make_allow_flag_default_factory(default=True), takes_self=True
+-        ),
++    _allow_recommending_already_measured: AutoBool = field(
++        alias="allow_recommending_already_measured",
++        default=AutoBool.AUTO,
++        converter=AutoBool.from_unstructured,  # type: ignore[misc]
+         validator=_validate_allow_flag,
+-        on_setattr=_set_with_cache_cleared,
++        on_setattr=_convert_validate_and_clear_cache,
+         kw_only=True,
+     )
+-    """Allow to recommend experiments that were already measured earlier.
+-    Can only be set for discrete search spaces."""
++    """Allow recommending experiments that have already been measured."""
+ 
+-    allow_recommending_already_recommended: bool | UnspecifiedType = field(
+-        default=Factory(
+-            _make_allow_flag_default_factory(default=False), takes_self=True
+-        ),
++    _allow_recommending_already_recommended: AutoBool = field(
++        alias="allow_recommending_already_recommended",
++        default=AutoBool.AUTO,
++        converter=AutoBool.from_unstructured,  # type: ignore[misc]
+         validator=_validate_allow_flag,
+-        on_setattr=_set_with_cache_cleared,
++        on_setattr=_convert_validate_and_clear_cache,
+         kw_only=True,
+     )
+-    """Allow to recommend experiments that were already recommended earlier.
+-    Can only be set for discrete search spaces."""
++    """Allow recommending experiments that have already been recommended."""
+ 
+-    allow_recommending_pending_experiments: bool | UnspecifiedType = field(
+-        default=Factory(
+-            _make_allow_flag_default_factory(default=False), takes_self=True
+-        ),
++    _allow_recommending_pending_experiments: AutoBool = field(
++        alias="allow_recommending_pending_experiments",
++        default=AutoBool.AUTO,
++        converter=AutoBool.from_unstructured,  # type: ignore[misc]
+         validator=_validate_allow_flag,
+-        on_setattr=_set_with_cache_cleared,
++        on_setattr=_convert_validate_and_clear_cache,
+         kw_only=True,
+     )
+-    """Allow pending experiments to be part of the recommendations.
+-    Can only be set for discrete search spaces."""
++    """Allow recommending pending experiments."""
+ 
+     # Metadata
+     _searchspace_metadata: pd.DataFrame = field(init=False, eq=eq_dataframe)
+@@ -264,6 +251,45 @@ def targets(self) -> tuple[Target, ...]:
+         """The targets of the underlying objective."""
+         return self.objective.targets if self.objective is not None else ()
+ 
++    @property
++    def allow_recommending_already_measured(self) -> bool:
++        """Allow recommending experiments that have already been measured."""
++        if self._allow_recommending_already_measured is AutoBool.AUTO:
++            return True
++        return bool(self._allow_recommending_already_measured)
++
++    @allow_recommending_already_measured.setter
++    def allow_recommending_already_measured(self, value: bool) -> None:
++        """Set candidate flag for already measured experiments."""
++        # Note: uses attrs converter
++        self._allow_recommending_already_measured = value  # type: ignore[assignment]
++
++    @property
++    def allow_recommending_already_recommended(self) -> bool:
++        """Allow recommending experiments that have already been recommended."""
++        if self._allow_recommending_already_recommended is AutoBool.AUTO:
++            return self.searchspace.type is not SearchSpaceType.DISCRETE
++        return bool(self._allow_recommending_already_recommended)
++
++    @allow_recommending_already_recommended.setter
++    def allow_recommending_already_recommended(self, value: bool) -> None:
++        """Set candidate flag for already recommended experiments."""
++        # Note: uses attrs converter
++        self._allow_recommending_already_recommended = value  # type: ignore[assignment]
++
++    @property
++    def allow_recommending_pending_experiments(self) -> bool:
++        """Allow recommending pending experiments."""
++        if self._allow_recommending_pending_experiments is AutoBool.AUTO:
++            return self.searchspace.type is not SearchSpaceType.DISCRETE
++        return bool(self._allow_recommending_pending_experiments)
++
++    @allow_recommending_pending_experiments.setter
++    def allow_recommending_pending_experiments(self, value: bool) -> None:
++        """Set candidate flag for pending experiments."""
++        # Note: uses attrs converter
++        self._allow_recommending_pending_experiments = value  # type: ignore[assignment]
++
+     @classmethod
+     def from_config(cls, config_json: str) -> Campaign:
+         """Create a campaign from a configuration JSON.
+@@ -509,7 +535,6 @@ def recommend(
+             active_settings.cache_campaign_recommendations
+             and (cache := self._cached_recommendation) is not None
+             and pending_experiments is None
+-            and self.allow_recommending_already_recommended is not UNSPECIFIED
+             and self.allow_recommending_already_recommended
+             and len(cache) == batch_size
+         ):
+@@ -580,9 +605,9 @@ def recommend(
+             ok_m = self.allow_recommending_already_measured
+             ok_r = self.allow_recommending_already_recommended
+             ok_p = self.allow_recommending_pending_experiments
+-            ok_m_name = f.allow_recommending_already_measured.name
+-            ok_r_name = f.allow_recommending_already_recommended.name
+-            ok_p_name = f.allow_recommending_pending_experiments.name
++            ok_m_name = f._allow_recommending_already_measured.alias
++            ok_r_name = f._allow_recommending_already_recommended.alias
++            ok_p_name = f._allow_recommending_pending_experiments.alias
+             no_blocked_pending_points = ok_p or (pending_experiments is None)
+ 
+             # If there are no candidate restrictions to be relaxed
+diff --git a/baybe/serialization/core.py b/baybe/serialization/core.py
+index 0d73523c95..089d99b075 100644
+--- a/baybe/serialization/core.py
++++ b/baybe/serialization/core.py
+@@ -14,7 +14,12 @@
+ from cattrs.strategies import configure_union_passthrough
+ 
+ from baybe.utils.basic import find_subclass
+-from baybe.utils.boolean import is_abstract
++from baybe.utils.boolean import (
++    AutoBool,
++    is_abstract,
++    structure_autobool,
++    unstructure_autobool,
++)
+ 
+ if TYPE_CHECKING:
+     from cattrs.dispatch import UnstructureHook
+@@ -180,3 +185,5 @@ def select_constructor_hook(specs: dict, cls: type[_T]) -> _T:
+ converter.register_structure_hook(
+     timedelta, lambda x, _: timedelta(seconds=float(x.removesuffix("s")))
+ )
++converter.register_unstructure_hook(AutoBool, unstructure_autobool)
++converter.register_structure_hook(AutoBool, structure_autobool)
+diff --git a/baybe/utils/boolean.py b/baybe/utils/boolean.py
+index d04d5e8069..ce47d2ced0 100644
+--- a/baybe/utils/boolean.py
++++ b/baybe/utils/boolean.py
+@@ -221,3 +221,15 @@ def from_unstructured(cls, value: AutoBool | bool | str | None, /) -> AutoBool:
+                     pass
+ 
+         raise ValueError(f"Cannot convert '{value}' to '{cls.__name__}'.")
++
++
++def unstructure_autobool(value: AutoBool, /) -> bool | str:
++    """Unstructure an :class:`AutoBool`."""
++    if value is AutoBool.AUTO:
++        return AutoBool.AUTO.value
++    return bool(value)
++
++
++def structure_autobool(value: bool | str, _, /) -> AutoBool:
++    """Structure an :class:`AutoBool`."""
++    return AutoBool.from_unstructured(value)
+diff --git a/docs/conf.py b/docs/conf.py
+index 1ba2279249..1927455f49 100644
+--- a/docs/conf.py
++++ b/docs/conf.py
+@@ -86,7 +86,10 @@
+     "sphinx_design",  # For dropdowns etc
+ ]
+ bibtex_bibfiles = ["references.bib"]
+-myst_enable_extensions = ["dollarmath"]  # Enables Latex-like math in markdown files
++myst_enable_extensions = [
++    "dollarmath",  # Enables Latex-like math in markdown files
++    "colon_fence",  # Enables ::: syntax for directives
++]
+ autosectionlabel_prefix_document = True  # Make sure autosectionlabels are unique
+ myst_heading_anchors = 4
+ 
+diff --git a/docs/userguide/campaigns.md b/docs/userguide/campaigns.md
+index 517e29cfa9..1c602409e4 100644
+--- a/docs/userguide/campaigns.md
++++ b/docs/userguide/campaigns.md
+@@ -113,17 +113,41 @@ experimentation is feasible in the first place, or whether the given time budget
+ even allows for sequential runs.
+ ```
+ 
+-### Candidate Control in Discrete Spaces
+-For discrete search spaces, campaigns provide additional control over how the candidate
+-set of recommendable points is built based on the trajectory the campaign has taken so
+-far. This is done by setting the following Boolean flags:
+-- `allow_recommending_already_measured`:  Controls whether points that have already been
+-  measured can be recommended.
+-- `allow_recommending_already_recommended`: Controls whether previously recommended points can
+-  be recommended again.
+-- `allow_recommending_pending_experiments`: Controls whether points marked as
+-  `pending_experiments` can be recommended (see [asynchronous
+-  workflows](PENDING_EXPERIMENTS)).
++### Candidate Control Flags
++Due to their sequential nature, campaigns provide some unique mechanisms to dynamically
++adjust the set of recommendable candidates based on the specific trajectory they have
++taken so far. This is done by setting the following optional
++{class}`~baybe.utils.boolean.AutoBool` flags:
++- `allow_recommending_already_measured`: Controls whether candidates that have already
++  been measured can be recommended.
++- `allow_recommending_already_recommended`: Controls whether previously recommended
++  candidates can be recommended again.
++- `allow_recommending_pending_experiments`: Controls whether candidates marked as
++  `pending_experiments` can be recommended
++  (see [asynchronous workflows](PENDING_EXPERIMENTS)).
++
++When set to `"auto"`/{attr}`~baybe.utils.boolean.AutoBool.AUTO`, the effective flag
++value is resolved based on the type of the configured search space:
++
++:::{table} Resolved values when flags are set to {attr}`~baybe.utils.boolean.AutoBool.AUTO`
++
++| Flag                                        | Discrete | Continuous | Hybrid |
++|:--------------------------------------------|:--------:|:----------:|:------:|
++| {attr}`~baybe.campaign.Campaign.allow_recommending_already_measured`       | `True`   | `True`     | `True` |
++| {attr}`~baybe.campaign.Campaign.allow_recommending_already_recommended`    | `False`  | `True`     | `True` |
++| {attr}`~baybe.campaign.Campaign.allow_recommending_pending_experiments`    | `False`  | `True`     | `True` |
++
++:::
++
++```{admonition} Non-Discrete Search Spaces
++:class: note
++
++For search spaces that involve a continuous subspace (i.e., continuous or hybrid),
++setting any of the above flags to `False`/{attr}`~baybe.utils.boolean.AutoBool.FALSE` is
++not supported for algorithmic reasons (continuous spaces have infinite candidate sets)
++and will raise an error. Use `True`/{attr}`~baybe.utils.boolean.AutoBool.TRUE` or
++`"auto"`/{attr}`~baybe.utils.boolean.AutoBool.AUTO` in those cases.
++```
+ 
+ ### Caching of Recommendations
+ 
+diff --git a/docs/userguide/getting_recommendations.md b/docs/userguide/getting_recommendations.md
+index 810ef1b472..c836882cc2 100644
+--- a/docs/userguide/getting_recommendations.md
++++ b/docs/userguide/getting_recommendations.md
+@@ -179,7 +179,7 @@ we need to consider two different cases:
+ 
+   {class}`~baybe.campaign.Campaign`s allow you to further control the candidate
+   generation based on the experimental trajectory taken via their `allow_*` 
+-  {ref}`flags <userguide/campaigns:Candidate Control in Discrete Spaces>`.
++  {ref}`flags <userguide/campaigns:Candidate Control Flags>`.
+   ```
+ 
+ 
+diff --git a/tests/test_campaign.py b/tests/test_campaign.py
+index 07776afb63..c8bd052c8a 100644
+--- a/tests/test_campaign.py
++++ b/tests/test_campaign.py
+@@ -14,7 +14,7 @@
+ from baybe.campaign import _EXCLUDED, Campaign
+ from baybe.constraints.conditions import SubSelectionCondition
+ from baybe.constraints.discrete import DiscreteExcludeConstraint
+-from baybe.exceptions import NotEnoughPointsLeftError
++from baybe.exceptions import IncompatibilityError, NotEnoughPointsLeftError
+ from baybe.objectives import DesirabilityObjective, ParetoObjective
+ from baybe.parameters.numerical import (
+     NumericalContinuousParameter,
+@@ -26,14 +26,13 @@
+     FPSRecommender,
+     RandomRecommender,
+ )
+-from baybe.searchspace.core import SearchSpaceType
++from baybe.searchspace.core import SearchSpace, SearchSpaceType
+ from baybe.searchspace.discrete import SubspaceDiscrete
+ from baybe.surrogates import (
+     BetaBernoulliMultiArmedBanditSurrogate,
+     GaussianProcessSurrogate,
+ )
+ from baybe.targets import BinaryTarget, NumericalTarget
+-from baybe.utils.basic import UNSPECIFIED
+ from baybe.utils.dataframe import add_fake_measurements
+ from tests.conftest import run_iterations
+ 
+@@ -119,36 +118,45 @@ def test_candidate_toggling(constraints, exclude, complement):
+ 
+ 
+ @pytest.mark.parametrize(
+-    "flag",
++    ("flag", "discrete_value"),
+     [
+-        "allow_recommending_already_measured",
+-        "allow_recommending_already_recommended",
+-        "allow_recommending_pending_experiments",
++        ["allow_recommending_already_measured", True],
++        ["allow_recommending_already_recommended", False],
++        ["allow_recommending_pending_experiments", False],
+     ],
+-    ids=lambda x: x.removeprefix("allow_recommending_"),
++    ids=["already_measured", "already_recommended", "pending_experiments"],
+ )
+ @pytest.mark.parametrize(
+-    "space_type",
+-    [SearchSpaceType.DISCRETE, SearchSpaceType.CONTINUOUS],
+-    ids=lambda x: x.name,
+-)
+-@pytest.mark.parametrize(
+-    "value", [True, False, param(UNSPECIFIED, id=repr(UNSPECIFIED))]
++    "searchspace",
++    [
++        NumericalDiscreteParameter("p", [0, 1]).to_searchspace(),
++        NumericalContinuousParameter("p", [0, 1]).to_searchspace(),
++        SearchSpace.from_product(
++            [
++                NumericalDiscreteParameter("p_disc", [0, 1]),
++                NumericalContinuousParameter("p_cont", [0, 1]),
++            ]
++        ),
++    ],
++    ids=["discrete", "continuous", "hybrid"],
+ )
+-def test_setting_allow_flags(flag, space_type, value):
+-    """Passed allow_* flags are rejected if incompatible with the search space type."""
+-    kwargs = {flag: value}
+-    expect_error = (space_type is SearchSpaceType.DISCRETE) != (
+-        value is not UNSPECIFIED
++@pytest.mark.parametrize("value", [True, False, "auto"])
++def test_setting_allow_flags(flag, searchspace, value, discrete_value):
++    """Passed allow_* flags are rejected if incompatible with the search space type
++    but otherwise properly resolved into Booleans."""  # noqa
++    expect_error = (searchspace.type is not SearchSpaceType.DISCRETE) and (
++        value is False
+     )
+ 
+-    if space_type is SearchSpaceType.DISCRETE:
+-        parameter = NumericalDiscreteParameter("p", [0, 1])
+-    else:
+-        parameter = NumericalContinuousParameter("p", [0, 1])
++    with pytest.raises(IncompatibilityError) if expect_error else nullcontext():
++        campaign = Campaign(searchspace, **{flag: value})
++
++    if expect_error:
++        return
+ 
+-    with pytest.raises(ValueError) if expect_error else nullcontext():
+-        Campaign(parameter, **kwargs)
++    fallback = discrete_value if searchspace.type is SearchSpaceType.DISCRETE else True
++    resolved = value if isinstance(value, bool) else fallback
++    assert getattr(campaign, flag) == resolved
+ 
+ 
+ @pytest.mark.parametrize(

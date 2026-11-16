@@ -1,0 +1,314 @@
+diff --git a/skfp/fingerprints/_new_mordred/calculator.py b/skfp/fingerprints/_new_mordred/calculator.py
+index 1ef63bbd0..9ea811a22 100644
+--- a/skfp/fingerprints/_new_mordred/calculator.py
++++ b/skfp/fingerprints/_new_mordred/calculator.py
+@@ -26,6 +26,7 @@
+     geometric_index,
+     gravitational_index,
+     molecular_distance_edge,
++    molecular_id,
+     morse,
+     path_count,
+     polarizability,
+@@ -80,6 +81,7 @@
+     extended_topochemical_atom,
+     fragment_complexity,
+     molecular_distance_edge,
++    molecular_id,
+     path_count,
+     polarizability,
+     rdkit_descriptors,  # both 2D and 3D
+@@ -247,6 +249,7 @@ def compute(mol: Mol, use_3D: bool) -> np.ndarray:
+         molecular_distance_edge: molecular_distance_edge.calc(
+             mol_regular, adjacency_matrix_regular, distance_matrix_regular
+         ),
++        molecular_id: molecular_id.calc(props_regular, n_frags),
+     }
+ 
+     for module, values in descriptors_2d.items():
+diff --git a/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py b/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py
+new file mode 100644
+index 000000000..a28bf7cc7
+--- /dev/null
++++ b/skfp/fingerprints/_new_mordred/descriptors/molecular_id.py
+@@ -0,0 +1,146 @@
++from math import sqrt
++
++import numpy as np
++
++from skfp.fingerprints._new_mordred.utils.atomic_properties import AtomicProperties
++from skfp.fingerprints._new_mordred.utils.periodic_table import HALOGEN_ATOMIC_NUMS
++
++"""
++Molecular ID descriptors.
++
++This code has been adapted from the BSD-licensed mordred-community library.
++https://github.com/JacksonBurns/mordred-community
++
++See skfp/fingerprints/data/mordred-community_bsd_license.txt for the license text.
++"""
++
++FEATURE_NAMES = [
++    "MID",
++    "AMID",
++    "MID_h",
++    "AMID_h",
++    "MID_C",
++    "AMID_C",
++    "MID_N",
++    "AMID_N",
++    "MID_O",
++    "AMID_O",
++    "MID_X",
++    "AMID_X",
++]
++
++# a path stops being extended once the product of its edge weights reaches this
++# limit, as anything longer would contribute less than Mordred's 1e-10 epsilon;
++# Mordred spells the same number as int(1 / eps ** 2)
++_WEIGHT_PRODUCT_LIMIT = 10**20
++
++# halogen flag per atomic number, for a fast vectorized NumPy lookup
++_NUM_ATOMIC_NUMBERS = 119  # atomic numbers 0 to 118, as RDKit reports them
++_IS_HALOGEN = np.zeros(_NUM_ATOMIC_NUMBERS, dtype=bool)
++_IS_HALOGEN[sorted(HALOGEN_ATOMIC_NUMS)] = True
++
++
++def calc(props_regular: AtomicProperties, n_frags: int) -> np.ndarray:
++    """
++    Molecular ID descriptors, sums of atomic IDs over a selected set of atoms.
++
++    The features come in pairs: a sum over the selected atoms and that same sum
++    averaged over the molecule. Selections are all atoms (``MID``), heteroatoms
++    (``MID_h``), carbons, nitrogens, oxygens and halogens (``MID_X``).
++
++    Atomic IDs are undefined for disconnected molecules, so NaN is returned for
++    those.
++    """
++    if n_frags != 1:
++        return np.full(len(FEATURE_NAMES), np.nan, dtype=np.float32)
++
++    atom_ids = _atom_ids(props_regular)
++    atomic_nums = props_regular.atomic_nums
++    # a heteroatom here is anything but carbon and hydrogen, unlike the
++    # carbon-only definition AtomicProperties.is_hetero uses
++    is_hetero = (atomic_nums != 1) & (atomic_nums != 6)
++    molecular_ids = [
++        atom_ids.sum(),  # every atom, so no selection to build
++        atom_ids[is_hetero].sum(),
++        atom_ids[atomic_nums == 6].sum(),  # carbon
++        atom_ids[atomic_nums == 7].sum(),  # nitrogen
++        atom_ids[atomic_nums == 8].sum(),  # oxygen
++        atom_ids[_IS_HALOGEN[atomic_nums]].sum(),
++    ]
++
++    values = []
++    for molecular_id in molecular_ids:
++        # averaged over every atom of the molecule, not over the selected ones
++        values += [molecular_id, molecular_id / props_regular.num_atoms]
++
++    return np.asarray(values, dtype=np.float32)
++
++
++def _atom_ids(props: AtomicProperties) -> np.ndarray:
++    """
++    Atomic ID of every atom: one plus half the sum, over all simple paths
++    starting at that atom, of the inverse square root of the product of the
++    path's edge weights.
++    """
++    adjacency = _weighted_adjacency(props)
++    num_atoms = props.num_atoms
++    visited = bytearray(num_atoms)
++
++    return np.fromiter(
++        (
++            1.0 + _sum_over_paths(adjacency, visited, start, 1) / 2.0
++            for start in range(num_atoms)
++        ),
++        dtype=np.float64,
++        count=num_atoms,
++    )
++
++
++def _weighted_adjacency(props: AtomicProperties) -> list[list[tuple[int, int]]]:
++    """
++    Neighbors of every atom paired with their bond weight, the product of the
++    degrees of the two bonded atoms.
++    """
++    degrees = props.degrees
++    begin_idxs = props.bond_begin_idxs.tolist()
++    end_idxs = props.bond_end_idxs.tolist()
++    weights = (degrees[props.bond_begin_idxs] * degrees[props.bond_end_idxs]).tolist()
++
++    adjacency: list[list[tuple[int, int]]] = [[] for _ in range(props.num_atoms)]
++    for begin, end, weight in zip(begin_idxs, end_idxs, weights, strict=True):
++        adjacency[begin].append((end, weight))
++        adjacency[end].append((begin, weight))
++
++    return adjacency
++
++
++def _sum_over_paths(
++    adjacency: list[list[tuple[int, int]]],
++    visited: bytearray,
++    atom: int,
++    weight_product: int,
++) -> float:
++    """
++    Sum of the inverse square root of the edge weight product over every simple
++    path extending the one that ends at ``atom``.
++
++    Backtracking search: ``visited`` marks the atoms on the current path and is
++    cleared on the way out, so each simple path is walked once. The cost is
++    exponential in the number of rings. Clearing the marks also lets a single
++    buffer serve every starting atom.
++    """
++    visited[atom] = 1
++    total = 0.0
++
++    for neighbor, weight in adjacency[atom]:
++        if visited[neighbor]:
++            continue
++
++        product = weight_product * weight
++        total += 1.0 / sqrt(product)
++        # a longer path would only add terms below the epsilon, so stop here
++        if product < _WEIGHT_PRODUCT_LIMIT:
++            total += _sum_over_paths(adjacency, visited, neighbor, product)
++
++    visited[atom] = 0
++    return total
+diff --git a/tests/fingerprints/_new_mordred/molecular_id.py b/tests/fingerprints/_new_mordred/molecular_id.py
+new file mode 100644
+index 000000000..c521e2504
+--- /dev/null
++++ b/tests/fingerprints/_new_mordred/molecular_id.py
+@@ -0,0 +1,99 @@
++import json
++from pathlib import Path
++
++import numpy as np
++import pytest
++from numpy.testing import assert_allclose
++from rdkit.Chem import GetMolFrags, Mol, MolFromSmiles
++
++from skfp.fingerprints._new_mordred.descriptors.molecular_id import FEATURE_NAMES, calc
++from skfp.fingerprints._new_mordred.utils.atomic_properties import AtomicProperties
++from skfp.fingerprints._new_mordred.utils.mol_preprocess import preprocess_mol
++
++"""
++This code has been adapted from the BSD-licensed mordred-community library.
++https://github.com/JacksonBurns/mordred-community
++
++Reference values for MID and AMID come from mordred-community's own reference
++data (mordred/tests/references/MolecularId.yaml) and are stored at
++./references/molecular_id.json as expected[molecule][descriptor]. The
++element-filtered features are not covered there, so their values below were
++computed with mordred-community.
++
++See skfp/fingerprints/data/mordred-community_bsd_license.txt for the license text.
++"""
++
++with open(Path(__file__).parent / "references" / "molecular_id.json") as f:
++    _REFERENCE = json.load(f)
++
++
++def _calc(mol: Mol) -> dict[str, float]:
++    values = calc(AtomicProperties.from_mol(mol), len(GetMolFrags(mol)))
++    return dict(zip(FEATURE_NAMES, values, strict=True))
++
++
++def _calc_from_smiles(smiles: str) -> dict[str, float]:
++    return _calc(preprocess_mol(MolFromSmiles(smiles)))
++
++
++@pytest.mark.parametrize("molecule", list(_REFERENCE))
++def test_molecular_id_reference_values(molecule, mordred_test_mols):
++    values = _calc(mordred_test_mols[molecule])
++
++    expected = _REFERENCE[molecule]
++    assert_allclose(
++        [values[name] for name in expected],
++        list(expected.values()),
++        rtol=1e-5,
++    )
++
++
++@pytest.mark.parametrize(
++    "smiles, feature, expected",
++    [
++        # a lone heavy atom has no paths, so its atomic id stays at 1
++        ("N", "MID", 1.0),
++        ("N", "MID_N", 1.0),
++        ("CCO", "MID_C", 3.310660),
++        ("CCO", "MID_O", 1.603553),
++        ("CCO", "MID_h", 1.603553),
++        ("CCO", "MID_N", 0.0),
++        ("CN1C=NC2=C1C(=O)N(C)C(=O)N2C", "MID_N", 8.359750),
++        ("CN1C=NC2=C1C(=O)N(C)C(=O)N2C", "MID_O", 3.521046),
++        ("CN1C=NC2=C1C(=O)N(C)C(=O)N2C", "MID_h", 11.880796),
++        ("CS(=O)(=O)N", "MID_N", 1.625),
++        ("CS(=O)(=O)N", "MID_O", 3.25),
++        # every halogen is also a heteroatom, and nothing here is carbon but one atom
++        ("FC(F)(Cl)Br", "MID_X", 6.5),
++        ("FC(F)(Cl)Br", "MID_h", 6.5),
++        ("FC(F)(Cl)Br", "MID_C", 2.0),
++        ("Clc1ccccc1", "MID_X", 1.745348),
++        # hydrogens that RemoveHs keeps are not heteroatoms, unlike every other
++        # non-carbon atom
++        ("[H][H]", "MID", 3.0),
++        ("[H][H]", "MID_h", 0.0),
++        ("[2H]C([2H])([2H])O", "MID_h", 1.625),
++    ],
++)
++def test_element_filtered_ids(smiles, feature, expected):
++    values = _calc_from_smiles(smiles)
++
++    assert_allclose(values[feature], expected, rtol=1e-5, atol=1e-6)
++
++
++def test_averaged_ids_divide_by_every_heavy_atom():
++    # AMID_C averages the carbon-only sum over all three heavy atoms, not over
++    # the two carbons
++    values = _calc_from_smiles("CCO")
++
++    assert_allclose(values["AMID_C"], values["MID_C"] / 3, rtol=1e-6)
++    assert_allclose(values["AMID_O"], values["MID_O"] / 3, rtol=1e-6)
++
++
++def test_disconnected_molecule_is_nan():
++    # atomic ids are undefined without a connected graph; mordred reports
++    # "multiple fragments" for these
++    values = _calc_from_smiles("[Na+].[Cl-]")
++
++    assert len(values) == len(FEATURE_NAMES)
++    assert all(np.isnan(value) for value in values.values())
+diff --git a/tests/fingerprints/_new_mordred/references/molecular_id.json b/tests/fingerprints/_new_mordred/references/molecular_id.json
+new file mode 100644
+index 000000000..c77f2f0b1
+--- /dev/null
++++ b/tests/fingerprints/_new_mordred/references/molecular_id.json
+@@ -0,0 +1,23 @@
++{
++  "Hexane": {"MID": 10.83915043, "AMID": 1.806525072},
++  "Benzene": {"MID": 11.8125, "AMID": 1.96875},
++  "Caffeine": {"MID": 27.80010233, "AMID": 1.985721595},
++  "Cyanidin": {"MID": 42.68983013, "AMID": 2.032849054},
++  "Lycopene": {"MID": 77.41561711, "AMID": 1.935390428},
++  "Epicatechin": {"MID": 42.68983013, "AMID": 2.032849054},
++  "Limonene": {"MID": 19.38570823, "AMID": 1.938570823},
++  "Allicin": {"MID": 16.65502353, "AMID": 1.85055817},
++  "Glutathione": {"MID": 37.80131214, "AMID": 1.890065607},
++  "Digoxin": {"MID": 113.2392334, "AMID": 2.058895153},
++  "Capsaicin": {"MID": 43.08947003, "AMID": 1.958612274},
++  "EllagicAcid": {"MID": 45.46110533, "AMID": 2.066413879},
++  "Astaxanthin": {"MID": 86.16657979, "AMID": 1.958331359},
++  "DMSO": {"MID": 6.732050808, "AMID": 1.683012702},
++  "DiethylThioketone": {"MID": 10.6758508, "AMID": 1.779308466},
++  "VinylsulfonicAcid": {"MID": 10.46599026, "AMID": 1.74433171},
++  "Thiophene": {"MID": 9.6875, "AMID": 1.9375},
++  "Triethoxyphosphine": {"MID": 18.66994061, "AMID": 1.866994061},
++  "MethylphosphonicAcid": {"MID": 8.5, "AMID": 1.7},
++  "MethylCyclopropane": {"MID": 7.175868588, "AMID": 1.793967147},
++  "Acetonitrile": {"MID": 4.914213562, "AMID": 1.638071187}
++}

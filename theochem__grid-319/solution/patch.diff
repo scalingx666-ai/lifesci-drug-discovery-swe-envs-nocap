@@ -1,0 +1,435 @@
+diff --git a/src/grid/__init__.py b/src/grid/__init__.py
+index 1a572ea2..952e79a9 100644
+--- a/src/grid/__init__.py
++++ b/src/grid/__init__.py
+@@ -36,4 +36,4 @@
+ from grid.rtransform import *
+ from grid.ngrid import *
+ from grid.coulomb import *
+-
++from grid.robust_poisson import *
+diff --git a/src/grid/robust_poisson.py b/src/grid/robust_poisson.py
+new file mode 100644
+index 00000000..5ddcbb58
+--- /dev/null
++++ b/src/grid/robust_poisson.py
+@@ -0,0 +1,189 @@
++# GRID is a numerical integration module for quantum chemistry.
++#
++# Copyright (C) 2011-2026 The GRID Development Team
++#
++# This file is part of GRID.
++#
++# GRID is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 3
++# of the License, or (at your option) any later version.
++#
++# GRID is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, see <http://www.gnu.org/licenses/>
++# --
++"""
++Robust Poisson Solver --- Split-1-Plus-Solve Architecture.
++
++Architecture
++------------
++::
++
++    Total Density rho(r)
++          |
++    [SPLIT 1]  Analytical core subtraction using pre-fitted Gaussian parameters
++          |     (load_atomic_gaussian_params -> coulomb_potential)
++          |
++    residual(r) = rho - rho_core   <-- smooth, nuclear-cusp-free
++          |
++    [SOLVE]  solve_poisson_bvp on residual  --> phi_numerical
++          |
++    Total Potential = phi_core (analytical) + phi_numerical
++
++Notes
++-----
++Split 2 (bonding/polarization residual fitting) and the full Double-Split
++pipeline will be added in a subsequent PR.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++
++from grid.atomgrid import AtomGrid
++from grid.coulomb import coulomb_potential, load_atomic_gaussian_params
++from grid.molgrid import MolGrid
++from grid.poisson import solve_poisson_bvp
++from grid.rtransform import BaseTransform
++
++__all__ = ["solve_poisson_robust"]
++
++
++def _build_core_density(
++    points: np.ndarray, center: np.ndarray, coeffs_s: np.ndarray, alphas_s: np.ndarray
++) -> np.ndarray:
++    """Evaluate a sum of normalized s-type Gaussians at the given points.
++
++    Computes the core electron density contributed by a single atomic center:
++
++    .. math::
++        \\rho_{\\text{core}}(\\mathbf{r}) =
++        \\sum_k c_k \\left(\\frac{\\alpha_k}{\\pi}\\right)^{3/2}
++        \\exp\\!\\left(-\\alpha_k \\,|\\mathbf{r} - \\mathbf{r}_0|^2\\right)
++
++    Parameters
++    ----------
++    points : ndarray, shape (N, 3)
++        Cartesian evaluation points in atomic units (Bohr).
++    center : ndarray, shape (3,)
++        Cartesian coordinates of the single atomic center :math:`\\mathbf{r}_0`.
++    coeffs_s : ndarray, shape (K,)
++        Contraction coefficients :math:`c_k` for each s-type Gaussian.
++    alphas_s : ndarray, shape (K,)
++        Gaussian exponents :math:`\\alpha_k` (strictly positive).
++
++    Returns
++    -------
++    ndarray, shape (N,)
++        Core electron density evaluated at each point in ``points``.
++    """
++    r_sq = np.sum((points - center) ** 2, axis=1)
++    rho = np.zeros(len(points))
++    for c, alpha in zip(coeffs_s, alphas_s, strict=True):
++        prefactor = c * (alpha / np.pi) ** 1.5
++        rho += prefactor * np.exp(-alpha * r_sq)
++    return rho
++
++
++def solve_poisson_robust(
++    molgrid: MolGrid | AtomGrid,
++    density_vals: np.ndarray,
++    transform: BaseTransform,
++    atnums: np.ndarray,
++    atcoords: np.ndarray,
++    **bvp_kwargs,
++) -> callable:
++    r"""Solve the Poisson equation robustly using analytical core subtraction (Split 1).
++
++    For each atomic center, pre-fitted Gaussian parameters are loaded via
++    :func:`~grid.coulomb.load_atomic_gaussian_params` and the exact analytical
++    core potential is computed with :func:`~grid.coulomb.coulomb_potential`.
++    The corresponding core density is subtracted from the input to form a smooth
++    residual, which is then solved numerically with
++    :func:`~grid.poisson.solve_poisson_bvp`.
++
++    Parameters
++    ----------
++    molgrid : MolGrid or AtomGrid
++        Molecular or atomic grid used for integration and ODE solving.
++    density_vals : ndarray(N,)
++        Total electron density evaluated at all grid points.
++    transform : BaseTransform
++        Radial coordinate transform passed to ``solve_poisson_bvp``.
++    atnums : ndarray(M,) of int
++        Atomic numbers for each of the M atomic centers.
++    atcoords : ndarray(M, 3)
++        Cartesian coordinates of the M atomic centers in atomic units (Bohr).
++    **bvp_kwargs
++        Additional keyword arguments forwarded to :func:`~grid.poisson.solve_poisson_bvp`.
++
++    Returns
++    -------
++    callable
++        Function ``V(points)`` returning the total electrostatic potential at
++        an array of Cartesian evaluation points, shape ``(N, 3) -> (N,)``.
++
++    Raises
++    ------
++    ValueError
++        If pre-fitted Gaussian parameters are not available for a given atomic number.
++    ValueError
++        If ``density_vals`` is not a 1-D array of length N matching the number
++        of grid points in ``molgrid``.
++
++    Notes
++    -----
++    Pre-fitted parameters are currently available for H (1), C (6), N (7),
++    O (8), and Cl (17).
++    """
++    residual = np.array(density_vals, dtype=float)
++    if residual.ndim != 1 or residual.shape[0] != molgrid.points.shape[0]:
++        raise ValueError(
++            f"density_vals must be 1-D with length matching molgrid.points "
++            f"({molgrid.points.shape[0]}); got shape {residual.shape}"
++        )
++
++    # Pre-cache Gaussian parameters for all atoms once (avoids repeated JSON lookups
++    # inside the returned closure, which may be called many times).
++    atom_params = [
++        (load_atomic_gaussian_params(int(atnum)), center)
++        for atnum, center in zip(atnums, atcoords, strict=True)
++    ]
++
++    # SPLIT 1: Analytical Core Subtraction
++    for (coeffs_s, alphas_s), center in atom_params:
++        residual -= _build_core_density(molgrid.points, center, coeffs_s, alphas_s)
++
++    # SOLVE: BVP solver on the smooth, nuclear-cusp-free residual
++    phi_residual_interp = solve_poisson_bvp(molgrid, residual, transform, **bvp_kwargs)
++
++    # SUM: Total potential = analytical core + numerical residual
++    def total_potential(points: np.ndarray) -> np.ndarray:
++        """Evaluate total electrostatic potential at Cartesian points."""
++        points = np.asarray(points, dtype=float)
++        if points.ndim != 2 or points.shape[1] != 3:
++            raise ValueError(f"points must have shape (N, 3); got {points.shape}")
++
++        # Analytical core contribution — uses pre-cached params
++        v_core = np.zeros(points.shape[0])
++        for (coeffs_s, alphas_s), center in atom_params:
++            centers_rep = np.tile(center, (len(coeffs_s), 1))
++            v_core += coulomb_potential(
++                points,
++                centers_s=centers_rep,
++                coeffs_s=coeffs_s,
++                alphas_s=alphas_s,
++                normalized=True,
++            )
++
++        # Numerical residual contribution
++        v_residual = phi_residual_interp(points)
++
++        return v_core + v_residual
++
++    return total_potential
+diff --git a/src/grid/tests/test_robust_poisson.py b/src/grid/tests/test_robust_poisson.py
+new file mode 100644
+index 00000000..ff675dc8
+--- /dev/null
++++ b/src/grid/tests/test_robust_poisson.py
+@@ -0,0 +1,224 @@
++# GRID is a numerical integration module for quantum chemistry.
++#
++# Copyright (C) 2011-2026 The GRID Development Team
++#
++# This file is part of GRID.
++#
++# GRID is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 3
++# of the License, or (at your option) any later version.
++#
++# GRID is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, see <http://www.gnu.org/licenses/>
++# --
++"""Tests for the robust Poisson solver (Split 1 + BVP)."""
++
++import numpy as np
++import pytest
++from scipy.special import erf
++
++from grid.atomgrid import AtomGrid
++from grid.onedgrid import GaussLegendre
++from grid.robust_poisson import solve_poisson_robust
++from grid.rtransform import BeckeRTransform, InverseRTransform
++
++
++def _make_single_center_grid(n_radial=100, l_degree=29, center=None):
++    """Return an AtomGrid and InverseRTransform at a given center."""
++    center = np.zeros(3) if center is None else np.asarray(center)
++    oned = GaussLegendre(n_radial)
++    tf = BeckeRTransform(1e-5, R=1.5)
++    radial = tf.transform_1d_grid(oned)
++    atgrid = AtomGrid(radial, degrees=[l_degree], center=center)
++    inv_tf = InverseRTransform(tf)
++    return atgrid, inv_tf
++
++
++def _gaussian_density(points, alpha, center=None):
++    """Normalized s-type Gaussian density: (alpha/pi)^(3/2) * exp(-alpha*r^2)."""
++    center = np.zeros(3) if center is None else np.asarray(center)
++    r_sq = np.sum((points - center) ** 2, axis=1)
++    return (alpha / np.pi) ** 1.5 * np.exp(-alpha * r_sq)
++
++
++def _gaussian_potential(points, alpha, center=None):
++    """Exact analytical potential of a normalized s-type Gaussian: erf(sqrt(alpha)*r)/r."""
++    center = np.zeros(3) if center is None else np.asarray(center)
++    r = np.linalg.norm(points - center, axis=1)
++    V = np.zeros_like(r)
++    mask = r >= 1e-12
++    V[mask] = erf(np.sqrt(alpha) * r[mask]) / r[mask]
++    V[~mask] = 2.0 * np.sqrt(alpha / np.pi)
++    return V
++
++
++def test_robust_poisson_moderate_gaussian():
++    """solve_poisson_robust should match exact Gaussian potential for alpha=0.5."""
++    alpha = 0.5
++    atgrid, tf = _make_single_center_grid(n_radial=100)
++
++    density = _gaussian_density(atgrid.points, alpha)
++    V_exact = _gaussian_potential(atgrid.points, alpha)
++
++    pot_func = solve_poisson_robust(
++        atgrid,
++        density,
++        tf,
++        atnums=np.array([1]),
++        atcoords=np.zeros((1, 3)),
++    )
++    V_computed = pot_func(atgrid.points)
++
++    # Relative L2 error should be well below 1%
++    rel_error = np.sqrt(np.mean((V_computed - V_exact) ** 2)) / np.sqrt(np.mean(V_exact**2))
++    assert rel_error < 0.01, f"Moderate Gaussian: relative L2 error = {rel_error:.4e}"
++
++
++def test_robust_poisson_sharp_gaussian():
++    """solve_poisson_robust should stay stable for a sharp cusp-like density (alpha=50)."""
++    alpha = 50.0
++    atgrid, tf = _make_single_center_grid(n_radial=150)
++
++    density = _gaussian_density(atgrid.points, alpha)
++    V_exact = _gaussian_potential(atgrid.points, alpha)
++
++    pot_func = solve_poisson_robust(
++        atgrid,
++        density,
++        tf,
++        atnums=np.array([1]),
++        atcoords=np.zeros((1, 3)),
++    )
++    V_computed = pot_func(atgrid.points)
++
++    rel_error = np.sqrt(np.mean((V_computed - V_exact) ** 2)) / np.sqrt(np.mean(V_exact**2))
++    # Tighter than the plain BVP would achieve without Split 1
++    assert rel_error < 0.05, f"Sharp Gaussian: relative L2 error = {rel_error:.4e}"
++
++
++def test_robust_poisson_returns_callable():
++    """solve_poisson_robust must return a callable that accepts (M, 3) point arrays."""
++    alpha = 1.0
++    atgrid, tf = _make_single_center_grid(n_radial=80)
++    density = _gaussian_density(atgrid.points, alpha)
++
++    result = solve_poisson_robust(
++        atgrid,
++        density,
++        tf,
++        atnums=np.array([1]),
++        atcoords=np.zeros((1, 3)),
++    )
++
++    assert callable(result)
++
++    # Evaluate on a small set of random points
++    rng = np.random.default_rng(42)
++    test_pts = rng.uniform(-3, 3, size=(10, 3))
++    vals = result(test_pts)
++    assert vals.shape == (10,)
++    assert np.all(np.isfinite(vals)), "Potential values must be finite at all evaluation points"
++
++
++def test_robust_poisson_unsupported_element_raises():
++    """solve_poisson_robust must raise ValueError for an element with no pre-fitted params."""
++    alpha = 1.0
++    atgrid, tf = _make_single_center_grid(n_radial=80)
++    density = _gaussian_density(atgrid.points, alpha)
++
++    with pytest.raises(ValueError):
++        solve_poisson_robust(
++            atgrid,
++            density,
++            tf,
++            atnums=np.array([2]),
++            atcoords=np.zeros((1, 3)),
++        )
++
++
++def test_robust_poisson_carbon():
++    """solve_poisson_robust should run without error for a Carbon center (Z=6)."""
++    alpha = 5.0
++    center = np.zeros(3)
++    atgrid, tf = _make_single_center_grid(n_radial=120, center=center)
++    density = _gaussian_density(atgrid.points, alpha, center=center)
++
++    pot_func = solve_poisson_robust(
++        atgrid,
++        density,
++        tf,
++        atnums=np.array([6]),
++        atcoords=center.reshape(1, 3),
++    )
++
++    V = pot_func(atgrid.points)
++    assert np.all(np.isfinite(V)), "Potential values must be finite for Carbon test"
++    assert np.all(V >= -1e-10), (
++        "Electrostatic potential of positive density should be non-negative "
++        "(within numerical tolerance)"
++    )
++
++
++def test_robust_poisson_transition_density():
++    """solve_poisson_robust must remain stable when density can be negative.
++
++    A transition density (off-diagonal element of the density matrix) changes
++    sign in space. Here we simulate it as a difference of two Gaussians.
++    The Split 1 core subtraction should not break on negative residuals.
++    """
++    center = np.zeros(3)
++    atgrid, tf = _make_single_center_grid(n_radial=100, center=center)
++
++    # Transition-like: broad positive Gaussian minus narrow positive Gaussian
++    # The result can be negative at small r and positive at large r.
++    rho_broad = _gaussian_density(atgrid.points, alpha=0.5, center=center)
++    rho_narrow = _gaussian_density(atgrid.points, alpha=5.0, center=center)
++    density = rho_broad - 0.8 * rho_narrow  # can be negative near origin
++
++    pot_func = solve_poisson_robust(
++        atgrid,
++        density,
++        tf,
++        atnums=np.array([1]),
++        atcoords=center.reshape(1, 3),
++    )
++
++    V = pot_func(atgrid.points)
++    assert np.all(np.isfinite(V)), "Potential must be finite for transition-like density"
++
++
++def test_robust_poisson_wrong_density_shape_raises():
++    """solve_poisson_robust must raise ValueError when density_vals shape mismatches grid."""
++    atgrid, tf = _make_single_center_grid(n_radial=80)
++
++    with pytest.raises(ValueError, match="density_vals must be 1-D"):
++        solve_poisson_robust(
++            atgrid,
++            np.ones(10),  # wrong length
++            tf,
++            atnums=np.array([1]),
++            atcoords=np.zeros((1, 3)),
++        )
++
++
++def test_robust_poisson_wrong_points_shape_raises():
++    """The returned callable must raise ValueError for wrong-shaped points."""
++    atgrid, tf = _make_single_center_grid(n_radial=80)
++    density = _gaussian_density(atgrid.points, alpha=1.0)
++
++    pot_func = solve_poisson_robust(
++        atgrid,
++        density,
++        tf,
++        atnums=np.array([1]),
++        atcoords=np.zeros((1, 3)),
++    )
++
++    with pytest.raises(ValueError, match="points must have shape"):
++        pot_func(np.array([1.0, 2.0, 3.0]))  # (3,) instead of (1, 3)

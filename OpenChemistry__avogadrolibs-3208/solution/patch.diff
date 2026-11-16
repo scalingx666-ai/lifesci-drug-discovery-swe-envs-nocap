@@ -1,0 +1,637 @@
+diff --git a/avogadro/core/molecule.cpp b/avogadro/core/molecule.cpp
+index 7717a7194a3..a6735964e56 100644
+--- a/avogadro/core/molecule.cpp
++++ b/avogadro/core/molecule.cpp
+@@ -401,6 +401,11 @@ void Molecule::setPartialCharges(const std::string& type, const MatrixX& value)
+   m_partialCharges[type] = value;
+ }
+ 
++void Molecule::removePartialCharges(const std::string& type)
++{
++  m_partialCharges.erase(type);
++}
++
+ MatrixX Molecule::partialCharges(const std::string& type) const
+ {
+   auto search = m_partialCharges.find(type);
+diff --git a/avogadro/core/molecule.h b/avogadro/core/molecule.h
+index 98ed72a0abd..966a0b9f70b 100644
+--- a/avogadro/core/molecule.h
++++ b/avogadro/core/molecule.h
+@@ -128,6 +128,12 @@ class AVOGADROCORE_EXPORT Molecule
+   /** Sets atomic partial charges with @p type to @p value. */
+   void setPartialCharges(const std::string& type, const MatrixX& value);
+ 
++  /**
++   * Discards the stored partial charges of type @p type, if any. Other
++   * charge types are left alone.
++   */
++  void removePartialCharges(const std::string& type);
++
+   /** @return the atomic partial charges of type @p type */
+   MatrixX partialCharges(const std::string& type) const;
+ 
+diff --git a/avogadro/qtgui/molecule.cpp b/avogadro/qtgui/molecule.cpp
+index f8ed71ade51..e837de7dc2b 100644
+--- a/avogadro/qtgui/molecule.cpp
++++ b/avogadro/qtgui/molecule.cpp
+@@ -365,6 +365,9 @@ void Molecule::emitChanged(unsigned int change)
+       m_basisSet = nullptr;
+       m_spectra.clear();
+       clearVibrations();
++      // Charges computed or read for the old structure no longer describe it.
++      for (const std::string& type : partialChargeTypes())
++        removePartialCharges(type);
+     }
+     emit changed(change);
+   }
+diff --git a/avogadro/qtgui/molecule.h b/avogadro/qtgui/molecule.h
+index f3a4641bf51..86349e1d5af 100644
+--- a/avogadro/qtgui/molecule.h
++++ b/avogadro/qtgui/molecule.h
+@@ -102,21 +102,22 @@ class AVOGADROQTGUI_EXPORT Molecule : public QObject, public Core::Molecule
+     /**
+      * Indicates the molecule's contents were replaced wholesale by a molecule
+      * built elsewhere (see RWMolecule::modifyMolecule). The derived data now
+-     * present (vibrations, spectra, cubes, meshes, basis set) came with the
+-     * replacement, so emitChanged() keeps it. Cached pointers into that data
+-     * are still stale: invalidatesDerivedData() remains true.
++     * present (vibrations, spectra, cubes, meshes, basis set, partial
++     * charges) came with the replacement, so emitChanged() keeps it. Cached
++     * pointers into that data are still stale: invalidatesDerivedData()
++     * remains true.
+      */
+     Replaced = 32768
+   };
+   Q_DECLARE_FLAGS(MoleculeChanges, MoleculeChange)
+ 
+   /**
+-   * @return True if @p changes leaves the cubes, meshes, basis set and
+-   * vibration data derived from this molecule stale: emitChanged() discards
+-   * them, unless @p changes includes Replaced, in which case it keeps the
+-   * replacement's own data but the objects are still new ones. Consumers that
+-   * cache raw pointers to any of that must refresh them in step with this,
+-   * rather than re-deriving the rule from the flags.
++   * @return True if @p changes leaves the cubes, meshes, basis set,
++   * vibration data and partial charges derived from this molecule stale:
++   * emitChanged() discards them, unless @p changes includes Replaced, in
++   * which case it keeps the replacement's own data but the objects are still
++   * new ones. Consumers that cache raw pointers to any of that must refresh
++   * them in step with this, rather than re-deriving the rule from the flags.
+    */
+   static bool invalidatesDerivedData(unsigned int changes);
+ 
+diff --git a/avogadro/qtplugins/label/label.cpp b/avogadro/qtplugins/label/label.cpp
+index 76e0635c409..87228e88882 100644
+--- a/avogadro/qtplugins/label/label.cpp
++++ b/avogadro/qtplugins/label/label.cpp
+@@ -324,12 +324,91 @@ struct LayerLabel : Core::LayerData
+ Label::Label(QObject* parent_) : QtGui::ScenePlugin(parent_)
+ {
+   m_layerManager = PluginLayerManager(m_name);
++
++  // Drags and optimizations change the molecule on every frame, so every
++  // charge calculation waits for the changes to settle.
++  m_chargeTimer.setSingleShot(true);
++  m_chargeTimer.setInterval(300);
++  connect(&m_chargeTimer, &QTimer::timeout, this, &Label::chargeTimerFired);
+ }
+ 
+ Label::~Label() {}
+ 
++void Label::watchMolecule(const QtGui::Molecule& molecule)
++{
++  auto* mol = const_cast<QtGui::Molecule*>(&molecule);
++  if (m_watchedMolecule == mol)
++    return;
++  QObject::disconnect(m_changedConnection);
++  m_chargeTimer.stop();
++  m_movedPending = false;
++  m_chargePending = false;
++  m_chargeMolecule.clear();
++  m_displayedCharges.resize(0, 0);
++  m_watchedMolecule = mol;
++  m_changedConnection =
++    connect(mol, &QtGui::Molecule::changed, this, &Label::moleculeChanged);
++}
++
++bool Label::showsPartialCharges()
++{
++  for (size_t layer = 0; layer < m_layerManager.layerCount(); ++layer) {
++    auto* interface = m_layerManager.getSetting<LayerLabel>(layer);
++    if (interface->atomOptions & LayerLabel::LabelOptions::PartialCharge)
++      return true;
++  }
++  return false;
++}
++
++void Label::moleculeChanged(unsigned int change)
++{
++  // Structural edits already discard the charges (see
++  // QtGui::Molecule::emitChanged()) and process() requests a new calculation.
++  // Only a move keeps them, so only a move leaves ours out of date.
++  if (!(change & QtGui::Molecule::Moved) ||
++      !(change & QtGui::Molecule::Atoms) ||
++      QtGui::Molecule::invalidatesDerivedData(change))
++    return;
++  QtGui::Molecule* molecule = m_watchedMolecule;
++  if (molecule == nullptr || m_ownChargeMolecule != molecule ||
++      m_ownChargeType.empty() ||
++      molecule->partialChargeTypes().count(m_ownChargeType) == 0 ||
++      !showsPartialCharges())
++    return;
++  m_movedPending = true;
++  m_chargeTimer.start();
++}
++
++void Label::chargeTimerFired()
++{
++  if (m_movedPending) {
++    m_movedPending = false;
++    recomputeMovedCharges();
++  }
++  // Does nothing if the recompute above already ran the calculation.
++  if (m_chargePending)
++    calculatePartialCharges();
++}
++
++void Label::recomputeMovedCharges()
++{
++  QtGui::Molecule* molecule = m_ownChargeMolecule;
++  if (molecule == nullptr || m_ownChargeType.empty() ||
++      molecule->partialChargeTypes().count(m_ownChargeType) == 0)
++    return;
++
++  // Keep the old charges on screen until the new ones are stored.
++  m_lastChargeMolecule.clear();
++  molecule->removePartialCharges(m_ownChargeType);
++  m_chargeMolecule = molecule;
++  m_recomputeType = m_ownChargeType;
++  calculatePartialCharges();
++  m_recomputeType.clear();
++}
++
+ void Label::process(const QtGui::Molecule& molecule, Rendering::GroupNode& node)
+ {
++  watchMolecule(molecule);
+   m_layerManager.load<LayerLabel>();
+   for (size_t layer = 0; layer < m_layerManager.layerCount(); ++layer) {
+     auto* interface = m_layerManager.getSetting<LayerLabel>(layer);
+@@ -412,16 +491,18 @@ std::string preferredChargeType(const std::set<std::string>& types)
+ void Label::requestPartialCharges(const QtGui::Molecule& molecule)
+ {
+   auto* mol = const_cast<QtGui::Molecule*>(&molecule);
+-  if (m_chargePending || molecule.atomCount() == 0)
++  if (molecule.atomCount() == 0)
+     return;
+   // Don't retry a calculation that already failed for this molecule
+   if (m_lastChargeMolecule == mol &&
+       m_lastChargeAtomCount == molecule.atomCount())
+     return;
+ 
++  // Restart the timer on every request: during a drag this runs once per
++  // frame, and the calculation should happen once, after the last one.
+   m_chargeMolecule = mol;
+   m_chargePending = true;
+-  QTimer::singleShot(0, this, &Label::calculatePartialCharges);
++  m_chargeTimer.start();
+ }
+ 
+ void Label::calculatePartialCharges()
+@@ -429,7 +510,9 @@ void Label::calculatePartialCharges()
+   m_chargePending = false;
+   QtGui::Molecule* molecule = m_chargeMolecule;
+   m_chargeMolecule.clear();
+-  if (molecule == nullptr || !molecule->partialChargeTypes().empty())
++  // A recompute replaces our own type even if other types are stored too.
++  if (molecule == nullptr ||
++      (m_recomputeType.empty() && !molecule->partialChargeTypes().empty()))
+     return;
+ 
+   const QPointer<QtGui::Molecule> guard(molecule);
+@@ -443,8 +526,11 @@ void Label::calculatePartialCharges()
+     m_lastChargeAtomCount = atomCount;
+   };
+ 
+-  const std::string type = preferredChargeType(
+-    Calc::ChargeManager::instance().identifiersForMolecule(*molecule));
++  const std::string type =
++    !m_recomputeType.empty()
++      ? m_recomputeType
++      : preferredChargeType(
++          Calc::ChargeManager::instance().identifiersForMolecule(*molecule));
+   if (type.empty()) {
+     recordFailure();
+     return;
+@@ -457,6 +543,8 @@ void Label::calculatePartialCharges()
+   if (!guard.isNull() && static_cast<Index>(charges.rows()) == atomCount &&
+       molecule->atomCount() == atomCount) {
+     molecule->setPartialCharges(type, charges);
++    m_ownChargeMolecule = molecule;
++    m_ownChargeType = type;
+     m_lastChargeMolecule.clear();
+     emit drawablesChanged();
+   } else {
+@@ -477,10 +565,18 @@ void Label::processAtom(const QtGui::Molecule& molecule,
+   if (m_layerManager.getSetting<LayerLabel>(layer)->atomOptions &
+       LayerLabel::LabelOptions::PartialCharge) {
+     const std::string type = preferredChargeType(molecule.partialChargeTypes());
+-    if (type.empty())
++    if (type.empty()) {
+       requestPartialCharges(molecule);
+-    else
++      // Keep showing the last values while the new ones are calculated, so
++      // labels don't blink during an edit. Only if the atoms still line up.
++      if (m_chargePending && m_displayedCharges.cols() > 0 &&
++          static_cast<Index>(m_displayedCharges.rows()) == molecule.atomCount())
++        charges = m_displayedCharges;
++    } else {
+       charges = molecule.partialCharges(type);
++      if (m_watchedMolecule == &molecule)
++        m_displayedCharges = charges;
++    }
+   }
+   std::map<unsigned char, size_t> atomCount;
+   for (Index i = 0; i < molecule.atomCount(); ++i) {
+diff --git a/avogadro/qtplugins/label/label.h b/avogadro/qtplugins/label/label.h
+index 83bd9b028be..6d3f096dd93 100644
+--- a/avogadro/qtplugins/label/label.h
++++ b/avogadro/qtplugins/label/label.h
+@@ -6,10 +6,13 @@
+ #ifndef AVOGADRO_QTPLUGINS_LABEL_H
+ #define AVOGADRO_QTPLUGINS_LABEL_H
+ 
++#include <avogadro/core/matrix.h>
+ #include <avogadro/core/vector.h>
+ #include <avogadro/qtgui/sceneplugin.h>
+ 
++#include <QtCore/QMetaObject>
+ #include <QtCore/QPointer>
++#include <QtCore/QTimer>
+ 
+ #include <string>
+ namespace Avogadro {
+@@ -59,7 +62,19 @@ private slots:
+    */
+   void calculatePartialCharges();
+ 
++  /** React to a molecule change: schedule a recompute after atoms move. */
++  void moleculeChanged(unsigned int change);
++
++  /** Run whatever charge calculation is waiting on the debounce timer. */
++  void chargeTimerFired();
++
++  /** Recompute the charges this plugin calculated, after atoms moved. */
++  void recomputeMovedCharges();
++
+ private:
++  void watchMolecule(const QtGui::Molecule& molecule);
++  bool showsPartialCharges();
++
+   void processAtom(const QtGui::Molecule& molecule, Rendering::GroupNode& node,
+                    size_t layer);
+   void requestPartialCharges(const QtGui::Molecule& molecule);
+@@ -81,6 +96,21 @@ private slots:
+   // recalculated even when the atom count returns to an earlier value.
+   QPointer<QtGui::Molecule> m_lastChargeMolecule;
+   Index m_lastChargeAtomCount = 0;
++
++  // The charges this plugin calculated itself, so that they (and only they)
++  // can be recomputed after atoms move. Charges from a file or from another
++  // plugin are never touched.
++  QPointer<QtGui::Molecule> m_ownChargeMolecule;
++  std::string m_ownChargeType;
++  // Set only while recomputing m_ownChargeType after a move.
++  std::string m_recomputeType;
++  QPointer<QtGui::Molecule> m_watchedMolecule;
++  QMetaObject::Connection m_changedConnection;
++  QTimer m_chargeTimer;
++  bool m_movedPending = false;
++  // The charges last displayed for the watched molecule, shown while a
++  // recalculation is pending.
++  MatrixX m_displayedCharges;
+ };
+ 
+ } // end namespace QtPlugins
+diff --git a/tests/core/moleculetest.cpp b/tests/core/moleculetest.cpp
+index ad66238a3a9..14c1df43d97 100644
+--- a/tests/core/moleculetest.cpp
++++ b/tests/core/moleculetest.cpp
+@@ -3729,3 +3729,24 @@ TEST_F(MoleculeTest, removeBondClearsStaleValueOfShortPropertyColumns)
+   EXPECT_FALSE(m.bondProperties().getDouble("d", 0).has_value());
+   EXPECT_FALSE(m.bondProperties().getInt("i", 0).has_value());
+ }
++
++TEST_F(MoleculeTest, removePartialCharges)
++{
++  Molecule molecule;
++  molecule.addAtom(1);
++  molecule.addAtom(8);
++  MatrixX charges(2, 1);
++  charges << 0.25, -0.25;
++  molecule.setPartialCharges("a", charges);
++  molecule.setPartialCharges("b", charges);
++
++  molecule.removePartialCharges("a");
++  EXPECT_EQ(molecule.partialChargeTypes().count("a"), 0u);
++  EXPECT_EQ(molecule.partialChargeTypes().count("b"), 1u);
++  EXPECT_DOUBLE_EQ(molecule.partialCharges("b")(0, 0), 0.25);
++  EXPECT_TRUE(molecule.partialCharges("a").isZero());
++
++  // Removing a type that is not stored is harmless.
++  molecule.removePartialCharges("missing");
++  EXPECT_EQ(molecule.partialChargeTypes().size(), 1u);
++}
+diff --git a/tests/qtgui/moleculetest.cpp b/tests/qtgui/moleculetest.cpp
+index 0fb3a895217..f12f0f19bb3 100644
+--- a/tests/qtgui/moleculetest.cpp
++++ b/tests/qtgui/moleculetest.cpp
+@@ -793,3 +793,34 @@ TEST_F(MoleculeTest, swapIgnoresIndicesThatAreNotThere)
+   EXPECT_EQ(1, molecule.atom(1).atomicNumber());
+   EXPECT_TRUE(molecule.bond(0, 1).isValid());
+ }
++
++TEST_F(MoleculeTest, partialChargesFollowStructuralChanges)
++{
++  Avogadro::MatrixX charges(3, 1);
++  charges << -0.8, 0.4, 0.4;
++  const auto store = [&]() {
++    m_testMolecule.setPartialCharges("test", charges);
++    m_testMolecule.setPartialCharges("other", charges);
++    ASSERT_EQ(m_testMolecule.partialChargeTypes().size(), 2u);
++  };
++
++  // Moving atoms keeps them: animation and optimization move every frame.
++  store();
++  m_testMolecule.emitChanged(Molecule::Atoms | Molecule::Moved);
++  EXPECT_EQ(m_testMolecule.partialChargeTypes().size(), 2u);
++
++  // Structural edits drop every type.
++  m_testMolecule.emitChanged(Molecule::Atoms | Molecule::Modified);
++  EXPECT_TRUE(m_testMolecule.partialChargeTypes().empty());
++
++  store();
++  m_testMolecule.emitChanged(Molecule::Bonds | Molecule::Added);
++  EXPECT_TRUE(m_testMolecule.partialChargeTypes().empty());
++
++  // A replacement brings its own charges.
++  store();
++  m_testMolecule.emitChanged(Molecule::Atoms | Molecule::Bonds |
++                             Molecule::Added | Molecule::Removed |
++                             Molecule::Replaced);
++  EXPECT_EQ(m_testMolecule.partialChargeTypes().size(), 2u);
++}
+diff --git a/tests/qtplugins/labelchargetest.cpp b/tests/qtplugins/labelchargetest.cpp
+index 4e4b915ef84..998d8d0c175 100644
+--- a/tests/qtplugins/labelchargetest.cpp
++++ b/tests/qtplugins/labelchargetest.cpp
+@@ -18,8 +18,10 @@
+ #include <avogadro/calc/chargemanager.h>
+ #include <avogadro/calc/chargemodel.h>
+ #include <avogadro/qtgui/molecule.h>
++#include <avogadro/qtgui/rwmolecule.h>
+ #include <avogadro/rendering/geometrynode.h>
+ #include <avogadro/rendering/groupnode.h>
++#include <avogadro/rendering/textlabel3d.h>
+ 
+ #include <QtCore/QCoreApplication>
+ #include <QtCore/QSettings>
+@@ -28,10 +30,12 @@
+ #include <QtGui/QOpenGLContext>
+ #include <QtGui/QSurfaceFormat>
+ #include <QtTest/QSignalSpy>
++#include <QtTest/QTest>
+ 
+ #include <gtest/gtest.h>
+ 
+ #include <string>
++#include <vector>
+ 
+ using Avogadro::Index;
+ using Avogadro::MatrixX;
+@@ -43,6 +47,7 @@ namespace R = Avogadro::Rendering;
+ namespace {
+ 
+ constexpr int kPartialCharge = 32; // LayerLabel::LabelOptions::PartialCharge
++constexpr int kSettle = 600;       // longer than Label's 300 ms debounce
+ const char* kModelId = "labeltestcharges";
+ 
+ // Counts how often it is asked for charges.
+@@ -74,7 +79,9 @@ class CountingModel : public Avogadro::Calc::ChargeModel
+   {
+     ++calls;
+     MatrixX charges(mol.atomCount(), 1);
+-    charges.setConstant(0.25);
++    // Depends on the geometry so a recalculation after a move shows.
++    for (Index i = 0; i < mol.atomCount(); ++i)
++      charges(i, 0) = 0.25 + mol.atomPosition3d(i).x();
+     return charges;
+   }
+ };
+@@ -186,9 +193,9 @@ TEST_F(LabelChargeTest, processDoesNotCalculateCharges)
+   process(label);
+   EXPECT_EQ(CountingModel::calls, 0);
+ 
+-  // From the event loop the charges are calculated once and stored, and a
++  // After the debounce the charges are calculated once and stored, and a
+   // scene rebuild is requested.
+-  QCoreApplication::processEvents();
++  QTest::qWait(kSettle);
+   EXPECT_EQ(CountingModel::calls, 1);
+   EXPECT_EQ(changed.count(), 1);
+   const auto types = m_harness.molecule()->partialChargeTypes();
+@@ -198,7 +205,7 @@ TEST_F(LabelChargeTest, processDoesNotCalculateCharges)
+ 
+   // The rebuild finds them and does not ask again.
+   EXPECT_GT(process(label), 0u);
+-  QCoreApplication::processEvents();
++  QTest::qWait(kSettle);
+   EXPECT_EQ(CountingModel::calls, 1);
+   EXPECT_EQ(changed.count(), 1);
+ }
+@@ -210,7 +217,7 @@ TEST_F(LabelChargeTest, chargesAreRecalculatedAfterAnEditKeepingAtomCount)
+   auto* mol = m_harness.molecule();
+ 
+   process(label);
+-  QCoreApplication::processEvents();
++  QTest::qWait(kSettle);
+   ASSERT_EQ(CountingModel::calls, 1);
+   ASSERT_FALSE(mol->partialChargeTypes().empty());
+ 
+@@ -222,7 +229,7 @@ TEST_F(LabelChargeTest, chargesAreRecalculatedAfterAnEditKeepingAtomCount)
+   ASSERT_EQ(mol->atomCount(), 3u);
+ 
+   process(label);
+-  QCoreApplication::processEvents();
++  QTest::qWait(kSettle);
+   EXPECT_EQ(CountingModel::calls, 2);
+   EXPECT_FALSE(mol->partialChargeTypes().empty());
+ }
+@@ -238,7 +245,7 @@ TEST_F(LabelChargeTest, failedCalculationIsNotRetried)
+   QSignalSpy changed(&label, &Label::drawablesChanged);
+   for (int i = 0; i < 3; ++i) {
+     process(label);
+-    QCoreApplication::processEvents();
++    QTest::qWait(kSettle);
+   }
+   EXPECT_EQ(CountingModel::calls, 0);
+   EXPECT_EQ(changed.count(), 0);
+@@ -258,6 +265,158 @@ TEST_F(LabelChargeTest, shortStoredChargesAreSafe)
+   Label label;
+   label.setEnabled(true);
+   EXPECT_GT(process(label), 0u);
++  QTest::qWait(kSettle);
++  EXPECT_EQ(CountingModel::calls, 0);
++}
++
++TEST_F(LabelChargeTest, movedAtomsRecomputeOwnChargesDebounced)
++{
++  Label label;
++  label.setEnabled(true);
++  auto* mol = m_harness.molecule();
++
++  process(label);
++  QTest::qWait(kSettle);
++  ASSERT_EQ(CountingModel::calls, 1);
++  const std::string type = *mol->partialChargeTypes().begin();
++  ASSERT_DOUBLE_EQ(mol->partialCharges(type)(0, 0), 0.25);
++  QSignalSpy changed(&label, &Label::drawablesChanged);
++
++  // A burst of moves, as during a drag or an optimization.
++  for (int i = 1; i <= 5; ++i) {
++    mol->setAtomPosition3d(0, Vector3(i, 0, 0));
++    mol->emitChanged(Avogadro::QtGui::Molecule::Atoms |
++                     Avogadro::QtGui::Molecule::Moved);
++  }
+   QCoreApplication::processEvents();
++  EXPECT_EQ(CountingModel::calls, 1);
++  // The old values stay until the recomputed ones are ready.
++  EXPECT_DOUBLE_EQ(mol->partialCharges(type)(0, 0), 0.25);
++
++  QTest::qWait(600);
++  EXPECT_EQ(CountingModel::calls, 2);
++  EXPECT_DOUBLE_EQ(mol->partialCharges(type)(0, 0), 5.25);
++  EXPECT_EQ(changed.count(), 1);
++
++  // Nothing further is pending.
++  QTest::qWait(600);
++  EXPECT_EQ(CountingModel::calls, 2);
++}
++
++TEST_F(LabelChargeTest, movedAtomsLeaveForeignChargesAlone)
++{
++  Label label;
++  label.setEnabled(true);
++  auto* mol = m_harness.molecule();
++
++  MatrixX charges(3, 1);
++  charges << 0.1, 0.2, 0.3;
++  mol->setPartialCharges("From File", charges);
++
++  EXPECT_GT(process(label), 0u);
++  QTest::qWait(kSettle);
++
++  mol->setAtomPosition3d(0, Vector3(3, 0, 0));
++  mol->emitChanged(Avogadro::QtGui::Molecule::Atoms |
++                   Avogadro::QtGui::Molecule::Moved);
++  QTest::qWait(600);
++
+   EXPECT_EQ(CountingModel::calls, 0);
++  const auto types = mol->partialChargeTypes();
++  ASSERT_EQ(types.size(), 1u);
++  EXPECT_EQ(*types.begin(), "From File");
++  EXPECT_DOUBLE_EQ(mol->partialCharges("From File")(0, 0), 0.1);
++}
++
++TEST_F(LabelChargeTest, structuralEditDropsAndRecalculatesCharges)
++{
++  Label label;
++  label.setEnabled(true);
++  auto* mol = m_harness.molecule();
++
++  process(label);
++  QTest::qWait(kSettle);
++  ASSERT_EQ(CountingModel::calls, 1);
++  ASSERT_FALSE(mol->partialChargeTypes().empty());
++
++  // An element change goes through RWMolecule; the editing tool then emits
++  // Atoms|Modified, which is what discards the charges.
++  mol->undoMolecule()->setAtomicNumber(2, 7);
++  mol->emitChanged(Avogadro::QtGui::Molecule::Atoms |
++                   Avogadro::QtGui::Molecule::Modified);
++  EXPECT_TRUE(mol->partialChargeTypes().empty());
++
++  // No debounce is involved: the rebuild queues the calculation.
++  process(label);
++  QTest::qWait(kSettle);
++  EXPECT_EQ(CountingModel::calls, 2);
++  EXPECT_FALSE(mol->partialChargeTypes().empty());
++}
++
++namespace {
++std::vector<std::string> labelTexts(R::Node* node)
++{
++  std::vector<std::string> texts;
++  if (auto* geometry = dynamic_cast<R::GeometryNode*>(node)) {
++    for (const auto* drawable : geometry->drawables()) {
++      if (const auto* label = dynamic_cast<const R::TextLabel3D*>(drawable))
++        texts.push_back(label->text());
++    }
++  }
++  if (auto* group = dynamic_cast<R::GroupNode*>(node)) {
++    for (const auto& child : group->children()) {
++      auto sub = labelTexts(child.node);
++      texts.insert(texts.end(), sub.begin(), sub.end());
++    }
++  }
++  return texts;
++}
++} // namespace
++
++TEST_F(LabelChargeTest, dragBurstCalculatesOnceAndKeepsLabelsVisible)
++{
++  Label label;
++  label.setEnabled(true);
++  auto* mol = m_harness.molecule();
++
++  process(label);
++  QTest::qWait(kSettle);
++  ASSERT_EQ(CountingModel::calls, 1);
++  const std::string type = *mol->partialChargeTypes().begin();
++  // The rebuild that drawablesChanged requests displays (and caches) them.
++  EXPECT_GT(process(label), 0u);
++
++  // The draw tool and others flag every drag frame as Atoms|Modified, which
++  // drops the charges each time.
++  for (int i = 1; i <= 10; ++i) {
++    mol->setAtomPosition3d(0, Vector3(i, 0, 0));
++    mol->emitChanged(Avogadro::QtGui::Molecule::Atoms |
++                     Avogadro::QtGui::Molecule::Modified);
++    ASSERT_TRUE(mol->partialChargeTypes().empty());
++
++    R::GroupNode root;
++    auto* node = new R::GroupNode(&root);
++    label.process(*mol, *node);
++    // The labels keep the last values instead of blanking.
++    const auto texts = labelTexts(node);
++    ASSERT_EQ(texts.size(), 3u);
++    EXPECT_NE(texts[0].find("0.25"), std::string::npos) << texts[0];
++    QCoreApplication::processEvents();
++  }
++  EXPECT_EQ(CountingModel::calls, 1);
++
++  QTest::qWait(kSettle);
++  EXPECT_EQ(CountingModel::calls, 2);
++  ASSERT_FALSE(mol->partialChargeTypes().empty());
++  EXPECT_DOUBLE_EQ(mol->partialCharges(type)(0, 0), 10.25);
++
++  // A changed atom count must not reuse the cached values.
++  mol->addAtom(1, Vector3(3, 3, 0));
++  mol->emitChanged(Avogadro::QtGui::Molecule::Atoms |
++                   Avogadro::QtGui::Molecule::Added);
++  R::GroupNode root;
++  auto* node = new R::GroupNode(&root);
++  label.process(*mol, *node);
++  for (const auto& text : labelTexts(node))
++    EXPECT_EQ(text.find("0.25"), std::string::npos) << text;
+ }

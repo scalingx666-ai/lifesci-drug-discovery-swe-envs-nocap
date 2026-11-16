@@ -1,0 +1,472 @@
+diff --git a/compert/data.py b/compert/data.py
+index d6355c3..3a807f2 100644
+--- a/compert/data.py
++++ b/compert/data.py
+@@ -163,7 +163,7 @@ def __init__(
+                         else:
+                             drug_ohe += float(d) * drugs_combos[j]
+                     drugs.append(drug_ohe)
+-                self.drugs = torch.Tensor(drugs)
++                self.drugs = torch.Tensor(np.array(drugs))
+ 
+                 # store a mapping from int -> drug_name, where the integer equals the position
+                 # of the drug in the OneHot encoding. Very convoluted, should be refactored.
+@@ -407,22 +407,3 @@ def load_dataset_splits(
+         return splits, dataset
+     else:
+         return splits
+-
+-
+-if __name__ == "__main__":
+-    print("Strating\n...")
+-    config = {
+-        "dataset_path": "datasets/trapnell_cpa_subset.h5ad",  # full path to the anndata dataset
+-        "perturbation_key": "condition",
+-        "covariate_keys": "cell_type",  # necessary field for cell types. Fill it with a dummy variable if no celltypes present.
+-        "dose_key": "dose",
+-        "split_key": "split1",  # necessary field for train, test, ood splits.
+-        "smiles_key": "SMILES",
+-        "split_key": "split1",
+-        "mol_featurizer": "canonical",
+-        "pert_category": "cov_drug_dose_name",
+-    }
+-    for featurizer in ["canonical", "AttentiveFP", "Pretrain"]:
+-        config["mol_featurizer"] = featurizer
+-        load_dataset_splits(**config)
+-        print(f'Finished for {config["mol_featurizer"]}.\n\n\n')
+diff --git a/compert/model.py b/compert/model.py
+index 58ddbdb..b7554ba 100644
+--- a/compert/model.py
++++ b/compert/model.py
+@@ -9,10 +9,12 @@
+ 
+ def _move_inputs(*inputs, device="cuda"):
+     def mv_input(x):
+-        if type(x) == list:
+-            return [mv_input(y) for y in x]
++        if x is None:
++            return None
++        elif isinstance(x, torch.Tensor):
++            return x.to(device)
+         else:
+-            return x.to(device) if x is not None else None
++            return [mv_input(y) for y in x]
+ 
+     return [mv_input(x) for x in inputs]
+ 
+diff --git a/compert/profiling.py b/compert/profiling.py
+new file mode 100644
+index 0000000..811dc21
+--- /dev/null
++++ b/compert/profiling.py
+@@ -0,0 +1,67 @@
++import os
++import shutil
++import signal
++import subprocess
++from pathlib import Path
++
++import sacred
++
++
++class Profiler:
++    outpath: Path
++    _process: subprocess.Popen
++
++    def __init__(self, seed: str, save_dir: str):
++        """
++        Creates a new profiler without start it yet.
++        @param seed: random string used for generating unique filepath.
++        @param save_dir: directory to save the file to.
++        """
++        assert Path(save_dir).is_dir(), f"{save_dir} is not a directory!"
++        self.outpath = Path(save_dir) / f"profile_{seed}.speedscope"
++        assert shutil.which("py-spy"), "py-spy not found, please install it first."
++
++    def start(self):
++        """Start recording the current Python process"""
++        # starts py-spy in a new subprocess
++        self._process = subprocess.Popen(
++            [
++                shutil.which("py-spy"),
++                "record",
++                "--pid",
++                str(os.getpid()),  # tells py-spy to profile the current Python process
++                "--rate",
++                "3",  # three samples per second should be fine-grained enough and the outfile won't get too large
++                "--format",
++                "speedscope",  # look at profiles via https://speedscope.app
++                "--output",
++                str(
++                    self.outpath
++                ),  # file to save results at (once profiling has finished)
++            ]
++        )
++
++    def stop(self, experiment: sacred.Experiment):
++        """
++        Stop recording and save the results to a file and to MongoDB
++        @param experiment: The seml / sacred experiment.
++        """
++        # First, send same signal as CTRL+C would. Py-spy should quit and save the results.
++        self._process.send_signal(signal.SIGINT)
++        try:
++            # if the profiler didn't exit after 10s, kill it
++            self._process.wait(timeout=10)
++        except subprocess.TimeoutExpired:
++            # sends SIGKILL. py-spy will quit, but will not save a profile.
++            self._process.kill()
++            print("killed py-spy due to timeout.")
++            # collect the zombie process
++            self._process.wait(timeout=2)
++
++        # upload the profiling results to mongoDB as a binary
++        if self.outpath.is_file():
++            experiment.add_artifact(
++                str(self.outpath),
++                name="py_spy_profile",
++                content_type="application/octet-stream",
++            )
+diff --git a/compert/seml_sweep_icb.py b/compert/seml_sweep_icb.py
+index 15c75da..e226494 100644
+--- a/compert/seml_sweep_icb.py
++++ b/compert/seml_sweep_icb.py
+@@ -2,12 +2,19 @@
+ import os
+ import time
+ from collections import defaultdict
++from pathlib import Path
+ 
+ import numpy as np
+ import seml
+ import torch
+ from sacred import Experiment
+ 
++from compert.data import load_dataset_splits
++from compert.embedding import get_chemical_representation
++from compert.model import ComPert
++from compert.profiling import Profiler
++from compert.train import custom_collate, evaluate, evaluate_r2
++
+ ex = Experiment()
+ seml.setup_logger(ex)
+ 
+@@ -27,6 +34,28 @@ def config():
+         )
+ 
+ 
++profiler = None
++
++
++@ex.pre_run_hook(prefix="profiling")
++def init_profiler(run_profiler: bool, outdir: str):
++    if run_profiler:
++        if not Path(outdir).exists():
++            Path(outdir).mkdir(parents=True)
++        global profiler
++        profiler = Profiler(
++            str(seml.utils.make_hash(ex.current_run.config)),
++            outdir,
++        )
++        profiler.start()
++
++
++@ex.post_run_hook
++def stop_profiler():
++    if profiler:
++        profiler.stop(experiment=ex)
++
++
+ def pjson(s):
+     """
+     Prints a string in JSON format and flushes stdout
+@@ -53,7 +82,6 @@ def init_dataset(self, dataset_type: str, data_params: dict):
+         Since we set prefix="dataset ", this method only gets passed the respective sub-dictionary, enabling a modular
+         experiment design.
+         """
+-        from compert.data import load_dataset_splits
+ 
+         if dataset_type in ("kang", "trapnell", "lincs"):
+             self.datasets, self.dataset = load_dataset_splits(
+@@ -62,8 +90,6 @@ def init_dataset(self, dataset_type: str, data_params: dict):
+ 
+     @ex.capture(prefix="model")
+     def init_drug_embedding(self, embedding: dict):
+-        from compert.embedding import get_chemical_representation
+-
+         device = "cuda" if torch.cuda.is_available() else "cpu"
+         if embedding["model"] is not None:
+             # ComPert will use the provided embedding, which is frozen during training
+@@ -79,7 +105,6 @@ def init_drug_embedding(self, embedding: dict):
+ 
+     @ex.capture(prefix="model")
+     def init_model(self, hparams: dict, additional_params: dict):
+-        from compert.model import ComPert
+ 
+         device = "cuda" if torch.cuda.is_available() else "cpu"
+ 
+@@ -98,7 +123,6 @@ def update_datasets(self):
+         """
+         Instantiates a torch DataLoader for the given batchsize
+         """
+-        from compert.train import custom_collate
+ 
+         self.datasets.update(
+             {
+@@ -132,10 +156,10 @@ def train(
+         max_minutes: int,
+         checkpoint_freq: int,
+         ignore_evaluation: bool,
++        run_eval_disentangle: bool,
+         save_checkpoints: bool,
+         save_dir: str,
+     ):
+-        from compert.train import evaluate, evaluate_r2
+ 
+         print(f"CWD: {os.getcwd()}")
+         print(f"Save dir: {save_dir}")
+@@ -204,7 +228,9 @@ def train(
+                         evaluation_stats = evaluate(self.autoencoder, self.datasets)
+                     else:
+                         evaluation_stats = evaluate(
+-                            self.autoencoder, self.datasets, disentangle=True
++                            self.autoencoder,
++                            self.datasets,
++                            disentangle=run_eval_disentangle,
+                         )
+                     for key, val in evaluation_stats.items():
+                         if not (key in self.autoencoder.history.keys()):
+diff --git a/compert/train.py b/compert/train.py
+index 553f291..82dd7a5 100644
+--- a/compert/train.py
++++ b/compert/train.py
+@@ -3,11 +3,10 @@
+ import time
+ 
+ import numpy as np
++import sklearn.model_selection
+ import torch
+ from sklearn.linear_model import LogisticRegression
+ from sklearn.metrics import balanced_accuracy_score, make_scorer
+-from sklearn.model_selection import cross_val_score
+-from sklearn.neighbors import KNeighborsClassifier
+ from sklearn.preprocessing import StandardScaler
+ from torchmetrics import R2Score
+ 
+@@ -124,60 +123,79 @@ def evaluate_logfold_r2(autoencoder, ds_treated, ds_ctrl):
+     return mean(logfold_score)
+ 
+ 
+-def evaluate_disentanglement(autoencoder, dataset, nonlinear=False):
++def evaluate_disentanglement(autoencoder, dataset, n_samples=10000):
+     """
+     Given a ComPert model, this function measures the correlation between
+     its latent space and 1) a dataset's drug vectors 2) a datasets covariate
+     vectors.
+ 
+     """
++
++    # generate random indices to subselect the dataset
++    assert n_samples > 0
++    indices = np.random.choice(
++        len(dataset), size=min(n_samples, len(dataset)), replace=False
++    )
++    data = dataset[indices]
++    print(f"Size of disentanglement testdata: {data[0].shape} (total {len(dataset)})")
++
+     if dataset.use_drugs_idx:
++        genes, drugs_idx, dosages, covariates = (
++            data[0],
++            data[1],
++            data[2],
++            data[3:],
++        )
+         _, latent_basal = autoencoder.predict(
+-            genes=dataset.genes,
+-            drugs_idx=dataset.drugs_idx,
+-            dosages=dataset.dosages,
+-            covariates=dataset.covariates,
++            genes=genes,
++            drugs_idx=drugs_idx,
++            dosages=dosages,
++            covariates=covariates,
+             return_latent_basal=True,
+         )
+     else:
++        genes, drugs, covariates = data[0], data[1], data[2:]
+         _, latent_basal = autoencoder.predict(
+-            genes=dataset.genes,
+-            drugs=dataset.drugs,
+-            covariates=dataset.covariates,
++            genes=genes,
++            drugs=drugs,
++            covariates=covariates,
+             return_latent_basal=True,
+         )
+ 
++    # move output from GPU to CPU
+     latent_basal = latent_basal.detach().cpu().numpy()
++    normalized_basal = StandardScaler().fit_transform(latent_basal)
++    bacc_scorer = make_scorer(balanced_accuracy_score)
+ 
+-    if nonlinear:
+-        clf = KNeighborsClassifier(n_neighbors=int(np.sqrt(len(latent_basal))))
+-    else:
+-        clf = LogisticRegression(
+-            solver="saga",
+-            multi_class="multinomial",
+-            max_iter=3000,
+-            # n_jobs=-1,
+-            # verbose=2,
+-            tol=1e-2,
+-        )
++    clf = LogisticRegression(
++        solver="saga",
++        multi_class="multinomial",
++        max_iter=100,
++        n_jobs=1,  # no parallelization possible with multinomial loss
++        tol=1e-2,
++    )
+ 
+-    pert_scores, cov_scores = 0, []
++    pert_score, cov_scores = 0, []
+ 
+     def compute_score(labels):
+-        scaler = StandardScaler().fit_transform(latent_basal)
+-        scorer = make_scorer(balanced_accuracy_score)
+-        return cross_val_score(clf, scaler, labels, scoring=scorer, cv=5, n_jobs=-1)
++        # generate a 80/20 split. There's probably a better way to do this
++        datasplit = sklearn.model_selection.KFold(n_splits=5).split(
++            normalized_basal, labels
++        )
++        train_index, test_index = next(iter(datasplit))
++        clf.fit(normalized_basal[train_index], labels[train_index])
++        return bacc_scorer(clf, normalized_basal[test_index], labels[test_index])
+ 
+     if dataset.perturbation_key is not None:
+-        pert_scores = compute_score(dataset.drugs_names)
++        pert_score = compute_score(dataset.drugs_names[indices])
+     for cov in list(dataset.covariate_names):
+         cov_scores = []
+         if len(np.unique(dataset.covariate_names[cov])) == 0:
+             cov_scores = [0]
+             break
+         else:
+-            cov_scores.append(compute_score(dataset.covariate_names[cov]))
+-        return [np.mean(pert_scores), *[np.mean(cov_score) for cov_score in cov_scores]]
++            cov_scores.append(compute_score(dataset.covariate_names[cov][indices]))
++        return [pert_score] + cov_scores
+ 
+ 
+ def evaluate_r2(autoencoder, dataset, genes_control):
+@@ -210,6 +228,7 @@ def evaluate_r2(autoencoder, dataset, genes_control):
+ 
+         emb_covs = [repeat_n(cov[idx], num) for cov in dataset.covariates]
+         if dataset.use_drugs_idx:
++            # spending a lot of time here. Why?
+             emb_drugs = (
+                 repeat_n(dataset.drugs_idx[idx], num).squeeze(),
+                 repeat_n(dataset.dosages[idx], num).squeeze(),
+diff --git a/environment.yml b/environment.yml
+index ebbb63f..9a0c64e 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -16,7 +16,7 @@ dependencies:
+   - jupytext
+   - pytorch::pytorch
+   - torchmetrics
+-  - cudatoolkit=10.2
++  - cudatoolkit=11.3
+   - dglteam::dgl
+   - dglteam::dgllife
+   - rdkit=2021.09.2
+@@ -24,3 +24,4 @@ dependencies:
+   - pyarrow
+   - pre-commit
+   - seml
++  - py-spy
+diff --git a/simon/config_lincs.yaml b/simon/config_lincs.yaml
+index 0ee73ba..cb625dd 100644
+--- a/simon/config_lincs.yaml
++++ b/simon/config_lincs.yaml
+@@ -14,15 +14,20 @@ slurm:
+     gres: gpu:1       # num GPUs
+     mem: 32G          # memory
+     cpus-per-task: 6  # num cores
+-    time: 0-08:01     # max time, D-HH:MM
++    time: 0-12:01     # max time, D-HH:MM
+ ###### BEGIN PARAMETER CONFIGURATION ######
+ 
+ fixed:
++  profiling.run_profiler: True
++  profiling.outdir: "./"
++
+   training.checkpoint_freq: 150 # checkpoint frequency to save intermediate results
+   training.num_epochs: 300 # maximum epochs for training
+   training.max_minutes: 300 # maximum computation time
+   training.ignore_evaluation: False
++  training.run_eval_disentangle: False
+   training.save_checkpoints: True
++  training.run_eval_disentangle: True
+   training.save_dir: sweeps/checkpoints/lincs_logsigm_grover
+   
+   model.additional_params.loss_ae: gauss # loss (currently only gaussian loss is supported)
+diff --git a/simon/config_sciplex3.yaml b/simon/config_sciplex3.yaml
+index f7b91a4..9be7f40 100644
+--- a/simon/config_sciplex3.yaml
++++ b/simon/config_sciplex3.yaml
+@@ -8,20 +8,25 @@ seml:
+ 
+ slurm:
+   max_simultaneous_jobs: 4
++  # 2 experiments in 1 job seems to work for Trapnell without getting GPU memory problems
+   experiments_per_job: 2
+   sbatch_options_template: GPU
+   sbatch_options:
+     gres: gpu:1       # num GPUs
+-    mem: 32G          # memory
++    mem: 50G          # memory
+     cpus-per-task: 6  # num cores
+     time: 0-04:01     # max time, D-HH:MM
+ ###### BEGIN PARAMETER CONFIGURATION ######
+ 
+ fixed:
++  profiling.run_profiler: False
++  profiling.outdir: "./"
++
+   training.checkpoint_freq: 50 # checkpoint frequency to save intermediate results
+   training.num_epochs: 500 # maximum epochs for training
+   training.max_minutes: 300 # maximum computation time
+   training.ignore_evaluation: False
++  training.run_eval_disentangle: True
+   training.save_checkpoints: True
+   training.save_dir: sweeps/checkpoints/trapnell_logsigm_grover
+   
+diff --git a/simon/config_sciplex3_interactive.yaml b/simon/config_sciplex3_interactive.yaml
+index 3eb0e25..87480ab 100644
+--- a/simon/config_sciplex3_interactive.yaml
++++ b/simon/config_sciplex3_interactive.yaml
+@@ -17,10 +17,14 @@ slurm:
+ ###### BEGIN PARAMETER CONFIGURATION ######
+ 
+ fixed:
++  profiling.run_profiler: False
++  profiling.outdir: "./"
++
+   training.checkpoint_freq: 50 # checkpoint frequency to save intermediate results
+   training.num_epochs: 10 # maximum epochs for training
+   training.max_minutes: 300 # maximum computation time
+   training.ignore_evaluation: False
++  training.run_eval_disentangle: True
+   training.save_checkpoints: False
+   training.save_dir: sweeps/checkpoints
+   
+@@ -39,7 +43,7 @@ fixed:
+   dataset.data_params.smiles_key: SMILES
+   dataset.data_params.split_key: split # necessary field for train, test, ood splits.
+   dataset.data_params.mol_featurizer: canonical
+-  dataset.data_params.use_drugs_idx: True
++  dataset.data_params.use_drugs_idx: False
+ 
+   model.hparams.dropout: 0.1
+   model.hparams.dim: 128

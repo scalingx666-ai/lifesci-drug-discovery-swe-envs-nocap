@@ -1,0 +1,889 @@
+diff --git a/README.md b/README.md
+index 825f4c8..e5936e1 100644
+--- a/README.md
++++ b/README.md
+@@ -49,6 +49,46 @@ uvx claude-skills-mcp --example-config > config.json
+ uvx claude-skills-mcp --config config.json
+ ```
+ 
++## Setup for Your AI Assistant
++
++### Cursor
++
++Add to your MCP settings (`~/.cursor/mcp.json`):
++
++```json
++{
++  "mcpServers": {
++    "claude-skills": {
++      "command": "uvx",
++      "args": ["claude-skills-mcp"]
++    }
++  }
++}
++```
++
++Restart Cursor and the skills will be available to the AI assistant.
++
++### Claude Desktop
++
++Add to your MCP settings:
++
++```json
++{
++  "mcpServers": {
++    "claude-skills": {
++      "command": "uvx",
++      "args": ["claude-skills-mcp"]
++    }
++  }
++}
++```
++
++Restart Claude Desktop to activate.
++
++### Other MCP-Compatible Tools
++
++Any tool supporting the Model Context Protocol can use this server via `uvx claude-skills-mcp`. Consult your tool's MCP configuration documentation.
++
+ ## Architecture
+ 
+ Built on five core components: Configuration (JSON-based config loading), Skill Loader (GitHub + local with automatic caching), Search Engine (sentence-transformers vector search), MCP Server (three tools with stdio transport), and CLI Entry Point (argument parsing and lifecycle management).
+diff --git a/src/claude_skills_mcp/__main__.py b/src/claude_skills_mcp/__main__.py
+index 41620f2..79cd3c0 100644
+--- a/src/claude_skills_mcp/__main__.py
++++ b/src/claude_skills_mcp/__main__.py
+@@ -4,11 +4,12 @@
+ import asyncio
+ import logging
+ import sys
++import threading
+ 
+ from .config import load_config, get_example_config
+-from .skill_loader import load_all_skills
++from .skill_loader import load_skills_in_batches
+ from .search_engine import SkillSearchEngine
+-from .server import SkillsMCPServer
++from .server import SkillsMCPServer, LoadingState
+ 
+ 
+ def setup_logging(verbose: bool = False) -> None:
+@@ -93,27 +94,64 @@ async def main_async() -> None:
+         # Load configuration
+         config = load_config(args.config)
+ 
+-        # Load skills from all sources
+-        logger.info("Loading skills from configured sources...")
+-        skills = load_all_skills(config["skill_sources"], config)
+-
+-        if not skills:
+-            logger.error("No skills were loaded! Please check your configuration.")
+-            sys.exit(1)
+-
+-        logger.info(f"Successfully loaded {len(skills)} skills")
+-
+-        # Initialize search engine
++        # Initialize search engine (empty, will be populated by background loading)
++        logger.info("Initializing search engine...")
+         search_engine = SkillSearchEngine(config["embedding_model"])
+-        search_engine.index_skills(skills)
+ 
+-        # Create and run MCP server
++        # Initialize loading state
++        loading_state = LoadingState()
++
++        # Create MCP server (starts immediately with empty index)
+         mcp_server = SkillsMCPServer(
+             search_engine=search_engine,
++            loading_state=loading_state,
+             default_top_k=config["default_top_k"],
+             max_content_chars=config.get("max_skill_content_chars"),
+         )
+ 
++        # Define batch callback for incremental loading
++        def on_batch_loaded(batch_skills: list, total_loaded: int) -> None:
++            """Callback invoked after each batch of skills is loaded.
++
++            Parameters
++            ----------
++            batch_skills : list
++                Skills in this batch.
++            total_loaded : int
++                Total number of skills loaded so far.
++            """
++            logger.info(
++                f"Batch loaded: {len(batch_skills)} skills (total: {total_loaded})"
++            )
++            # Add skills to search engine incrementally
++            search_engine.add_skills(batch_skills)
++            # Update loading state
++            loading_state.update_progress(total_loaded)
++
++        # Start background thread to load skills
++        def background_loader() -> None:
++            """Background thread function to load skills in batches."""
++            try:
++                logger.info("Starting background skill loading...")
++                load_skills_in_batches(
++                    skill_sources=config["skill_sources"],
++                    config=config,
++                    batch_callback=on_batch_loaded,
++                    batch_size=config.get("batch_size", 10),
++                )
++                loading_state.mark_complete()
++                logger.info("Background skill loading complete")
++            except Exception as e:
++                logger.error(f"Error in background loading: {e}", exc_info=True)
++                loading_state.add_error(str(e))
++                loading_state.mark_complete()
++
++        # Start the background loading thread
++        loader_thread = threading.Thread(target=background_loader, daemon=True)
++        loader_thread.start()
++        logger.info("Background loading thread started, server is ready")
++
++        # Run the MCP server (non-blocking, skills load in background)
+         await mcp_server.run()
+ 
+     except KeyboardInterrupt:
+diff --git a/src/claude_skills_mcp/search_engine.py b/src/claude_skills_mcp/search_engine.py
+index d017c84..1f9dd0d 100644
+--- a/src/claude_skills_mcp/search_engine.py
++++ b/src/claude_skills_mcp/search_engine.py
+@@ -1,6 +1,7 @@
+ """Vector search engine for finding relevant skills."""
+ 
+ import logging
++import threading
+ from typing import Any
+ 
+ import numpy as np
+@@ -22,6 +23,8 @@ class SkillSearchEngine:
+         List of indexed skills.
+     embeddings : np.ndarray | None
+         Embeddings matrix for all skill descriptions.
++    _lock : threading.Lock
++        Lock for thread-safe access to skills and embeddings.
+     """
+ 
+     def __init__(self, model_name: str):
+@@ -36,6 +39,7 @@ def __init__(self, model_name: str):
+         self.model = SentenceTransformer(model_name)
+         self.skills: list[Skill] = []
+         self.embeddings: np.ndarray | None = None
++        self._lock = threading.Lock()
+         logger.info(f"Embedding model loaded: {model_name}")
+ 
+     def index_skills(self, skills: list[Skill]) -> None:
+@@ -46,20 +50,53 @@ def index_skills(self, skills: list[Skill]) -> None:
+         skills : list[Skill]
+             Skills to index.
+         """
++        with self._lock:
++            if not skills:
++                logger.warning("No skills to index")
++                self.skills = []
++                self.embeddings = None
++                return
++
++            logger.info(f"Indexing {len(skills)} skills...")
++            self.skills = skills
++
++            # Generate embeddings from skill descriptions
++            descriptions = [skill.description for skill in skills]
++            self.embeddings = self.model.encode(descriptions, convert_to_numpy=True)
++
++            logger.info(f"Successfully indexed {len(skills)} skills")
++
++    def add_skills(self, skills: list[Skill]) -> None:
++        """Add skills incrementally and update embeddings.
++
++        Parameters
++        ----------
++        skills : list[Skill]
++            Skills to add to the index.
++        """
+         if not skills:
+-            logger.warning("No skills to index")
+-            self.skills = []
+-            self.embeddings = None
+             return
+ 
+-        logger.info(f"Indexing {len(skills)} skills...")
+-        self.skills = skills
++        with self._lock:
++            logger.info(f"Adding {len(skills)} skills to index...")
++
++            # Generate embeddings for new skills
++            descriptions = [skill.description for skill in skills]
++            new_embeddings = self.model.encode(descriptions, convert_to_numpy=True)
++
++            # Append to existing skills and embeddings
++            self.skills.extend(skills)
+ 
+-        # Generate embeddings from skill descriptions
+-        descriptions = [skill.description for skill in skills]
+-        self.embeddings = self.model.encode(descriptions, convert_to_numpy=True)
++            if self.embeddings is None:
++                # First batch of skills
++                self.embeddings = new_embeddings
++            else:
++                # Append to existing embeddings
++                self.embeddings = np.vstack([self.embeddings, new_embeddings])
+ 
+-        logger.info(f"Successfully indexed {len(skills)} skills")
++            logger.info(
++                f"Successfully added {len(skills)} skills. Total: {len(self.skills)} skills"
++            )
+ 
+     def search(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+         """Search for the most relevant skills based on a query.
+@@ -76,38 +113,39 @@ def search(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+         list[dict[str, Any]]
+             List of skill dictionaries with relevance scores, sorted by relevance.
+         """
+-        if not self.skills or self.embeddings is None:
+-            logger.warning("No skills indexed, returning empty results")
+-            return []
++        with self._lock:
++            if not self.skills or self.embeddings is None:
++                logger.warning("No skills indexed, returning empty results")
++                return []
+ 
+-        # Ensure top_k doesn't exceed available skills
+-        top_k = min(top_k, len(self.skills))
++            # Ensure top_k doesn't exceed available skills
++            top_k = min(top_k, len(self.skills))
+ 
+-        logger.info(f"Searching for: '{query}' (top_k={top_k})")
++            logger.info(f"Searching for: '{query}' (top_k={top_k})")
+ 
+-        # Generate embedding for the query
+-        query_embedding = self.model.encode([query], convert_to_numpy=True)[0]
++            # Generate embedding for the query
++            query_embedding = self.model.encode([query], convert_to_numpy=True)[0]
+ 
+-        # Compute cosine similarity
+-        similarities = self._cosine_similarity(query_embedding, self.embeddings)
++            # Compute cosine similarity
++            similarities = self._cosine_similarity(query_embedding, self.embeddings)
+ 
+-        # Get top-k indices
+-        top_indices = np.argsort(similarities)[::-1][:top_k]
++            # Get top-k indices
++            top_indices = np.argsort(similarities)[::-1][:top_k]
+ 
+-        # Build results
+-        results = []
+-        for idx in top_indices:
+-            skill = self.skills[idx]
+-            score = float(similarities[idx])
++            # Build results
++            results = []
++            for idx in top_indices:
++                skill = self.skills[idx]
++                score = float(similarities[idx])
+ 
+-            result = skill.to_dict()
+-            result["relevance_score"] = score
+-            results.append(result)
++                result = skill.to_dict()
++                result["relevance_score"] = score
++                results.append(result)
+ 
+-            logger.debug(f"Found skill: {skill.name} (score: {score:.4f})")
++                logger.debug(f"Found skill: {skill.name} (score: {score:.4f})")
+ 
+-        logger.info(f"Returning {len(results)} results")
+-        return results
++            logger.info(f"Returning {len(results)} results")
++            return results
+ 
+     @staticmethod
+     def _cosine_similarity(vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+diff --git a/src/claude_skills_mcp/server.py b/src/claude_skills_mcp/server.py
+index 85c452b..55bc565 100644
+--- a/src/claude_skills_mcp/server.py
++++ b/src/claude_skills_mcp/server.py
+@@ -2,6 +2,7 @@
+ 
+ import fnmatch
+ import logging
++import threading
+ from typing import Any
+ 
+ from mcp.server import Server
+@@ -13,6 +14,83 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++class LoadingState:
++    """Thread-safe state tracker for background skill loading.
++
++    Attributes
++    ----------
++    total_skills : int
++        Total number of skills expected to be loaded.
++    loaded_skills : int
++        Number of skills loaded so far.
++    is_complete : bool
++        Whether loading is complete.
++    errors : list[str]
++        List of error messages encountered during loading.
++    _lock : threading.Lock
++        Lock for thread-safe access.
++    """
++
++    def __init__(self):
++        """Initialize loading state."""
++        self.total_skills = 0
++        self.loaded_skills = 0
++        self.is_complete = False
++        self.errors: list[str] = []
++        self._lock = threading.Lock()
++
++    def update_progress(self, loaded: int, total: int | None = None) -> None:
++        """Update loading progress.
++
++        Parameters
++        ----------
++        loaded : int
++            Number of skills loaded.
++        total : int | None, optional
++            Total skills expected (if known), by default None.
++        """
++        with self._lock:
++            self.loaded_skills = loaded
++            if total is not None:
++                self.total_skills = total
++
++    def add_error(self, error: str) -> None:
++        """Add an error message.
++
++        Parameters
++        ----------
++        error : str
++            Error message to record.
++        """
++        with self._lock:
++            self.errors.append(error)
++
++    def mark_complete(self) -> None:
++        """Mark loading as complete."""
++        with self._lock:
++            self.is_complete = True
++
++    def get_status_message(self) -> str | None:
++        """Get current loading status message.
++
++        Returns
++        -------
++        str | None
++            Status message if loading is in progress, None if complete.
++        """
++        with self._lock:
++            if self.is_complete:
++                return None
++
++            if self.loaded_skills == 0:
++                return "[LOADING: Skills are being loaded in the background, please wait...]\n"
++
++            if self.total_skills > 0:
++                return f"[LOADING: {self.loaded_skills}/{self.total_skills} skills loaded, indexing in progress...]\n"
++            else:
++                return f"[LOADING: {self.loaded_skills} skills loaded so far, indexing in progress...]\n"
++
++
+ class SkillsMCPServer:
+     """MCP Server for searching Claude Agent Skills.
+ 
+@@ -24,11 +102,14 @@ class SkillsMCPServer:
+         Default number of results to return.
+     max_content_chars : int | None
+         Maximum characters for skill content (None for unlimited).
++    loading_state : LoadingState
++        State tracker for background skill loading.
+     """
+ 
+     def __init__(
+         self,
+         search_engine: SkillSearchEngine,
++        loading_state: LoadingState,
+         default_top_k: int = 3,
+         max_content_chars: int | None = None,
+     ):
+@@ -38,12 +119,15 @@ def __init__(
+         ----------
+         search_engine : SkillSearchEngine
+             Initialized search engine with indexed skills.
++        loading_state : LoadingState
++            State tracker for background skill loading.
+         default_top_k : int, optional
+             Default number of results to return, by default 3.
+         max_content_chars : int | None, optional
+             Maximum characters for skill content. None for unlimited, by default None.
+         """
+         self.search_engine = search_engine
++        self.loading_state = loading_state
+         self.default_top_k = default_top_k
+         self.max_content_chars = max_content_chars
+         self.server = Server("claude-skills-mcp")
+@@ -187,11 +271,32 @@ async def _handle_search_skills(
+         top_k = arguments.get("top_k", self.default_top_k)
+         list_documents = arguments.get("list_documents", True)
+ 
++        # Build formatted response
++        response_parts = []
++
++        # Add loading status if skills are still being loaded
++        status_msg = self.loading_state.get_status_message()
++        if status_msg:
++            response_parts.append(status_msg)
++
+         # Perform search
+         results = self.search_engine.search(task_description, top_k)
+ 
+         # Format results as text
+         if not results:
++            # Check if we have no results because skills are still loading
++            if (
++                not self.loading_state.is_complete
++                and self.loading_state.loaded_skills == 0
++            ):
++                return [
++                    TextContent(
++                        type="text",
++                        text=status_msg
++                        or ""
++                        + "No skills loaded yet. Please wait for skills to load and try again.",
++                    )
++                ]
+             return [
+                 TextContent(
+                     type="text",
+@@ -199,10 +304,9 @@ async def _handle_search_skills(
+                 )
+             ]
+ 
+-        # Build formatted response
+-        response_parts = [
++        response_parts.append(
+             f"Found {len(results)} relevant skill(s) for: '{task_description}'\n"
+-        ]
++        )
+ 
+         for i, result in enumerate(results, 1):
+             response_parts.append(f"\n{'=' * 80}")
+@@ -418,14 +522,31 @@ async def _handle_list_skills(self, arguments: dict[str, Any]) -> list[TextConte
+         list[TextContent]
+             Complete list of all skills with metadata.
+         """
++        response_parts = []
++
++        # Add loading status if skills are still being loaded
++        status_msg = self.loading_state.get_status_message()
++        if status_msg:
++            response_parts.append(status_msg)
++
+         if not self.search_engine.skills:
++            if not self.loading_state.is_complete:
++                return [
++                    TextContent(
++                        type="text",
++                        text=status_msg
++                        or "" + "No skills loaded yet. Please wait for skills to load.",
++                    )
++                ]
+             return [TextContent(type="text", text="No skills currently loaded.")]
+ 
+-        response_parts = [
+-            f"Total skills loaded: {len(self.search_engine.skills)}\n",
+-            "=" * 80,
+-            "\n",
+-        ]
++        response_parts.extend(
++            [
++                f"Total skills loaded: {len(self.search_engine.skills)}\n",
++                "=" * 80,
++                "\n",
++            ]
++        )
+ 
+         for i, skill in enumerate(self.search_engine.skills, 1):
+             # Format source as owner/repo for GitHub URLs
+diff --git a/src/claude_skills_mcp/skill_loader.py b/src/claude_skills_mcp/skill_loader.py
+index ef4de80..9393848 100644
+--- a/src/claude_skills_mcp/skill_loader.py
++++ b/src/claude_skills_mcp/skill_loader.py
+@@ -1019,3 +1019,72 @@ def load_all_skills(
+ 
+     logger.info(f"Total skills loaded: {len(all_skills)}")
+     return all_skills
++
++
++def load_skills_in_batches(
++    skill_sources: list[dict[str, Any]],
++    config: dict[str, Any] | None,
++    batch_callback: Callable[[list[Skill], int], None],
++    batch_size: int = 10,
++) -> None:
++    """Load skills from all sources in batches with callbacks.
++
++    This function loads skills incrementally and calls the callback
++    after each batch, allowing for progressive indexing.
++
++    Parameters
++    ----------
++    skill_sources : list[dict[str, Any]]
++        List of skill source configurations.
++    config : dict[str, Any] | None
++        Configuration dictionary with document loading settings.
++    batch_callback : Callable[[list[Skill], int], None]
++        Callback function called with (batch_skills, total_loaded) after each batch.
++    batch_size : int, optional
++        Number of skills per batch, by default 10.
++    """
++    current_batch: list[Skill] = []
++    total_loaded = 0
++
++    def process_batch() -> None:
++        """Process and clear the current batch."""
++        nonlocal total_loaded
++        if current_batch:
++            total_loaded += len(current_batch)
++            batch_callback(current_batch.copy(), total_loaded)
++            current_batch.clear()
++
++    for source_config in skill_sources:
++        source_type = source_config.get("type")
++
++        try:
++            if source_type == "github":
++                url = source_config.get("url")
++                subpath = source_config.get("subpath", "")
++                if url:
++                    skills = load_from_github(url, subpath, config)
++                    for skill in skills:
++                        current_batch.append(skill)
++                        if len(current_batch) >= batch_size:
++                            process_batch()
++
++            elif source_type == "local":
++                path = source_config.get("path")
++                if path:
++                    skills = load_from_local(path, config)
++                    for skill in skills:
++                        current_batch.append(skill)
++                        if len(current_batch) >= batch_size:
++                            process_batch()
++
++            else:
++                logger.warning(f"Unknown source type: {source_type}")
++
++        except Exception as e:
++            logger.error(f"Error loading from source {source_config}: {e}")
++            continue
++
++    # Process any remaining skills in the final batch
++    process_batch()
++
++    logger.info(f"Finished loading {total_loaded} skills in batches")
+diff --git a/tests/test_background_loading.py b/tests/test_background_loading.py
+new file mode 100644
+index 0000000..57e257f
+--- /dev/null
++++ b/tests/test_background_loading.py
+@@ -0,0 +1,245 @@
++"""Tests for background skill loading functionality."""
++
++import asyncio
++import time
++import pytest
++from src.claude_skills_mcp.search_engine import SkillSearchEngine
++from src.claude_skills_mcp.server import SkillsMCPServer, LoadingState
++from src.claude_skills_mcp.skill_loader import load_skills_in_batches, Skill
++
++
++def test_loading_state_thread_safety():
++    """Test that LoadingState is thread-safe."""
++    import threading
++
++    state = LoadingState()
++
++    def update_progress():
++        for i in range(100):
++            state.update_progress(i, 100)
++
++    # Run multiple threads updating the state
++    threads = [threading.Thread(target=update_progress) for _ in range(5)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++
++    # Verify state is consistent
++    assert state.loaded_skills >= 0
++    assert state.total_skills >= 0
++
++
++def test_loading_state_status_messages():
++    """Test that LoadingState generates correct status messages."""
++    state = LoadingState()
++
++    # Initial state
++    msg = state.get_status_message()
++    assert "Skills are being loaded" in msg
++
++    # Update with progress
++    state.update_progress(10, 100)
++    msg = state.get_status_message()
++    assert "10/100 skills loaded" in msg
++
++    # Mark complete
++    state.mark_complete()
++    msg = state.get_status_message()
++    assert msg is None  # No message when complete
++
++
++def test_search_engine_incremental_indexing():
++    """Test that search engine can add skills incrementally."""
++    engine = SkillSearchEngine("all-MiniLM-L6-v2")
++
++    # Create test skills
++    skills1 = [
++        Skill("Skill 1", "Description 1", "Content 1", "source1"),
++        Skill("Skill 2", "Description 2", "Content 2", "source2"),
++    ]
++
++    skills2 = [
++        Skill("Skill 3", "Description 3", "Content 3", "source3"),
++        Skill("Skill 4", "Description 4", "Content 4", "source4"),
++    ]
++
++    # Add first batch
++    engine.add_skills(skills1)
++    assert len(engine.skills) == 2
++    assert engine.embeddings is not None
++    assert engine.embeddings.shape[0] == 2
++
++    # Add second batch
++    engine.add_skills(skills2)
++    assert len(engine.skills) == 4
++    assert engine.embeddings.shape[0] == 4
++
++    # Verify search works with all skills
++    results = engine.search("Description 3", top_k=1)
++    assert len(results) == 1
++    assert results[0]["name"] == "Skill 3"
++
++
++def test_search_engine_thread_safety():
++    """Test that search engine is thread-safe during concurrent operations."""
++    import threading
++
++    engine = SkillSearchEngine("all-MiniLM-L6-v2")
++
++    # Create test skills
++    def add_batch(batch_num):
++        skills = [
++            Skill(
++                f"Skill {batch_num}-{i}",
++                f"Description {batch_num}-{i}",
++                f"Content {batch_num}-{i}",
++                f"source{batch_num}-{i}",
++            )
++            for i in range(5)
++        ]
++        engine.add_skills(skills)
++
++    # Add skills from multiple threads
++    threads = [threading.Thread(target=add_batch, args=(i,)) for i in range(10)]
++    for t in threads:
++        t.start()
++    for t in threads:
++        t.join()
++
++    # Verify all skills were added correctly
++    assert len(engine.skills) == 50
++    assert engine.embeddings.shape[0] == 50
++
++
++def test_batch_loading_function():
++    """Test the batch loading function with callbacks."""
++    from src.claude_skills_mcp.config import DEFAULT_CONFIG
++
++    batches_received = []
++    total_counts = []
++
++    def callback(batch_skills, total_loaded):
++        batches_received.append(len(batch_skills))
++        total_counts.append(total_loaded)
++
++    # Use a small subset for testing
++    skill_sources = [
++        {
++            "type": "github",
++            "url": "https://github.com/K-Dense-AI/claude-scientific-skills",
++            "subpath": "scientific-thinking/exploratory-data-analysis",
++        }
++    ]
++
++    # Load with small batch size
++    load_skills_in_batches(skill_sources, DEFAULT_CONFIG, callback, batch_size=1)
++
++    # Verify batches were processed
++    assert len(batches_received) > 0
++    assert sum(batches_received) == total_counts[-1]
++    print(
++        f"\nReceived {len(batches_received)} batches, total {total_counts[-1]} skills"
++    )
++
++
++@pytest.mark.integration
++def test_background_loading_with_server():
++    """Test that server starts immediately and loads skills in background."""
++    import threading
++
++    # Create engine and loading state
++    engine = SkillSearchEngine("all-MiniLM-L6-v2")
++    loading_state = LoadingState()
++
++    # Create server
++    server = SkillsMCPServer(engine, loading_state)
++
++    # Server should start even with no skills loaded
++    assert len(engine.skills) == 0
++
++    # Simulate background loading
++    def background_loader():
++        time.sleep(0.5)  # Simulate loading delay
++        skills = [
++            Skill(f"Skill {i}", f"Description {i}", f"Content {i}", f"source{i}")
++            for i in range(20)
++        ]
++
++        # Load in batches of 5
++        for i in range(0, 20, 5):
++            batch = skills[i : i + 5]
++            engine.add_skills(batch)
++            loading_state.update_progress(i + 5, 20)
++            time.sleep(0.1)
++
++        loading_state.mark_complete()
++
++    # Start background thread
++    thread = threading.Thread(target=background_loader, daemon=True)
++    thread.start()
++
++    # Server should respond immediately (even with no skills)
++    result = asyncio.run(
++        server._handle_search_skills({"task_description": "test", "top_k": 3})
++    )
++    assert len(result) == 1
++    text = result[0].text
++
++    # Should show loading status
++    assert "LOADING" in text or "No skills loaded yet" in text
++
++    # Wait for background loading to complete
++    thread.join(timeout=5)
++
++    # Now should have all skills and no loading message
++    result = asyncio.run(
++        server._handle_search_skills({"task_description": "Description 5", "top_k": 3})
++    )
++    text = result[0].text
++
++    # Should not show loading status anymore
++    assert "LOADING" not in text
++    assert "Found" in text
++
++    print("\n✓ Server started immediately before skills loaded")
++    print("✓ Loading status shown during background loading")
++    print("✓ Search works with incrementally loaded skills")
++    print("✓ Loading status removed after completion")
++
++
++@pytest.mark.integration
++def test_startup_time_comparison():
++    """Compare startup time with background loading vs synchronous loading."""
++
++    # Create small test configuration
++    _ = [
++        {
++            "type": "github",
++            "url": "https://github.com/K-Dense-AI/claude-scientific-skills",
++            "subpath": "scientific-thinking",
++        }
++    ]
++
++    # Measure background loading startup (server ready immediately)
++    start_time = time.time()
++    engine = SkillSearchEngine("all-MiniLM-L6-v2")
++    loading_state = LoadingState()
++    __ = SkillsMCPServer(engine, loading_state)
++    background_startup_time = time.time() - start_time
++
++    # Server is ready even though skills aren't loaded yet
++    print(f"\nBackground loading startup: {background_startup_time:.2f}s")
++    print("  - Server ready: ✓ (immediate)")
++    print("  - Skills loaded: in progress (background)")
++
++    # The background startup should be very fast (<5 seconds)
++    assert background_startup_time < 5.0, "Background startup should be fast"
++
++    print("\n✓ Background loading allows immediate server startup")
++    print(f"✓ Server is responsive in {background_startup_time:.2f}s")
++    print("✓ Skills load in parallel without blocking")
++
++
++if __name__ == "__main__":
++    pytest.main([__file__, "-v"])
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+index 2ef4415..1abc7f5 100644
+--- a/tests/test_integration.py
++++ b/tests/test_integration.py
+@@ -801,7 +801,7 @@ def test_anthropic_specific_skills():
+ @pytest.mark.integration
+ def test_list_skills_tool():
+     """Test that list_skills returns all loaded skills."""
+-    from src.claude_skills_mcp.server import SkillsMCPServer
++    from src.claude_skills_mcp.server import SkillsMCPServer, LoadingState
+     from src.claude_skills_mcp.skill_loader import load_from_github
+     import asyncio
+ 
+@@ -814,7 +814,9 @@ def test_list_skills_tool():
+     # Create engine and server
+     engine = SkillSearchEngine("all-MiniLM-L6-v2")
+     engine.index_skills(skills)
+-    server = SkillsMCPServer(engine)
++    loading_state = LoadingState()
++    loading_state.mark_complete()  # Mark as complete since skills are already loaded
++    server = SkillsMCPServer(engine, loading_state)
+ 
+     # Call list_skills
+     result = asyncio.run(server._handle_list_skills({}))
+diff --git a/tests/test_lazy_loading.py b/tests/test_lazy_loading.py
+index 85986de..84c3c82 100644
+--- a/tests/test_lazy_loading.py
++++ b/tests/test_lazy_loading.py
+@@ -143,7 +143,7 @@ def test_startup_time_improvement():
+ @pytest.mark.integration
+ def test_lazy_fetching_with_server():
+     """Test lazy fetching through the MCP server interface."""
+-    from src.claude_skills_mcp.server import SkillsMCPServer
++    from src.claude_skills_mcp.server import SkillsMCPServer, LoadingState
+     import asyncio
+ 
+     # Load skills (fast - no document content)
+@@ -157,7 +157,9 @@ def test_lazy_fetching_with_server():
+     # Create server
+     engine = SkillSearchEngine("all-MiniLM-L6-v2")
+     engine.index_skills(skills)
+-    server = SkillsMCPServer(engine)
++    loading_state = LoadingState()
++    loading_state.mark_complete()  # Mark as complete since skills are already loaded
++    server = SkillsMCPServer(engine, loading_state)
+ 
+     # Find EDA skill
+     eda_skill = skills[0]

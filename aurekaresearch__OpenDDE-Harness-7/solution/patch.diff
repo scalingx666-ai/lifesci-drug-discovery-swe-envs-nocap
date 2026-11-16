@@ -1,0 +1,806 @@
+diff --git a/opendde_harness/plugin/protein_design/agents/phases.py b/opendde_harness/plugin/protein_design/agents/phases.py
+index da514a5..b3a242f 100644
+--- a/opendde_harness/plugin/protein_design/agents/phases.py
++++ b/opendde_harness/plugin/protein_design/agents/phases.py
+@@ -497,9 +497,11 @@ async def post_filter_run(
+             ensure_ascii=False,
+         )
+         profile = AGENT_PROFILES[AgentRole.POST_FILTER]
++        candidate_ids = {candidate.candidate_id for candidate in candidates}
+         return await self._session.run(
+             profile,
+             prompt,
++            output_validator=lambda output: output.validate_ranking(candidate_ids),
+             skills=self._catalog.select(profile.default_skills),
+             tool_context=ToolContext(
+                 compute=self._compute,
+diff --git a/opendde_harness/plugin/protein_design/agents/session.py b/opendde_harness/plugin/protein_design/agents/session.py
+index c7a81e6..35ca428 100644
+--- a/opendde_harness/plugin/protein_design/agents/session.py
++++ b/opendde_harness/plugin/protein_design/agents/session.py
+@@ -5,7 +5,7 @@
+ import inspect
+ import json
+ import time
+-from collections.abc import Collection
++from collections.abc import Callable, Collection
+ from typing import Any, Protocol, TypeVar, cast
+ 
+ from json_repair import repair_json
+@@ -119,6 +119,7 @@ async def run(
+         *,
+         skills: Collection[SkillDocument] = (),
+         tool_context: ToolContext | None = None,
++        output_validator: Callable[[T], None] | None = None,
+     ) -> T:
+         context = tool_context or ToolContext()
+         started = time.perf_counter()
+@@ -130,7 +131,7 @@ async def run(
+         }
+         self._emit_agent(profile, input_payload, context, ProgressStatus.STARTED)
+         try:
+-            result = await self._run_profile(profile, prompt, skills, context)
++            result = await self._run_profile(profile, prompt, skills, context, output_validator)
+         except Exception as exc:
+             self._emit_agent(
+                 profile,
+@@ -157,6 +158,7 @@ async def _run_profile(
+         prompt: str,
+         skills: Collection[SkillDocument],
+         tool_context: ToolContext,
++        output_validator: Callable[[T], None] | None = None,
+     ) -> T:
+         schema = profile.output_schema
+         messages: list[dict] = [
+@@ -388,6 +390,8 @@ async def _run_profile(
+                         )
+                         continue
+                 else:
++                    if output_validator is not None:
++                        output_validator(validated)
+                     return validated
+             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+                 attempts += 1
+diff --git a/opendde_harness/plugin/protein_design/core/contracts.py b/opendde_harness/plugin/protein_design/core/contracts.py
+index 9890c4b..fb90e38 100644
+--- a/opendde_harness/plugin/protein_design/core/contracts.py
++++ b/opendde_harness/plugin/protein_design/core/contracts.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import math
++from collections import Counter
+ from collections.abc import Mapping
+ from enum import StrEnum
+ from typing import Any, Literal
+@@ -404,6 +405,24 @@ class PostFilterAgentOutput(ContractModel):
+     decisions: list[PostFilterDecision] = Field(min_length=1)
+     risk_notes: list[str] = Field(default_factory=list, max_length=8)
+ 
++    def validate_ranking(self, candidate_ids: set[str]) -> None:
++        counts = Counter(item.candidate_id for item in self.decisions)
++        missing = sorted(candidate_ids - counts.keys())
++        unexpected = sorted(counts.keys() - candidate_ids)
++        duplicates = sorted(candidate_id for candidate_id, count in counts.items() if count > 1)
++        if missing or unexpected or duplicates:
++            raise ValueError(
++                "PostFilter Agent must rank every eligible candidate exactly once; "
++                f"missing IDs: {missing}; unexpected IDs: {unexpected}; duplicate IDs: {duplicates}. "
++                "Return the complete corrected ranking, not only the changed entries."
++            )
++        if sorted(item.rank for item in self.decisions) != list(range(1, len(candidate_ids) + 1)):
++            raise ValueError(
++                "PostFilter Agent ranks must be unique and contiguous from 1 "
++                f"through {len(candidate_ids)}; received ranks: {[item.rank for item in self.decisions]}. "
++                "Return the complete corrected ranking."
++            )
++
+ 
+ class AnalysisResponse(ContractModel):
+     available: bool = True
+diff --git a/opendde_harness/plugin/protein_design/core/orchestrator.py b/opendde_harness/plugin/protein_design/core/orchestrator.py
+index ce8cdb2..636f221 100644
+--- a/opendde_harness/plugin/protein_design/core/orchestrator.py
++++ b/opendde_harness/plugin/protein_design/core/orchestrator.py
+@@ -1339,11 +1339,7 @@ def _post_filter_policy_selection(
+         output = PostFilterAgentOutput.model_validate(value)
+         by_id = {candidate.candidate_id: candidate for candidate in eligible}
+         decisions = output.decisions
+-        ids = [item.candidate_id for item in decisions]
+-        if len(ids) != len(set(ids)) or set(ids) != set(by_id):
+-            raise ValueError("PostFilter Agent must rank every eligible candidate exactly once")
+-        if sorted(item.rank for item in decisions) != list(range(1, len(by_id) + 1)):
+-            raise ValueError("PostFilter Agent ranks must be unique and contiguous from 1")
++        output.validate_ranking(set(by_id))
+         ranked = sorted(decisions, key=lambda item: item.rank)
+         result = [
+             {
+diff --git a/opendde_harness/tracing/viewer/protein-design-store.js b/opendde_harness/tracing/viewer/protein-design-store.js
+index f4e68d6..75cdbd4 100644
+--- a/opendde_harness/tracing/viewer/protein-design-store.js
++++ b/opendde_harness/tracing/viewer/protein-design-store.js
+@@ -269,6 +269,10 @@ function projectPostFilter(summary, readArtifact) {
+         objective: finiteNumber(decision?.objective),
+         sequence: typeof candidate.sequence === 'string' ? candidate.sequence : '',
+         metrics,
++        metadata: {
++          gate_evidence: candidate.metadata?.gate_evidence || null,
++          loss: candidate.metadata?.loss || null
++        },
+         passFilter: decision?.pass_filter === true,
+         hardEligible: decision?.hard_eligible === true,
+         rationale: String(decision?.rationale || ''),
+diff --git a/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js b/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js
+index 4a31b7e..e82252c 100644
+--- a/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js
++++ b/opendde_harness/tracing/viewer/test/protein-design-candidates.test.js
+@@ -23,11 +23,121 @@ const {
+   propertyTicks,
+   renderParallelCoordinates,
+   renderProteinDesignDashboard,
++  resultRun,
+   restoreDashboardViewState,
+   selectRunId,
+   shortTaskId
+ } = require('../ui/protein-design-candidates')
+ 
++test('post-filter reuses candidate rows and refolded metrics without mutating design results', () => {
++  const original = {
++    candidateId: 'a',
++    cycle: 3,
++    sequence: 'AAA',
++    metrics: { iptm: 0.1, loss: 5 },
++    structureArtifactPath: '/old.json'
++  }
++  const run = {
++    taskId: 'run',
++    cycles: [{ cycle: 3, candidates: [original] }],
++    structures: [{ candidateId: 'a', cycle: 3, artifactPath: '/old.json' }],
++    postFilter: {
++      decisions: [
++        {
++          candidateId: 'a',
++          rank: 1,
++          passFilter: true,
++          rationale: 'Best geometry',
++          metrics: { iptm: 0.9, plddt: 0.8 },
++          structureArtifactPath: '/refold.json',
++          targetChainIds: ['A'],
++          binderChainIds: ['B']
++        },
++        {
++          candidateId: 'b',
++          rank: 2,
++          passFilter: false,
++          hardEligible: false,
++          sequence: 'BBB',
++          metrics: {},
++          structureArtifactPath: null
++        }
++      ]
++    }
++  }
++  assert.equal(resultRun(run, 'design'), run)
++  const projected = resultRun(run, 'post-filter')
++  const rows = candidateGroups(projected)
++  assert.equal(rows.length, 2)
++  assert.equal(rows[0].candidates[0].sequence, 'AAA')
++  assert.deepEqual(rows[0].candidates[0].metrics, { iptm: 0.9, plddt: 0.8 })
++  assert.equal(projected.structures[0].artifactPath, '/refold.json')
++  assert.deepEqual(projected.structures[0].binderChainIds, ['B'])
++  assert.equal(original.metrics.iptm, 0.1)
++  const html = renderProteinDesignDashboard({ run: projected })
++  assert.match(html, /protein-candidate-table/)
++  assert.match(html, /protein-inspector-panel/)
++  assert.match(html, /#1 · Selected/)
++  assert.match(html, /Best geometry/)
++  assert.match(html, /Hard rejected/)
++  assert.doesNotMatch(html, /protein-filter-structure-panel|View other sequences/)
++  assert.match(html, /value="metric:plddt">pLDDT/)
++  assert.match(html, /data-table-metrics=".*&quot;plddt&quot;:0.8/)
++})
++
++test('post-filter does not reuse design candidates when decisions are absent', () => {
++  const run = { cycles: [{ cycle: 1, candidates: [{ candidateId: 'design-only' }] }] }
++  const projected = resultRun(run, 'post-filter')
++  assert.deepEqual(candidateGroups(projected), [])
++  assert.deepEqual(projected.structures, [])
++})
++
++test('post-filter reads final contact and loss evidence without borrowing design evidence', () => {
++  const oldMetadata = {
++    gate_evidence: { cdr_total_contacts: 999, framework_total_contacts: 999 },
++    loss: { loss_components: { i_pae: 999 } }
++  }
++  const run = {
++    cycles: [
++      {
++        cycle: 1,
++        candidates: [
++          { candidateId: 'ok', metadata: oldMetadata },
++          { candidateId: 'failed', metadata: oldMetadata }
++        ]
++      }
++    ],
++    postFilter: {
++      decisions: [
++        {
++          candidateId: 'ok',
++          metrics: { iptm: 0.8, ranking_score: 0.7, loss: 1.2 },
++          metadata: {
++            gate_evidence: { cdr_total_contacts: 66, framework_total_contacts: 0 },
++            loss: { loss_components: { i_pae: 0.3 } }
++          }
++        },
++        { candidateId: 'failed', metrics: {} }
++      ]
++    }
++  }
++  const projected = resultRun(run, 'post-filter')
++  const [ok, failed] = candidateGroups(projected).map(group => group.candidates[0])
++  const value = (candidate, key) =>
++    propertyValue(
++      candidate,
++      PROPERTY_DEFINITIONS.find(item => item.key === key)
++    )
++  assert.equal(value(ok, 'contacts'), 66)
++  assert.equal(value(ok, 'frame_contacts'), 0)
++  assert.equal(value(ok, 'min_ipa'), 0.3)
++  for (const key of ['contacts', 'frame_contacts', 'min_ipa']) assert.equal(value(failed, key), null)
++  assert.equal(oldMetadata.gate_evidence.cdr_total_contacts, 999)
++  const complete = { ...projected, cycles: [{ cycle: 1, candidates: [ok] }] }
++  assert.doesNotMatch(renderProteinDesignDashboard({ run: complete }), /metrics incomplete/)
++  assert.match(renderProteinDesignDashboard({ run: projected }), /metrics incomplete/)
++})
++
+ test('metric labels use canonical scientific capitalization', () => {
+   assert.equal(metricLabel('cdr3_gate_passed'), 'CDR3 gate passed')
+   for (const [key, label] of Object.entries({
+diff --git a/opendde_harness/tracing/viewer/test/protein-design-store.test.js b/opendde_harness/tracing/viewer/test/protein-design-store.test.js
+index 9bbf1e9..521c4fa 100644
+--- a/opendde_harness/tracing/viewer/test/protein-design-store.test.js
++++ b/opendde_harness/tracing/viewer/test/protein-design-store.test.js
+@@ -186,7 +186,11 @@ test('projects dynamic cycle and global-best metric series without conflating ca
+       {
+         candidate_id: 'cycle-best',
+         sequence: 'ACDE',
+-        metrics: { iptm: 0.81, plddt: 0.88, cdr_contact_fraction: 0.84, gate_passed: 1 }
++        metrics: { iptm: 0.81, plddt: 0.88, cdr_contact_fraction: 0.84, gate_passed: 1 },
++        metadata: {
++          gate_evidence: { cdr_total_contacts: 66, framework_total_contacts: 0 },
++          loss: { loss_components: { i_pae: 0.3 } }
++        }
+       }
+     ],
+     decisions: [
+@@ -255,6 +259,7 @@ test('projects dynamic cycle and global-best metric series without conflating ca
+   assert.equal(projected.run.postFilter.decisions[0].metrics.plddt, 0.88)
+   assert.equal(projected.run.postFilter.decisions[0].metrics.cdr_contact_fraction, 0.84)
+   assert.equal(projected.run.postFilter.decisions[0].metrics.gate_passed, undefined)
++  assert.deepEqual(projected.run.postFilter.decisions[0].metadata, finalSelection.candidates[0].metadata)
+   assert.equal(projected.run.failureCount, 1)
+   const candidateNode = projected.run.tree.nodes.find(node => node.id === 'candidate:cycle-best')
+   assert.equal(candidateNode.parentId, 'candidate:missing-parent')
+@@ -550,5 +555,6 @@ test('post-filter failures are failed, never fallback, and obsolete scores are i
+     assert.equal(Object.hasOwn(result, 'metricWeights'), false)
+     assert.equal(Object.hasOwn(result.decisions[0], 'score'), false)
+     assert.equal(result.decisions[0].rank, 1)
++    assert.deepEqual(result.decisions[0].metadata, { gate_evidence: null, loss: null })
+   }
+ })
+diff --git a/opendde_harness/tracing/viewer/test/protein-design-ui.test.js b/opendde_harness/tracing/viewer/test/protein-design-ui.test.js
+index 0142536..a74969a 100644
+--- a/opendde_harness/tracing/viewer/test/protein-design-ui.test.js
++++ b/opendde_harness/tracing/viewer/test/protein-design-ui.test.js
+@@ -215,8 +215,6 @@ test('renders run controls metric points structure controls and candidate tree',
+   assert.match(html, /protein-properties-pane/)
+   assert.match(html, /data-structure-color="plddt-confidence"/)
+   assert.match(html, /data-structure-action="expand"/)
+-  assert.match(html, /data-target-chain-ids="\[&quot;A&quot;\]"/)
+-  assert.match(html, /data-binder-chain-ids="\[&quot;D&quot;\]"/)
+   assert.match(html, /data-cycle="0"/)
+   assert.match(html, /class="protein-tree-svg"/)
+   assert.match(html, /class="protein-tree-legend"/)
+@@ -225,17 +223,14 @@ test('renders run controls metric points structure controls and candidate tree',
+   assert.ok(html.indexOf('Prefer intended CDR contacts') < html.indexOf('protein-design-details'))
+   assert.doesNotMatch(html, /Selected candidate evidence|Finalizing design artifacts and traces/)
+   assert.match(html, /Prefer intended CDR contacts/)
+-  assert.match(html, /Best CDR geometry/)
+   assert.doesNotMatch(html, /Filter score/)
+   assert.match(html, /Successfully refolded/)
+-  assert.match(html, /data-post-filter-structure/)
++  assert.doesNotMatch(html, /data-post-filter-structure/)
+   assert.match(html, /class="protein-filter-overview"/)
+-  assert.match(html, /class="protein-filter-structure-panel"/)
+-  assert.match(html, /data-structure-path="\/artifacts\/refolded-best\.json"/)
++  assert.doesNotMatch(html, /class="protein-filter-structure-panel"/)
+   assert.match(html, /data-candidate-id="candidate-2"/)
+   assert.match(html, /ipTM/)
+   assert.match(html, /pLDDT/)
+-  assert.match(html, /0\.81/)
+ })
+ 
+ test('keeps the post-filter panel empty when the stage was not enabled', () => {
+diff --git a/opendde_harness/tracing/viewer/ui/protein-design-candidates.js b/opendde_harness/tracing/viewer/ui/protein-design-candidates.js
+index 38cd099..24d0c06 100644
+--- a/opendde_harness/tracing/viewer/ui/protein-design-candidates.js
++++ b/opendde_harness/tracing/viewer/ui/protein-design-candidates.js
+@@ -294,6 +294,7 @@
+   }
+ 
+   function candidateTableValue(candidate, run, key) {
++    if (key === 'filter_rank') return finiteValue(candidate.postFilterDecision?.rank)
+     if (key === 'cycle') return finiteValue(Number(candidate.cycle))
+     if (key === 'sequence') return candidate.sequence || ''
+     if (key === 'candidate_id') return candidate.candidateId || ''
+@@ -306,15 +307,19 @@
+ 
+   function candidateTableAttributes(candidate, run) {
+     const values = Object.fromEntries(
+-      [...new Set([...TABLE_SORT_DEFINITIONS, ...TABLE_FILTER_DEFINITIONS].map(definition => definition.key))].map(
+-        key => [key, candidateTableValue(candidate, run, key)]
+-      )
++      [
++        ...new Set(
++          [...TABLE_SORT_DEFINITIONS, ...TABLE_FILTER_DEFINITIONS, ...PROPERTY_DEFINITIONS].map(
++            definition => definition.key
++          )
++        )
++      ].map(key => [key, candidateTableValue(candidate, run, key)])
+     )
+     const attributes = Object.entries(values).map(
+       ([key, value]) => `data-table-${key.replaceAll('_', '-')}="${escapeHtml(value ?? '')}"`
+     )
+     const searchable = [candidate.sequence, candidate.candidateId, run.target].filter(Boolean).join(' ').toLowerCase()
+-    return `${attributes.join(' ')} data-table-search="${escapeHtml(searchable)}"`
++    return `${attributes.join(' ')} data-table-filter-rank="${escapeHtml(candidate.postFilterDecision?.rank ?? '')}" data-table-metrics="${escapeHtml(JSON.stringify(candidate.metrics || {}))}" data-table-search="${escapeHtml(searchable)}"`
+   }
+ 
+   function tableFilterDomain(run, definition) {
+@@ -341,9 +346,16 @@
+   }
+ 
+   function renderCandidateControls(run) {
+-    const options = TABLE_SORT_DEFINITIONS.map(
+-      definition => `<option value="${escapeHtml(definition.key)}">${escapeHtml(definition.label)}</option>`
+-    ).join('')
++    const definitions = [
++      ...(run.resultView === 'post-filter' ? [{ key: 'filter_rank', label: 'Post-filter rank' }] : []),
++      ...TABLE_SORT_DEFINITIONS,
++      ...availableProperties(run).filter(
++        definition => !['ranking_score', 'contacts', 'min_ipa'].includes(definition.key)
++      )
++    ]
++    const options = definitions
++      .map(definition => `<option value="${escapeHtml(definition.key)}">${escapeHtml(definition.label)}</option>`)
++      .join('')
+     return `<div class="protein-table-controls"><label>View <select data-result-view><option value="design">Design</option><option value="post-filter">Post-filter</option></select></label><label data-design-only>Sort by <select data-candidate-sort>${options}</select></label><button type="button" data-sort-direction value="desc" title="Reverse sort order">DESC ↓</button>${renderCandidateFilters(run)}</div>`
+   }
+ 
+@@ -371,6 +383,11 @@
+   }
+ 
+   function candidateGroups(run) {
++    if (run.resultView === 'post-filter') {
++      return (run.cycles || []).flatMap(cycle =>
++        cycle.candidates.map(candidate => ({ cycle: cycle.cycle, candidates: [candidate] }))
++      )
++    }
+     return (run.cycles || [])
+       .map(cycle => ({
+         cycle: cycle.cycle,
+@@ -384,6 +401,42 @@
+     return candidateGroups(run).flatMap(group => group.candidates)
+   }
+ 
++  function resultRun(run, view) {
++    if (!run || view !== 'post-filter') return run
++    const originals = new Map(allCandidates(run).map(candidate => [candidate.candidateId, candidate]))
++    const candidates = (run.postFilter?.decisions || []).map(decision => {
++      const original = originals.get(decision.candidateId)
++      return {
++        ...original,
++        ...decision,
++        cycle: original?.cycle ?? null,
++        sequence: decision.sequence || original?.sequence || '',
++        metrics: { ...decision.metrics },
++        metadata: {
++          ...original?.metadata,
++          loss: decision.metadata?.loss || null,
++          gate_evidence: decision.metadata?.gate_evidence || null
++        },
++        postFilterDecision: decision
++      }
++    })
++    return {
++      ...run,
++      resultView: view,
++      candidateCount: candidates.length,
++      cycles: candidates.map(candidate => ({ cycle: candidate.cycle, candidates: [candidate] })),
++      structures: candidates
++        .filter(candidate => candidate.structureArtifactPath)
++        .map(candidate => ({
++          candidateId: candidate.candidateId,
++          cycle: candidate.cycle,
++          artifactPath: candidate.structureArtifactPath,
++          targetChainIds: candidate.targetChainIds || [],
++          binderChainIds: candidate.binderChainIds || []
++        }))
++    }
++  }
++
+   function cycleLeaders(run) {
+     return candidateGroups(run).map(group => group.candidates[0])
+   }
+@@ -423,6 +476,19 @@
+     const cdrContacts = candidateTableValue(candidate, run, 'cdr_contacts')
+     const minPae = candidateTableValue(candidate, run, 'min_pae')
+     const sequence = candidate.sequence || 'Sequence unavailable'
++    const decision = candidate.postFilterDecision
++    const decisionLabel = decision
++      ? `#${decision.rank || '-'} · ${decision.passFilter ? 'Selected' : decision.hardEligible ? 'Not selected' : 'Hard rejected'}`
++      : ''
++    const decisionDetail = decision
++      ? [
++          decision.rationale,
++          ...(decision.strengths || []).map(value => `Strength: ${value}`),
++          ...(decision.risks || []).map(value => `Risk: ${value}`)
++        ]
++          .filter(Boolean)
++          .join('\n')
++      : ''
+     const missingProperties = PROPERTY_DEFINITIONS.filter(
+       definition => propertyValue(candidate, definition) === null
+     ).map(definition => definition.label)
+@@ -432,7 +498,7 @@
+         <span aria-hidden="true"></span>
+       </label>
+       <div class="protein-candidate-cycle"><span>${escapeHtml(candidate.cycle)}</span></div>
+-      <div class="protein-candidate-id"><code title="${escapeHtml(candidate.candidateId)}">${escapeHtml(candidate.candidateId)}</code></div>
++      <div class="protein-candidate-id"><code title="${escapeHtml(candidate.candidateId)}">${escapeHtml(candidate.candidateId)}</code>${decision ? `<small class="protein-post-filter-status" tabindex="0" title="${escapeHtml(decisionDetail)}">${escapeHtml(decisionLabel)}</small>` : ''}</div>
+       <div class="protein-candidate-target" title="${escapeHtml(run.target || 'Unknown target')}">${escapeHtml(run.target || '-')}</div>
+       <div class="protein-candidate-sequence"><div class="protein-candidate-sequence-main"><span class="protein-sequence-summary" tabindex="0">${renderCandidateSequence(candidate, run)}</span><button type="button" data-copy-sequence="${escapeHtml(sequence)}" title="Copy sequence">Copy</button>${renderSequencePreview(candidate, run)}</div><small>${escapeHtml(sequence.length)} residues${isLeader ? ' · cycle leader' : ''}${missingProperties.length ? ` · <span title="Missing: ${escapeHtml(missingProperties.join(', '))}">metrics incomplete</span>` : ''}</small></div>
+       <div class="protein-candidate-score"><strong>${escapeHtml(formatNumber(ranking))}</strong></div>
+@@ -456,7 +522,7 @@
+           .map(candidate => renderCandidateRow(candidate, selectedKeys, false, run, extraMetrics))
+           .join('')
+         return `<section class="protein-cycle-group" data-cycle="${escapeHtml(group.cycle)}">
+-        ${renderCandidateRow(leader, selectedKeys, true, run, extraMetrics)}
++        ${renderCandidateRow(leader, selectedKeys, run.resultView !== 'post-filter', run, extraMetrics)}
+         ${others.length ? `<details class="protein-cycle-more"><summary><div class="protein-cycle-more-label">View other sequences <span data-other-count>${escapeHtml(others.length)}</span></div></summary><div>${otherRows}</div></details>` : ''}
+       </section>`
+       })
+@@ -696,8 +762,8 @@
+       <header class="protein-dashboard-header">${renderOverview(run)}${renderRunPicker(runs, payload.selectedRunId || run.taskId)}</header>
+       <main class="protein-candidate-workspace">
+         <section class="protein-candidate-panel">
+-          <header class="protein-panel-toolbar"><div><strong>Design candidates</strong><span>${escapeHtml(run.candidateCount || allCandidates(run).length)} sequences across ${escapeHtml(candidateGroups(run).length)} cycles</span></div>${renderCandidateControls(run)}</header>
+-          <div class="protein-design-results">${renderCandidateTable(run, resolvedSelectedKeys)}</div><div class="protein-post-filter-results" hidden><!--post-filter-results--></div>
++          <header class="protein-panel-toolbar"><div><strong>Design candidates</strong><span>${escapeHtml(run.candidateCount || allCandidates(run).length)} sequences across ${escapeHtml(new Set(candidateGroups(run).map(group => group.cycle)).size)} cycles</span></div>${renderCandidateControls(run)}</header>
++          <div class="protein-post-filter-results" hidden><!--post-filter-results--></div><div class="protein-design-results">${renderCandidateTable(run, resolvedSelectedKeys)}</div>
+         </section>
+         <section class="protein-inspector-panel">
+           <div class="protein-structure-pane">
+@@ -1548,6 +1614,7 @@
+   }
+ 
+   function rowTableValue(row, key) {
++    if (key.startsWith('metric:')) return finiteValue(JSON.parse(row.dataset.tableMetrics || '{}')[key.slice(7)])
+     const value = row.dataset[tableDatasetName(key)]
+     if (['sequence', 'candidate_id', 'target'].includes(key)) return value || ''
+     return value === '' || value == null ? null : Number(value)
+@@ -1701,7 +1768,9 @@
+   }
+ 
+   function mount(rootElement, payload, handlers = {}, savedViewState = null) {
+-    const run = payload.run
++    const sameTask = rootElement._proteinRunId === payload.run?.taskId
++    if (!sameTask) rootElement._proteinResultView = 'design'
++    const run = resultRun(payload.run, rootElement._proteinResultView)
+     const viewState = savedViewState || captureDashboardViewState(rootElement)
+     if (!run) {
+       rootElement._proteinViewer?.dispose?.()
+@@ -1735,14 +1804,19 @@
+     rootElement._proteinCandidateTableState =
+       sameRun && rootElement._proteinCandidateTableState
+         ? rootElement._proteinCandidateTableState
+-        : { sortKey: 'cycle', direction: 'desc', query: '', ranges: {} }
++        : {
++            sortKey: run.resultView === 'post-filter' ? 'filter_rank' : 'cycle',
++            direction: run.resultView === 'post-filter' ? 'asc' : 'desc',
++            query: '',
++            ranges: {}
++          }
+     if (!STRUCTURE_COLOR_MODES[rootElement._proteinStructureColorMode])
+       rootElement._proteinStructureColorMode = 'design'
+     rootElement._proteinShowSidechains = rootElement._proteinShowSidechains === true
+     if (!sameRun) rootElement._proteinResultView = 'design'
+     rootElement._proteinRunId = run.taskId
+     rootElement.innerHTML = renderProteinDesignDashboard(
+-      payload,
++      { ...payload, run },
+       rootElement._proteinSelectedKeys,
+       rootElement._proteinVisiblePropertyKeys
+     )
+@@ -1757,19 +1831,21 @@
+     const showResults = () => {
+       const postFilter = resultView.value === 'post-filter'
+       rootElement._proteinResultView = resultView.value
+-      rootElement.querySelector('.protein-design-results').hidden = postFilter
+       rootElement.querySelector('.protein-post-filter-results').hidden = !postFilter
+-      rootElement
+-        .querySelectorAll('[data-design-only], [data-sort-direction], .protein-candidate-filters')
+-        .forEach(node => {
+-          node.hidden = postFilter
+-        })
+       rootElement.querySelector('.protein-panel-toolbar > div > strong').textContent = postFilter
+         ? 'Post-filter results'
+         : 'Design candidates'
+     }
+     resultView.value = rootElement._proteinResultView || 'design'
+-    resultView.addEventListener('change', showResults)
++    resultView.addEventListener('change', () => {
++      rootElement._proteinResultView = resultView.value
++      rootElement._proteinCandidateTableState = null
++      rootElement._proteinSelectedKeys = new Set()
++      rootElement._proteinActiveCandidateKey = null
++      rootElement._proteinDisplayedSignature = null
++      if (handlers.onResultViewChange) handlers.onResultViewChange()
++      else mount(rootElement, payload, handlers)
++    })
+     showResults()
+ 
+     rootElement.querySelectorAll('[data-run-id]').forEach(button => {
+@@ -1905,7 +1981,7 @@
+         .querySelector(`[data-candidate-key="${CSS.escape(rootElement._proteinActiveCandidateKey)}"]`)
+         ?.classList.add('is-active')
+       showCandidateStructures(rootElement, run, structureCandidates(rootElement, run, byKey))
+-    }
++    } else showCandidateStructures(rootElement, run, [])
+   }
+ 
+   return {
+@@ -1926,6 +2002,7 @@
+     pdbAlphaCarbons,
+     parallelGeometry,
+     propertyValue,
++    resultRun,
+     propertyTicks,
+     propertyDefinitions,
+     metricLabel,
+diff --git a/opendde_harness/tracing/viewer/ui/protein-design.css b/opendde_harness/tracing/viewer/ui/protein-design.css
+index 33b8d24..f9bf615 100644
+--- a/opendde_harness/tracing/viewer/ui/protein-design.css
++++ b/opendde_harness/tracing/viewer/ui/protein-design.css
+@@ -1748,7 +1748,11 @@ body.app-view-protein-design .protein-design-details .protein-section { backgrou
+ body.app-view-protein-design .protein-design-details .protein-activity-list { max-height: 460px; }
+ body.app-view-protein-design .protein-design-details #proteinSelectedEvidence { padding: 14px; }
+ body.app-view-protein-design .protein-design-results { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+-body.app-view-protein-design .protein-post-filter-results { flex: 1; min-height: 0; overflow: auto; padding: 12px; }
++body.app-view-protein-design .protein-post-filter-results { flex: 0 0 auto; max-height: 28vh; overflow: auto; padding: 12px; }
++body.app-view-protein-design .protein-post-filter-status { display: block; color: var(--text-muted); white-space: normal; }
++body.app-view-protein-design .protein-post-filter-results .protein-filter-overview { grid-template-columns: minmax(0, 1fr); }
++body.app-view-protein-design .protein-post-filter-results .protein-filter-summary { grid-template-columns: repeat(5, minmax(0, 1fr)); }
++body.app-view-protein-design .protein-post-filter-results .protein-filter-summary > div { min-width: 0; padding: 8px; overflow-wrap: anywhere; }
+ body.app-view-protein-design [hidden] { display: none !important; }
+ body.app-view-protein-design .protein-metric-explorer { display: block; }
+ body.app-view-protein-design .protein-metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); max-height: none; overflow: visible; }
+@@ -1836,7 +1840,9 @@ body.app-view-protein-design :is(.protein-unified-menu, .protein-cycle-picker >
+   background: var(--theme-surface-1, white); padding: 6px; box-shadow: 0 8px 24px #24144420;
+   max-height: min(360px, 55vh); overflow-y: auto; overscroll-behavior: contain;
+ }
+-body.app-view-protein-design .protein-unified-menu { position: fixed; inset: auto; margin: 0; z-index: 2000; }
++body.app-view-protein-design .protein-unified-menu { position: fixed; inset: auto; margin: 0; z-index: 2000; overflow-y: scroll; overflow-x: hidden; scrollbar-gutter: stable; scrollbar-width: auto; scrollbar-color: var(--border-strong) var(--theme-surface-1, white); }
++body.app-view-protein-design .protein-unified-menu::-webkit-scrollbar { width: 12px; }
++body.app-view-protein-design .protein-unified-menu::-webkit-scrollbar-thumb { background: var(--border-strong); border: 3px solid var(--theme-surface-1, white); border-radius: 8px; }
+ body.app-view-protein-design :is(.protein-unified-menu, .protein-cycle-picker > div, .protein-structure-color-menu > div) button {
+   display: block; width: 100%; min-height: 32px; height: auto; padding: 7px 10px;
+   border: 0; border-radius: 6px; background: var(--theme-surface-1, white); text-align: left;
+diff --git a/opendde_harness/tracing/viewer/ui/protein-design.js b/opendde_harness/tracing/viewer/ui/protein-design.js
+index 57be8d0..56191be 100644
+--- a/opendde_harness/tracing/viewer/ui/protein-design.js
++++ b/opendde_harness/tracing/viewer/ui/protein-design.js
+@@ -450,46 +450,6 @@
+       return '<div class="protein-empty-inline">No post-filter stage data for this run.</div>'
+     }
+     const errors = [postFilter.postRefoldError, postFilter.postFilterError].filter(Boolean)
+-    const decisions = (postFilter.decisions || [])
+-      .map(decision => {
+-        const metricRows = Object.entries(decision.metrics || {})
+-          .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+-          .sort(([left], [right]) => left.localeCompare(right))
+-          .map(
+-            ([name, value]) =>
+-              `<div><dt>${escapeHtml(humanizeFieldName(name))}</dt><dd>${escapeHtml(formatNumber(value))}</dd></div>`
+-          )
+-          .join('')
+-        const structurePanel = decision.structureArtifactPath
+-          ? `<section class="protein-filter-structure-panel">
+-            <header><strong>Refolded final structure</strong><span>${escapeHtml(decision.candidateId)}</span></header>
+-            <div class="protein-filter-structure" data-post-filter-structure
+-              data-structure-path="${escapeHtml(decision.structureArtifactPath)}"
+-              data-target-chain-ids="${escapeHtml(JSON.stringify(decision.targetChainIds || []))}"
+-              data-binder-chain-ids="${escapeHtml(JSON.stringify(decision.binderChainIds || []))}">
+-              <div class="protein-structure-message">Structure will load when visible.</div>
+-            </div>
+-          </section>`
+-          : `<section class="protein-filter-structure-panel">
+-            <header><strong>Refolded final structure</strong><span>${escapeHtml(decision.candidateId)}</span></header>
+-            <div class="protein-filter-structure protein-filter-structure-missing"><div class="protein-structure-message">No captured structure for this candidate.</div></div>
+-          </section>`
+-        return `
+-      <article class="protein-filter-decision${decision.passFilter ? ' is-selected' : ''}" data-candidate-id="${escapeHtml(decision.candidateId)}">
+-        <div class="protein-filter-decision-head">
+-          <div class="protein-filter-rank">#${escapeHtml(decision.rank || '-')}</div>
+-          <div class="protein-filter-decision-main">
+-            <div><strong>${escapeHtml(decision.candidateId)}</strong><span>${decision.passFilter ? 'Selected' : decision.hardEligible ? 'Not selected' : 'Hard rejected'}</span></div>
+-            <p>${escapeHtml(decision.rationale || 'No rationale captured.')}</p>
+-            ${decision.strengths?.length ? `<small>Strengths · ${escapeHtml(decision.strengths.join('; '))}</small>` : ''}
+-            ${decision.risks?.length ? `<small class="protein-filter-risk">Risks · ${escapeHtml(decision.risks.join('; '))}</small>` : ''}
+-          </div>
+-        </div>
+-        <dl class="protein-filter-metrics"><div><dt>Objective</dt><dd>${escapeHtml(formatNumber(decision.objective))}</dd></div>${metricRows}</dl>
+-        ${structurePanel}
+-      </article>`
+-      })
+-      .join('')
+     return `<div class="protein-filter-overview">
+         <div class="protein-filter-summary">
+           <div><span>Status</span><strong>${escapeHtml(humanizeFieldName(postFilter.status))}</strong></div>
+@@ -501,7 +461,7 @@
+         <div class="protein-filter-strategy"><strong>Selection criteria</strong><p>${escapeHtml(postFilter.strategySummary || '-')}</p></div>
+       </div>
+       ${errors.length ? `<div class="protein-filter-errors">${errors.map(error => `<p>${escapeHtml(error)}</p>`).join('')}</div>` : ''}
+-      <div class="protein-filter-decisions">${decisions || '<div class="protein-empty-inline">Post-filter ran without candidate decisions.</div>'}</div>`
++      ${postFilter.decisions?.length ? '' : '<div class="protein-empty-inline">Post-filter ran without candidate decisions.</div>'}`
+   }
+ 
+   function renderProteinDesignDashboard(payload) {
+@@ -1242,7 +1202,16 @@
+     } else if (previousWorkspace) {
+       previousWorkspace._proteinViewer?.dispose?.()
+     }
+-    if (workspace) candidatesDashboard.mount(workspace, payload, handlers, sameRun ? candidateViewState : null)
++    if (workspace)
++      candidatesDashboard.mount(
++        workspace,
++        payload,
++        {
++          ...handlers,
++          onResultViewChange: () => mount(rootElement, payload, handlers)
++        },
++        sameRun ? candidateViewState : null
++      )
+     rootElement.querySelector('#proteinOpenTrace')?.addEventListener('click', () => {
+       if (payload.run) handlers.onOpenTrace?.(payload.run)
+     })
+diff --git a/tests/test_protein_design_post_filter_retry.py b/tests/test_protein_design_post_filter_retry.py
+new file mode 100644
+index 0000000..8e78121
+--- /dev/null
++++ b/tests/test_protein_design_post_filter_retry.py
+@@ -0,0 +1,124 @@
++"""Post-filter semantic validation shares the bounded structured-output repair loop."""
++
++import asyncio
++import copy
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from opendde_harness.plugin.protein_design.agents.phases import ProteinDesignPhases
++from opendde_harness.plugin.protein_design.agents.profiles import AGENT_PROFILES, AgentRole
++from opendde_harness.plugin.protein_design.agents.session import OpenDDEHarnessStructuredSession
++from opendde_harness.plugin.protein_design.core.contracts import AnalyzeAgentOutput, Candidate
++from opendde_harness.providers.base import LLMResponse
++
++
++def ranking(ids=("a", "b"), ranks=(1, 2)):
++    return json.dumps(
++        {
++            "strategy_summary": "Use refold evidence",
++            "decisions": [
++                {"candidate_id": candidate_id, "rank": rank, "rationale": "Evidence-backed order"}
++                for candidate_id, rank in zip(ids, ranks, strict=True)
++            ],
++        }
++    )
++
++
++class Provider:
++    def __init__(self, responses):
++        self.responses = iter(responses)
++        self.calls = []
++
++    async def chat_with_retry(self, **kwargs):
++        self.calls.append(copy.deepcopy(kwargs))
++        response = next(self.responses)
++        if isinstance(response, BaseException):
++            raise response
++        return response
++
++
++def run(provider):
++    phases = ProteinDesignPhases(
++        OpenDDEHarnessStructuredSession(provider, "test"),
++        compute=None,
++        memory=None,
++        catalog=SimpleNamespace(select=lambda _: []),
++    )
++    config = SimpleNamespace(
++        metadata={},
++        target="test",
++        objective_key="loss",
++        minimize=True,
++        post_filter_top_k=1,
++        cdr_regions={},
++        cycles=1,
++        reflection_interval=10,
++        binder_chains={"D": "ACDE"},
++        llm_model=None,
++        llm_max_tokens=None,
++    )
++    return asyncio.run(
++        phases.post_filter_run(
++            config,
++            [Candidate(candidate_id=name, sequence="ACDE") for name in ("a", "b")],
++            AnalyzeAgentOutput(downstream_header="test"),
++        )
++    )
++
++
++@pytest.mark.parametrize(
++    "invalid, detail",
++    [
++        (ranking(("a", "a")), "duplicate IDs: ['a']"),
++        (ranking(("a",), (1,)), "missing IDs: ['b']"),
++        (ranking(("a", "unknown")), "unexpected IDs: ['unknown']"),
++        (ranking(ranks=(1, 1)), "unique and contiguous"),
++        (ranking(ranks=(1, 3)), "unique and contiguous"),
++    ],
++)
++def test_invalid_ranking_is_repaired_with_feedback(invalid, detail):
++    provider = Provider([LLMResponse(invalid), LLMResponse(ranking())])
++    output = run(provider)
++    assert [item.candidate_id for item in output.decisions] == ["a", "b"]
++    assert len(provider.calls) == 2
++    repair_messages = json.dumps(provider.calls[1]["messages"])
++    assert detail in repair_messages
++    assert "complete corrected ranking" in repair_messages
++    assert len(provider.calls[1]["messages"]) > len(provider.calls[0]["messages"])
++
++
++def test_valid_ranking_needs_only_one_attempt():
++    provider = Provider([LLMResponse(ranking())])
++    run(provider)
++    assert len(provider.calls) == 1
++
++
++def test_invalid_rankings_exhaust_three_attempts():
++    provider = Provider([LLMResponse(ranking(("a", "a")))] * 3)
++    with pytest.raises(ValueError, match="missing IDs.*b.*duplicate IDs.*a"):
++        run(provider)
++    assert len(provider.calls) == 3
++
++
++@pytest.mark.parametrize(
++    "response, exception",
++    [
++        (LLMResponse("provider exhausted", finish_reason="error"), RuntimeError),
++        (asyncio.CancelledError(), asyncio.CancelledError),
++    ],
++)
++def test_transport_failure_and_cancellation_are_not_output_retries(response, exception):
++    provider = Provider([response])
++    with pytest.raises(exception):
++        run(provider)
++    assert len(provider.calls) == 1
++
++
++def test_other_sessions_do_not_require_a_semantic_validator():
++    provider = Provider([LLMResponse(ranking())])
++    output = asyncio.run(
++        OpenDDEHarnessStructuredSession(provider, "test").run(AGENT_PROFILES[AgentRole.POST_FILTER], "rank candidates")
++    )
++    assert len(output.decisions) == 2

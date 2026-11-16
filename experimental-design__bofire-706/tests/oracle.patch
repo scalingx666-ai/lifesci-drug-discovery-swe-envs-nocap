@@ -1,0 +1,411 @@
+diff --git a/bofire/data_models/features/api.py b/bofire/data_models/features/api.py
+index f05ae6490..c98554329 100644
+--- a/bofire/data_models/features/api.py
++++ b/bofire/data_models/features/api.py
+@@ -11,6 +11,7 @@
+     EngineeredFeature,
+     MeanFeature,
+     MolecularWeightedSumFeature,
++    ProductFeature,
+     SumFeature,
+     WeightedSumFeature,
+ )
+@@ -46,6 +47,7 @@
+     WeightedSumFeature,
+     MolecularWeightedSumFeature,
+     ContinuousMolecularInput,
++    ProductFeature,
+ ]
+ 
+ AnyInput = Union[
+@@ -66,4 +68,5 @@
+     MeanFeature,
+     WeightedSumFeature,
+     MolecularWeightedSumFeature,
++    ProductFeature,
+ ]
+diff --git a/bofire/data_models/features/engineered_feature.py b/bofire/data_models/features/engineered_feature.py
+index a885629ce..8cc536ab1 100644
+--- a/bofire/data_models/features/engineered_feature.py
++++ b/bofire/data_models/features/engineered_feature.py
+@@ -1,5 +1,7 @@
+ from abc import abstractmethod
+-from typing import TYPE_CHECKING, ClassVar, Literal
++from typing import TYPE_CHECKING, Annotated, ClassVar, List, Literal
++
++from pydantic import Field
+ 
+ from bofire.data_models.features.api import ContinuousDescriptorInput, ContinuousInput
+ from bofire.data_models.features.feature import Feature
+@@ -139,3 +141,23 @@ def validate_features(self, inputs: "Inputs"):
+                 raise ValueError(
+                     f"Feature '{feature_key}' is not a ContinuousMolecularInput",
+                 )
++
++
++class ProductFeature(EngineeredFeature):
++    """Product feature, which compute the sum over the specified features.
++
++    Args:
++        features: The features to be used to compute the product.
++            It is allowed to state a feature more than once to for example
++            an quadratic term.
++        keep_features: Whether to keep the original features after
++            creating the engineered feature in surrogate creation.
++    """
++
++    type: Literal["ProductFeature"] = "ProductFeature"
++    order_id: ClassVar[int] = 4
++    features: Annotated[List[str], Field(min_length=2)]
++
++    @property
++    def n_transformed_inputs(self) -> int:
++        return 1
+diff --git a/bofire/data_models/surrogates/deterministic.py b/bofire/data_models/surrogates/deterministic.py
+index 880b9cb24..31cee404e 100644
+--- a/bofire/data_models/surrogates/deterministic.py
++++ b/bofire/data_models/surrogates/deterministic.py
+@@ -1,7 +1,8 @@
+ from typing import Annotated, Dict, Literal, Type
+ 
+-from pydantic import Field, model_validator
++from pydantic import Field, field_validator, model_validator
+ 
++from bofire.data_models.domain.api import EngineeredFeatures
+ from bofire.data_models.features.api import (
+     AnyOutput,
+     CategoricalInput,
+@@ -66,6 +67,9 @@ def validate_mapping(self):
+ 
+ class LinearDeterministicSurrogate(BotorchSurrogate):
+     type: Literal["LinearDeterministicSurrogate"] = "LinearDeterministicSurrogate"
++    engineered_features: EngineeredFeatures = Field(
++        default_factory=lambda: EngineeredFeatures()
++    )
+     coefficients: Annotated[Dict[str, float], Field(min_length=1)]
+     intercept: float
+ 
+@@ -87,8 +91,24 @@ def validate_input_types(self):
+             )
+         return self
+ 
++    @field_validator("engineered_features")
++    @classmethod
++    def validate_engineered_features(cls, engineered_features, info):
++        for feat in engineered_features.get():
++            if feat.n_transformed_inputs != 1:
++                raise ValueError(
++                    "Only engineered feature that create one output are supported."
++                )
++            if feat.keep_features is False:
++                raise ValueError(
++                    "Invalid engineered feature: LinearDeterministicSurrogate requires keep_features=True for all engineered features."
++                )
++        return engineered_features
++
+     @model_validator(mode="after")
+     def validate_coefficients(self):
+-        if sorted(self.inputs.get_keys()) != sorted(self.coefficients.keys()):
++        if sorted(
++            self.inputs.get_keys() + self.engineered_features.get_keys()
++        ) != sorted(self.coefficients.keys()):
+             raise ValueError("coefficient keys do not match input feature keys.")
+         return self
+diff --git a/bofire/surrogates/deterministic.py b/bofire/surrogates/deterministic.py
+index 1d99f22a4..a742164ca 100644
+--- a/bofire/surrogates/deterministic.py
++++ b/bofire/surrogates/deterministic.py
+@@ -1,5 +1,6 @@
+ import torch
+ from botorch.models.deterministic import AffineDeterministicModel
++from botorch.models.transforms.input import ChainedInputTransform
+ 
+ from bofire.data_models.enum import CategoricalEncodingEnum
+ from bofire.data_models.surrogates.api import (
+@@ -9,6 +10,7 @@
+     LinearDeterministicSurrogate as LinearDeterministicSurrogateDataModel,
+ )
+ from bofire.surrogates.botorch import BotorchSurrogate
++from bofire.surrogates.engineered_features import map as map_feature
+ from bofire.utils.torch_tools import get_NumericToCategorical_input_transform, tkwargs
+ 
+ 
+@@ -20,15 +22,33 @@ def __init__(
+     ):
+         self.intercept = data_model.intercept
+         self.coefficients = data_model.coefficients
++        self.engineered_features = data_model.engineered_features
+         super().__init__(data_model=data_model, **kwargs)
+         self.model = AffineDeterministicModel(
+             b=data_model.intercept,
+             a=torch.tensor(
+-                [data_model.coefficients[key] for key in self.inputs.get_keys()],
++                [data_model.coefficients[key] for key in self.inputs.get_keys()]
++                + [
++                    data_model.coefficients[key]
++                    for key in self.engineered_features.get_keys()
++                ],
+             )
+             .to(**tkwargs)
+             .unsqueeze(-1),
+         )
++        # we have to set an input transform here to do the feature engineering
++        if len(self.engineered_features) > 0:
++            transforms = {}
++            for feature in self.engineered_features.get():
++                transforms[feature.key] = map_feature(
++                    data_model=feature,
++                    inputs=self.inputs,
++                    transform_specs=self.categorical_encodings,
++                )
++            if len(transforms) == 1:
++                self.model.input_transform = list(transforms.values())[0]
++            else:
++                self.model.input_transform = ChainedInputTransform(**transforms)
+ 
+ 
+ class CategoricalDeterministicSurrogate(BotorchSurrogate):
+diff --git a/bofire/surrogates/engineered_features.py b/bofire/surrogates/engineered_features.py
+index babfdc125..849f44048 100644
+--- a/bofire/surrogates/engineered_features.py
++++ b/bofire/surrogates/engineered_features.py
+@@ -1,3 +1,6 @@
++from functools import partial
++from typing import Callable
++
+ import pandas as pd
+ import torch
+ from botorch.models.transforms.input import AppendFeatures
+@@ -7,6 +10,7 @@
+     EngineeredFeature,
+     MeanFeature,
+     MolecularWeightedSumFeature,
++    ProductFeature,
+     SumFeature,
+     WeightedSumFeature,
+ )
+@@ -25,40 +29,33 @@ def _weighted_sum_features(
+     return result.expand(*result.shape[:-2], 1, -1)
+ 
+ 
+-def map_sum_feature(
+-    inputs: Inputs, transform_specs: InputTransformSpecs, feature: SumFeature
++def _map_reduction_feature(
++    inputs: Inputs,
++    transform_specs: InputTransformSpecs,
++    feature: EngineeredFeature,
++    reducer: Callable,
+ ) -> AppendFeatures:
+-    # Get indices of features to be summed
+     features2idx, _ = inputs._get_transform_info(transform_specs)
+-    indices = [features2idx[key][0] for key in feature.features]
+-
+-    def sum_features(X: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+-        result = torch.sum(X[..., indices], dim=-1, keepdim=True).unsqueeze(-2)
++    indices = [features2idx[key][0] for key in feature.features]  # type: ignore
++
++    def reduce_features(
++        X: torch.Tensor,
++        indices: torch.Tensor,
++        reducer: Callable,
++    ) -> torch.Tensor:
++        result = reducer(X[..., indices], dim=-1, keepdim=True).unsqueeze(-2)
+         return result.expand(*result.shape[:-2], 1, -1)
+ 
+     return AppendFeatures(
+-        f=sum_features,  # type: ignore
+-        fkwargs={"indices": indices},
++        f=reduce_features,  # type: ignore
++        fkwargs={"indices": indices, "reducer": reducer},
+         transform_on_train=True,
+     )
+ 
+ 
+-def map_mean_feature(
+-    inputs: Inputs, transform_specs: InputTransformSpecs, feature: MeanFeature
+-) -> AppendFeatures:
+-    # Get indices of features to be summed
+-    features2idx, _ = inputs._get_transform_info(transform_specs)
+-    indices = [features2idx[key][0] for key in feature.features]
+-
+-    def average_features(X: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+-        result = torch.mean(X[..., indices], dim=-1, keepdim=True).unsqueeze(-2)
+-        return result.expand(*result.shape[:-2], 1, -1)
+-
+-    return AppendFeatures(
+-        f=average_features,  # type: ignore
+-        fkwargs={"indices": indices},
+-        transform_on_train=True,
+-    )
++map_sum_feature = partial(_map_reduction_feature, reducer=torch.sum)
++map_product_feature = partial(_map_reduction_feature, reducer=torch.prod)
++map_mean_feature = partial(_map_reduction_feature, reducer=torch.mean)
+ 
+ 
+ def map_weighted_sum_feature(
+@@ -110,6 +107,7 @@ def map_molecular_weighted_sum_feature(
+ 
+ AGGREGATE_MAP = {
+     SumFeature: map_sum_feature,
++    ProductFeature: map_product_feature,
+     MeanFeature: map_mean_feature,
+     WeightedSumFeature: map_weighted_sum_feature,
+     MolecularWeightedSumFeature: map_molecular_weighted_sum_feature,
+diff --git a/tests/bofire/data_models/specs/features.py b/tests/bofire/data_models/specs/features.py
+index 2014934bf..509b282a0 100644
+--- a/tests/bofire/data_models/specs/features.py
++++ b/tests/bofire/data_models/specs/features.py
+@@ -25,6 +25,25 @@
+     },
+ )
+ 
++
++specs.add_valid(
++    features.ProductFeature,
++    lambda: {
++        "key": str(uuid.uuid4()),
++        "features": ["a", "b", "c"],
++        "keep_features": True,
++    },
++)
++
++specs.add_valid(
++    features.ProductFeature,
++    lambda: {
++        "key": str(uuid.uuid4()),
++        "features": ["a", "a"],
++        "keep_features": True,
++    },
++)
++
+ specs.add_valid(
+     features.MeanFeature,
+     lambda: {
+diff --git a/tests/bofire/data_models/specs/surrogates.py b/tests/bofire/data_models/specs/surrogates.py
+index 4825fc797..319460254 100644
+--- a/tests/bofire/data_models/specs/surrogates.py
++++ b/tests/bofire/data_models/specs/surrogates.py
+@@ -717,6 +717,7 @@
+                 features.valid(ContinuousOutput).obj(),
+             ],
+         ).model_dump(),
++        "engineered_features": EngineeredFeatures().model_dump(),
+         "intercept": 5.0,
+         "coefficients": {"a": 2.0, "b": -3.0},
+         "input_preprocessing_specs": {},
+@@ -748,6 +749,7 @@
+     message="coefficient keys do not match input feature keys.",
+ )
+ 
++
+ specs.add_invalid(
+     models.LinearDeterministicSurrogate,
+     lambda: {
+diff --git a/tests/bofire/surrogates/test_deterministic.py b/tests/bofire/surrogates/test_deterministic.py
+index a842d7dde..47498a700 100644
+--- a/tests/bofire/surrogates/test_deterministic.py
++++ b/tests/bofire/surrogates/test_deterministic.py
+@@ -2,11 +2,12 @@
+ from pandas.testing import assert_frame_equal
+ 
+ import bofire.surrogates.api as surrogates
+-from bofire.data_models.domain.api import Inputs, Outputs
++from bofire.data_models.domain.api import EngineeredFeatures, Inputs, Outputs
+ from bofire.data_models.features.api import (
+     CategoricalInput,
+     ContinuousInput,
+     ContinuousOutput,
++    ProductFeature,
+ )
+ from bofire.data_models.surrogates.api import (
+     CategoricalDeterministicSurrogate,
+@@ -33,6 +34,30 @@ def test_linear_deterministic_surrogate():
+     assert_frame_equal(preds, pd.DataFrame(data={"y_pred": [1.5, 10.0], "y_sd": 0.0}))
+ 
+ 
++def test_linear_deterministic_surrogate_engineered():
++    surrogate_data = LinearDeterministicSurrogate(
++        inputs=Inputs(
++            features=[
++                ContinuousInput(key="a", bounds=(0, 1)),
++                ContinuousInput(key="b", bounds=(0, 1)),
++            ],
++        ),
++        engineered_features=EngineeredFeatures(
++            features=[ProductFeature(key="a*a", features=["a", "a"])]
++        ),
++        outputs=Outputs(features=[ContinuousOutput(key="y")]),
++        intercept=2.0,
++        coefficients={"b": 3.0, "a": -2.0, "a*a": 3},
++    )
++    surrogate = surrogates.map(surrogate_data)
++    assert surrogate.input_preprocessing_specs == {}
++    experiments = pd.DataFrame(data={"a": [1.0, 2.0], "b": [0.5, 4.0]})
++    preds = surrogate.predict(experiments)
++    assert_frame_equal(
++        preds, pd.DataFrame(data={"y_pred": [1.5 + 3, 10.0 + 12], "y_sd": 0.0})
++    )
++
++
+ def test_categorical_deterministic_surrogate():
+     surrogate_data = CategoricalDeterministicSurrogate(
+         inputs=Inputs(
+diff --git a/tests/bofire/surrogates/test_engineered_features.py b/tests/bofire/surrogates/test_engineered_features.py
+index b83504147..e136326ac 100644
+--- a/tests/bofire/surrogates/test_engineered_features.py
++++ b/tests/bofire/surrogates/test_engineered_features.py
+@@ -11,6 +11,7 @@
+     ContinuousMolecularInput,
+     MeanFeature,
+     MolecularWeightedSumFeature,
++    ProductFeature,
+     SumFeature,
+     WeightedSumFeature,
+ )
+@@ -18,6 +19,7 @@
+ from bofire.surrogates.engineered_features import (
+     map_mean_feature,
+     map_molecular_weighted_sum_feature,
++    map_product_feature,
+     map_sum_feature,
+     map_weighted_sum_feature,
+ )
+@@ -73,6 +75,38 @@ def test_map_mean_feature():
+     assert torch.allclose(result[:, -1], orig[:, 1:4].mean(dim=1))
+ 
+ 
++@pytest.mark.parametrize(
++    "features, expected_idx",
++    [
++        (["x1", "x3"], [0, 2]),
++        (["x2", "x2"], [1, 1]),
++    ],
++)
++def test_map_product_feature(features, expected_idx):
++    inputs = Inputs(
++        features=[
++            ContinuousInput(key="x1", bounds=[0, 1]),
++            ContinuousInput(key="x2", bounds=[0, 1]),
++            ContinuousInput(key="x3", bounds=[0, 1]),
++        ]
++    )
++    aggregation = ProductFeature(key="agg1", features=features)
++
++    aggregator = map_product_feature(
++        inputs=inputs, transform_specs={}, feature=aggregation
++    )
++
++    orig = torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]).to(**tkwargs)
++    result = aggregator(orig)
++    assert result.shape[0] == 2
++    assert result.shape[1] == 4
++
++    assert torch.allclose(result[:, :-1], orig)
++    assert torch.allclose(
++        result[:, -1], orig[:, expected_idx[0]] * orig[:, expected_idx[1]]
++    )
++
++
+ def test_map_weighted_sum_feature():
+     inputs = Inputs(
+         features=[

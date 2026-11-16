@@ -1,0 +1,1882 @@
+diff --git a/.github/workflows/build_wheels.yml b/.github/workflows/build_wheels.yml
+index 8e4c493e8ed..687c04b216e 100644
+--- a/.github/workflows/build_wheels.yml
++++ b/.github/workflows/build_wheels.yml
+@@ -48,6 +48,7 @@ env:
+     pytest {project}/scripts/github-actions/simple_test.py
+     {project}/python/tests/test_core_bindings.py
+     {project}/python/tests/test_io_bindings.py
++    {project}/python/tests/test_calc_bindings.py
+ 
+   # We can't currently test Mac arm64 builds on x64
+   CIBW_TEST_SKIP: "*_arm64"
+diff --git a/python/CMakeLists.txt b/python/CMakeLists.txt
+index fbb638af84e..1a10e0c47c5 100644
+--- a/python/CMakeLists.txt
++++ b/python/CMakeLists.txt
+@@ -53,6 +53,19 @@ target_link_libraries(avogadroiopython
+ )
+ install(TARGETS avogadroiopython LIBRARY COMPONENT python DESTINATION "${_python_module_install_dir}")
+ 
++# Calc (force fields and optimizers)
++pybind11_add_module(avogadrocalcpython calc.cpp)
++set_target_properties(avogadrocalcpython
++  PROPERTIES
++    OUTPUT_NAME calc)
++target_link_libraries(avogadrocalcpython
++  PRIVATE
++    Avogadro::Calc
++    Avogadro::Core
++    pybind11::module
++)
++install(TARGETS avogadrocalcpython LIBRARY COMPONENT python DESTINATION "${_python_module_install_dir}")
++
+ # Set the RPATH so the dependent libraries can be found in the wheel.
+ if(APPLE)
+   set(_rpath_value "@loader_path")
+@@ -61,7 +74,8 @@ elseif(UNIX)
+ endif()
+ 
+ if (NOT WIN32)
+-  set_target_properties(avogadrocorepython avogadroiopython PROPERTIES
++  set_target_properties(avogadrocorepython avogadroiopython avogadrocalcpython
++                        PROPERTIES
+                         INSTALL_RPATH ${_rpath_value})
+ endif()
+ 
+@@ -71,7 +85,7 @@ install(FILES ${PY_SRCS} COMPONENT python DESTINATION "${_python_module_install_
+ 
+ # Set the output directory so the python modules can be used from the build
+ # tree.
+-set_target_properties(avogadrocorepython avogadroiopython
++set_target_properties(avogadrocorepython avogadroiopython avogadrocalcpython
+   PROPERTIES
+     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/avogadro"
+     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib/avogadro"
+diff --git a/python/avogadro/__init__.py b/python/avogadro/__init__.py
+index fa067e6c09e..b2545cfee7f 100644
+--- a/python/avogadro/__init__.py
++++ b/python/avogadro/__init__.py
+@@ -2,5 +2,6 @@
+ from . import command
+ from . import connect
+ from . import core
++from . import calc
+ from . import energy
+ from . import io
+diff --git a/python/calc.cpp b/python/calc.cpp
+new file mode 100644
+index 00000000000..13a1c307999
+--- /dev/null
++++ b/python/calc.cpp
+@@ -0,0 +1,726 @@
++#include <pybind11/eigen.h>
++#include <pybind11/numpy.h>
++#include <pybind11/pybind11.h>
++#include <pybind11/stl.h>
++
++#include <avogadro/calc/energycalculator.h>
++#include <avogadro/calc/energymanager.h>
++#include <avogadro/calc/energyoptimizer.h>
++#include <avogadro/calc/lennardjones.h>
++#include <avogadro/calc/uff.h>
++#include <avogadro/core/constraint.h>
++#include <avogadro/core/molecule.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++#include <memory>
++#include <optional>
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace py = pybind11;
++
++using namespace Avogadro;
++
++namespace {
++
++using PositionArray =
++  py::array_t<double, py::array::c_style | py::array::forcecast>;
++
++// Every change to a calculator (new molecule, mask, constraints) takes a new
++// value from this counter. An OptimizerState remembers the revision it was
++// last used with, so a state cached for another calculator or setup is
++// discarded instead of feeding a stale gradient to the optimizer. Only ever
++// touched with the GIL held.
++std::uint64_t nextRevision()
++{
++  static std::uint64_t counter = 0;
++  return ++counter;
++}
++
++// Python wrapper around a Calc::EnergyCalculator. The C++ class hierarchy is
++// not exposed: the calculator caches a raw Molecule pointer, so the wrapper
++// also keeps the Python Molecule alive and remembers how big it was.
++struct Calculator
++{
++  // molecule is declared first so that it is destroyed after impl, which
++  // holds a pointer into it.
++  py::object molecule; // None until set_molecule()
++  std::unique_ptr<Calc::EnergyCalculator> impl;
++  Index atomCount = 0;
++  Index bondCount = 0;
++  bool busy = false; // true while optimize_steps runs without the GIL
++  std::uint64_t revision = nextRevision();
++
++  explicit Calculator(std::unique_ptr<Calc::EnergyCalculator> model)
++    : molecule(py::none()), impl(std::move(model))
++  {
++  }
++
++  bool hasMolecule() const { return !molecule.is_none(); }
++  Core::Molecule& mol() const { return molecule.cast<Core::Molecule&>(); }
++};
++
++// Python wrapper around Calc::OptimizerState. It also records which
++// calculator setup and which positions the cached energy / gradient belong to.
++struct OptimizerState
++{
++  Calc::OptimizerState state;
++  Eigen::VectorXd lastPositions;
++  std::uint64_t revision = 0;
++  bool used = false;
++  bool busy = false;
++
++  void reset()
++  {
++    state = Calc::OptimizerState();
++    lastPositions.resize(0);
++    used = false;
++  }
++};
++
++py::array_t<double> toArray(const double* data, Eigen::Index rows)
++{
++  py::array_t<double> result({ static_cast<Py_ssize_t>(rows), Py_ssize_t(3) });
++  if (rows > 0)
++    std::memcpy(result.mutable_data(), data,
++                static_cast<size_t>(rows) * 3 * sizeof(double));
++  return result;
++}
++
++py::array_t<double> toArray(const Eigen::VectorXd& vector)
++{
++  return toArray(vector.data(), vector.size() / 3);
++}
++
++void requireIdle(const Calculator& calc)
++{
++  if (calc.busy)
++    throw std::runtime_error(
++      "calculator is in use by optimize_steps() on another thread");
++}
++
++// The checks that come before every evaluation.
++void requireCurrent(const Calculator& calc)
++{
++  requireIdle(calc);
++  if (!calc.hasMolecule())
++    throw std::runtime_error("no molecule set; call set_molecule() first");
++  const Core::Molecule& molecule = calc.mol();
++  if (molecule.atomCount() != calc.atomCount ||
++      molecule.bondCount() != calc.bondCount)
++    throw std::runtime_error(
++      "molecule changed since set_molecule(); call set_molecule() again");
++}
++
++// Positions as the flat (x0, y0, z0, x1, ...) vector the C++ side wants.
++Eigen::VectorXd resolvePositions(const Calculator& calc,
++                                 const std::optional<PositionArray>& positions)
++{
++  const Index n = calc.atomCount;
++  Eigen::VectorXd x(static_cast<Eigen::Index>(3 * n));
++  if (positions) {
++    auto buf = positions->request();
++    if (buf.ndim != 2 || buf.shape[1] != 3)
++      throw py::value_error("positions must have shape (N, 3)");
++    if (static_cast<Index>(buf.shape[0]) != n)
++      throw py::value_error("positions must have one row per atom (expected " +
++                            std::to_string(n) + ", got " +
++                            std::to_string(buf.shape[0]) + ")");
++    if (n > 0)
++      std::memcpy(x.data(), buf.ptr,
++                  static_cast<size_t>(n) * 3 * sizeof(double));
++  } else {
++    const auto& pos = calc.mol().atomPositions3d();
++    if (pos.size() != n)
++      throw py::value_error(
++        "the molecule has no 3D positions for every atom; pass positions");
++    if (n > 0)
++      std::memcpy(x.data(), pos.constData(),
++                  static_cast<size_t>(n) * 3 * sizeof(double));
++  }
++  if (!x.allFinite())
++    throw py::value_error("positions must be finite");
++  return x;
++}
++
++void setMolecule(Calculator& calc, py::object molecule)
++{
++  requireIdle(calc);
++  if (!py::isinstance<Core::Molecule>(molecule))
++    throw py::type_error("molecule must be an avogadro.core.Molecule");
++  Core::Molecule& mol = molecule.cast<Core::Molecule&>();
++  const Calc::EnergyCalculator& model = *calc.impl;
++
++  // Apply the same compatibility rules as
++  // EnergyManager::identifiersForMolecule.
++  const std::string who = model.identifier();
++  if (mol.totalCharge() != 0 && !model.acceptsIons())
++    throw py::value_error(who + " cannot handle charged molecules");
++  if (mol.totalSpinMultiplicity() != 1 && !model.acceptsRadicals())
++    throw py::value_error(who + " cannot handle radicals");
++  if (mol.unitCell() != nullptr && !model.acceptsUnitCell())
++    throw py::value_error(who + " cannot handle periodic systems");
++  const auto present = mol.elements();
++  const auto supported = model.elements();
++  if ((supported & present).count() != present.count()) {
++    std::string missing;
++    for (size_t z = 0; z < present.size(); ++z)
++      if (present[z] && !supported[z])
++        missing += (missing.empty() ? "" : ", ") + std::to_string(z);
++    throw py::value_error(who + " has no parameters for atomic number(s) " +
++                          missing);
++  }
++
++  // Constraints set earlier name atoms of the old molecule.
++  for (const auto& constraint : model.constraints())
++    if (!constraint.isValid(mol.atomCount()))
++      throw py::value_error(
++        "existing constraints refer to atoms the molecule does not have; "
++        "clear them first (calculator.constraints = [])");
++
++  calc.molecule = std::move(molecule);
++  calc.atomCount = mol.atomCount();
++  calc.bondCount = mol.bondCount();
++  // also resets the mask to the molecule's frozen atoms (all free if none)
++  calc.impl->setMolecule(&mol);
++  calc.revision = nextRevision();
++}
++
++Eigen::VectorXd parseMask(const Calculator& calc, const PositionArray& array)
++{
++  const Index n = calc.atomCount;
++  auto buf = array.request();
++  const double* data = static_cast<const double*>(buf.ptr);
++  Eigen::VectorXd mask(static_cast<Eigen::Index>(3 * n));
++  if (buf.ndim == 2 && buf.shape[1] == 3 &&
++      static_cast<Index>(buf.shape[0]) == n) {
++    if (n > 0)
++      std::memcpy(mask.data(), data,
++                  static_cast<size_t>(3 * n) * sizeof(double));
++  } else if (buf.ndim == 1 && static_cast<Index>(buf.shape[0]) == n) {
++    for (Index i = 0; i < n; ++i)
++      mask.segment<3>(static_cast<Eigen::Index>(3 * i)).setConstant(data[i]);
++  } else {
++    throw py::value_error("mask must have shape (N, 3) or (N,), with N = " +
++                          std::to_string(n) + " atoms");
++  }
++  for (Eigen::Index i = 0; i < mask.size(); ++i)
++    if (mask[i] != 0.0 && mask[i] != 1.0)
++      throw py::value_error("mask entries must be 0 (frozen) or 1 (free)");
++  return mask;
++}
++
++void validateOptions(const Calc::OptimizationOptions& o)
++{
++  auto require = [](bool ok, const char* message) {
++    if (!ok)
++      throw py::value_error(message);
++  };
++  require(o.chunkIterations >= 1, "chunk_iterations must be at least 1");
++  const auto& l = o.lbfgs;
++  require(std::isfinite(l.maxStep) && l.maxStep >= 0.0,
++          "lbfgs.max_step must be finite and >= 0 (0 disables the cap)");
++  require(std::isfinite(l.wolfeGtol) && l.wolfeGtol >= 0.0 && l.wolfeGtol < 1.0,
++          "lbfgs.wolfe_gtol must be in [0, 1)");
++  const auto& f = o.fire;
++  if (o.algorithm != Calc::OptimizationAlgorithm::Lbfgs) {
++    require(std::isfinite(f.dt0) && f.dt0 > 0.0, "fire.dt0 must be > 0");
++    require(std::isfinite(f.dtMax) && f.dtMax > 0.0, "fire.dt_max must be > 0");
++    require(std::isfinite(f.alphaStart) && f.alphaStart >= 0.0 &&
++              f.alphaStart <= 1.0,
++            "fire.alpha_start must be in [0, 1]");
++    require(std::isfinite(f.fAlpha) && f.fAlpha > 0.0 && f.fAlpha <= 1.0,
++            "fire.f_alpha must be in (0, 1]");
++    require(std::isfinite(f.fInc) && f.fInc >= 1.0, "fire.f_inc must be >= 1");
++    require(std::isfinite(f.fDec) && f.fDec > 0.0 && f.fDec < 1.0,
++            "fire.f_dec must be in (0, 1)");
++    require(f.nDelay >= 0, "fire.n_delay must be >= 0");
++    require(std::isfinite(f.maxMove) && f.maxMove >= 0.0,
++            "fire.max_move must be finite and >= 0 (0 disables the cap)");
++    require(std::isfinite(f.mass) && f.mass > 0.0, "fire.mass must be > 0");
++  }
++  if (o.algorithm == Calc::OptimizationAlgorithm::Hybrid)
++    require(std::isfinite(o.hybrid.switchGradient) &&
++              o.hybrid.switchGradient >= 0.0,
++            "hybrid.switch_gradient must be finite and >= 0");
++}
++
++py::array_t<double> optimizeSteps(
++  Calculator& calc, const std::optional<PositionArray>& positions,
++  const std::optional<Calc::OptimizationOptions>& options,
++  OptimizerState* state)
++{
++  requireCurrent(calc);
++  Eigen::VectorXd x = resolvePositions(calc, positions);
++  const Calc::OptimizationOptions opts =
++    options ? *options : Calc::OptimizationOptions();
++  validateOptions(opts);
++
++  if (state != nullptr) {
++    if (state->busy)
++      throw std::runtime_error("state is in use by another optimize_steps()");
++    // A state only describes the run that produced it: another calculator
++    // setup, or positions other than the ones it returned, make its cached
++    // energy and gradient wrong.
++    if (state->used && (state->revision != calc.revision ||
++                        state->lastPositions.size() != x.size() ||
++                        !(state->lastPositions.array() == x.array()).all()))
++      state->reset();
++  }
++
++  Calc::EnergyCalculator& model = *calc.impl;
++  Calc::OptimizerState* statePtr = state ? &state->state : nullptr;
++  bool ok = false;
++  {
++    // Flags are only read and written with the GIL held, so a second thread
++    // that gets in while this one is computing sees them.
++    struct Busy
++    {
++      bool& a;
++      bool* b;
++      Busy(bool& first, bool* second) : a(first), b(second)
++      {
++        a = true;
++        if (b)
++          *b = true;
++      }
++      ~Busy()
++      {
++        a = false;
++        if (b)
++          *b = false;
++      }
++    } busy(calc.busy, state ? &state->busy : nullptr);
++
++    // Safe without the GIL: nothing in here calls back into Python, because
++    // EnergyCalculator cannot be subclassed from Python.
++    py::gil_scoped_release release;
++    ok = Calc::optimizeSteps(model, x, opts, statePtr);
++  }
++  if (!ok)
++    throw std::runtime_error("optimizeSteps failed");
++
++  if (state != nullptr) {
++    state->lastPositions = x;
++    state->revision = calc.revision;
++    state->used = true;
++  }
++  return toArray(x);
++}
++
++std::string join(const std::set<std::string>& names)
++{
++  std::string result;
++  for (const auto& name : names)
++    result += (result.empty() ? "" : ", ") + name;
++  return result;
++}
++
++std::unique_ptr<Calculator> fromIdentifier(const std::string& identifier)
++{
++  std::unique_ptr<Calc::EnergyCalculator> model(
++    Calc::EnergyManager::instance().model(identifier));
++  if (!model)
++    throw py::value_error(
++      "unknown energy model '" + identifier +
++      "'; available: " + join(Calc::EnergyManager::instance().identifiers()));
++  return std::make_unique<Calculator>(std::move(model));
++}
++
++const Core::Molecule& requireMolecule(const py::object& molecule)
++{
++  if (!py::isinstance<Core::Molecule>(molecule))
++    throw py::type_error("expected an avogadro.core.Molecule");
++  return molecule.cast<const Core::Molecule&>();
++}
++
++} // namespace
++
++PYBIND11_MODULE(calc, m)
++{
++  py::module_::import("avogadro.core"); // registers Molecule and Constraint
++
++  m.doc() = "Force fields and geometry optimization.\n\n"
++            "Units: coordinates in Angstrom, energies in kJ/mol, gradients "
++            "in kJ/(mol*Angstrom).\n\n"
++            "Only the built-in models, UFF and LJ (Lennard-Jones), exist in "
++            "this package; MMFF94 and GAFF are provided by the Avogadro "
++            "application's plugins.";
++
++  // --- Optimizer options ---
++
++  py::enum_<Calc::OptimizationAlgorithm>(m, "OptimizationAlgorithm")
++    .value("Lbfgs", Calc::OptimizationAlgorithm::Lbfgs, "Limited-memory BFGS")
++    .value("Fire2", Calc::OptimizationAlgorithm::Fire2, "FIRE 2.0")
++    .value("AbcFire", Calc::OptimizationAlgorithm::AbcFire,
++           "FIRE with bias correction (ABC-FIRE)")
++    .value("Hybrid", Calc::OptimizationAlgorithm::Hybrid,
++           "ABC-FIRE until the largest gradient component falls below "
++           "HybridParameters.switch_gradient, then L-BFGS (one-way switch)");
++
++  py::class_<Calc::LbfgsParameters>(m, "LbfgsParameters")
++    .def(py::init<>())
++    .def_readwrite("max_step", &Calc::LbfgsParameters::maxStep,
++                   "Cap on the length of a step |x_new - x|, in Angstrom. 0 "
++                   "disables the cap.")
++    .def_readwrite("wolfe_gtol", &Calc::LbfgsParameters::wolfeGtol,
++                   "Strong Wolfe curvature tolerance of the line search, "
++                   "in [0, 1). Dimensionless; 0 uses the library default.")
++    .def("__repr__", [](const Calc::LbfgsParameters& p) {
++      return "LbfgsParameters(max_step=" + std::to_string(p.maxStep) +
++             ", wolfe_gtol=" + std::to_string(p.wolfeGtol) + ")";
++    });
++
++  py::class_<Calc::FireParameters>(m, "FireParameters")
++    .def(py::init<>())
++    .def_readwrite("dt0", &Calc::FireParameters::dt0,
++                   "Initial time step (unit mass per coordinate, forces in "
++                   "kJ/(mol*Angstrom))")
++    .def_readwrite("dt_max", &Calc::FireParameters::dtMax, "Largest time step")
++    .def_readwrite("alpha_start", &Calc::FireParameters::alphaStart,
++                   "Initial velocity mixing, in [0, 1]")
++    .def_readwrite("f_alpha", &Calc::FireParameters::fAlpha,
++                   "Factor applied to the mixing after n_delay uphill-free "
++                   "steps, in (0, 1]")
++    .def_readwrite("f_inc", &Calc::FireParameters::fInc,
++                   "Factor to grow the time step by, >= 1")
++    .def_readwrite("f_dec", &Calc::FireParameters::fDec,
++                   "Factor to shrink the time step by, in (0, 1)")
++    .def_readwrite("n_delay", &Calc::FireParameters::nDelay,
++                   "Steps of downhill motion before the time step grows")
++    .def_readwrite("max_move", &Calc::FireParameters::maxMove,
++                   "Largest per-atom displacement per step, in Angstrom. 0 "
++                   "disables the cap.")
++    .def_readwrite("mass", &Calc::FireParameters::mass,
++                   "Mass per coordinate, > 0 (unitless)")
++    .def("__repr__", [](const Calc::FireParameters& p) {
++      return "FireParameters(dt0=" + std::to_string(p.dt0) +
++             ", dt_max=" + std::to_string(p.dtMax) +
++             ", alpha_start=" + std::to_string(p.alphaStart) +
++             ", f_alpha=" + std::to_string(p.fAlpha) +
++             ", f_inc=" + std::to_string(p.fInc) +
++             ", f_dec=" + std::to_string(p.fDec) +
++             ", n_delay=" + std::to_string(p.nDelay) +
++             ", max_move=" + std::to_string(p.maxMove) +
++             ", mass=" + std::to_string(p.mass) + ")";
++    });
++
++  py::class_<Calc::HybridParameters>(m, "HybridParameters")
++    .def(py::init<>())
++    .def_readwrite("switch_gradient", &Calc::HybridParameters::switchGradient,
++                   "Largest gradient component, in kJ/(mol*Angstrom), below "
++                   "which the Hybrid algorithm hands off from ABC-FIRE to "
++                   "L-BFGS")
++    .def("__repr__", [](const Calc::HybridParameters& p) {
++      return "HybridParameters(switch_gradient=" +
++             std::to_string(p.switchGradient) + ")";
++    });
++
++  py::class_<Calc::OptimizationOptions>(m, "OptimizationOptions")
++    .def(py::init<>())
++    .def_readwrite("algorithm", &Calc::OptimizationOptions::algorithm,
++                   "The OptimizationAlgorithm (default Lbfgs)")
++    .def_readwrite("chunk_iterations",
++                   &Calc::OptimizationOptions::chunkIterations,
++                   "Iterations per optimize_steps() call, at least 1 "
++                   "(default 5). L-BFGS memory is not carried from one call "
++                   "to the next, so larger chunks need fewer total "
++                   "iterations; FIRE state is carried by an OptimizerState.")
++    .def_readwrite("lbfgs", &Calc::OptimizationOptions::lbfgs,
++                   "LbfgsParameters (modified in place)")
++    .def_readwrite("fire", &Calc::OptimizationOptions::fire,
++                   "FireParameters (modified in place)")
++    .def_readwrite("hybrid", &Calc::OptimizationOptions::hybrid,
++                   "HybridParameters (modified in place)")
++    .def("__repr__", [](const Calc::OptimizationOptions& o) {
++      return "OptimizationOptions(chunk_iterations=" +
++             std::to_string(o.chunkIterations) + ", ...)";
++    });
++
++  py::class_<OptimizerState>(
++    m, "OptimizerState",
++    "State carried between optimize_steps() calls: the energy and gradient "
++    "at the last returned positions, plus the integrator state of the FIRE "
++    "algorithms. It is discarded automatically if the next call uses a "
++    "different calculator setup or positions other than the ones "
++    "optimize_steps() last returned, so a stale gradient is never reused. "
++    "Do not share one between threads.")
++    .def(py::init<>())
++    .def_property_readonly(
++      "energy", [](const OptimizerState& self) { return self.state.energy; },
++      "Energy in kJ/mol at the last returned positions; NaN before the first "
++      "call (or if the energy was not finite)")
++    .def_property_readonly(
++      "gradient",
++      [](const OptimizerState& self) -> py::object {
++        if (self.state.gradient.size() == 0 ||
++            self.state.gradient.size() % 3 != 0)
++          return py::none();
++        return toArray(self.state.gradient);
++      },
++      "Gradient in kJ/(mol*Angstrom) as an (N, 3) array at the last returned "
++      "positions (a copy), or None before the first call")
++    .def_property_readonly(
++      "hybrid_switched",
++      [](const OptimizerState& self) { return self.state.hybridSwitched; },
++      "True once the Hybrid algorithm has switched from ABC-FIRE to L-BFGS")
++    .def(
++      "reset", [](OptimizerState& self) { self.reset(); },
++      "Forget everything; the next optimize_steps() starts afresh")
++    .def("__repr__", [](const OptimizerState& self) {
++      return "OptimizerState(energy=" + std::to_string(self.state.energy) + ")";
++    });
++
++  // --- Calculators ---
++
++  py::class_<Calculator>(
++    m, "EnergyCalculator", py::is_final(),
++    "An energy model (force field) bound to a molecule.\n\n"
++    "EnergyCalculator('UFF') creates the model with that identifier; see "
++    "models(). Call set_molecule(), then energy(), gradient() and "
++    "energy_and_gradient(). Energies are in kJ/mol, gradients in "
++    "kJ/(mol*Angstrom) and positions in Angstrom, as (N, 3) arrays.\n\n"
++    "The calculator keeps the Molecule alive, but it analyses the molecule "
++    "(atom types, non-bonded pairs) when set_molecule() is called. If you "
++    "add or remove atoms or bonds afterwards, evaluations raise "
++    "RuntimeError until you call set_molecule() again; it cannot see changes "
++    "to bond orders or atomic numbers, so call set_molecule() after those "
++    "too. Positions may change freely.\n\n"
++    "Python subclasses are not supported. An instance is not thread-safe.")
++    .def(py::init([](const std::string& identifier) {
++           return fromIdentifier(identifier);
++         }),
++         py::arg("identifier"),
++         "Create the model with this identifier (ValueError if unknown)")
++    .def_property_readonly(
++      "identifier", [](const Calculator& c) { return c.impl->identifier(); },
++      "Short identifier of the model, e.g. 'UFF'")
++    .def_property_readonly(
++      "name", [](const Calculator& c) { return c.impl->name(); },
++      "Name of the model")
++    .def_property_readonly(
++      "description", [](const Calculator& c) { return c.impl->description(); },
++      "Description of the model")
++    .def_property_readonly(
++      "accepts_ions", [](const Calculator& c) { return c.impl->acceptsIons(); },
++      "Whether the model can handle charged molecules")
++    .def_property_readonly(
++      "accepts_radicals",
++      [](const Calculator& c) { return c.impl->acceptsRadicals(); },
++      "Whether the model can handle radicals")
++    .def_property_readonly(
++      "accepts_unit_cell",
++      [](const Calculator& c) { return c.impl->acceptsUnitCell(); },
++      "Whether the model can handle periodic systems")
++    .def_property_readonly(
++      "molecule", [](const Calculator& c) { return c.molecule; },
++      "The Molecule given to set_molecule(), or None")
++    .def("set_molecule", &setMolecule, py::arg("molecule"),
++         "Bind a molecule (or re-analyse it after editing it). ValueError if "
++         "the model cannot handle its elements, charge, spin or unit cell. "
++         "Resets the mask to the molecule's frozen atoms (every atom free "
++         "if none are frozen); existing constraints must still be valid "
++         "for the new atom count.")
++    .def(
++      "energy",
++      [](Calculator& self, const std::optional<PositionArray>& positions) {
++        requireCurrent(self);
++        return self.impl->value(resolvePositions(self, positions));
++      },
++      py::arg("positions") = py::none(),
++      "Energy in kJ/mol, including constraint restraints. positions is an "
++      "(N, 3) array in Angstrom; None means the molecule's current "
++      "positions (ValueError if it lacks 3D positions for every atom).")
++    .def(
++      "gradient",
++      [](Calculator& self, const std::optional<PositionArray>& positions) {
++        requireCurrent(self);
++        Eigen::VectorXd x = resolvePositions(self, positions);
++        Eigen::VectorXd grad;
++        self.impl->evaluate(x, &grad);
++        if (grad.size() != x.size())
++          throw std::runtime_error("calculator returned a gradient of the "
++                                   "wrong size");
++        return toArray(grad);
++      },
++      py::arg("positions") = py::none(),
++      "Gradient in kJ/(mol*Angstrom) as a new (N, 3) array. Components of "
++      "frozen coordinates (see mask) are zero.")
++    .def(
++      "energy_and_gradient",
++      [](Calculator& self, const std::optional<PositionArray>& positions) {
++        requireCurrent(self);
++        Eigen::VectorXd x = resolvePositions(self, positions);
++        Eigen::VectorXd grad;
++        const double energy = self.impl->evaluate(x, &grad);
++        if (grad.size() != x.size())
++          throw std::runtime_error("calculator returned a gradient of the "
++                                   "wrong size");
++        return py::make_tuple(energy, toArray(grad));
++      },
++      py::arg("positions") = py::none(),
++      "(energy, gradient): kJ/mol and a new (N, 3) array in "
++      "kJ/(mol*Angstrom)")
++    .def_property(
++      "mask",
++      [](const Calculator& self) -> py::object {
++        requireIdle(self);
++        const Eigen::VectorXd mask = self.impl->mask();
++        if (!self.hasMolecule() ||
++            mask.size() != static_cast<Eigen::Index>(3 * self.atomCount))
++          return py::none();
++        return toArray(mask);
++      },
++      [](Calculator& self, const std::optional<PositionArray>& mask) {
++        requireIdle(self);
++        if (!mask) {
++          self.impl->setMask(Eigen::VectorXd());
++        } else {
++          if (!self.hasMolecule())
++            throw std::runtime_error(
++              "no molecule set; call set_molecule() first");
++          self.impl->setMask(parseMask(self, *mask));
++        }
++        self.revision = nextRevision();
++      },
++      "Which coordinates may move, as an (N, 3) array (0 = frozen, 1 = free; "
++      "returned as a copy) or None for no mask. Accepts (N, 3) or one value "
++      "per atom, shape (N,). Gradient components of frozen coordinates are "
++      "zeroed, so the optimizers leave them alone. Needs set_molecule() "
++      "first, which resets it to the molecule's frozen atoms.")
++    .def(
++      "freeze_atoms",
++      [](Calculator& self, const std::vector<Index>& indices) {
++        requireIdle(self);
++        if (!self.hasMolecule())
++          throw std::runtime_error(
++            "no molecule set; call set_molecule() first");
++        for (Index index : indices)
++          if (index >= self.atomCount)
++            throw py::value_error("atom index " + std::to_string(index) +
++                                  " is out of range");
++        const auto size = static_cast<Eigen::Index>(3 * self.atomCount);
++        Eigen::VectorXd mask = self.impl->mask();
++        if (mask.size() != size)
++          mask = Eigen::VectorXd::Ones(size);
++        for (Index index : indices)
++          mask.segment<3>(static_cast<Eigen::Index>(3 * index)).setZero();
++        self.impl->setMask(mask);
++        self.revision = nextRevision();
++      },
++      py::arg("indices"),
++      "Freeze all three coordinates of these atoms (added to the mask)")
++    .def_property(
++      "constraints",
++      [](const Calculator& self) {
++        requireIdle(self);
++        return self.impl->constraints();
++      },
++      [](Calculator& self, const std::vector<Core::Constraint>& constraints) {
++        requireIdle(self);
++        if (!self.hasMolecule())
++          throw std::runtime_error(
++            "no molecule set; call set_molecule() first");
++        for (size_t i = 0; i < constraints.size(); ++i)
++          if (!constraints[i].isValid(self.atomCount))
++            throw py::value_error("constraint " + std::to_string(i) +
++                                  " names an atom the molecule does not have");
++        self.impl->setConstraints(constraints);
++        self.revision = nextRevision();
++      },
++      "List of avogadro.core.Constraint restraints added to the energy and "
++      "gradient. Assigning replaces the list; every atom index is checked "
++      "against the molecule. The getter returns copies, grouped by type "
++      "(distances, angles, torsions) rather than in assignment order. Each "
++      "adds k * (value - target)**2 in kJ/mol, with k in kJ/(mol*A**2) for "
++      "distances and kJ/(mol*rad**2) for angles and torsions.")
++    .def("__repr__", [](const Calculator& self) {
++      return "<avogadro.calc.EnergyCalculator '" + self.impl->identifier() +
++             (self.hasMolecule() ? "' with molecule>" : "'>");
++    });
++
++  m.def(
++    "UFF",
++    [] { return std::make_unique<Calculator>(std::make_unique<Calc::UFF>()); },
++    "A new Universal Force Field calculator (elements 1-102)");
++  m.def(
++    "LennardJones",
++    [] {
++      return std::make_unique<Calculator>(
++        std::make_unique<Calc::LennardJones>());
++    },
++    "A new Lennard-Jones calculator (all elements; a generic fallback, not "
++    "a chemically accurate force field)");
++
++  // --- Model registry ---
++
++  m.def(
++    "models",
++    [] {
++      const auto ids = Calc::EnergyManager::instance().identifiers();
++      return std::vector<std::string>(ids.begin(), ids.end());
++    },
++    "Sorted identifiers of the available models ('LJ', 'UFF')");
++  m.def(
++    "models_for_molecule",
++    [](const py::object& molecule) {
++      const auto ids = Calc::EnergyManager::instance().identifiersForMolecule(
++        requireMolecule(molecule));
++      return std::vector<std::string>(ids.begin(), ids.end());
++    },
++    py::arg("molecule"),
++    "Sorted identifiers of the models that can handle this molecule");
++  m.def(
++    "recommended_model",
++    [](const py::object& molecule) {
++      return Calc::EnergyManager::instance().recommendedModel(
++        requireMolecule(molecule));
++    },
++    py::arg("molecule"),
++    "Identifier of the best model for this molecule. In this package that "
++    "is 'UFF' or, if UFF cannot handle it, 'LJ'.");
++  m.def(
++    "model_name",
++    [](const std::string& identifier) {
++      const auto& manager = Calc::EnergyManager::instance();
++      const auto ids = manager.identifiers();
++      if (ids.find(identifier) == ids.end())
++        throw py::value_error("unknown energy model '" + identifier +
++                              "'; available: " + join(ids));
++      return manager.nameForModel(identifier);
++    },
++    py::arg("identifier"), "Name of the model with this identifier");
++
++  // --- Optimizer ---
++
++  m.def("optimize_steps", &optimizeSteps, py::arg("calculator"),
++        py::arg("positions") = py::none(), py::arg("options") = py::none(),
++        py::arg("state") = py::none(),
++        "Run one chunk (options.chunk_iterations iterations) of geometry "
++        "optimization and return the new positions as an (N, 3) array. The "
++        "molecule is not modified, and the GIL is released while this runs.\n\n"
++        "positions defaults to the molecule's current positions; options "
++        "defaults to OptimizationOptions(); state is an optional "
++        "OptimizerState that receives the energy and gradient at the result "
++        "(and carries FIRE state between calls). If the energy becomes "
++        "non-finite no exception is raised; check state.energy.\n\n"
++        "Chunking: L-BFGS memory is not carried between calls, so larger "
++        "chunks converge in fewer total iterations. Call it in a loop and "
++        "decide yourself when to stop:\n\n"
++        "    state = calc.OptimizerState()\n"
++        "    x = mol.positions\n"
++        "    for _ in range(max_chunks):\n"
++        "        x = calc.optimize_steps(ff, x, opts, state)\n"
++        "        if np.abs(state.gradient).max() < 1e-4:  # kJ/(mol*A), same "
++        "test as the GUI\n"
++        "            break\n"
++        "    mol.positions = x\n\n"
++        "A full optimize() with shared convergence criteria is planned.");
++}
+diff --git a/python/core.cpp b/python/core.cpp
+index 74eda4462d6..0c26958e496 100644
+--- a/python/core.cpp
++++ b/python/core.cpp
+@@ -4,11 +4,16 @@
+ #include <pybind11/pybind11.h>
+ #include <pybind11/stl.h>
+ 
++#include <avogadro/core/constraint.h>
+ #include <avogadro/core/molecule.h>
+ #include <avogadro/core/unitcell.h>
+ 
++#include <cmath>
++#include <optional>
+ #include <stdexcept>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ namespace py = pybind11;
+ 
+@@ -117,6 +122,99 @@ PYBIND11_MODULE(core, m)
+     .def("distance", &UnitCell::distance,
+          "Calculate the distance between two points in the unit cell");
+ 
++  // --- Constraint ---
++
++  py::class_<Constraint> constraintClass(
++    m, "Constraint",
++    "A harmonic restraint on a distance, angle or torsion.\n\n"
++    "Distances are in Angstrom and angles / torsions in DEGREES. The "
++    "restraint energy is k * (x - x0)^2 (no factor of one half), with k in "
++    "kJ/mol/Angstrom^2 for a distance and kJ/mol/radian^2 for an angle or "
++    "torsion (the angle is converted to radians internally). Torsions are "
++    "periodic. Immutable once created. Atom indices are checked against a "
++    "molecule when the constraint is assigned to an "
++    "avogadro.calc.EnergyCalculator.");
++
++  py::enum_<Constraint::Type>(constraintClass, "Type")
++    .value("Distance", Constraint::DistanceConstraint)
++    .value("Angle", Constraint::AngleConstraint)
++    .value("Torsion", Constraint::TorsionConstraint)
++    .value("OutOfPlane", Constraint::OutOfPlaneConstraint)
++    .value("Unknown", Constraint::UnknownConstraint);
++
++  constraintClass
++    .def(
++      py::init([](const std::vector<Index>& atoms, double value,
++                  std::optional<double> forceConstant) {
++        if (atoms.size() < 2 || atoms.size() > 4)
++          throw py::value_error(
++            "atoms must have 2 (distance), 3 (angle) or 4 (torsion) indices");
++        for (size_t i = 0; i < atoms.size(); ++i) {
++          if (atoms[i] == MaxIndex)
++            throw py::value_error("invalid atom index");
++          for (size_t j = 0; j < i; ++j)
++            if (atoms[i] == atoms[j])
++              throw py::value_error("atoms must be distinct");
++        }
++        if (!std::isfinite(value))
++          throw py::value_error("value must be finite");
++        Constraint constraint(atoms[0], atoms[1],
++                              atoms.size() > 2 ? atoms[2] : MaxIndex,
++                              atoms.size() > 3 ? atoms[3] : MaxIndex, value);
++        if (forceConstant) {
++          const double k = *forceConstant;
++          if (!std::isfinite(k) || k < 0.0)
++            throw py::value_error("force_constant must be finite and >= 0");
++          constraint.setK(k);
++        }
++        return constraint;
++      }),
++      py::arg("atoms"), py::arg("value"),
++      py::arg("force_constant") = py::none(),
++      "Create a constraint on 2 (distance), 3 (angle) or 4 (torsion) atoms. "
++      "value is in Angstrom or degrees. force_constant defaults to "
++      "Constraint.DEFAULT_DISTANCE_K or Constraint.DEFAULT_ANGULAR_K.")
++    .def_property_readonly(
++      "atoms",
++      [](const Constraint& self) {
++        std::vector<Index> atoms{ self.aIndex(), self.bIndex() };
++        if (self.cIndex() != MaxIndex)
++          atoms.push_back(self.cIndex());
++        if (self.dIndex() != MaxIndex)
++          atoms.push_back(self.dIndex());
++        return py::tuple(py::cast(atoms));
++      },
++      "Tuple of the 2, 3 or 4 atom indices")
++    .def_property_readonly("type", &Constraint::type,
++                           "The Constraint.Type, inferred from the atoms")
++    .def_property_readonly("value", &Constraint::value,
++                           "Target value: Angstrom (distance) or degrees "
++                           "(angle, torsion)")
++    .def_property_readonly("force_constant", &Constraint::k,
++                           "Harmonic force constant (see the class docs for "
++                           "units)")
++    .def("is_valid", &Constraint::isValid, py::arg("atom_count"),
++         "True if every atom index is below atom_count")
++    .def("__repr__",
++         [](const Constraint& self) {
++           std::string atoms;
++           for (auto index :
++                { self.aIndex(), self.bIndex(), self.cIndex(), self.dIndex() })
++             if (index != MaxIndex)
++               atoms += (atoms.empty() ? "" : ", ") + std::to_string(index);
++           return "Constraint(atoms=(" + atoms +
++                  "), value=" + std::to_string(self.value()) +
++                  ", force_constant=" + std::to_string(self.k()) + ")";
++         })
++    .def_property_readonly_static(
++      "DEFAULT_DISTANCE_K",
++      [](py::object) { return Constraint::DefaultDistanceK; },
++      "Default distance force constant, kJ/mol/Angstrom^2")
++    .def_property_readonly_static(
++      "DEFAULT_ANGULAR_K",
++      [](py::object) { return Constraint::DefaultAngularK; },
++      "Default angle / torsion force constant, kJ/mol/radian^2");
++
+   // Register types from other files. Order matters: BasisSet and Cube must
+   // be registered before Molecule (which references them via properties).
+   exportBasisSet(m);
+diff --git a/python/tests/test_calc_bindings.py b/python/tests/test_calc_bindings.py
+new file mode 100644
+index 00000000000..3a272280958
+--- /dev/null
++++ b/python/tests/test_calc_bindings.py
+@@ -0,0 +1,879 @@
++"""Tests for the avogadro.calc pybind11 bindings (force fields, optimizer).
++
++These need the compiled extension modules (a built wheel), so they skip
++cleanly in a source checkout.
++"""
++
++import gc
++import math
++
++import pytest
++
++np = pytest.importorskip("numpy")
++core = pytest.importorskip("avogadro.core")
++calc = pytest.importorskip("avogadro.calc")
++
++
++def make_water():
++    mol = core.Molecule()
++    mol.add_atom(8)
++    mol.add_atom(1)
++    mol.add_atom(1)
++    mol.add_bond(0, 1, 1)
++    mol.add_bond(0, 2, 1)
++    # Distorted: long bonds and an obtuse angle (as in
++    # tests/calc/energyoptimizertest.cpp).
++    mol.positions = np.array(
++        [[0.0, 0.0, 0.0], [1.30, 0.35, 0.0], [-1.05, 0.55, 0.0]]
++    )
++    return mol
++
++
++def make_alkane(n_carbons=4):
++    """A bonded n-alkane with every coordinate displaced by a fixed
++    pseudo-random offset. Mirrors perturbedAlkane() in
++    tests/calc/energyoptimizertest.cpp."""
++    mol = core.Molecule()
++    pos = []
++    carbons = []
++    for i in range(n_carbons):
++        carbons.append(mol.add_atom(6).index)
++        pos.append([1.25 * i, 0.4 if i % 2 else 0.0, 0.0])
++        if i > 0:
++            mol.add_bond(carbons[i - 1], carbons[i], 1)
++    side = 1.0 if n_carbons > 0 else 0.0
++    for i in range(n_carbons):
++        up = 1.0 if i % 2 else -1.0
++        n_h = 3 if i == 0 or i + 1 == n_carbons else 2
++        for h in range(n_h):
++            dz = 0.9 if h == 0 else -0.9
++            pos.append(
++                [
++                    pos[i][0] + (-0.6 * side if h == 2 else 0.0),
++                    pos[i][1] + 0.5 * up,
++                    pos[i][2] + (0.0 if h == 2 else dz),
++                ]
++            )
++            a = mol.add_atom(1).index
++            mol.add_bond(carbons[i], a, 1)
++    pos = np.array(pos)
++    offsets = np.sin(12.9898 * np.arange(pos.size, dtype=float) + 1.0)
++    pos = pos + 0.1 * offsets.reshape(pos.shape)
++    mol.positions = pos
++    return mol
++
++
++def make_dimer(distance):
++    mol = core.Molecule()
++    mol.add_atom(6)
++    mol.add_atom(6)
++    mol.positions = np.array([[0.0, 0.0, 0.0], [distance, 0.0, 0.0]])
++    return mol
++
++
++def make_ff(factory, mol):
++    ff = factory()
++    ff.set_molecule(mol)
++    return ff
++
++
++def max_gradient(state):
++    return np.abs(state.gradient).max()
++
++
++def run_chunks(ff, x, options, state, max_chunks, tol=1e-4):
++    energies = []
++    for _ in range(max_chunks):
++        x = calc.optimize_steps(ff, x, options, state)
++        energies.append(state.energy)
++        if max_gradient(state) < tol:
++            break
++    return x, energies
++
++
++FACTORIES = [calc.UFF, calc.LennardJones]
++
++
++# --- Registry ---
++
++
++def test_models():
++    assert calc.models() == ["LJ", "UFF"]
++    assert calc.model_name("UFF") == "UFF"
++    assert calc.model_name("LJ") == "Lennard-Jones"
++
++
++def test_models_for_molecule_and_recommended():
++    mol = make_water()
++    assert calc.models_for_molecule(mol) == ["LJ", "UFF"]
++    assert calc.recommended_model(mol) == "UFF"
++
++
++def test_model_with_element_uff_lacks():
++    mol = core.Molecule()
++    mol.add_atom(6)
++    mol.add_atom(110)
++    assert calc.models_for_molecule(mol) == ["LJ"]
++    assert calc.recommended_model(mol) == "LJ"
++
++
++def test_unknown_model_name():
++    with pytest.raises(ValueError, match="LJ, UFF"):
++        calc.model_name("MMFF94")
++
++
++def test_calculator_properties():
++    uff = calc.UFF()
++    assert uff.identifier == "UFF"
++    assert uff.name == "UFF"
++    assert "Universal" in uff.description
++    assert uff.accepts_ions and uff.accepts_radicals and uff.accepts_unit_cell
++    assert uff.molecule is None
++    lj = calc.EnergyCalculator("LJ")
++    assert lj.identifier == "LJ"
++    assert "LJ" in repr(lj)
++
++
++def test_unknown_identifier():
++    with pytest.raises(ValueError, match="available: LJ, UFF"):
++        calc.EnergyCalculator("MMFF94")
++
++
++def test_calculators_are_independent():
++    a, b = calc.UFF(), calc.UFF()
++    a.set_molecule(make_water())
++    assert b.molecule is None
++
++
++def test_no_python_subclasses():
++    with pytest.raises(TypeError):
++
++        class Sub(calc.EnergyCalculator):
++            pass
++
++
++# --- Energies and gradients ---
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_energy_matches_energy_and_gradient(factory):
++    # No C++ test asserts an absolute UFF / LJ energy, so this checks that
++    # the separate energy() path agrees with the fused one.
++    mol = make_alkane(3)
++    ff = make_ff(factory, mol)
++    energy = ff.energy()
++    e2, grad = ff.energy_and_gradient()
++    assert math.isfinite(energy)
++    assert energy == pytest.approx(e2, rel=1e-10, abs=1e-8)
++    assert grad.shape == (mol.atom_count(), 3)
++    assert np.array_equal(grad, ff.gradient())
++    assert energy == pytest.approx(ff.energy(mol.positions))
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_gradient_matches_finite_difference(factory):
++    mol = make_alkane(3)
++    ff = make_ff(factory, mol)
++    x = mol.positions
++    grad = ff.gradient(x)
++    numeric = np.zeros_like(x)
++    h = 1e-5
++    for i in range(x.shape[0]):
++        for k in range(3):
++            plus, minus = x.copy(), x.copy()
++            plus[i, k] += h
++            minus[i, k] -= h
++            numeric[i, k] = (ff.energy(plus) - ff.energy(minus)) / (2 * h)
++    assert np.abs(grad).max() > 1.0  # a meaningful test, not all zeros
++    np.testing.assert_allclose(grad, numeric, rtol=1e-5, atol=1e-4)
++
++
++def test_results_are_new_arrays():
++    mol = make_water()
++    ff = make_ff(calc.UFF, mol)
++    g1 = ff.gradient()
++    g1[:] = 0
++    assert np.abs(ff.gradient()).max() > 0
++    x = mol.positions
++    ff.energy(x)
++    assert np.array_equal(x, mol.positions)
++
++
++def test_positions_accepts_lists_and_ints():
++    mol = make_water()
++    ff = make_ff(calc.UFF, mol)
++    as_list = mol.positions.tolist()
++    assert ff.energy(as_list) == ff.energy()
++
++
++# --- Errors ---
++
++
++def test_no_molecule():
++    ff = calc.UFF()
++    for call in (ff.energy, ff.gradient, ff.energy_and_gradient):
++        with pytest.raises(RuntimeError, match="set_molecule"):
++            call()
++    with pytest.raises(RuntimeError):
++        calc.optimize_steps(ff, np.zeros((3, 3)))
++    with pytest.raises(RuntimeError):
++        ff.mask = np.ones((3, 3))
++    with pytest.raises(RuntimeError):
++        ff.constraints = []
++    assert ff.mask is None
++    assert ff.constraints == []
++
++
++@pytest.mark.parametrize(
++    "positions",
++    [
++        np.zeros((2, 3)),  # wrong atom count
++        np.zeros((4, 3)),
++        np.zeros(9),  # flat
++        np.zeros((3, 2)),
++        np.zeros((3, 3, 1)),
++        np.full((3, 3), np.nan),
++        np.array([[0.0, 0, 0], [np.inf, 0, 0], [0, 1, 0]]),
++    ],
++)
++def test_bad_positions(positions):
++    ff = make_ff(calc.UFF, make_water())
++    for call in (ff.energy, ff.gradient, ff.energy_and_gradient):
++        with pytest.raises(ValueError):
++            call(positions)
++    with pytest.raises(ValueError):
++        calc.optimize_steps(ff, positions)
++
++
++def test_molecule_without_positions():
++    mol = core.Molecule()
++    mol.add_atom(6)
++    mol.add_atom(1)
++    mol.add_bond(0, 1, 1)
++    for factory in FACTORIES:
++        ff = make_ff(factory, mol)
++        with pytest.raises(ValueError, match="3D positions"):
++            ff.energy()
++        with pytest.raises(ValueError):
++            calc.optimize_steps(ff)
++        assert math.isfinite(ff.energy(np.array([[0.0, 0, 0], [1.1, 0, 0]])))
++
++
++def test_molecule_edited_after_set_molecule():
++    mol = make_water()
++    ff = make_ff(calc.UFF, mol)
++    ff.energy()
++    mol.add_atom(1)
++    with pytest.raises(RuntimeError, match="set_molecule"):
++        ff.energy()
++    with pytest.raises(RuntimeError, match="set_molecule"):
++        calc.optimize_steps(ff, np.zeros((4, 3)))
++    mol.positions = np.vstack([mol.positions[:3], [[0.0, -1.0, 0.0]]])
++    ff.set_molecule(mol)
++    assert math.isfinite(ff.energy())
++    mol.add_bond(0, 3, 1)  # a bond count change is caught as well
++    with pytest.raises(RuntimeError, match="set_molecule"):
++        ff.gradient()
++    ff.set_molecule(mol)
++    assert ff.gradient().shape == (4, 3)
++
++
++def test_element_not_supported_by_uff():
++    mol = core.Molecule()
++    mol.add_atom(6)
++    mol.add_atom(110)
++    mol.positions = np.array([[0.0, 0, 0], [2.0, 0, 0]])
++    ff = calc.UFF()
++    with pytest.raises(ValueError, match="110"):
++        ff.set_molecule(mol)
++    assert ff.molecule is None
++    lj = make_ff(calc.LennardJones, mol)
++    assert math.isfinite(lj.energy())
++
++
++def test_failed_set_molecule_keeps_previous_molecule():
++    water = make_water()
++    ff = make_ff(calc.UFF, water)
++    bad = core.Molecule()
++    bad.add_atom(110)
++    with pytest.raises(ValueError):
++        ff.set_molecule(bad)
++    assert ff.molecule is water
++    assert math.isfinite(ff.energy())
++
++
++def test_set_molecule_wrong_type():
++    ff = calc.UFF()
++    for bad in (5, "water", None, [1, 2]):
++        with pytest.raises(TypeError):
++            ff.set_molecule(bad)
++
++
++# --- Edge cases ---
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++@pytest.mark.parametrize("n_atoms", [0, 1, 2])
++@pytest.mark.parametrize("algorithm", list(calc.OptimizationAlgorithm.__members__.values()))
++def test_tiny_molecules(factory, n_atoms, algorithm):
++    mol = core.Molecule()
++    for _ in range(n_atoms):
++        mol.add_atom(6)
++    x0 = np.array([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]])[:n_atoms].reshape(n_atoms, 3)
++    mol.positions = x0
++    ff = make_ff(factory, mol)
++    assert math.isfinite(ff.energy())
++    assert ff.gradient().shape == (n_atoms, 3)
++    options = calc.OptimizationOptions()
++    options.algorithm = algorithm
++    state = calc.OptimizerState()
++    x = calc.optimize_steps(ff, options=options, state=state)
++    assert x.shape == (n_atoms, 3)
++    assert np.isfinite(x).all()
++
++
++# --- Mask and constraints ---
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_frozen_atoms_do_not_move(factory):
++    mol = make_alkane(4)
++    ff = make_ff(factory, mol)
++    ff.freeze_atoms([0, 5])
++    mask = ff.mask
++    assert mask.shape == (mol.atom_count(), 3)
++    assert not mask[[0, 5]].any()
++    assert mask[[1, 2]].all()
++    x0 = mol.positions
++    assert not ff.gradient()[[0, 5]].any()
++    state = calc.OptimizerState()
++    options = calc.OptimizationOptions()
++    options.chunk_iterations = 100
++    x, _ = run_chunks(ff, x0, options, state, 5)
++    assert np.array_equal(x[[0, 5]], x0[[0, 5]])
++    assert np.abs(x - x0).max() > 1e-3
++
++
++def test_mask_setter_forms():
++    mol = make_water()
++    ff = make_ff(calc.UFF, mol)
++    assert ff.mask.shape == (3, 3) and ff.mask.all()  # no frozen atoms
++    ff.mask = np.array([True, False, True])  # per atom
++    assert ff.mask.tolist() == [[1, 1, 1], [0, 0, 0], [1, 1, 1]]
++    ff.mask = [[1, 0, 1], [1, 1, 1], [1, 1, 1]]  # per coordinate
++    assert ff.mask[0].tolist() == [1, 0, 1]
++    assert ff.gradient()[0, 1] == 0
++    ff.mask = None
++    assert ff.mask is None
++    assert ff.gradient()[0, 1] != 0
++
++
++@pytest.mark.parametrize(
++    "mask",
++    [np.ones((2, 3)), np.ones(4), np.ones(9), np.ones((3, 2)), np.full((3, 3), 0.5)],
++)
++def test_bad_mask(mask):
++    ff = make_ff(calc.UFF, make_water())
++    ff.mask = np.ones(3)
++    with pytest.raises(ValueError):
++        ff.mask = mask
++    assert ff.mask.all()  # unchanged by the failed assignment
++
++
++def test_freeze_atoms_out_of_range():
++    ff = make_ff(calc.UFF, make_water())
++    with pytest.raises(ValueError):
++        ff.freeze_atoms([0, 3])
++    assert ff.mask.all()  # unchanged by the failed call
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_set_molecule_resets_mask(factory):
++    # set_molecule() starts again from the molecule's frozen atoms (none
++    # here), for the same atom count and for a changed one
++    mol = make_water()
++    ff = make_ff(factory, mol)
++    ff.freeze_atoms([0])
++    ff.set_molecule(mol)
++    assert ff.mask.shape == (3, 3) and ff.mask.all()
++    ff.freeze_atoms([0])
++    mol.add_atom(1)
++    mol.positions = np.vstack([mol.positions[:3], [[0.0, -1.0, 0.0]]])
++    ff.set_molecule(mol)
++    assert ff.mask.shape == (4, 3) and ff.mask.all()
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_distance_constraint_respected(factory):
++    # Far from the unconstrained minimum of the dimer (UFF has no bond
++    # here, so only the van der Waals well pulls the carbons together).
++    target = 4.5
++    mol = make_dimer(3.8)
++    ff = make_ff(factory, mol)
++    free, _ = run_chunks(
++        ff, mol.positions, calc.OptimizationOptions(), calc.OptimizerState(), 200
++    )
++    free_distance = np.linalg.norm(free[0] - free[1])
++    assert abs(free_distance - target) > 0.5
++
++    ff.constraints = [core.Constraint([0, 1], target)]
++    options = calc.OptimizationOptions()
++    options.chunk_iterations = 50
++    x, _ = run_chunks(ff, mol.positions, options, calc.OptimizerState(), 50)
++    assert np.linalg.norm(x[0] - x[1]) == pytest.approx(target, rel=0.02)
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_angle_constraint_value_is_in_degrees(factory):
++    mol = make_water()
++    ff = make_ff(factory, mol)
++    ff.constraints = [core.Constraint([1, 0, 2], 90.0, 1e6)]
++    options = calc.OptimizationOptions()
++    options.chunk_iterations = 200
++    x, _ = run_chunks(ff, mol.positions, options, calc.OptimizerState(), 20)
++    v1, v2 = x[1] - x[0], x[2] - x[0]
++    cosine = v1 @ v2 / np.linalg.norm(v1) / np.linalg.norm(v2)
++    assert np.degrees(np.arccos(cosine)) == pytest.approx(90.0, abs=0.5)
++
++
++def test_constraints_roundtrip_and_validation():
++    mol = make_water()
++    ff = make_ff(calc.UFF, mol)
++    cs = [core.Constraint([0, 1], 1.0), core.Constraint([1, 0, 2], 104.5)]
++    ff.constraints = cs
++    back = ff.constraints
++    assert [c.atoms for c in back] == [(0, 1), (1, 0, 2)]
++    assert [c.value for c in back] == [1.0, 104.5]
++    with pytest.raises(ValueError, match="constraint 1"):
++        ff.constraints = [core.Constraint([0, 1], 1.0), core.Constraint([0, 3], 1.0)]
++    assert len(ff.constraints) == 2  # failed assignment changed nothing
++    ff.constraints = []
++    assert ff.constraints == []
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_constraint_energy_is_added_in_kj(factory):
++    # A restraint adds exactly k * delta**2 kJ/mol under every model (UFF
++    # used to scale it by 4.184 along with its own kcal/mol terms).
++    mol = make_water()
++    ff = make_ff(factory, mol)
++    plain = ff.energy()
++    x = mol.positions
++    distance = np.linalg.norm(x[1] - x[0])
++    ff.constraints = [core.Constraint([0, 1], distance - 0.1, 50.0)]
++    assert ff.energy() - plain == pytest.approx(50.0 * 0.1**2, abs=1e-9)
++
++
++def test_set_molecule_rejects_stale_constraints():
++    mol = make_water()
++    ff = make_ff(calc.UFF, mol)
++    ff.constraints = [core.Constraint([0, 2], 1.0)]
++    small = core.Molecule()
++    small.add_atom(1)
++    small.add_atom(1)
++    small.positions = np.array([[0.0, 0, 0], [0.8, 0, 0]])
++    with pytest.raises(ValueError, match="constraints"):
++        ff.set_molecule(small)
++    assert ff.molecule is mol
++    ff.constraints = []
++    ff.set_molecule(small)
++
++
++def test_constraints_wrong_types():
++    ff = make_ff(calc.UFF, make_water())
++    for bad in (5, [5], ["a"], [(0, 1)], core.Constraint([0, 1], 1.0)):
++        with pytest.raises(TypeError):
++            ff.constraints = bad
++
++
++# --- Optimizer options ---
++
++
++def test_options_defaults_and_nested_assignment():
++    opts = calc.OptimizationOptions()
++    assert opts.algorithm == calc.OptimizationAlgorithm.Lbfgs
++    assert opts.chunk_iterations == 5
++    assert opts.lbfgs.max_step == 0.0
++    assert opts.lbfgs.wolfe_gtol == 0.9
++    assert opts.fire.dt0 == 0.05
++    assert opts.fire.n_delay == 5
++    assert opts.hybrid.switch_gradient == 5.0
++    # def_readwrite on a struct member must edit opts itself, not a copy.
++    opts.lbfgs.max_step = 0.1
++    opts.fire.max_move = 0.01
++    opts.hybrid.switch_gradient = 1.5
++    assert opts.lbfgs.max_step == 0.1
++    assert opts.fire.max_move == 0.01
++    assert opts.hybrid.switch_gradient == 1.5
++    held = opts.fire
++    held.mass = 2.0
++    assert opts.fire.mass == 2.0
++    opts.fire = calc.FireParameters()
++    assert opts.fire.mass == 1.0
++    assert "chunk_iterations=5" in repr(opts)
++    assert "max_move" in repr(opts.fire)
++    assert "wolfe_gtol" in repr(opts.lbfgs)
++    assert "switch_gradient" in repr(opts.hybrid)
++
++
++def test_nested_options_reach_the_optimizer():
++    mol = make_alkane(3)
++    ff = make_ff(calc.UFF, mol)
++    x0 = mol.positions
++    big = calc.OptimizationOptions()
++    big.chunk_iterations = 20
++    small = calc.OptimizationOptions()
++    small.chunk_iterations = 20
++    small.lbfgs.max_step = 1e-3
++    moved_big = np.abs(calc.optimize_steps(ff, x0, big) - x0).max()
++    moved_small = np.abs(calc.optimize_steps(ff, x0, small) - x0).max()
++    assert moved_small < moved_big
++    assert moved_small <= 20 * 1e-3 * (1 + 1e-9)
++
++
++def test_algorithm_enum():
++    names = set(calc.OptimizationAlgorithm.__members__)
++    assert names == {"Lbfgs", "Fire2", "AbcFire", "Hybrid"}
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        lambda o: setattr(o, "chunk_iterations", 0),
++        lambda o: setattr(o.lbfgs, "max_step", -1.0),
++        lambda o: setattr(o.lbfgs, "wolfe_gtol", 1.5),
++        lambda o: setattr(o.lbfgs, "max_step", float("nan")),
++    ],
++)
++def test_bad_lbfgs_options(mutate):
++    ff = make_ff(calc.UFF, make_water())
++    opts = calc.OptimizationOptions()
++    mutate(opts)
++    with pytest.raises(ValueError):
++        calc.optimize_steps(ff, options=opts)
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [
++        lambda o: setattr(o.fire, "mass", 0.0),
++        lambda o: setattr(o.fire, "dt0", -1.0),
++        lambda o: setattr(o.fire, "f_dec", 1.0),
++        lambda o: setattr(o.fire, "f_inc", 0.5),
++        lambda o: setattr(o.fire, "n_delay", -1),
++        lambda o: setattr(o.fire, "max_move", float("nan")),
++        lambda o: setattr(o.hybrid, "switch_gradient", float("nan")),
++    ],
++)
++def test_bad_fire_and_hybrid_options(mutate):
++    ff = make_ff(calc.UFF, make_water())
++    opts = calc.OptimizationOptions()
++    opts.algorithm = calc.OptimizationAlgorithm.Hybrid
++    mutate(opts)
++    with pytest.raises(ValueError):
++        calc.optimize_steps(ff, options=opts)
++
++
++# --- Optimizer ---
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++@pytest.mark.parametrize(
++    "algorithm",
++    [calc.OptimizationAlgorithm.Lbfgs, calc.OptimizationAlgorithm.Hybrid],
++)
++def test_chunked_loop_converges(factory, algorithm):
++    mol = make_alkane(4)
++    ff = make_ff(factory, mol)
++    x0 = mol.positions
++    start = ff.energy(x0)
++    options = calc.OptimizationOptions()
++    options.algorithm = algorithm
++    options.chunk_iterations = 50
++    state = calc.OptimizerState()
++    x, energies = run_chunks(ff, x0, options, state, 400)
++    assert max_gradient(state) < 1e-4
++    assert ff.energy(x) < start
++    if algorithm == calc.OptimizationAlgorithm.Lbfgs:
++        assert all(b <= a + 1e-9 for a, b in zip(energies, energies[1:]))
++    if algorithm == calc.OptimizationAlgorithm.Hybrid:
++        assert state.hybrid_switched
++
++
++@pytest.mark.parametrize(
++    "algorithm",
++    [calc.OptimizationAlgorithm.Fire2, calc.OptimizationAlgorithm.AbcFire],
++)
++def test_fire_makes_progress(algorithm):
++    mol = make_alkane(4)
++    ff = make_ff(calc.UFF, mol)
++    x0 = mol.positions
++    start_energy, start_grad = ff.energy_and_gradient(x0)
++    options = calc.OptimizationOptions()
++    options.algorithm = algorithm
++    options.chunk_iterations = 50
++    state = calc.OptimizerState()
++    x, _ = run_chunks(ff, x0, options, state, 100)
++    assert ff.energy(x) < start_energy
++    assert max_gradient(state) < 0.1 * np.abs(start_grad).max()
++
++
++def test_optimize_steps_does_not_modify_molecule():
++    mol = make_alkane(3)
++    ff = make_ff(calc.UFF, mol)
++    before = mol.positions
++    x = calc.optimize_steps(ff)
++    assert np.array_equal(mol.positions, before)
++    assert x.shape == before.shape
++    assert x is not before
++    assert np.abs(x - before).max() > 0
++    # Passed-in positions are not modified either.
++    given = before.copy()
++    y = calc.optimize_steps(ff, given)
++    assert np.array_equal(given, before)
++    assert np.array_equal(x, y)
++
++
++def test_state_consistent_with_calculator():
++    mol = make_alkane(3)
++    ff = make_ff(calc.UFF, mol)
++    state = calc.OptimizerState()
++    assert math.isnan(state.energy)
++    assert state.gradient is None
++    assert not state.hybrid_switched
++    assert "OptimizerState" in repr(state)
++    for algorithm in calc.OptimizationAlgorithm.__members__.values():
++        options = calc.OptimizationOptions()
++        options.algorithm = algorithm
++        x = calc.optimize_steps(ff, mol.positions, options, state)
++        energy, grad = ff.energy_and_gradient(x)
++        assert state.energy == pytest.approx(energy, rel=1e-9)
++        np.testing.assert_allclose(state.gradient, grad, rtol=1e-9, atol=1e-9)
++        assert state.gradient.shape == x.shape
++        state.reset()
++        assert math.isnan(state.energy)
++        assert state.gradient is None
++
++
++def test_state_gradient_is_a_copy():
++    ff = make_ff(calc.UFF, make_alkane(3))
++    state = calc.OptimizerState()
++    calc.optimize_steps(ff, state=state)
++    g = state.gradient
++    g[:] = 0
++    assert np.abs(state.gradient).max() > 0
++
++
++@pytest.mark.parametrize(
++    "algorithm",
++    [
++        calc.OptimizationAlgorithm.Lbfgs,
++        calc.OptimizationAlgorithm.Fire2,
++        calc.OptimizationAlgorithm.Hybrid,
++    ],
++)
++def test_stale_state_is_discarded(algorithm):
++    mol = make_alkane(3)
++    ff = make_ff(calc.UFF, mol)
++    options = calc.OptimizationOptions()
++    options.algorithm = algorithm
++    options.chunk_iterations = 10
++    x1 = mol.positions
++    x2 = x1 + 0.05 * np.cos(np.arange(x1.size)).reshape(x1.shape)
++
++    state = calc.OptimizerState()
++    calc.optimize_steps(ff, x1, options, state)
++    reused = calc.optimize_steps(ff, x2, options, state)  # not x1's result
++    fresh = calc.optimize_steps(ff, x2, options, calc.OptimizerState())
++    assert np.array_equal(reused, fresh)
++
++    # Changing the calculator setup also drops it.
++    state = calc.OptimizerState()
++    calc.optimize_steps(ff, x1, options, state)
++    ff.freeze_atoms([0])
++    reused = calc.optimize_steps(ff, x2, options, state)
++    fresh = calc.optimize_steps(ff, x2, options, calc.OptimizerState())
++    assert np.array_equal(reused, fresh)
++
++
++def test_state_continues_across_chunks():
++    ff = make_ff(calc.UFF, make_alkane(3))
++    options = calc.OptimizationOptions()
++    options.algorithm = calc.OptimizationAlgorithm.Fire2
++    options.chunk_iterations = 10
++    x = ff.molecule.positions
++    state = calc.OptimizerState()
++    for _ in range(3):
++        x = calc.optimize_steps(ff, x, options, state)
++    one = calc.OptimizationOptions()
++    one.algorithm = calc.OptimizationAlgorithm.Fire2
++    one.chunk_iterations = 30
++    y = calc.optimize_steps(ff, ff.molecule.positions, one, calc.OptimizerState())
++    np.testing.assert_allclose(x, y, atol=1e-9)
++
++
++def test_hybrid_switch_flag_resets():
++    ff = make_ff(calc.UFF, make_alkane(3))
++    options = calc.OptimizationOptions()
++    options.algorithm = calc.OptimizationAlgorithm.Hybrid
++    options.hybrid.switch_gradient = 1e9  # switch at the first chance
++    options.chunk_iterations = 5
++    state = calc.OptimizerState()
++    x = calc.optimize_steps(ff, None, options, state)
++    assert not state.hybrid_switched
++    calc.optimize_steps(ff, x, options, state)
++    assert state.hybrid_switched
++    state.reset()
++    assert not state.hybrid_switched
++
++
++def test_optimize_with_nonfinite_energy_does_not_raise():
++    mol = make_dimer(3.0)
++    ff = make_ff(calc.LennardJones, mol)
++    x = calc.optimize_steps(ff, np.array([[0.0, 0, 0], [1e-300, 0, 0]]))
++    assert x.shape == (2, 3)
++
++
++# --- Lifetime ---
++
++
++@pytest.mark.parametrize("factory", FACTORIES)
++def test_calculator_keeps_molecule_alive(factory):
++    ff = factory()
++    ff.set_molecule(make_alkane(3))
++    gc.collect()
++    assert math.isfinite(ff.energy())
++    assert ff.gradient().shape == (11, 3)
++    assert ff.molecule.atom_count() == 11
++    x = calc.optimize_steps(ff)
++    assert x.shape == (11, 3)
++
++
++def test_replacing_molecule_releases_old_one():
++    ff = calc.UFF()
++    ff.set_molecule(make_water())
++    ff.set_molecule(make_alkane(2))
++    gc.collect()
++    assert ff.molecule.atom_count() == 8
++    assert math.isfinite(ff.energy())
++
++
++def test_calculator_outlives_module_references():
++    def build():
++        ff = calc.UFF()
++        ff.set_molecule(make_water())
++        return ff
++
++    ff = build()
++    gc.collect()
++    assert math.isfinite(ff.energy())
++
++
++# --- Wrong-typed arguments must raise TypeError, never crash ---
++# pybind11 3.1 runs keep_alive post-call hooks even after a failed argument
++# conversion; nothing in avogadro.calc uses keep_alive, and these calls
++# prove that stays true.
++
++WRONG = [5, "x", 2.5, object(), [object()], {}]
++
++
++def test_wrong_typed_arguments():
++    ff = make_ff(calc.UFF, make_water())
++    for bad in (object(), "x", {}, [object()], [["a", "b", "c"]] * 3):
++        for method in (ff.energy, ff.gradient, ff.energy_and_gradient):
++            with pytest.raises((TypeError, ValueError)):
++                method(bad)
++    for bad in (object(), {}, "x", [[object()]] * 3):
++        with pytest.raises(TypeError):
++            ff.mask = bad
++    for bad in (5, "x", [-1], ["a"], 2.5):
++        with pytest.raises(TypeError):
++            ff.freeze_atoms(bad)
++    for bad in (5, 2.5, object(), [object()], {}, None):
++        with pytest.raises(TypeError):
++            calc.EnergyCalculator(bad)
++        with pytest.raises(TypeError):
++            calc.model_name(bad)
++    for bad in WRONG:
++        with pytest.raises(TypeError):
++            calc.models_for_molecule(bad)
++        with pytest.raises(TypeError):
++            calc.recommended_model(bad)
++        with pytest.raises(TypeError):
++            calc.optimize_steps(bad)
++        with pytest.raises(TypeError):
++            calc.optimize_steps(ff, None, bad)
++        with pytest.raises(TypeError):
++            calc.optimize_steps(ff, None, None, bad)
++    with pytest.raises(TypeError):
++        calc.optimize_steps(ff, None, calc.OptimizationOptions(), core.Molecule())
++    with pytest.raises(TypeError):
++        calc.optimize_steps(ff, None, calc.OptimizerState(), None)
++    with pytest.raises(TypeError):
++        calc.optimize_steps(None, None)
++    with pytest.raises(TypeError):
++        calc.UFF(1)
++    with pytest.raises(ValueError):  # a scalar converts, but has no shape
++        ff.energy(positions=5)
++    with pytest.raises(TypeError):
++        ff.energy(not_a_keyword=1)
++    with pytest.raises(TypeError):
++        ff.energy(None, None)
++
++
++def test_wrong_typed_options_fields():
++    opts = calc.OptimizationOptions()
++    for attr, bad in [
++        ("algorithm", 5),
++        ("algorithm", "Lbfgs"),
++        ("chunk_iterations", "x"),
++        ("chunk_iterations", -1),
++        ("chunk_iterations", None),
++        ("lbfgs", 5),
++        ("fire", calc.LbfgsParameters()),
++        ("hybrid", None),
++    ]:
++        with pytest.raises(TypeError):
++            setattr(opts, attr, bad)
++    with pytest.raises(TypeError):
++        opts.lbfgs.max_step = "x"
++    with pytest.raises(TypeError):
++        opts.fire.n_delay = 1.5
++    with pytest.raises(TypeError):
++        calc.LbfgsParameters(1)
++    with pytest.raises(TypeError):
++        calc.OptimizerState(1)
++    with pytest.raises(TypeError):
++        calc.OptimizationOptions(1)
++
++
++def test_unbound_methods_with_wrong_self():
++    cls = calc.EnergyCalculator
++    for name in ("energy", "gradient", "energy_and_gradient", "set_molecule"):
++        method = getattr(cls, name)
++        arg = (make_water(),) if name == "set_molecule" else ()
++        for bad_self in (5, "x", None, object(), core.Molecule(), calc.OptimizerState()):
++            with pytest.raises(TypeError):
++                method(bad_self, *arg)
++    with pytest.raises(TypeError):
++        cls.energy(5)
++    with pytest.raises(TypeError):
++        cls.freeze_atoms(5, [0])
++    for prop in ("identifier", "name", "description", "molecule", "mask", "constraints"):
++        with pytest.raises(TypeError):
++            getattr(cls, prop).__get__(5)
++    with pytest.raises(TypeError):
++        cls.mask.__set__(5, None)
++    with pytest.raises(TypeError):
++        cls.constraints.__set__(5, [])
++    state_cls = calc.OptimizerState
++    with pytest.raises(TypeError):
++        state_cls.reset(5)
++    with pytest.raises(TypeError):
++        state_cls.energy.__get__(5)
++    with pytest.raises(TypeError):
++        calc.LbfgsParameters.max_step.__get__(5)
++    with pytest.raises(TypeError):
++        calc.OptimizationOptions.lbfgs.__get__(5)
++    with pytest.raises(TypeError):
++        calc.OptimizationOptions.lbfgs.__set__(5, calc.LbfgsParameters())
+diff --git a/python/tests/test_core_bindings.py b/python/tests/test_core_bindings.py
+index 2e1d42ad832..f73a5944408 100644
+--- a/python/tests/test_core_bindings.py
++++ b/python/tests/test_core_bindings.py
+@@ -362,3 +362,73 @@ def test_cube_data_before_limits_rejected():
+     cube = core.Molecule().add_cube()
+     with pytest.raises(ValueError):
+         cube.data = np.ones(8, dtype=np.float32)
++
++
++# --- Constraint ---
++
++
++def test_constraint_types_from_atom_count():
++    assert core.Constraint([0, 1], 1.5).type == core.Constraint.Type.Distance
++    assert core.Constraint([0, 1, 2], 109.5).type == core.Constraint.Type.Angle
++    assert core.Constraint([0, 1, 2, 3], 60.0).type == core.Constraint.Type.Torsion
++
++
++def test_constraint_properties():
++    c = core.Constraint((3, 1, 2), 120.0, 5000.0)
++    assert c.atoms == (3, 1, 2)
++    assert c.value == 120.0
++    assert c.force_constant == 5000.0
++    assert "120" in repr(c)
++
++
++def test_constraint_default_force_constants():
++    # Distances are in kJ/mol/A^2, angles and torsions in kJ/mol/rad^2.
++    assert core.Constraint([0, 1], 1.0).force_constant == core.Constraint.DEFAULT_DISTANCE_K
++    assert core.Constraint([0, 1, 2], 90.0).force_constant == core.Constraint.DEFAULT_ANGULAR_K
++    assert core.Constraint([0, 1, 2, 3], 0.0).force_constant == core.Constraint.DEFAULT_ANGULAR_K
++
++
++def test_constraint_is_valid():
++    c = core.Constraint([0, 4, 2], 90.0)
++    assert c.is_valid(5)
++    assert not c.is_valid(4)
++    assert not c.is_valid(0)
++
++
++@pytest.mark.parametrize(
++    "args",
++    [
++        ([0], 1.0),
++        ([0, 1, 2, 3, 4], 1.0),
++        ([], 1.0),
++        ([0, 0], 1.0),
++        ([0, 1, 0], 1.0),
++        ([0, 1], float("nan")),
++        ([0, 1], float("inf")),
++    ],
++)
++def test_constraint_bad_values(args):
++    with pytest.raises(ValueError):
++        core.Constraint(*args)
++
++
++@pytest.mark.parametrize("k", [-1.0, float("nan")])
++def test_constraint_bad_force_constant(k):
++    with pytest.raises(ValueError):
++        core.Constraint([0, 1], 1.0, k)
++
++
++@pytest.mark.parametrize(
++    "args",
++    [(5, 1.0), (["a", "b"], 1.0), ([-1, 1], 1.0), ([0, 1], "x"), ([0, 1], 1.0, "k")],
++)
++def test_constraint_wrong_types(args):
++    with pytest.raises(TypeError):
++        core.Constraint(*args)
++
++
++def test_constraint_unbound_wrong_self():
++    with pytest.raises(TypeError):
++        core.Constraint.is_valid(5, 3)
++    with pytest.raises(TypeError):
++        core.Constraint.is_valid(core.Constraint([0, 1], 1.0), "x")

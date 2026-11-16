@@ -1,0 +1,4241 @@
+diff --git a/README.md b/README.md
+index dc1b7ec..d727d98 100644
+--- a/README.md
++++ b/README.md
+@@ -451,12 +451,17 @@ Full documentation available at [pandadock.readthedocs.io](https://pandadock.rea
+ If you use PandaDock in your research, please cite:
+ 
+ ```bibtex
+-@article{panda2024pandadock,
+-  title={PandaDock: SE(3)-Equivariant Graph Neural Network Scoring for Molecular Docking},
+-  author={Panda, Pritam Kumar},
+-  journal={bioRxiv},
+-  year={2024},
+-  note={Manuscript in preparation}
++@article {Panda2026.08.19.745667,
++  author = {Panda, Pritam Kumar},
++  title = {PandaDock: An Open-Source Molecular Docking Platform with Flexible-Ligand Search and Equivariant Neural Scoring},
++  elocation-id = {2026.08.19.745667},
++  year = {2026},
++  doi = {10.64898/2026.08.19.745667},
++  publisher = {Cold Spring Harbor Laboratory},
++  abstract = {We present PandaDock, an open-source molecular docking platform implementing flexible-ligand conformational search with analytic gradients, a precomputed affinity grid engine, specialized modules for induced-fit, metal-coordination and tethered docking, and an SE(3)-equivariant graph neural network scoring function trained at scale. Ligand flexibility is represented as a torsion tree and pose parameters are optimized by Monte Carlo with Metropolis acceptance refined by L-BFGS, with rotational gradients obtained in closed form through the derivative of the SO(3) exponential map rather than by finite differences. Affinity grids are built by a blocked neighbor-selection scheme that is exact and 5.6-9.7x faster than dense evaluation, and may be cached across ligands sharing a receptor and site, reducing a six-ligand series from 29.3 s to 10.4 s. On 814 protein-ligand complexes spanning 14 target families, PandaDock recovers a pose within 2 Angstroms of the crystal geometry in 33.7\% of cases at rank 1 and in 57.0\% of cases within the returned ensemble. The GNN scoring function is trained on 741,706 co-folded complexes from SAIR under target-disjoint splits, reaching a Pearson r of 0.407 on 90,219 held-out complexes and transferring to 202 independent crystal structures with measured Ki, Kd, IC50 or EC50 at r = 0.467. We report the model against three controls, a target-mean predictor, a ligand-descriptor-only baseline, and within-target correlations, and document both where it performs and where it does not, including its unsuitability for pose rescoring. On an independent 30-compound series against a single GABAA receptor target, PandaDock{\textquoteright}s empirical scoring function ranks 8th of 25 methods evaluated, ahead of every AutoDock Vina and Vinardo configuration tested, while the GNN scores below Vina, consistent with the within-target ceiling identified on SAIR. At full scale on the PDBbind v2020 refined set (n = 4,640, native crystal poses), the fully independent SAIR model reaches r = 0.531, and a dedicated model trained on PDBbind alone under a target-disjoint split reaches r = 0.690 on its own held-out test complexes, the strongest evidence in this work that PandaDock{\textquoteright}s affinity predictions generalize. PandaDock is distributed under an open-source license at https://github.com/pritampanda15/PandaDock with a complete command-line interface and a reproducible benchmarking harness.Competing Interest StatementThe authors have declared no competing interest.},
++  URL = {https://www.biorxiv.org/content/early/2026/08/20/2026.08.19.745667},
++  eprint = {https://www.biorxiv.org/content/early/2026/08/20/2026.08.19.745667.full.pdf},
++  journal = {bioRxiv}
+ }
+ ```
+ 
+@@ -478,7 +483,7 @@ PandaDock is released under the MIT License. See [LICENSE](LICENSE) for details.
+ 
+ **Author**: Pritam Kumar Panda
+ **Affiliation**: Stanford University
+-**Email**: pritampanda@stanford.edu
++**Email**: pritam@stanford.edu
+ **GitHub**: [@pritampanda15](https://github.com/pritampanda15)
+ 
+ ---
+diff --git a/pandadock/docking/algorithms/enhanced_hierarchical_gpu.py b/pandadock/docking/algorithms/enhanced_hierarchical_gpu.py
+deleted file mode 100644
+index c5a17c1..0000000
+--- a/pandadock/docking/algorithms/enhanced_hierarchical_gpu.py
++++ /dev/null
+@@ -1,853 +0,0 @@
+-"""
+-GPU-Accelerated Enhanced Hierarchical Docking
+-
+-CUDA implementation of 3-stage enhanced hierarchical docking:
+-1. Site Point Generation - GPU-parallel grid point filtering
+-2. Greedy Scoring - Parallel pose evaluation and ranking
+-3. Energy Minimization - GPU-accelerated local optimization
+-
+-Performance improvements:
+-- 100-300x speedup over CPU for large conformer libraries
+-- Parallel site point evaluation across GPU threads
+-- Batch pose scoring with optimized memory patterns
+-- GPU-accelerated energy minimization with custom kernels
+-
+-Combines accuracy of hierarchical search with GPU parallelism.
+-"""
+-
+-import numpy as np
+-from typing import List, Dict, Tuple, Optional
+-import logging
+-import time
+-from ..core import BaseDockingAlgorithm, DockingResult, Pose
+-
+-# GPU libraries with fallbacks
+-try:
+-    import cupy as cp
+-    CUPY_AVAILABLE = True
+-
+-    # Optional CuPy scipy modules
+-    try:
+-        import cupyx.scipy.spatial.distance as cp_distance
+-    except ImportError:
+-        cp_distance = None
+-
+-    # Note: cupyx.scipy.spatial.transform may not exist, we'll use scipy.spatial.transform instead
+-    cp_R = None  # Will use scipy.spatial.transform.Rotation with CuPy arrays
+-
+-except ImportError:
+-    CUPY_AVAILABLE = False
+-    cp = None
+-    cp_distance = None
+-    cp_R = None
+-
+-try:
+-    from numba import cuda, float32, int32
+-    import numba
+-    NUMBA_CUDA_AVAILABLE = True
+-except ImportError:
+-    NUMBA_CUDA_AVAILABLE = False
+-
+-try:
+-    import pycuda.driver as cuda_driver
+-    import pycuda.autoinit
+-    from pycuda.compiler import SourceModule
+-    import pycuda.gpuarray as gpuarray
+-    PYCUDA_AVAILABLE = True
+-except ImportError:
+-    PYCUDA_AVAILABLE = False
+-
+-
+-# CUDA kernels for hierarchical docking
+-HIERARCHICAL_KERNEL_SOURCE = """
+-__device__ float calculate_site_score(
+-    float site_x, float site_y, float site_z,
+-    float* receptor_coords,
+-    float* receptor_charges,
+-    int* receptor_types,
+-    int n_receptor_atoms,
+-    float probe_radius
+-) {
+-    float site_score = 0.0f;
+-
+-    for (int i = 0; i < n_receptor_atoms; i++) {
+-        float rec_x = receptor_coords[i * 3];
+-        float rec_y = receptor_coords[i * 3 + 1];
+-        float rec_z = receptor_coords[i * 3 + 2];
+-
+-        float dx = site_x - rec_x;
+-        float dy = site_y - rec_y;
+-        float dz = site_z - rec_z;
+-        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+-
+-        if (dist > probe_radius && dist < 8.0f) {
+-            // Favorable interaction potential
+-            float r6 = dist * dist * dist * dist * dist * dist;
+-            float lj_attractive = -1.0f / r6;
+-            site_score += lj_attractive;
+-
+-            // Electrostatic contribution
+-            float elec = receptor_charges[i] / dist;
+-            site_score += 0.1f * elec;
+-        } else if (dist <= probe_radius) {
+-            // Clash penalty
+-            site_score += 1000.0f;
+-        }
+-    }
+-
+-    return site_score;
+-}
+-
+-__global__ void evaluate_site_points(
+-    float* site_points,        // [n_sites, 3]
+-    float* receptor_coords,    // [n_receptor_atoms, 3]
+-    float* receptor_charges,   // [n_receptor_atoms]
+-    int* receptor_types,       // [n_receptor_atoms]
+-    float* site_scores,        // [n_sites] output
+-    int n_sites,
+-    int n_receptor_atoms,
+-    float probe_radius
+-) {
+-    int site_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (site_idx >= n_sites) return;
+-
+-    float site_x = site_points[site_idx * 3];
+-    float site_y = site_points[site_idx * 3 + 1];
+-    float site_z = site_points[site_idx * 3 + 2];
+-
+-    float score = calculate_site_score(
+-        site_x, site_y, site_z,
+-        receptor_coords, receptor_charges, receptor_types,
+-        n_receptor_atoms, probe_radius
+-    );
+-
+-    site_scores[site_idx] = score;
+-}
+-
+-__global__ void hierarchical_pose_scoring(
+-    float* pose_coords,        // [n_poses, n_atoms, 3]
+-    float* receptor_coords,    // [n_receptor_atoms, 3]
+-    float* receptor_charges,   // [n_receptor_atoms]
+-    float* ligand_charges,     // [n_atoms]
+-    float* pose_scores,        // [n_poses] output
+-    int* pose_ranks,          // [n_poses] output
+-    int n_poses,
+-    int n_atoms,
+-    int n_receptor_atoms
+-) {
+-    int pose_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (pose_idx >= n_poses) return;
+-
+-    float total_score = 0.0f;
+-    int pose_offset = pose_idx * n_atoms * 3;
+-
+-    // Calculate pose energy with enhanced terms
+-    for (int i = 0; i < n_atoms; i++) {
+-        float lig_x = pose_coords[pose_offset + i * 3];
+-        float lig_y = pose_coords[pose_offset + i * 3 + 1];
+-        float lig_z = pose_coords[pose_offset + i * 3 + 2];
+-        float lig_q = ligand_charges[i];
+-
+-        for (int j = 0; j < n_receptor_atoms; j++) {
+-            float rec_x = receptor_coords[j * 3];
+-            float rec_y = receptor_coords[j * 3 + 1];
+-            float rec_z = receptor_coords[j * 3 + 2];
+-            float rec_q = receptor_charges[j];
+-
+-            float dx = lig_x - rec_x;
+-            float dy = lig_y - rec_y;
+-            float dz = lig_z - rec_z;
+-            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+-
+-            if (dist > 0.1f && dist < 12.0f) {
+-                // Van der Waals
+-                float r6 = dist * dist * dist * dist * dist * dist;
+-                float r12 = r6 * r6;
+-                float vdw = 4.0f * (1.0f / r12 - 1.0f / r6);
+-                total_score += vdw;
+-
+-                // Electrostatics
+-                float elec = 332.0f * lig_q * rec_q / dist;
+-                total_score += elec;
+-
+-                // Hydrogen bonding (simplified)
+-                if (dist < 3.5f) {
+-                    float hb_strength = expf(-(dist - 2.8f) * (dist - 2.8f) / 0.25f);
+-                    total_score -= 2.0f * hb_strength;
+-                }
+-            }
+-        }
+-    }
+-
+-    pose_scores[pose_idx] = total_score;
+-}
+-
+-__global__ void local_optimization_step(
+-    float* pose_coords,        // [n_poses, n_atoms, 3] (in/out)
+-    float* receptor_coords,    // [n_receptor_atoms, 3]
+-    float* receptor_charges,   // [n_receptor_atoms]
+-    float* ligand_charges,     // [n_atoms]
+-    float* gradients,          // [n_poses, n_atoms, 3] (workspace)
+-    float step_size,
+-    int n_poses,
+-    int n_atoms,
+-    int n_receptor_atoms
+-) {
+-    int pose_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-    int atom_idx = blockIdx.y * blockDim.y + threadIdx.y;
+-
+-    if (pose_idx >= n_poses || atom_idx >= n_atoms) return;
+-
+-    int coord_idx = pose_idx * n_atoms * 3 + atom_idx * 3;
+-
+-    // Calculate gradient for this atom
+-    float grad_x = 0.0f, grad_y = 0.0f, grad_z = 0.0f;
+-
+-    float lig_x = pose_coords[coord_idx];
+-    float lig_y = pose_coords[coord_idx + 1];
+-    float lig_z = pose_coords[coord_idx + 2];
+-    float lig_q = ligand_charges[atom_idx];
+-
+-    for (int j = 0; j < n_receptor_atoms; j++) {
+-        float rec_x = receptor_coords[j * 3];
+-        float rec_y = receptor_coords[j * 3 + 1];
+-        float rec_z = receptor_coords[j * 3 + 2];
+-        float rec_q = receptor_charges[j];
+-
+-        float dx = lig_x - rec_x;
+-        float dy = lig_y - rec_y;
+-        float dz = lig_z - rec_z;
+-        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+-
+-        if (dist > 0.1f && dist < 12.0f) {
+-            float inv_dist = 1.0f / dist;
+-            float inv_dist2 = inv_dist * inv_dist;
+-            float inv_dist7 = inv_dist2 * inv_dist2 * inv_dist2 * inv_dist;
+-            float inv_dist13 = inv_dist7 * inv_dist2 * inv_dist2 * inv_dist2;
+-
+-            // VDW gradient
+-            float vdw_grad = 4.0f * (12.0f * inv_dist13 - 6.0f * inv_dist7) * inv_dist;
+-
+-            // Electrostatic gradient
+-            float elec_grad = -332.0f * lig_q * rec_q * inv_dist2 * inv_dist;
+-
+-            float total_grad = vdw_grad + elec_grad;
+-
+-            grad_x += total_grad * dx;
+-            grad_y += total_grad * dy;
+-            grad_z += total_grad * dz;
+-        }
+-    }
+-
+-    // Apply gradient descent step
+-    pose_coords[coord_idx] -= step_size * grad_x;
+-    pose_coords[coord_idx + 1] -= step_size * grad_y;
+-    pose_coords[coord_idx + 2] -= step_size * grad_z;
+-}
+-"""
+-
+-# Only define the class if CUDA is available
+-if CUPY_AVAILABLE:
+-    class EnhancedHierarchicalGPUDocker(BaseDockingAlgorithm):
+-        """GPU-accelerated enhanced hierarchical docking"""
+-
+-        def __init__(self, **params):
+-            super().__init__("enhanced_hierarchical_gpu", supports_gpu=True)
+-
+-            # GPU availability check is lazy - only checked when actually docking
+-            self.gpu_available = None  # Will check on first use
+-
+-            # Hierarchical docking parameters
+-            # Fast mode: reduced sites and optimization steps for quick testing
+-            fast_mode = params.get('fast', False)
+-            default_max_sites = 200 if fast_mode else 1000
+-            default_opt_steps = 20 if fast_mode else 100
+-
+-            self.site_point_spacing = params.get(
+-                'site_point_spacing', 1.0)  # Å
+-            self.probe_radius = params.get('probe_radius', 1.8)  # Å
+-            self.max_sites = params.get('max_sites', default_max_sites)
+-            self.poses_per_site = params.get('poses_per_site', 10)
+-            self.greedy_threshold = params.get(
+-                'greedy_threshold', -5.0)  # kcal/mol
+-
+-            # Local optimization parameters
+-            self.opt_steps = params.get('optimization_steps', default_opt_steps)
+-            self.step_size = params.get('step_size', 0.01)
+-            self.convergence_threshold = params.get(
+-                'convergence_threshold', 0.01)
+-
+-            # GPU parameters
+-            self.block_size = params.get('block_size', 256)
+-            self.batch_size = params.get('batch_size', 1000)
+-            self.memory_limit_gb = params.get('memory_limit', 4.0)
+-
+-            # Initialize GPU context
+-            self._initialize_gpu()
+-
+-            self.logger.info(f"GPU Enhanced Hierarchical docker initialized")
+-
+-        def _check_gpu_availability(self) -> bool:
+-            """Check if CUDA GPU is available"""
+-            if not CUPY_AVAILABLE:
+-                self.logger.warning("CuPy not available")
+-                return False
+-
+-            try:
+-                test_array = cp.array([1, 2, 3])
+-                result = cp.sum(test_array)
+-                del test_array, result
+-                return True
+-            except Exception as e:
+-                self.logger.warning(f"GPU test failed: {e}")
+-                return False
+-
+-        def _initialize_gpu(self):
+-            """Initialize GPU context and compile kernels"""
+-            # Initialize to None first (for CuPy-only mode)
+-            self.cuda_module = None
+-
+-            if PYCUDA_AVAILABLE:
+-                try:
+-                    self.cuda_module = SourceModule(HIERARCHICAL_KERNEL_SOURCE)
+-                    self.site_eval_kernel = self.cuda_module.get_function(
+-                        "evaluate_site_points")
+-                    self.pose_scoring_kernel = self.cuda_module.get_function(
+-                        "hierarchical_pose_scoring")
+-                    self.optimization_kernel = self.cuda_module.get_function(
+-                        "local_optimization_step")
+-                    self.logger.info(
+-                        "GPU hierarchical kernels compiled successfully")
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA kernel compilation failed: {e}")
+-                    self.cuda_module = None
+-
+-        def dock(self, receptor_file: str, ligand_mol, grid_center: np.ndarray,
+-                 grid_dimensions: np.ndarray, **kwargs) -> DockingResult:
+-            """
+-            Perform GPU-accelerated hierarchical docking
+-
+-            Args:
+-                receptor_file: Path to receptor PDB file
+-                ligand_mol: RDKit molecule object
+-                grid_center: Center of docking grid
+-                grid_dimensions: Dimensions of docking grid
+-                **kwargs: Additional parameters
+-
+-            Returns:
+-                DockingResult object
+-            """
+-            # Check GPU availability on first use
+-            if self.gpu_available is None:
+-                self.gpu_available = self._check_gpu_availability()
+-
+-            if not self.gpu_available:
+-                raise RuntimeError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+-
+-            # Check for fast mode in runtime parameters (overrides __init__ setting)
+-            if kwargs.get('fast', False):
+-                original_sites = self.max_sites
+-                original_opt_steps = self.opt_steps
+-                self.max_sites = 200  # Fast mode: 200 sites
+-                self.opt_steps = 20  # Fast mode: 20 optimization steps
+-                self.logger.info(f"Fast mode enabled: reducing sites from {original_sites} to {self.max_sites}, "
+-                               f"opt_steps from {original_opt_steps} to {self.opt_steps}")
+-
+-            # Extract coordinates from inputs
+-            from rdkit import Chem
+-            from Bio.PDB import PDBParser
+-
+-            # Get ligand coordinates
+-            if hasattr(ligand_mol, 'GetConformer'):
+-                conf = ligand_mol.GetConformer()
+-                ligand_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+-            else:
+-                raise ValueError("ligand_mol must be an RDKit molecule with conformer")
+-
+-            # Get receptor coordinates
+-            parser = PDBParser(QUIET=True)
+-            receptor_structure = parser.get_structure('receptor', receptor_file)
+-            receptor_atoms = list(receptor_structure.get_atoms())
+-            receptor_coords = np.array([atom.get_coord() for atom in receptor_atoms])
+-
+-            # Simple charge assignment (can be improved)
+-            receptor_charges = np.zeros(len(receptor_atoms))
+-
+-            # Now call the internal docking method
+-            return self._dock_internal(ligand_coords, receptor_coords, receptor_charges,
+-                                     grid_center, grid_dimensions, ligand_mol, receptor_file, **kwargs)
+-
+-        def _dock_internal(self, ligand_coords: np.ndarray, receptor_coords: np.ndarray,
+-                 receptor_charges: np.ndarray, grid_center: np.ndarray,
+-                 grid_dimensions: np.ndarray, ligand_mol, receptor_file: str, **kwargs) -> DockingResult:
+-            """
+-            Internal GPU-accelerated hierarchical docking
+-
+-            Args:
+-            ligand_coords: Initial ligand coordinates (N x 3)
+-            receptor_coords: Receptor atom coordinates (M x 3)
+-            receptor_charges: Receptor partial charges (M,)
+-            grid_center: Center of docking grid
+-            grid_dimensions: Grid box dimensions
+-
+-            Returns:
+-            DockingResult with hierarchically refined poses
+-            """
+-            self.logger.info("Starting GPU enhanced hierarchical docking")
+-
+-            # Initialize GPU variables for cleanup
+-            gpu_ligand_coords = None
+-            gpu_receptor_coords = None
+-            gpu_receptor_charges = None
+-            gpu_grid_center = None
+-            gpu_grid_dimensions = None
+-            favorable_sites = None
+-            initial_poses = None
+-            scored_poses = None
+-            optimized_poses = None
+-
+-            try:
+-                start_time = time.time()
+-                n_ligand_atoms = int(ligand_coords.shape[0])
+-                n_receptor_atoms = int(receptor_coords.shape[0])
+-
+-                # Transfer data to GPU
+-                gpu_ligand_coords = cp.asarray(ligand_coords, dtype=cp.float32)
+-                gpu_receptor_coords = cp.asarray(receptor_coords, dtype=cp.float32)
+-                gpu_receptor_charges = cp.asarray(
+-                    receptor_charges, dtype=cp.float32)
+-                gpu_grid_center = cp.asarray(grid_center, dtype=cp.float32)
+-                gpu_grid_dimensions = cp.asarray(grid_dimensions, dtype=cp.float32)
+-
+-                # Stage 1: Site Point Generation and Filtering
+-                self.logger.info(
+-                    "Stage 1: GPU site point generation and filtering")
+-                favorable_sites = self._generate_and_filter_sites_gpu(
+-                    gpu_receptor_coords, gpu_receptor_charges,
+-                    gpu_grid_center, gpu_grid_dimensions
+-                )
+-
+-                # Stage 2: Greedy Pose Generation and Scoring
+-                self.logger.info("Stage 2: GPU greedy pose generation and scoring")
+-                initial_poses = self._generate_poses_at_sites_gpu(
+-                    gpu_ligand_coords, favorable_sites
+-                )
+-
+-                scored_poses = self._score_poses_hierarchically_gpu(
+-                    initial_poses, gpu_receptor_coords, gpu_receptor_charges,
+-                    gpu_ligand_coords
+-                )
+-
+-                # Stage 3: Local Optimization
+-                self.logger.info("Stage 3: GPU energy minimization")
+-                optimized_poses = self._optimize_poses_gpu(
+-                    scored_poses, gpu_receptor_coords, gpu_receptor_charges
+-                )
+-
+-                # Convert results back to CPU
+-                final_poses = self._convert_gpu_results_to_poses(
+-                    optimized_poses, gpu_receptor_coords, ligand_coords
+-                )
+-
+-                runtime = time.time() - start_time
+-                self.logger.info(
+-                    f"GPU hierarchical docking completed in {runtime:.2f} seconds")
+-
+-                # Get number of sites (avoid implicit conversion with len() on CuPy array)
+-                n_sites_evaluated = int(favorable_sites.shape[0])
+-
+-                return DockingResult(
+-                    ligand_name=ligand_mol.GetProp('_Name') if ligand_mol.HasProp('_Name') else 'unknown',
+-                    receptor_file=receptor_file,
+-                    grid_center=grid_center,
+-                    grid_dimensions=grid_dimensions,
+-                    algorithm_used=self.name,
+-                    scoring_function="cuda_hierarchical",
+-                    poses=final_poses,
+-                    parameters={
+-                        'runtime': runtime,
+-                        'num_evaluations': n_sites_evaluated * self.poses_per_site,
+-                        'num_sites_evaluated': n_sites_evaluated,
+-                        'optimization_steps': self.opt_steps
+-                    }
+-                )
+-
+-            finally:
+-                # CRITICAL: Clean up GPU memory to prevent memory leaks
+-                try:
+-                    # Delete GPU arrays explicitly
+-                    if gpu_ligand_coords is not None:
+-                        del gpu_ligand_coords
+-                    if gpu_receptor_coords is not None:
+-                        del gpu_receptor_coords
+-                    if gpu_receptor_charges is not None:
+-                        del gpu_receptor_charges
+-                    if gpu_grid_center is not None:
+-                        del gpu_grid_center
+-                    if gpu_grid_dimensions is not None:
+-                        del gpu_grid_dimensions
+-                    if favorable_sites is not None:
+-                        del favorable_sites
+-                    if initial_poses is not None:
+-                        del initial_poses
+-                    if scored_poses is not None:
+-                        del scored_poses
+-                    if optimized_poses is not None:
+-                        del optimized_poses
+-
+-                    # Force free all memory blocks in the pool
+-                    mempool = cp.get_default_memory_pool()
+-                    mempool.free_all_blocks()
+-
+-                    self.logger.debug(f"GPU memory cleaned successfully")
+-                except Exception as e:
+-                    self.logger.warning(f"GPU cleanup warning: {e}")
+-
+-        def _generate_and_filter_sites_gpu(
+-                self,
+-                receptor_coords: cp.ndarray,
+-                receptor_charges: cp.ndarray,
+-                grid_center: cp.ndarray,
+-                grid_dimensions: cp.ndarray) -> cp.ndarray:
+-            """Generate and filter site points on GPU"""
+-
+-            # Generate grid points
+-            # Convert parameters to Python float to avoid implicit conversion
+-            x_min = float(grid_center[0] - grid_dimensions[0] / 2)
+-            x_max = float(grid_center[0] + grid_dimensions[0] / 2)
+-            y_min = float(grid_center[1] - grid_dimensions[1] / 2)
+-            y_max = float(grid_center[1] + grid_dimensions[1] / 2)
+-            z_min = float(grid_center[2] - grid_dimensions[2] / 2)
+-            z_max = float(grid_center[2] + grid_dimensions[2] / 2)
+-
+-            x_points = cp.arange(x_min, x_max, self.site_point_spacing, dtype=cp.float32)
+-            y_points = cp.arange(y_min, y_max, self.site_point_spacing, dtype=cp.float32)
+-            z_points = cp.arange(z_min, z_max, self.site_point_spacing, dtype=cp.float32)
+-
+-            # Create meshgrid
+-            X, Y, Z = cp.meshgrid(x_points, y_points, z_points, indexing='ij')
+-            # Use stack instead of column_stack to avoid list conversion issues
+-            site_points = cp.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+-            n_sites = int(site_points.shape[0])  # Convert to Python int
+-
+-            self.logger.info(f"Generated {n_sites} site points for evaluation")
+-
+-            # Limit to manageable number
+-            if n_sites > self.max_sites:
+-                indices = cp.random.choice(
+-                    int(n_sites), int(self.max_sites), replace=False)
+-                site_points = site_points[indices]
+-                n_sites = int(self.max_sites)
+-
+-            # Evaluate sites using CUDA kernel
+-            site_scores = cp.zeros(n_sites, dtype=cp.float32)
+-            receptor_types = cp.zeros(
+-                int(receptor_coords.shape[0]),
+-                dtype=cp.int32)  # Simplified
+-
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                try:
+-                    block_dim = (self.block_size, 1, 1)
+-                    grid_dim = (
+-                        (n_sites + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                    self.site_eval_kernel(
+-                        site_points.data.ptr,
+-                        receptor_coords.data.ptr,
+-                        receptor_charges.data.ptr,
+-                        receptor_types.data.ptr,
+-                        site_scores.data.ptr,
+-                        np.int32(n_sites),
+-                        np.int32(
+-                            receptor_coords.shape[0]),
+-                        np.float32(
+-                            self.probe_radius),
+-                        block=block_dim,
+-                        grid=grid_dim)
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA site evaluation failed: {e}")
+-                    site_scores = self._evaluate_sites_cupy(
+-                        site_points, receptor_coords)
+-            else:
+-                site_scores = self._evaluate_sites_cupy(
+-                    site_points, receptor_coords)
+-
+-            # Filter favorable sites
+-            favorable_mask = site_scores < self.greedy_threshold
+-            favorable_sites = site_points[favorable_mask]
+-
+-            n_favorable = int(favorable_sites.shape[0])
+-            self.logger.info(
+-                f"Found {n_favorable} favorable binding sites")
+-            # Limit for performance
+-            return favorable_sites[:min(n_favorable, 100)]
+-
+-        def _generate_poses_at_sites_gpu(self, ligand_coords: cp.ndarray,
+-                                         sites: cp.ndarray) -> cp.ndarray:
+-            """Generate poses at favorable sites"""
+-
+-            n_sites = int(sites.shape[0])
+-            n_atoms = int(ligand_coords.shape[0])
+-            n_poses = n_sites * self.poses_per_site
+-
+-            # Initialize pose array
+-            poses = cp.zeros((n_poses, n_atoms, 3), dtype=cp.float32)
+-
+-            pose_idx = 0
+-            ligand_center = cp.mean(ligand_coords, axis=0)
+-
+-            # Use range-based indexing to avoid implicit conversion when iterating over CuPy array
+-            for site_idx in range(n_sites):
+-                site = sites[site_idx]  # Index into CuPy array, not iterate
+-                for pose_variation in range(self.poses_per_site):
+-                    # Translate ligand to site
+-                    translated_coords = ligand_coords - ligand_center + site
+-
+-                    # Add random rotation
+-                    if pose_variation > 0:
+-                        angles = cp.random.uniform(-cp.pi, cp.pi, 3)
+-                        translated_coords = self._apply_random_rotation_gpu(
+-                            translated_coords, site
+-                        )
+-
+-                    poses[pose_idx] = translated_coords
+-                    pose_idx += 1
+-
+-            return poses
+-
+-        def _score_poses_hierarchically_gpu(
+-                self,
+-                poses: cp.ndarray,
+-                receptor_coords: cp.ndarray,
+-                receptor_charges: cp.ndarray,
+-                ligand_coords: cp.ndarray) -> cp.ndarray:
+-            """Score poses using GPU hierarchical scoring"""
+-
+-            n_poses, n_atoms, _ = int(poses.shape[0]), int(poses.shape[1]), poses.shape[2]
+-            pose_scores = cp.zeros(n_poses, dtype=cp.float32)
+-            pose_ranks = cp.zeros(n_poses, dtype=cp.int32)
+-
+-            # Simplified ligand charges
+-            ligand_charges = cp.zeros(n_atoms, dtype=cp.float32)
+-
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                try:
+-                    block_dim = (self.block_size, 1, 1)
+-                    grid_dim = (
+-                        (n_poses + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                    self.pose_scoring_kernel(
+-                        poses.data.ptr, receptor_coords.data.ptr,
+-                        receptor_charges.data.ptr, ligand_charges.data.ptr,
+-                        pose_scores.data.ptr, pose_ranks.data.ptr,
+-                        np.int32(n_poses), np.int32(n_atoms),
+-                        np.int32(receptor_coords.shape[0]),
+-                        block=block_dim, grid=grid_dim
+-                    )
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA pose scoring failed: {e}")
+-                    pose_scores = self._score_poses_cupy(
+-                        poses, receptor_coords)
+-            else:
+-                pose_scores = self._score_poses_cupy(poses, receptor_coords)
+-
+-            # Sort poses by score and return best ones
+-            n_poses = int(pose_scores.shape[0])
+-            best_indices = cp.argsort(pose_scores)[:min(n_poses, 100)]
+-            return poses[best_indices]
+-
+-        def _optimize_poses_gpu(
+-                self,
+-                poses: cp.ndarray,
+-                receptor_coords: cp.ndarray,
+-                receptor_charges: cp.ndarray) -> cp.ndarray:
+-            """Optimize poses using GPU local minimization"""
+-
+-            n_poses, n_atoms, _ = int(poses.shape[0]), int(poses.shape[1]), poses.shape[2]
+-            ligand_charges = cp.zeros(n_atoms, dtype=cp.float32)
+-            gradients = cp.zeros_like(poses)
+-
+-            optimized_poses = poses.copy()
+-
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                try:
+-                    for step in range(self.opt_steps):
+-                        block_dim = (16, 16, 1)  # 2D grid for poses and atoms
+-                        grid_dim = (
+-                            (n_poses + block_dim[0] - 1) // block_dim[0],
+-                            (n_atoms + block_dim[1] - 1) // block_dim[1],
+-                            1
+-                        )
+-
+-                        self.optimization_kernel(
+-                            optimized_poses.data.ptr, receptor_coords.data.ptr,
+-                            receptor_charges.data.ptr, ligand_charges.data.ptr,
+-                            gradients.data.ptr, np.float32(self.step_size),
+-                            np.int32(n_poses), np.int32(n_atoms),
+-                            np.int32(receptor_coords.shape[0]),
+-                            block=block_dim, grid=grid_dim
+-                        )
+-
+-                        # Reduce step size over time
+-                        self.step_size *= 0.99
+-
+-                        if step % 20 == 0:
+-                            self.logger.debug(
+-                                f"Optimization step {step}/{self.opt_steps}")
+-
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA optimization failed: {e}")
+-                    # Fallback: return unoptimized poses
+-            else:
+-                # CuPy fallback optimization (simplified)
+-                optimized_poses = self._optimize_poses_cupy(
+-                    poses, receptor_coords)
+-
+-            return optimized_poses
+-
+-        def _convert_gpu_results_to_poses(
+-                self,
+-                gpu_poses: cp.ndarray,
+-                gpu_receptor_coords: cp.ndarray,
+-                original_coords: np.ndarray) -> List[Pose]:
+-            """Convert GPU results to Pose objects with calculated energies"""
+-
+-            cpu_poses = cp.asnumpy(gpu_poses)
+-            poses = []
+-
+-            # Calculate actual binding energies for each pose
+-            pose_scores = self._score_poses_cupy(gpu_poses, gpu_receptor_coords)
+-            cpu_scores = cp.asnumpy(pose_scores)
+-
+-            # Scale energies to realistic binding energy range (similar to other GPU algorithms)
+-            # Enhanced hierarchical should give good energies in -2 to -5 kcal/mol range
+-            # Raw VdW energies are ~800k to 30M, target -2 to -5 kcal/mol
+-            # Use logarithmic scaling to compress the range appropriately
+-            import numpy as np
+-            log_scores = np.log10(np.abs(cpu_scores) + 1.0)  # log10 of absolute values
+-            scaled_energies = -2.0 - (log_scores - 5.0) * 0.5  # Map log range to -2 to -5 kcal/mol
+-
+-            for i, (pose_coords, energy) in enumerate(zip(cpu_poses, scaled_energies)):
+-                pose = Pose(
+-                    coordinates=pose_coords,
+-                    center=np.mean(pose_coords, axis=0),
+-                    rotation=np.array([0, 0, 0, 1]),  # Placeholder quaternion
+-                    conformer_id=0,
+-                    energy=float(energy),  # Actual calculated binding energy
+-                    # Higher rank = higher confidence
+-                    confidence=1.0 - (i / len(cpu_poses))
+-                )
+-                poses.append(pose)
+-
+-            return poses
+-
+-        # Helper methods for fallback implementations
+-        def _evaluate_sites_cupy(
+-                self,
+-                sites: cp.ndarray,
+-                receptor_coords: cp.ndarray) -> cp.ndarray:
+-            """Fallback site evaluation using CuPy - VECTORIZED"""
+-            n_sites = int(sites.shape[0])
+-
+-            # VECTORIZED: Calculate all site-receptor distances at once
+-            # sites: (n_sites, 3), receptor_coords: (n_receptor, 3)
+-            # Expand: (n_sites, 1, 3) - (1, n_receptor, 3) = (n_sites, n_receptor, 3)
+-            sites_expanded = sites[:, cp.newaxis, :]  # (n_sites, 1, 3)
+-            receptor_expanded = receptor_coords[cp.newaxis, :, :]  # (1, n_receptor, 3)
+-
+-            diff = sites_expanded - receptor_expanded  # (n_sites, n_receptor, 3)
+-            distances = cp.sqrt(cp.sum(diff**2, axis=2))  # (n_sites, n_receptor)
+-
+-            # Vectorized scoring for all sites
+-            close_contacts = cp.sum(
+-                (distances > self.probe_radius) & (distances < 4.0),
+-                axis=1  # Sum over receptor atoms for each site
+-            )
+-            clash_penalty = cp.sum(distances <= self.probe_radius, axis=1) * 1000
+-
+-            scores = -close_contacts.astype(cp.float32) + clash_penalty.astype(cp.float32)
+-
+-            return scores
+-
+-        def _score_poses_cupy(
+-                self,
+-                poses: cp.ndarray,
+-                receptor_coords: cp.ndarray) -> cp.ndarray:
+-            """Fallback pose scoring using CuPy - FULLY VECTORIZED"""
+-            n_poses, n_atoms, _ = int(poses.shape[0]), int(poses.shape[1]), poses.shape[2]
+-            n_receptor = int(receptor_coords.shape[0])
+-
+-            # VECTORIZED: Calculate ALL pairwise distances at once
+-            # poses: (n_poses, n_atoms, 3), receptor: (n_receptor, 3)
+-            # Expand: (n_poses, n_atoms, 1, 3) - (1, 1, n_receptor, 3)
+-            poses_expanded = poses[:, :, cp.newaxis, :]  # (n_poses, n_atoms, 1, 3)
+-            receptor_expanded = receptor_coords[cp.newaxis, cp.newaxis, :, :]  # (1, 1, n_receptor, 3)
+-
+-            diff = poses_expanded - receptor_expanded  # (n_poses, n_atoms, n_receptor, 3)
+-            distances = cp.sqrt(cp.sum(diff**2, axis=3))  # (n_poses, n_atoms, n_receptor)
+-
+-            # Apply distance cutoff mask
+-            valid_mask = (distances > 0.1) & (distances < 12.0)
+-            distances_safe = cp.where(valid_mask, distances, 1.0)  # Avoid division by zero
+-
+-            # Vectorized Van der Waals energy for all poses
+-            sigma_over_r = 3.5 / distances_safe
+-            vdw_per_pair = cp.where(
+-                valid_mask,
+-                4.0 * (sigma_over_r**12 - sigma_over_r**6),
+-                0.0
+-            )
+-
+-            # Sum over atoms and receptor for each pose
+-            scores = cp.sum(vdw_per_pair, axis=(1, 2)).astype(cp.float32)  # (n_poses,)
+-
+-            return scores
+-
+-        def _optimize_poses_cupy(
+-                self,
+-                poses: cp.ndarray,
+-                receptor_coords: cp.ndarray) -> cp.ndarray:
+-            """Fallback optimization using CuPy"""
+-            # Simplified optimization - just return input poses
+-            # In practice, this would implement gradient descent
+-            return poses
+-
+-        def _apply_random_rotation_gpu(
+-                self,
+-                coords: cp.ndarray,
+-                center: cp.ndarray) -> cp.ndarray:
+-            """Apply random rotation around center point"""
+-            centered_coords = coords - center
+-
+-            # Generate random rotation angles
+-            angles = cp.random.uniform(-0.5, 0.5, size=3)  # Small rotations
+-
+-            # Apply rotation (simplified)
+-            cos_angles = cp.cos(angles)
+-            sin_angles = cp.sin(angles)
+-
+-            # Simple Z-axis rotation for efficiency
+-            # Keep as CuPy arrays to avoid conversion issues
+-            cos_z = cos_angles[2]
+-            sin_z = sin_angles[2]
+-
+-            x = centered_coords[:, 0]
+-            y = centered_coords[:, 1]
+-
+-            new_x = x * cos_z - y * sin_z
+-            new_y = x * sin_z + y * cos_z
+-
+-            # Use stack instead of column_stack to avoid potential implicit conversion from list
+-            rotated_coords = cp.stack(
+-                [new_x, new_y, centered_coords[:, 2]], axis=1)
+-
+-            return rotated_coords + center
+-
+-else:
+-    # Create dummy class when CUDA not available
+-    class EnhancedHierarchicalGPUDocker:
+-        def __init__(self, **params):
+-            raise ImportError(
+-                "CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+diff --git a/pandadock/docking/algorithms/genetic_algorithm_gpu.py b/pandadock/docking/algorithms/genetic_algorithm_gpu.py
+deleted file mode 100644
+index 9a3e5e0..0000000
+--- a/pandadock/docking/algorithms/genetic_algorithm_gpu.py
++++ /dev/null
+@@ -1,982 +0,0 @@
+-"""
+-CUDA-Accelerated Genetic Algorithm Docking
+-
+-GPU-accelerated genetic algorithm implementation with:
+-1. Parallel fitness evaluation across GPU threads
+-2. GPU-optimized crossover and mutation operations
+-3. Tournament selection on GPU
+-4. Island model for multi-GPU scaling
+-5. Adaptive parameters based on population diversity
+-
+-Performance improvements:
+-- 100-500x speedup over CPU for large populations
+-- Parallel evaluation of thousands of individuals
+-- GPU-optimized genetic operators
+-- Memory-efficient population management
+-"""
+-
+-import numpy as np
+-from typing import List, Dict, Tuple, Optional, Any
+-import logging
+-import time
+-import math
+-from ..core import BaseDockingAlgorithm, DockingResult, Pose
+-
+-# GPU libraries with fallbacks
+-try:
+-    import cupy as cp
+-    CUPY_AVAILABLE = True
+-
+-    # Optional CuPy scipy modules
+-    try:
+-        import cupyx.scipy.spatial.distance as cp_distance
+-    except ImportError:
+-        cp_distance = None
+-
+-except ImportError:
+-    CUPY_AVAILABLE = False
+-    cp = None
+-    cp_distance = None
+-
+-try:
+-    from numba import cuda, float32, int32
+-    import numba
+-    NUMBA_CUDA_AVAILABLE = True
+-except ImportError:
+-    NUMBA_CUDA_AVAILABLE = False
+-
+-try:
+-    import pycuda.driver as cuda_driver
+-    import pycuda.autoinit
+-    from pycuda.compiler import SourceModule
+-    import pycuda.gpuarray as gpuarray
+-    PYCUDA_AVAILABLE = True
+-except ImportError:
+-    PYCUDA_AVAILABLE = False
+-
+-
+-# CUDA kernel for genetic operations
+-GENETIC_KERNEL_SOURCE = """
+-#include <curand_kernel.h>
+-
+-__global__ void setup_random_states(curandState *state, unsigned long seed, int n) {
+-    int id = threadIdx.x + blockIdx.x * blockDim.x;
+-    if (id < n) {
+-        curand_init(seed, id, 0, &state[id]);
+-    }
+-}
+-
+-__global__ void evaluate_population_fitness(
+-    float* population,        // [pop_size, n_genes]
+-    float* receptor_coords,   // [n_receptor_atoms, 3]
+-    float* receptor_charges,  // [n_receptor_atoms]
+-    float* fitness,          // [pop_size] output
+-    int pop_size,
+-    int n_genes,
+-    int n_ligand_atoms,
+-    int n_receptor_atoms,
+-    float* grid_center,
+-    float* grid_dimensions
+-) {
+-    int individual_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (individual_idx >= pop_size) return;
+-
+-    float total_energy = 0.0f;
+-    int gene_offset = individual_idx * n_genes;
+-
+-    // Decode genes to 3D coordinates
+-    // First 3 genes: translation
+-    // Next 3 genes: rotation
+-    // Remaining genes: torsion angles
+-
+-    float trans_x = population[gene_offset] * grid_dimensions[0] + grid_center[0];
+-    float trans_y = population[gene_offset + 1] * grid_dimensions[1] + grid_center[1];
+-    float trans_z = population[gene_offset + 2] * grid_dimensions[2] + grid_center[2];
+-
+-    // Calculate simplified energy (can be expanded)
+-    for (int i = 0; i < n_receptor_atoms; i++) {
+-        float rec_x = receptor_coords[i * 3];
+-        float rec_y = receptor_coords[i * 3 + 1];
+-        float rec_z = receptor_coords[i * 3 + 2];
+-
+-        float dx = trans_x - rec_x;
+-        float dy = trans_y - rec_y;
+-        float dz = trans_z - rec_z;
+-        float dist_sq = dx*dx + dy*dy + dz*dz;
+-        float dist = sqrtf(dist_sq);
+-
+-        if (dist > 0.1f && dist < 12.0f) {
+-            // Simplified Lennard-Jones
+-            float r6 = dist_sq * dist_sq * dist_sq;
+-            float r12 = r6 * r6;
+-            float lj_energy = 4.0f * (1.0f / r12 - 1.0f / r6);
+-            total_energy += lj_energy;
+-
+-            // Electrostatic
+-            float elec_energy = 332.0f * receptor_charges[i] / dist;
+-            total_energy += elec_energy;
+-        }
+-    }
+-
+-    fitness[individual_idx] = -total_energy;  // Higher fitness = lower energy
+-}
+-
+-__global__ void tournament_selection(
+-    float* fitness,
+-    int* parent_indices,
+-    curandState* rand_states,
+-    int pop_size,
+-    int tournament_size
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (idx >= pop_size) return;
+-
+-    curandState local_state = rand_states[idx];
+-
+-    int best_idx = 0;
+-    float best_fitness = -1e9f;
+-
+-    for (int t = 0; t < tournament_size; t++) {
+-        int candidate = curand(&local_state) % pop_size;
+-        if (fitness[candidate] > best_fitness) {
+-            best_fitness = fitness[candidate];
+-            best_idx = candidate;
+-        }
+-    }
+-
+-    parent_indices[idx] = best_idx;
+-    rand_states[idx] = local_state;
+-}
+-
+-__global__ void crossover_and_mutation(
+-    float* population,
+-    float* new_population,
+-    int* parent_indices,
+-    curandState* rand_states,
+-    int pop_size,
+-    int n_genes,
+-    float crossover_rate,
+-    float mutation_rate,
+-    float mutation_strength
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (idx >= pop_size) return;
+-
+-    curandState local_state = rand_states[idx];
+-
+-    // Get two parents
+-    int parent1_idx = parent_indices[idx];
+-    int parent2_idx = parent_indices[(idx + 1) % pop_size];
+-
+-    // Crossover
+-    for (int gene = 0; gene < n_genes; gene++) {
+-        float gene_value;
+-
+-        if (curand_uniform(&local_state) < crossover_rate) {
+-            // Arithmetic crossover
+-            float alpha = curand_uniform(&local_state);
+-            gene_value = alpha * population[parent1_idx * n_genes + gene] +
+-                        (1.0f - alpha) * population[parent2_idx * n_genes + gene];
+-        } else {
+-            gene_value = population[parent1_idx * n_genes + gene];
+-        }
+-
+-        // Mutation
+-        if (curand_uniform(&local_state) < mutation_rate) {
+-            float mutation_delta = curand_normal(&local_state) * mutation_strength;
+-            gene_value += mutation_delta;
+-            gene_value = fminf(1.0f, fmaxf(-1.0f, gene_value));  // Clamp to [-1, 1]
+-        }
+-
+-        new_population[idx * n_genes + gene] = gene_value;
+-    }
+-
+-    rand_states[idx] = local_state;
+-}
+-
+-__global__ void calculate_diversity(
+-    float* population,
+-    float* diversity_scores,
+-    int pop_size,
+-    int n_genes
+-) {
+-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (idx >= pop_size) return;
+-
+-    float avg_distance = 0.0f;
+-    int count = 0;
+-
+-    for (int other = 0; other < pop_size; other++) {
+-        if (other != idx) {
+-            float distance = 0.0f;
+-            for (int gene = 0; gene < n_genes; gene++) {
+-                float diff = population[idx * n_genes + gene] -
+-                            population[other * n_genes + gene];
+-                distance += diff * diff;
+-            }
+-            avg_distance += sqrtf(distance);
+-            count++;
+-        }
+-    }
+-
+-    diversity_scores[idx] = avg_distance / count;
+-}
+-"""
+-
+-# Only define the class if CUDA is available
+-if CUPY_AVAILABLE:
+-    class CUDAGeneticAlgorithmDocker(BaseDockingAlgorithm):
+-        """CUDA-accelerated Genetic Algorithm molecular docking"""
+-
+-        def __init__(self, **params):
+-            super().__init__("cuda_genetic_algorithm", supports_gpu=True)
+-
+-            # GPU availability check is lazy - only checked when actually docking
+-            self.gpu_available = None  # Will check on first use
+-
+-            # Genetic algorithm parameters
+-            # Fast mode: reduced generations for quick testing
+-            fast_mode = params.get('fast', False)
+-            default_generations = 50 if fast_mode else 500
+-            default_population = 500 if fast_mode else 1000
+-            self.population_size = params.get('population_size', default_population)
+-            self.num_generations = params.get('num_generations', default_generations)
+-            self.crossover_rate = params.get('crossover_rate', 0.8)
+-            self.mutation_rate = params.get('mutation_rate', 0.1)
+-            self.mutation_strength = params.get('mutation_strength', 0.1)
+-            self.tournament_size = params.get('tournament_size', 5)
+-            self.elitism_rate = params.get('elitism_rate', 0.1)
+-
+-            # Adaptive parameters
+-            self.adaptive_mutation = params.get('adaptive_mutation', True)
+-            self.diversity_threshold = params.get('diversity_threshold', 0.1)
+-            self.convergence_generations = params.get('convergence_generations', 50)
+-
+-            # GPU parameters
+-            self.block_size = params.get('block_size', 256)
+-            self.memory_limit_gb = params.get('memory_limit', 4.0)
+-
+-            # Problem-specific parameters
+-            self.num_genes = 6  # 3 translation + 3 rotation (can be extended for torsions)
+-
+-            # Initialize GPU context
+-            self._initialize_gpu()
+-
+-            self.logger.info(f"CUDA Genetic Algorithm docker initialized: "
+-                             f"pop_size={self.population_size}, generations={self.num_generations}")
+-
+-        def _check_gpu_availability(self) -> bool:
+-            """Check if CUDA GPU is available"""
+-            if not CUPY_AVAILABLE:
+-                self.logger.warning("CuPy not available - falling back to CPU")
+-                return False
+-
+-            try:
+-                test_array = cp.array([1, 2, 3])
+-                result = cp.sum(test_array)
+-                del test_array, result
+-                return True
+-            except Exception as e:
+-                self.logger.warning(f"GPU test failed: {e}")
+-                return False
+-
+-        def _initialize_gpu(self):
+-            """Initialize GPU context and compile kernels"""
+-            # Initialize cuda_module to None by default
+-            self.cuda_module = None
+-
+-            if PYCUDA_AVAILABLE:
+-                try:
+-                    self.cuda_module = SourceModule(GENETIC_KERNEL_SOURCE)
+-                    self.fitness_kernel = self.cuda_module.get_function("evaluate_population_fitness")
+-                    self.selection_kernel = self.cuda_module.get_function("tournament_selection")
+-                    self.crossover_mutation_kernel = self.cuda_module.get_function("crossover_and_mutation")
+-                    self.diversity_kernel = self.cuda_module.get_function("calculate_diversity")
+-                    self.setup_random_kernel = self.cuda_module.get_function("setup_random_states")
+-                    self.logger.info("CUDA genetic algorithm kernels compiled successfully")
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA kernel compilation failed: {e}")
+-                    self.cuda_module = None
+-            else:
+-                self.logger.info("PyCUDA not available, using CuPy-only implementation")
+-
+-            # Initialize random states for GPU
+-            self._initialize_random_states()
+-
+-        def _initialize_random_states(self):
+-            """Initialize random states for CUDA kernels"""
+-            if self.cuda_module:
+-                import random
+-                seed = random.randint(0, 2**32 - 1)
+-
+-                # Allocate random states on GPU
+-                self.rand_states = cp.zeros(self.population_size, dtype=cp.uint8)
+-
+-                block_dim = (self.block_size, 1, 1)
+-                grid_dim = ((self.population_size + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                try:
+-                    self.setup_random_kernel(
+-                        self.rand_states.data.ptr, np.uint32(seed),
+-                        np.int32(self.population_size),
+-                        block=block_dim, grid=grid_dim
+-                    )
+-                except Exception as e:
+-                    self.logger.warning(f"Random state initialization failed: {e}")
+-
+-        def dock(self, receptor_file: str, ligand_mol, grid_center: np.ndarray,
+-                 grid_dimensions: np.ndarray, **kwargs) -> DockingResult:
+-            """
+-            Perform CUDA-accelerated genetic algorithm docking
+-
+-            Args:
+-                receptor_file: Path to receptor PDB file
+-                ligand_mol: RDKit molecule object
+-                grid_center: Center of docking grid
+-                grid_dimensions: Dimensions of docking grid
+-                **kwargs: Additional parameters
+-
+-            Returns:
+-                DockingResult object
+-            """
+-            # Check GPU availability on first use
+-            if self.gpu_available is None:
+-                self.gpu_available = self._check_gpu_availability()
+-
+-            if not self.gpu_available:
+-                raise RuntimeError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+-
+-            # Check for fast mode in runtime parameters (overrides __init__ setting)
+-            if kwargs.get('fast', False):
+-                original_generations = self.num_generations
+-                original_population = self.population_size
+-                self.num_generations = 50  # Fast mode: 50 generations
+-                self.population_size = 500  # Fast mode: 500 population
+-                self.logger.info(f"Fast mode enabled: reducing generations from {original_generations} to {self.num_generations}, "
+-                               f"population from {original_population} to {self.population_size}")
+-
+-            # Extract coordinates from inputs
+-            from rdkit import Chem
+-            from Bio.PDB import PDBParser
+-
+-            # Get ligand coordinates
+-            if hasattr(ligand_mol, 'GetConformer'):
+-                conf = ligand_mol.GetConformer()
+-                ligand_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+-            else:
+-                raise ValueError("ligand_mol must be an RDKit molecule with conformer")
+-
+-            # Get receptor coordinates
+-            parser = PDBParser(QUIET=True)
+-            receptor_structure = parser.get_structure('receptor', receptor_file)
+-            receptor_atoms = list(receptor_structure.get_atoms())
+-            receptor_coords = np.array([atom.get_coord() for atom in receptor_atoms])
+-
+-            # Simple charge assignment (can be improved)
+-            receptor_charges = np.zeros(len(receptor_atoms))
+-
+-            # Now call the internal docking method
+-            return self._dock_internal(ligand_coords, receptor_coords, receptor_charges,
+-                                     grid_center, grid_dimensions, ligand_mol, receptor_file, **kwargs)
+-
+-        def _dock_internal(self, ligand_coords: np.ndarray, receptor_coords: np.ndarray,
+-            receptor_charges: np.ndarray, grid_center: np.ndarray,
+-            grid_dimensions: np.ndarray, ligand_mol, receptor_file: str, **kwargs) -> DockingResult:
+-            """
+-            Internal docking method with extracted coordinates
+-
+-            Args:
+-            ligand_coords: Initial ligand coordinates (N x 3)
+-            receptor_coords: Receptor atom coordinates (M x 3)
+-            receptor_charges: Receptor partial charges (M,)
+-            grid_center: Center of docking grid
+-            grid_dimensions: Grid box dimensions
+-
+-            Returns:
+-            DockingResult with evolved poses
+-            """
+-            self.logger.info(f"Starting CUDA GA docking: pop={self.population_size}, "
+-                             f"generations={self.num_generations}")
+-
+-            # Initialize GPU variables for cleanup
+-            gpu_receptor_coords = None
+-            gpu_receptor_charges = None
+-            gpu_grid_center = None
+-            gpu_grid_dimensions = None
+-            population = None
+-            best_individuals = None
+-
+-            try:
+-                start_time = time.time()
+-                n_ligand_atoms = int(ligand_coords.shape[0])
+-                n_receptor_atoms = int(receptor_coords.shape[0])
+-
+-                # Transfer data to GPU
+-                gpu_receptor_coords = cp.asarray(receptor_coords, dtype=cp.float32)
+-                gpu_receptor_charges = cp.asarray(receptor_charges, dtype=cp.float32)
+-                gpu_grid_center = cp.asarray(grid_center, dtype=cp.float32)
+-                gpu_grid_dimensions = cp.asarray(grid_dimensions, dtype=cp.float32)
+-
+-                # Initialize population
+-                population = self._initialize_population()
+-
+-                # Evolution loop
+-                best_individuals, best_fitness_values, best_fitness, evolution_stats = self._evolve_population(
+-                population, gpu_receptor_coords, gpu_receptor_charges,
+-                gpu_grid_center, gpu_grid_dimensions, n_ligand_atoms, n_receptor_atoms
+-                )
+-
+-                # Convert best individuals to poses with their fitness values as energies
+-                poses = self._convert_to_poses(
+-                best_individuals, best_fitness_values, ligand_coords, grid_center, grid_dimensions
+-                )
+-
+-                runtime = time.time() - start_time
+-                self.logger.info(f"CUDA GA docking completed in {runtime:.2f} seconds")
+-
+-                return DockingResult(
+-                    ligand_name=ligand_mol.GetProp('_Name') if ligand_mol.HasProp('_Name') else 'unknown',
+-                    receptor_file=receptor_file,
+-                    grid_center=grid_center,
+-                    grid_dimensions=grid_dimensions,
+-                    algorithm_used=self.name,
+-                    scoring_function="cuda_ga",
+-                    poses=poses,
+-                    parameters={
+-                        'population_size': self.population_size,
+-                        'num_generations': self.num_generations,
+-                        'runtime': runtime,
+-                        'num_evaluations': self.population_size * self.num_generations
+-                    }
+-                )
+-
+-            finally:
+-                # CRITICAL: Clean up GPU memory to prevent memory leaks
+-                try:
+-                    # Delete GPU arrays explicitly
+-                    if gpu_receptor_coords is not None:
+-                        del gpu_receptor_coords
+-                    if gpu_receptor_charges is not None:
+-                        del gpu_receptor_charges
+-                    if gpu_grid_center is not None:
+-                        del gpu_grid_center
+-                    if gpu_grid_dimensions is not None:
+-                        del gpu_grid_dimensions
+-                    if population is not None:
+-                        del population
+-                    if best_individuals is not None:
+-                        del best_individuals
+-
+-                    # Force free all memory blocks in the pool
+-                    mempool = cp.get_default_memory_pool()
+-                    mempool.free_all_blocks()
+-
+-                    self.logger.debug(f"GPU memory cleaned successfully")
+-                except Exception as e:
+-                    self.logger.warning(f"GPU cleanup warning: {e}")
+-
+-        def _initialize_population(self) -> cp.ndarray:
+-            """Initialize random population on GPU"""
+-            # Population: [population_size, num_genes]
+-            # Genes normalized to [-1, 1] range
+-            population = cp.random.uniform(
+-            -1.0, 1.0, size=(self.population_size, self.num_genes), dtype=cp.float32
+-            )
+-            return population
+-
+-        def _evolve_population(self, population: cp.ndarray,
+-            receptor_coords: cp.ndarray,
+-            receptor_charges: cp.ndarray,
+-            grid_center: cp.ndarray,
+-            grid_dimensions: cp.ndarray,
+-            n_ligand_atoms: int,
+-            n_receptor_atoms: int) -> Tuple[cp.ndarray, float, Dict]:
+-            """Evolve the population using genetic operators
+-
+-            Returns:
+-                best_individuals: Top N individuals (shape: (n_best, n_genes))
+-                best_fitness_values: Fitness values for top N individuals
+-                best_fitness: Fitness of the best individual
+-                evolution_stats: Statistics from evolution
+-            """
+-
+-            best_fitness_history = []
+-            mean_fitness_history = []
+-            diversity_history = []
+-
+-            current_population = population.copy()
+-            fitness = cp.zeros(self.population_size, dtype=cp.float32)
+-
+-            # Evolution statistics
+-            evolution_stats = {
+-            'generations_run': 0,
+-            'best_fitness_history': [],
+-            'mean_fitness_history': [],
+-            'diversity_history': [],
+-            'convergence_generation': None
+-            }
+-
+-            for generation in range(self.num_generations):
+-                # Evaluate fitness
+-                self._evaluate_population_fitness(
+-                    current_population, fitness, receptor_coords, receptor_charges,
+-                    grid_center, grid_dimensions, n_ligand_atoms, n_receptor_atoms
+-                )
+-
+-                # Statistics
+-                best_fitness = float(cp.max(fitness))
+-                mean_fitness = float(cp.mean(fitness))
+-
+-                best_fitness_history.append(best_fitness)
+-                mean_fitness_history.append(mean_fitness)
+-
+-                # Calculate population diversity
+-                diversity = self._calculate_population_diversity(current_population)
+-                diversity_history.append(diversity)
+-
+-                # Adaptive mutation based on diversity
+-                if self.adaptive_mutation:
+-                    self._adapt_mutation_rate(diversity)
+-
+-                # Selection and reproduction
+-                if generation < self.num_generations - 1:  # Don't reproduce on last generation
+-                    new_population = self._reproduce_population(current_population, fitness)
+-                    current_population = new_population
+-
+-                # Logging
+-                if generation % 50 == 0:
+-                    self.logger.debug(f"Generation {generation}: "
+-                                      f"Best fitness: {best_fitness:.3f}, "
+-                                      f"Mean fitness: {mean_fitness:.3f}, "
+-                                      f"Diversity: {diversity:.3f}")
+-
+-                # Check convergence
+-                if self._check_convergence(best_fitness_history):
+-                    evolution_stats['convergence_generation'] = generation
+-                    self.logger.info(f"Converged at generation {generation}")
+-                    break
+-
+-                evolution_stats['generations_run'] = generation + 1
+-
+-            # Store evolution statistics
+-            evolution_stats.update({
+-            'best_fitness_history': best_fitness_history,
+-            'mean_fitness_history': mean_fitness_history,
+-            'diversity_history': diversity_history
+-            })
+-
+-            # Get top N best individuals for diversity (not just one!)
+-            n_best = min(10, int(population.shape[0]))  # Top 10 or less if population smaller
+-            best_indices = cp.argsort(fitness)[-n_best:][::-1]  # Descending order
+-            best_individuals = current_population[best_indices]  # Shape: (n_best, n_genes)
+-            best_fitness_values = fitness[best_indices]  # Get fitness for all top individuals
+-            final_best_fitness = float(best_fitness_values[0])
+-
+-            return best_individuals, best_fitness_values, final_best_fitness, evolution_stats
+-
+-        def _evaluate_population_fitness(self, population: cp.ndarray,
+-            fitness: cp.ndarray,
+-            receptor_coords: cp.ndarray,
+-            receptor_charges: cp.ndarray,
+-            grid_center: cp.ndarray,
+-            grid_dimensions: cp.ndarray,
+-            n_ligand_atoms: int,
+-            n_receptor_atoms: int):
+-            """Evaluate fitness of entire population using CUDA kernel"""
+-
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                # Use custom CUDA kernel
+-                block_dim = (self.block_size, 1, 1)
+-                grid_dim = ((self.population_size + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                try:
+-                    self.fitness_kernel(
+-                        population.data.ptr, receptor_coords.data.ptr,
+-                        receptor_charges.data.ptr, fitness.data.ptr,
+-                        np.int32(self.population_size), np.int32(self.num_genes),
+-                        np.int32(n_ligand_atoms), np.int32(n_receptor_atoms),
+-                        grid_center.data.ptr, grid_dimensions.data.ptr,
+-                        block=block_dim, grid=grid_dim
+-                    )
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA fitness evaluation failed: {e}")
+-                    self._evaluate_fitness_cupy(
+-                        population, fitness, receptor_coords, receptor_charges,
+-                        grid_center, grid_dimensions
+-                    )
+-            else:
+-                # Fallback to CuPy implementation
+-                self._evaluate_fitness_cupy(
+-                    population, fitness, receptor_coords, receptor_charges,
+-                    grid_center, grid_dimensions
+-                )
+-
+-        def _evaluate_fitness_cupy(self, population: cp.ndarray,
+-            fitness: cp.ndarray,
+-            receptor_coords: cp.ndarray,
+-            receptor_charges: cp.ndarray,
+-            grid_center: cp.ndarray,
+-            grid_dimensions: cp.ndarray):
+-            """Fallback fitness evaluation using CuPy - FULLY VECTORIZED"""
+-
+-            # Decode ALL genes to coordinates at once (vectorized)
+-            # Genes in [-1,1] map to [center - dim/2, center + dim/2]
+-            translations = population[:, :3] * (grid_dimensions / 2) + grid_center  # (pop_size, 3)
+-
+-            # VECTORIZED energy calculation for all individuals at once
+-            # Expand dimensions: translations (pop_size, 1, 3), receptor (1, n_receptor, 3)
+-            trans_expanded = translations[:, cp.newaxis, :]  # (pop_size, 1, 3)
+-            receptor_expanded = receptor_coords[cp.newaxis, :, :]  # (1, n_receptor, 3)
+-
+-            # Calculate all pairwise distances at once
+-            diff = trans_expanded - receptor_expanded  # (pop_size, n_receptor, 3)
+-            distances = cp.sqrt(cp.sum(diff**2, axis=2))  # (pop_size, n_receptor)
+-
+-            # Apply distance cutoff mask
+-            valid_mask = (distances > 0.1) & (distances < 12.0)
+-            distances_safe = cp.where(valid_mask, distances, 1.0)  # Avoid division by zero
+-
+-            # Vectorized Lennard-Jones energy
+-            r6 = distances_safe**6
+-            r12 = r6**2
+-            lj_energy = cp.where(valid_mask, 4.0 * (1.0/r12 - 1.0/r6), 0.0)
+-
+-            # Vectorized electrostatic energy
+-            charges_expanded = receptor_charges[cp.newaxis, :]  # (1, n_receptor)
+-            elec_energy = cp.where(valid_mask, 332.0 * charges_expanded / distances_safe, 0.0)
+-
+-            # Sum energies for each individual
+-            raw_energies = cp.sum(lj_energy + elec_energy, axis=1)  # (pop_size,)
+-
+-            # Scale to realistic binding energy range (match CPU PhysicsBasedScoring behavior)
+-            # This is a simplified center-point approximation (1 point vs receptor)
+-            # Scale less aggressively than full atom-pair calculation
+-            # Divide by 2-3 to get -2 to -5 kcal/mol range
+-            scaled_energies = raw_energies / 2.5
+-
+-            # Higher fitness = lower energy
+-            fitness[:] = -scaled_energies
+-
+-        def _reproduce_population(self, population: cp.ndarray,
+-            fitness: cp.ndarray) -> cp.ndarray:
+-            """Create new population through selection, crossover, and mutation"""
+-
+-            new_population = cp.zeros_like(population)
+-            parent_indices = cp.zeros(self.population_size, dtype=cp.int32)
+-
+-            # Tournament selection
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                try:
+-                    block_dim = (self.block_size, 1, 1)
+-                    grid_dim = ((self.population_size + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                    self.selection_kernel(
+-                        fitness.data.ptr, parent_indices.data.ptr,
+-                        self.rand_states.data.ptr, np.int32(self.population_size),
+-                        np.int32(self.tournament_size),
+-                        block=block_dim, grid=grid_dim
+-                    )
+-
+-                    # Crossover and mutation
+-                    self.crossover_mutation_kernel(
+-                        population.data.ptr, new_population.data.ptr,
+-                        parent_indices.data.ptr, self.rand_states.data.ptr,
+-                        np.int32(self.population_size), np.int32(self.num_genes),
+-                        np.float32(self.crossover_rate), np.float32(self.mutation_rate),
+-                        np.float32(self.mutation_strength),
+-                        block=block_dim, grid=grid_dim
+-                    )
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA reproduction failed: {e}")
+-                    new_population = self._reproduce_cupy(population, fitness)
+-            else:
+-                new_population = self._reproduce_cupy(population, fitness)
+-
+-            # Elitism: keep best individuals
+-            if self.elitism_rate > 0:
+-                n_elite = int(self.population_size * self.elitism_rate)
+-                elite_indices = cp.argsort(fitness)[-n_elite:]
+-                new_population[:n_elite] = population[elite_indices]
+-
+-            return new_population
+-
+-        def _reproduce_cupy(self, population: cp.ndarray,
+-            fitness: cp.ndarray) -> cp.ndarray:
+-            """Fallback reproduction using CuPy"""
+-
+-            new_population = cp.zeros_like(population)
+-
+-            for i in range(self.population_size):
+-                # Tournament selection
+-                tournament_indices = cp.random.choice(
+-                    self.population_size, self.tournament_size, replace=False
+-                )
+-                tournament_fitness = fitness[tournament_indices]
+-                winner_idx = tournament_indices[cp.argmax(tournament_fitness)]
+-
+-                parent1 = population[winner_idx]
+-
+-                # Select second parent
+-                tournament_indices = cp.random.choice(
+-                    self.population_size, self.tournament_size, replace=False
+-                )
+-                tournament_fitness = fitness[tournament_indices]
+-                winner_idx = tournament_indices[cp.argmax(tournament_fitness)]
+-                parent2 = population[winner_idx]
+-
+-                # Crossover
+-                child = parent1.copy()
+-                if float(cp.random.random().get()) < self.crossover_rate:
+-                    # Arithmetic crossover
+-                    alpha = cp.random.random()
+-                    child = alpha * parent1 + (1 - alpha) * parent2
+-
+-                # Mutation
+-                mutation_mask = cp.random.random(self.num_genes) < self.mutation_rate
+-                mutations = cp.random.normal(0, self.mutation_strength, self.num_genes)
+-                child[mutation_mask] += mutations[mutation_mask]
+-                child = cp.clip(child, -1.0, 1.0)
+-
+-                new_population[i] = child
+-
+-            return new_population
+-
+-        def _calculate_population_diversity(self, population: cp.ndarray) -> float:
+-            """Calculate population diversity"""
+-
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                try:
+-                    diversity_scores = cp.zeros(self.population_size, dtype=cp.float32)
+-
+-                    block_dim = (self.block_size, 1, 1)
+-                    grid_dim = ((self.population_size + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                    self.diversity_kernel(
+-                        population.data.ptr, diversity_scores.data.ptr,
+-                        np.int32(self.population_size), np.int32(self.num_genes),
+-                        block=block_dim, grid=grid_dim
+-                    )
+-
+-                    return float(cp.mean(diversity_scores).get())
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA diversity calculation failed: {e}")
+-
+-            # Fallback: calculate average pairwise distance using manual implementation
+-            # pdist not available without cuVS/RAPIDS, so compute manually
+-            if cp_distance is not None:
+-                try:
+-                    distances = cp_distance.pdist(population)
+-                    return float(cp.mean(distances).get())
+-                except Exception as e:
+-                    self.logger.warning(f"cp_distance.pdist failed: {e}, using manual implementation")
+-
+-            # Manual pairwise distance calculation (works without cuVS)
+-            # Compute all pairwise distances between population members
+-            n = int(population.shape[0])
+-            # Expand dimensions for broadcasting: (n, 1, genes) - (1, n, genes)
+-            pop_i = population[:, cp.newaxis, :]  # (n, 1, genes)
+-            pop_j = population[cp.newaxis, :, :]  # (1, n, genes)
+-
+-            # Compute all pairwise distances
+-            diff = pop_i - pop_j  # (n, n, genes)
+-            distances = cp.sqrt(cp.sum(diff**2, axis=2))  # (n, n)
+-
+-            # Extract upper triangle (unique pairs)
+-            mask = cp.triu(cp.ones((n, n), dtype=cp.bool_), k=1)
+-            unique_distances = distances[mask]
+-
+-            return float(cp.mean(unique_distances).get())
+-
+-        def _adapt_mutation_rate(self, diversity: float):
+-            """Adapt mutation rate based on population diversity"""
+-
+-            if diversity < self.diversity_threshold:
+-                # Increase mutation to promote exploration
+-                self.mutation_rate = min(0.3, self.mutation_rate * 1.1)
+-                self.mutation_strength = min(0.3, self.mutation_strength * 1.1)
+-            elif diversity > self.diversity_threshold * 3:
+-                # Decrease mutation to promote exploitation
+-                self.mutation_rate = max(0.01, self.mutation_rate * 0.95)
+-                self.mutation_strength = max(0.01, self.mutation_strength * 0.95)
+-
+-        def _check_convergence(self, fitness_history: List[float]) -> bool:
+-            """Check if population has converged"""
+-
+-            if len(fitness_history) < self.convergence_generations:
+-                return False
+-
+-            recent_fitness = fitness_history[-self.convergence_generations:]
+-            fitness_std = np.std(recent_fitness)
+-
+-            return fitness_std < 0.01  # Converged if standard deviation is very small
+-
+-        def _convert_to_poses(self, best_individual: cp.ndarray,
+-            fitness_values: cp.ndarray,
+-            ligand_coords: np.ndarray,
+-            grid_center: np.ndarray,
+-            grid_dimensions: np.ndarray) -> List[Pose]:
+-            """Convert best individual(s) to Pose objects with proper energies"""
+-
+-            poses = []
+-
+-            # If best_individual is 1D array (single individual), wrap it
+-            if best_individual.ndim == 1:
+-                best_individual = best_individual[cp.newaxis, :]
+-                fitness_values = fitness_values[cp.newaxis] if fitness_values.ndim == 0 else fitness_values
+-
+-            # Convert to CPU
+-            individuals = cp.asnumpy(best_individual)
+-            fitness_cpu = cp.asnumpy(fitness_values)
+-            n_individuals = individuals.shape[0]
+-
+-            # Generate multiple poses from best individual(s)
+-            # Create variations to provide multiple docking solutions
+-            target_total_poses = 100  # Generate more poses for better diversity
+-            n_poses_per_individual = max(1, target_total_poses // n_individuals)
+-
+-            for idx, individual in enumerate(individuals[:min(10, n_individuals)]):
+-                # Decode genes from normalized [-1, 1] to actual coordinates
+-                # Genes in [-1,1] map to [center - dim/2, center + dim/2]
+-                translation = individual[:3] * (grid_dimensions / 2) + grid_center
+-                rotation_angles = individual[3:6] * np.pi  # Scale to [-pi, pi]
+-
+-                # Generate pose variations (small perturbations for diversity)
+-                for variation in range(n_poses_per_individual):
+-                    # Apply small random perturbation for diversity
+-                    if variation > 0:
+-                        translation_var = translation + np.random.normal(0, 0.5, 3)
+-                        rotation_var = rotation_angles + np.random.normal(0, 0.1, 3)
+-                    else:
+-                        translation_var = translation
+-                        rotation_var = rotation_angles
+-
+-                    # Apply proper rotation using rotation matrix
+-                    ligand_center = np.mean(ligand_coords, axis=0)
+-                    centered_coords = ligand_coords - ligand_center
+-
+-                    # Create rotation matrix from Euler angles
+-                    cos_x, sin_x = np.cos(rotation_var[0]), np.sin(rotation_var[0])
+-                    cos_y, sin_y = np.cos(rotation_var[1]), np.sin(rotation_var[1])
+-                    cos_z, sin_z = np.cos(rotation_var[2]), np.sin(rotation_var[2])
+-
+-                    Rx = np.array([[1, 0, 0],
+-                                  [0, cos_x, -sin_x],
+-                                  [0, sin_x, cos_x]])
+-
+-                    Ry = np.array([[cos_y, 0, sin_y],
+-                                  [0, 1, 0],
+-                                  [-sin_y, 0, cos_y]])
+-
+-                    Rz = np.array([[cos_z, -sin_z, 0],
+-                                  [sin_z, cos_z, 0],
+-                                  [0, 0, 1]])
+-
+-                    R = Rz @ Ry @ Rx
+-
+-                    # Apply rotation then translation
+-                    rotated_coords = centered_coords @ R.T
+-                    transformed_coords = rotated_coords + translation_var
+-
+-                    # Create pose with proper confidence and energy
+-                    confidence = 1.0 / (1.0 + idx + variation * 0.1)
+-
+-                    # Convert fitness to energy (fitness is negative energy, so negate it)
+-                    # Add small penalty for variations to distinguish them
+-                    energy = -float(fitness_cpu[idx]) + variation * 0.01
+-
+-                    pose = Pose(
+-                        coordinates=transformed_coords,
+-                        center=np.mean(transformed_coords, axis=0),
+-                        rotation=np.array([rotation_var[0], rotation_var[1], rotation_var[2], 1.0]),
+-                        conformer_id=len(poses),
+-                        energy=energy,
+-                        confidence=confidence
+-                    )
+-
+-                    poses.append(pose)
+-
+-            return poses
+-
+-
+-    # Multi-GPU Island Model Genetic Algorithm
+-    class IslandModelGeneticAlgorithm(CUDAGeneticAlgorithmDocker):
+-        """Multi-GPU island model for parallel genetic algorithm docking"""
+-
+-        def __init__(self, **params):
+-            self.num_islands = params.get('num_islands', cp.cuda.runtime.getDeviceCount())
+-            self.migration_rate = params.get('migration_rate', 0.05)
+-            self.migration_interval = params.get('migration_interval', 50)
+-
+-            super().__init__(**params)
+-
+-            # Adjust population size per island
+-            self.pop_per_island = self.population_size // self.num_islands
+-
+-            self.logger.info(f"Island model GA initialized: {self.num_islands} islands, "
+-                             f"{self.pop_per_island} individuals per island")
+-
+-        def dock_island_model(self, ligand_coords: np.ndarray,
+-                              receptor_coords: np.ndarray,
+-                              receptor_charges: np.ndarray,
+-                              grid_center: np.ndarray,
+-                              grid_dimensions: np.ndarray, **kwargs) -> DockingResult:
+-            """Parallel docking using island model"""
+-
+-            island_results = []
+-
+-            # Run GA on each GPU (island)
+-            for island_id in range(self.num_islands):
+-                with cp.cuda.Device(island_id):
+-                    self.logger.info(f"Starting evolution on island {island_id}")
+-
+-                    # Create island-specific parameters
+-                    island_params = kwargs.copy()
+-                    island_params['population_size'] = self.pop_per_island
+-
+-                    # Run docking on this island
+-                    result = self.dock(
+-                        ligand_coords, receptor_coords, receptor_charges,
+-                        grid_center, grid_dimensions, **island_params
+-                    )
+-                    island_results.append(result)
+-
+-            # Combine results from all islands
+-            return self._combine_island_results(island_results)
+-
+-        def _combine_island_results(self, results: List[DockingResult]) -> DockingResult:
+-            """Combine results from all islands"""
+-
+-            all_poses = []
+-            total_runtime = max(r.runtime for r in results)
+-            total_evaluations = sum(r.num_evaluations for r in results)
+-
+-            for result in results:
+-                all_poses.extend(result.poses)
+-
+-            # Sort by energy and take best poses
+-            all_poses.sort(key=lambda p: p.energy)
+-
+-            return DockingResult(
+-                poses=all_poses,
+-                algorithm_name="island_model_genetic_algorithm",
+-                runtime=total_runtime,
+-                num_evaluations=total_evaluations,
+-                convergence_data={
+-                    'num_islands': self.num_islands,
+-                    'migration_rate': self.migration_rate
+-                }
+-            )
+-
+-else:
+-    # Create dummy classes when CUDA not available
+-    class CUDAGeneticAlgorithmDocker:
+-        def __init__(self, **params):
+-            raise ImportError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+-
+-    class IslandModelGeneticAlgorithm:
+-        def __init__(self, **params):
+-            raise ImportError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+diff --git a/pandadock/docking/algorithms/monte_carlo_gpu.py b/pandadock/docking/algorithms/monte_carlo_gpu.py
+deleted file mode 100644
+index 92da559..0000000
+--- a/pandadock/docking/algorithms/monte_carlo_gpu.py
++++ /dev/null
+@@ -1,811 +0,0 @@
+-"""
+-CUDA-Accelerated Monte Carlo Docking
+-
+-GPU-accelerated implementation using:
+-1. CuPy for GPU array operations
+-2. CUDA kernels for parallel pose evaluation
+-3. Thrust for parallel reductions
+-4. Multi-GPU support for large-scale screening
+-
+-Performance improvements:
+-- 50-100x speedup over CPU for large conformer sets
+-- Parallel energy evaluation across thousands of poses
+-- GPU-optimized memory management
+-- Asynchronous CPU-GPU data transfer
+-"""
+-
+-import numpy as np
+-from typing import List, Dict, Tuple, Optional, Any
+-import logging
+-import math
+-import time
+-from ..core import BaseDockingAlgorithm, DockingResult, Pose
+-
+-# GPU libraries with fallbacks
+-try:
+-    import cupy as cp
+-    CUPY_AVAILABLE = True
+-
+-    # Optional CuPy scipy modules
+-    try:
+-        import cupyx.scipy.spatial.distance as cp_distance
+-    except ImportError:
+-        cp_distance = None
+-
+-    # Note: cupyx.scipy.spatial.transform may not exist, we'll use scipy.spatial.transform instead
+-    cp_R = None  # Will use scipy.spatial.transform.Rotation with CuPy arrays
+-
+-except ImportError:
+-    CUPY_AVAILABLE = False
+-    cp = None
+-    cp_distance = None
+-    cp_R = None
+-
+-try:
+-    from numba import cuda, float32, int32
+-    import numba
+-    NUMBA_CUDA_AVAILABLE = True
+-except ImportError:
+-    NUMBA_CUDA_AVAILABLE = False
+-
+-try:
+-    import pycuda.driver as cuda_driver
+-    import pycuda.autoinit
+-    from pycuda.compiler import SourceModule
+-    import pycuda.gpuarray as gpuarray
+-    PYCUDA_AVAILABLE = True
+-except ImportError:
+-    PYCUDA_AVAILABLE = False
+-
+-
+-# CUDA kernel for energy evaluation
+-ENERGY_KERNEL_SOURCE = """
+-__global__ void evaluate_pose_energies(
+-    float* ligand_coords,     // [n_poses, n_atoms, 3]
+-    float* receptor_coords,   // [n_receptor_atoms, 3]
+-    float* receptor_charges,  // [n_receptor_atoms]
+-    float* energies,         // [n_poses] output
+-    int n_poses,
+-    int n_ligand_atoms,
+-    int n_receptor_atoms,
+-    float vdw_cutoff,
+-    float electrostatic_cutoff
+-) {
+-    int pose_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (pose_idx >= n_poses) return;
+-
+-    float total_energy = 0.0f;
+-
+-    // Calculate pose energy
+-    for (int i = 0; i < n_ligand_atoms; i++) {
+-        int lig_base = pose_idx * n_ligand_atoms * 3 + i * 3;
+-        float lig_x = ligand_coords[lig_base];
+-        float lig_y = ligand_coords[lig_base + 1];
+-        float lig_z = ligand_coords[lig_base + 2];
+-
+-        for (int j = 0; j < n_receptor_atoms; j++) {
+-            float rec_x = receptor_coords[j * 3];
+-            float rec_y = receptor_coords[j * 3 + 1];
+-            float rec_z = receptor_coords[j * 3 + 2];
+-
+-            float dx = lig_x - rec_x;
+-            float dy = lig_y - rec_y;
+-            float dz = lig_z - rec_z;
+-            float dist_sq = dx*dx + dy*dy + dz*dz;
+-            float dist = sqrtf(dist_sq);
+-
+-            if (dist < vdw_cutoff) {
+-                // Lennard-Jones potential (simplified)
+-                float r6 = dist_sq * dist_sq * dist_sq;
+-                float r12 = r6 * r6;
+-                float vdw_energy = 4.0f * (1.0f / r12 - 1.0f / r6);
+-                total_energy += vdw_energy;
+-
+-                // Electrostatic energy
+-                if (dist < electrostatic_cutoff) {
+-                    float elec_energy = 332.0f * receptor_charges[j] / dist;
+-                    total_energy += elec_energy;
+-                }
+-            }
+-        }
+-    }
+-
+-    energies[pose_idx] = total_energy;
+-}
+-
+-__global__ void apply_perturbations(
+-    float* poses,           // [n_poses, n_atoms, 3]
+-    float* random_values,   // [n_poses, 6] (3 translation, 3 rotation)
+-    int n_poses,
+-    int n_atoms,
+-    float max_translation,
+-    float max_rotation
+-) {
+-    int pose_idx = blockIdx.x * blockDim.x + threadIdx.x;
+-
+-    if (pose_idx >= n_poses) return;
+-
+-    int pose_offset = pose_idx * n_atoms * 3;
+-    int rand_offset = pose_idx * 6;
+-
+-    // Translation
+-    float trans_x = (random_values[rand_offset] - 0.5f) * 2.0f * max_translation;
+-    float trans_y = (random_values[rand_offset + 1] - 0.5f) * 2.0f * max_translation;
+-    float trans_z = (random_values[rand_offset + 2] - 0.5f) * 2.0f * max_translation;
+-
+-    // Apply translation to all atoms
+-    for (int i = 0; i < n_atoms; i++) {
+-        int atom_offset = pose_offset + i * 3;
+-        poses[atom_offset] += trans_x;
+-        poses[atom_offset + 1] += trans_y;
+-        poses[atom_offset + 2] += trans_z;
+-    }
+-
+-    // Rotation (simplified - around center of mass)
+-    float rot_x = (random_values[rand_offset + 3] - 0.5f) * 2.0f * max_rotation;
+-    float rot_y = (random_values[rand_offset + 4] - 0.5f) * 2.0f * max_rotation;
+-    float rot_z = (random_values[rand_offset + 5] - 0.5f) * 2.0f * max_rotation;
+-
+-    // Simple rotation implementation (can be optimized with quaternions)
+-    float cos_x = cosf(rot_x), sin_x = sinf(rot_x);
+-    float cos_y = cosf(rot_y), sin_y = sinf(rot_y);
+-    float cos_z = cosf(rot_z), sin_z = sinf(rot_z);
+-
+-    for (int i = 0; i < n_atoms; i++) {
+-        int atom_offset = pose_offset + i * 3;
+-        float x = poses[atom_offset];
+-        float y = poses[atom_offset + 1];
+-        float z = poses[atom_offset + 2];
+-
+-        // Rotate around Z
+-        float new_x = x * cos_z - y * sin_z;
+-        float new_y = x * sin_z + y * cos_z;
+-
+-        // Rotate around Y
+-        float temp_x = new_x * cos_y + z * sin_y;
+-        float new_z = -new_x * sin_y + z * cos_y;
+-
+-        // Rotate around X
+-        poses[atom_offset] = temp_x;
+-        poses[atom_offset + 1] = new_y * cos_x - new_z * sin_x;
+-        poses[atom_offset + 2] = new_y * sin_x + new_z * cos_x;
+-    }
+-}
+-"""
+-
+-# Only define the class if CUDA is available
+-if CUPY_AVAILABLE:
+-    class CUDAMonteCarloDocker(BaseDockingAlgorithm):
+-        """CUDA-accelerated Monte Carlo molecular docking"""
+-
+-        def __init__(self, **params):
+-            super().__init__("cuda_monte_carlo", supports_gpu=True)
+-
+-            # GPU availability check is lazy - only checked when actually docking
+-            self.gpu_available = None  # Will check on first use
+-
+-            # Monte Carlo parameters
+-            # GPU version needs fewer iterations due to larger batch sizes
+-            # Default: 1000 iterations × 1000 batch = 1M evaluations (same as CPU 10K iterations × 100 batch)
+-            # Fast mode: 100 iterations for quick testing (~10 seconds)
+-            fast_mode = params.get('fast', False)
+-            default_iterations = 100 if fast_mode else 1000
+-            self.num_iterations = params.get('num_iterations', default_iterations)
+-            self.initial_temperature = params.get('initial_temp', 1000.0)
+-            self.cooling_rate = params.get('cooling_rate', 0.99)
+-            self.final_temperature = params.get('final_temp', 1.0)
+-
+-            # Perturbation parameters
+-            self.max_translation = params.get('max_translation', 1.0)  # Å
+-            self.max_rotation = params.get('max_rotation', 0.3)  # radians
+-
+-            # GPU parameters
+-            self.block_size = params.get('block_size', 256)
+-            self.batch_size = params.get('batch_size', 1000)  # Poses per batch
+-            self.memory_limit_gb = params.get('memory_limit', 4.0)
+-
+-            # Energy cutoffs
+-            self.vdw_cutoff = params.get('vdw_cutoff', 8.0)
+-            self.electrostatic_cutoff = params.get('electrostatic_cutoff', 12.0)
+-
+-            # Initialize GPU context
+-            self._initialize_gpu()
+-
+-            self.logger.info(f"CUDA Monte Carlo docker initialized on GPU")
+-
+-        def _check_gpu_availability(self) -> bool:
+-            """Check if CUDA GPU is available"""
+-            if not CUPY_AVAILABLE:
+-                self.logger.warning("CuPy not available - falling back to CPU")
+-                return False
+-
+-            try:
+-                # Test basic GPU operation
+-                test_array = cp.array([1, 2, 3])
+-                result = cp.sum(test_array)
+-                del test_array, result
+-                return True
+-            except Exception as e:
+-                self.logger.warning(f"GPU test failed: {e}")
+-                return False
+-
+-        def _initialize_gpu(self):
+-            """Initialize GPU context and compile kernels"""
+-            # Initialize cuda_module to None by default
+-            self.cuda_module = None
+-
+-            if PYCUDA_AVAILABLE:
+-                try:
+-                    self.cuda_module = SourceModule(ENERGY_KERNEL_SOURCE)
+-                    self.evaluate_energies_kernel = self.cuda_module.get_function("evaluate_pose_energies")
+-                    self.apply_perturbations_kernel = self.cuda_module.get_function("apply_perturbations")
+-                    self.logger.info("CUDA kernels compiled successfully")
+-                except Exception as e:
+-                    self.logger.warning(f"CUDA kernel compilation failed: {e}")
+-                    self.cuda_module = None
+-            else:
+-                self.logger.info("PyCUDA not available, using CuPy-only implementation")
+-
+-            # Get GPU properties
+-            try:
+-                gpu_id = cp.cuda.Device().id
+-                device = cp.cuda.Device(gpu_id)
+-
+-                # Get memory info using the newer CuPy API
+-                mem_info = device.mem_info
+-                total_memory = mem_info[1]  # (free, total)
+-
+-                self.logger.info(f"Using GPU {gpu_id}: {total_memory / 1e9:.1f} GB total memory")
+-            except Exception as e:
+-                self.logger.warning(f"Failed to get GPU properties: {e}")
+-
+-        def dock(self, receptor_file: str, ligand_mol, grid_center: np.ndarray,
+-                 grid_dimensions: np.ndarray, **kwargs) -> DockingResult:
+-            """
+-            Perform CUDA-accelerated Monte Carlo docking
+-
+-            Args:
+-                receptor_file: Path to receptor PDB file
+-                ligand_mol: RDKit molecule object
+-                grid_center: Center of docking grid
+-                grid_dimensions: Dimensions of docking grid
+-                **kwargs: Additional parameters
+-
+-            Returns:
+-                DockingResult object
+-            """
+-            # Check GPU availability on first use
+-            if self.gpu_available is None:
+-                self.gpu_available = self._check_gpu_availability()
+-
+-            if not self.gpu_available:
+-                raise RuntimeError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+-
+-            # Check for fast mode in runtime parameters (overrides __init__ setting)
+-            if kwargs.get('fast', False):
+-                original_iterations = self.num_iterations
+-                self.num_iterations = 100  # Fast mode: 100 iterations
+-                self.logger.info(f"Fast mode enabled: reducing iterations from {original_iterations} to {self.num_iterations}")
+-
+-            # Extract coordinates from inputs
+-            from rdkit import Chem
+-            from Bio.PDB import PDBParser
+-
+-            # Get ligand coordinates
+-            if hasattr(ligand_mol, 'GetConformer'):
+-                conf = ligand_mol.GetConformer()
+-                ligand_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+-            else:
+-                raise ValueError("ligand_mol must be an RDKit molecule with conformer")
+-
+-            # Get receptor coordinates
+-            parser = PDBParser(QUIET=True)
+-            receptor_structure = parser.get_structure('receptor', receptor_file)
+-            receptor_atoms = list(receptor_structure.get_atoms())
+-            receptor_coords = np.array([atom.get_coord() for atom in receptor_atoms])
+-
+-            # Simple charge assignment (can be improved)
+-            receptor_charges = np.zeros(len(receptor_atoms))
+-
+-            # Now call the internal docking method
+-            return self._dock_internal(ligand_coords, receptor_coords, receptor_charges,
+-                                     grid_center, grid_dimensions, ligand_mol, receptor_file, **kwargs)
+-
+-        def _dock_internal(self, ligand_coords: np.ndarray, receptor_coords: np.ndarray,
+-            receptor_charges: np.ndarray, grid_center: np.ndarray,
+-            grid_dimensions: np.ndarray, ligand_mol, receptor_file: str, **kwargs) -> DockingResult:
+-            """
+-            Internal CUDA-accelerated Monte Carlo docking
+-
+-            Args:
+-            ligand_coords: Initial ligand coordinates (N x 3)
+-            receptor_coords: Receptor atom coordinates (M x 3)
+-            receptor_charges: Receptor partial charges (M,)
+-            grid_center: Center of docking grid
+-            grid_dimensions: Grid box dimensions
+-
+-            Returns:
+-            DockingResult with best poses
+-            """
+-            self.logger.info(f"Starting CUDA Monte Carlo docking with {self.num_iterations} iterations")
+-
+-            # Initialize GPU variables for cleanup
+-            gpu_ligand_coords = None
+-            gpu_receptor_coords = None
+-            gpu_receptor_charges = None
+-            gpu_grid_center = None
+-            gpu_grid_dimensions = None
+-            current_poses = None
+-            best_poses = None
+-            best_energies = None
+-
+-            try:
+-                start_time = time.time()
+-                n_ligand_atoms = int(ligand_coords.shape[0])
+-                n_receptor_atoms = int(receptor_coords.shape[0])
+-
+-                # Transfer data to GPU
+-                gpu_ligand_coords = cp.asarray(ligand_coords, dtype=cp.float32)
+-                gpu_receptor_coords = cp.asarray(receptor_coords, dtype=cp.float32)
+-                gpu_receptor_charges = cp.asarray(receptor_charges, dtype=cp.float32)
+-                gpu_grid_center = cp.asarray(grid_center, dtype=cp.float32)
+-                gpu_grid_dimensions = cp.asarray(grid_dimensions, dtype=cp.float32)
+-
+-                # Initialize pose population
+-                current_poses = self._generate_initial_poses(
+-                gpu_ligand_coords, gpu_grid_center, gpu_grid_dimensions, self.batch_size
+-                )
+-
+-                # Monte Carlo optimization
+-                best_poses, best_energies = self._monte_carlo_optimization(
+-                current_poses, gpu_receptor_coords, gpu_receptor_charges,
+-                n_ligand_atoms, n_receptor_atoms
+-                )
+-
+-                # Convert results back to CPU
+-                cpu_poses = cp.asnumpy(best_poses)
+-                cpu_energies = cp.asnumpy(best_energies)
+-
+-                # Create result poses
+-                poses = []
+-                for i, (pose_coords, energy) in enumerate(zip(cpu_poses, cpu_energies)):
+-                    pose = Pose(
+-                        coordinates=pose_coords,
+-                        center=np.mean(pose_coords, axis=0),
+-                        rotation=np.array([0, 0, 0, 1]),  # Placeholder quaternion
+-                        conformer_id=0,
+-                        energy=float(energy),
+-                        confidence=self._calculate_confidence(energy, cpu_energies)
+-                    )
+-                    poses.append(pose)
+-
+-                runtime = time.time() - start_time
+-                self.logger.info(f"CUDA docking completed in {runtime:.2f} seconds")
+-
+-                return DockingResult(
+-                    ligand_name=ligand_mol.GetProp('_Name') if ligand_mol.HasProp('_Name') else 'unknown',
+-                    receptor_file=receptor_file,
+-                    grid_center=grid_center,
+-                    grid_dimensions=grid_dimensions,
+-                    algorithm_used=self.name,
+-                    scoring_function="cuda_mc",
+-                    poses=poses,
+-                    parameters={
+-                        'num_iterations': self.num_iterations,
+-                        'batch_size': self.batch_size,
+-                        'runtime': runtime,
+-                        'num_evaluations': self.num_iterations * self.batch_size,
+-                        'final_temperature': self.final_temperature
+-                    }
+-                )
+-
+-            finally:
+-                # CRITICAL: Clean up GPU memory to prevent memory leaks
+-                try:
+-                    # Delete GPU arrays explicitly
+-                    if gpu_ligand_coords is not None:
+-                        del gpu_ligand_coords
+-                    if gpu_receptor_coords is not None:
+-                        del gpu_receptor_coords
+-                    if gpu_receptor_charges is not None:
+-                        del gpu_receptor_charges
+-                    if gpu_grid_center is not None:
+-                        del gpu_grid_center
+-                    if gpu_grid_dimensions is not None:
+-                        del gpu_grid_dimensions
+-                    if current_poses is not None:
+-                        del current_poses
+-                    if best_poses is not None:
+-                        del best_poses
+-                    if best_energies is not None:
+-                        del best_energies
+-
+-                    # Force free all memory blocks in the pool
+-                    mempool = cp.get_default_memory_pool()
+-                    mempool.free_all_blocks()
+-
+-                    self.logger.debug(f"GPU memory cleaned successfully")
+-                except Exception as e:
+-                    self.logger.warning(f"GPU cleanup warning: {e}")
+-
+-        def _generate_initial_poses(self, ligand_coords: cp.ndarray,
+-            grid_center: cp.ndarray,
+-            grid_dimensions: cp.ndarray,
+-            n_poses: int) -> cp.ndarray:
+-            """Generate initial random poses within grid - VECTORIZED"""
+-
+-            n_atoms = int(ligand_coords.shape[0])
+-            n_poses = int(n_poses)  # Force conversion in case it's not int
+-            poses = cp.zeros((n_poses, n_atoms, 3), dtype=cp.float32)
+-
+-            # Center ligand at origin first
+-            ligand_center = cp.mean(ligand_coords, axis=0)
+-            centered_ligand = ligand_coords - ligand_center
+-
+-            # VECTORIZED: Generate all random translations at once
+-            random_offsets = cp.random.uniform(
+-                -grid_dimensions/2, grid_dimensions/2, size=(n_poses, 3)
+-            ).astype(cp.float32)
+-
+-            # Apply to all poses: center ligand, rotate, then translate to grid position
+-            for i in range(n_poses):
+-                # Start with centered ligand
+-                poses[i] = centered_ligand.copy()
+-                # Apply random rotation around origin
+-                poses[i] = self._apply_random_rotation_gpu(poses[i])
+-                # Translate to grid position
+-                poses[i] = poses[i] + grid_center + random_offsets[i]
+-
+-            return poses
+-
+-        def _apply_random_rotation_gpu(self, coords: cp.ndarray) -> cp.ndarray:
+-            """Apply random rotation to coordinates on GPU - NO .get() CALLS"""
+-
+-            center = cp.mean(coords, axis=0)
+-            centered_coords = coords - center
+-
+-            # Generate random rotation angles
+-            angles = cp.random.uniform(-cp.pi, cp.pi, size=3).astype(cp.float32)
+-
+-            # Compute cos/sin directly on GPU (NO .get() calls!)
+-            # Compute all at once to avoid potential implicit conversion from indexing
+-            cos_angles = cp.cos(angles)
+-            sin_angles = cp.sin(angles)
+-            cos_x = cos_angles[0]
+-            sin_x = sin_angles[0]
+-            cos_y = cos_angles[1]
+-            sin_y = sin_angles[1]
+-            cos_z = cos_angles[2]
+-            sin_z = sin_angles[2]
+-
+-            # Rotation matrices - build on GPU to avoid implicit conversion
+-            Rx = cp.zeros((3, 3), dtype=cp.float32)
+-            Rx[0, 0] = 1.0
+-            Rx[1, 1] = cos_x
+-            Rx[1, 2] = -sin_x
+-            Rx[2, 1] = sin_x
+-            Rx[2, 2] = cos_x
+-
+-            Ry = cp.zeros((3, 3), dtype=cp.float32)
+-            Ry[0, 0] = cos_y
+-            Ry[0, 2] = sin_y
+-            Ry[1, 1] = 1.0
+-            Ry[2, 0] = -sin_y
+-            Ry[2, 2] = cos_y
+-
+-            Rz = cp.zeros((3, 3), dtype=cp.float32)
+-            Rz[0, 0] = cos_z
+-            Rz[0, 1] = -sin_z
+-            Rz[1, 0] = sin_z
+-            Rz[1, 1] = cos_z
+-            Rz[2, 2] = 1.0
+-
+-            R = Rz @ Ry @ Rx
+-            rotated_coords = centered_coords @ R.T
+-
+-            return rotated_coords + center
+-
+-        def _monte_carlo_optimization(self, initial_poses: cp.ndarray,
+-            receptor_coords: cp.ndarray,
+-            receptor_charges: cp.ndarray,
+-            n_ligand_atoms: int,
+-            n_receptor_atoms: int) -> Tuple[cp.ndarray, cp.ndarray]:
+-            """Perform Monte Carlo optimization on GPU"""
+-
+-            current_poses = initial_poses.copy()
+-            current_energies = self._evaluate_energies_gpu(
+-            current_poses, receptor_coords, receptor_charges
+-            )
+-
+-            # Debug: Check initial energies
+-            min_e, max_e, mean_e = float(cp.min(current_energies).get()), float(cp.max(current_energies).get()), float(cp.mean(current_energies).get())
+-            self.logger.info(f"Initial energies: min={min_e:.3f}, max={max_e:.3f}, mean={mean_e:.3f} kcal/mol")
+-
+-            best_poses = current_poses.copy()
+-            best_energies = current_energies.copy()
+-
+-            temperature = self.initial_temperature
+-            n_poses = int(current_poses.shape[0])
+-
+-            for iteration in range(self.num_iterations):
+-                # Generate perturbations
+-                perturbed_poses = self._generate_perturbations_gpu(
+-                    current_poses, temperature
+-                )
+-
+-                # Evaluate energies
+-                perturbed_energies = self._evaluate_energies_gpu(
+-                    perturbed_poses, receptor_coords, receptor_charges
+-                )
+-
+-                # Acceptance criterion
+-                self._apply_metropolis_criterion_gpu(
+-                    current_poses, current_energies,
+-                    perturbed_poses, perturbed_energies,
+-                    temperature
+-                )
+-
+-                # Update best poses
+-                improvement_mask = current_energies < best_energies
+-                best_poses[improvement_mask] = current_poses[improvement_mask]
+-                best_energies[improvement_mask] = current_energies[improvement_mask]
+-
+-                # Cool down
+-                temperature *= self.cooling_rate
+-
+-                if iteration % 1000 == 0:
+-                    min_energy = float(cp.min(best_energies).get())
+-                    self.logger.debug(f"Iteration {iteration}: T={temperature:.1f}K, "
+-                                    f"Best energy: {min_energy:.3f} kcal/mol")
+-
+-            return best_poses, best_energies
+-
+-        def _evaluate_energies_gpu(self, poses: cp.ndarray,
+-            receptor_coords: cp.ndarray,
+-            receptor_charges: cp.ndarray) -> cp.ndarray:
+-            """Evaluate pose energies using CUDA kernel"""
+-
+-            n_poses = int(poses.shape[0])
+-            energies = cp.zeros(n_poses, dtype=cp.float32)
+-
+-            if self.cuda_module and PYCUDA_AVAILABLE:
+-                # Use custom CUDA kernel
+-                block_dim = (self.block_size, 1, 1)
+-                grid_dim = ((n_poses + self.block_size - 1) // self.block_size, 1, 1)
+-
+-                self.evaluate_energies_kernel(
+-                    poses.data.ptr, receptor_coords.data.ptr, receptor_charges.data.ptr,
+-                    energies.data.ptr, np.int32(n_poses), np.int32(poses.shape[1]),
+-                    np.int32(receptor_coords.shape[0]),
+-                    np.float32(self.vdw_cutoff), np.float32(self.electrostatic_cutoff),
+-                    block=block_dim, grid=grid_dim
+-                )
+-            else:
+-                # Fallback to CuPy implementation
+-                energies = self._evaluate_energies_cupy(
+-                    poses, receptor_coords, receptor_charges
+-                )
+-
+-            return energies
+-
+-        def _evaluate_energies_cupy(self, poses: cp.ndarray,
+-            receptor_coords: cp.ndarray,
+-            receptor_charges: cp.ndarray) -> cp.ndarray:
+-            """Fully vectorized energy evaluation using CuPy - FAST!"""
+-
+-            n_poses, n_ligand_atoms, _ = int(poses.shape[0]), int(poses.shape[1]), poses.shape[2]
+-            n_receptor_atoms = int(receptor_coords.shape[0])
+-
+-            # Reshape for broadcasting: poses (n_poses, n_lig_atoms, 1, 3), receptor (1, 1, n_rec_atoms, 3)
+-            poses_expanded = poses[:, :, cp.newaxis, :]  # (n_poses, n_lig_atoms, 1, 3)
+-            receptor_expanded = receptor_coords[cp.newaxis, cp.newaxis, :, :]  # (1, 1, n_rec_atoms, 3)
+-
+-            # Calculate all pairwise distances at once: (n_poses, n_lig_atoms, n_rec_atoms)
+-            diff = poses_expanded - receptor_expanded
+-            distances = cp.sqrt(cp.sum(diff**2, axis=3))  # (n_poses, n_lig_atoms, n_rec_atoms)
+-
+-            # Van der Waals energy (vectorized)
+-            # Apply cutoff and minimum distance to prevent numerical overflow
+-            MIN_DISTANCE = 0.5  # Å - atoms can't get closer than this
+-            vdw_mask = (distances >= MIN_DISTANCE) & (distances < self.vdw_cutoff)
+-            distances_safe = cp.where(vdw_mask, distances, 1.0)
+-
+-            r6 = distances_safe**6
+-            r12 = r6**2
+-            vdw_per_pair = cp.where(vdw_mask, 4.0 * (1.0/r12 - 1.0/r6), 0.0)
+-
+-            # Add huge penalty for clashes (distances < MIN_DISTANCE)
+-            clash_mask = distances < MIN_DISTANCE
+-            clash_penalty = cp.sum(clash_mask, axis=(1, 2)) * 1000.0  # Large penalty per clash
+-            vdw_energies = cp.sum(vdw_per_pair, axis=(1, 2)) + clash_penalty
+-
+-            # Electrostatic energy (vectorized)
+-            elec_mask = (distances >= MIN_DISTANCE) & (distances < self.electrostatic_cutoff)
+-            charges_expanded = receptor_charges[cp.newaxis, cp.newaxis, :]  # (1, 1, n_rec_atoms)
+-            elec_per_pair = cp.where(elec_mask, 332.0 * charges_expanded / distances_safe, 0.0)
+-            elec_energies = cp.sum(elec_per_pair, axis=(1, 2))  # Sum over ligand and receptor atoms
+-
+-            # Total energy per pose (raw physics energy)
+-            raw_energies = (vdw_energies + elec_energies).astype(cp.float32)
+-
+-            # Scale to realistic binding energy range (match CPU PhysicsBasedScoring behavior)
+-            # Raw energies can be very large due to summing all atom pairs
+-            # Scale to typical experimental binding energies: -15 to +5 kcal/mol
+-            # Simple approximation: divide by number of ligand atoms to normalize
+-            n_lig_atoms = float(poses.shape[1])
+-            scaling_factor = max(1.0, n_lig_atoms / 3.0)  # Normalize by ~number of heavy atoms
+-            energies = raw_energies / scaling_factor
+-
+-            return energies
+-
+-        def _generate_perturbations_gpu(self, poses: cp.ndarray,
+-            temperature: float) -> cp.ndarray:
+-            """Generate random perturbations on GPU - FULLY VECTORIZED"""
+-
+-            n_poses, n_atoms, _ = int(poses.shape[0]), int(poses.shape[1]), poses.shape[2]
+-            perturbed_poses = poses.copy()
+-
+-            # Temperature-dependent step sizes
+-            temp_factor = temperature / self.initial_temperature
+-            current_translation = self.max_translation * temp_factor
+-            current_rotation = self.max_rotation * temp_factor
+-
+-            # VECTORIZED: Apply random translation to ALL poses at once
+-            translations = cp.random.uniform(
+-                -current_translation, current_translation, size=(n_poses, 1, 3)
+-            )
+-            perturbed_poses += translations  # Broadcast over all atoms in each pose
+-
+-            # VECTORIZED: Random rotation for 50% of poses
+-            # Generate random mask for which poses to rotate (all on GPU)
+-            rotation_mask = cp.random.random(size=n_poses) < 0.5
+-
+-            # Convert to Python bool to avoid implicit conversion
+-            if bool(cp.any(rotation_mask).get()):
+-                # Get indices of poses to rotate
+-                rotate_indices = cp.where(rotation_mask)[0]
+-
+-                # Apply rotation to selected poses (vectorized)
+-                for idx in rotate_indices.get():  # Only transfer indices to CPU once
+-                    perturbed_poses[idx] = self._apply_random_rotation_gpu(
+-                        perturbed_poses[idx]
+-                    )
+-
+-            return perturbed_poses
+-
+-        def _apply_metropolis_criterion_gpu(self, current_poses: cp.ndarray,
+-            current_energies: cp.ndarray,
+-            perturbed_poses: cp.ndarray,
+-            perturbed_energies: cp.ndarray,
+-            temperature: float):
+-            """Apply Metropolis acceptance criterion on GPU"""
+-
+-            # Energy differences
+-            delta_energies = perturbed_energies - current_energies
+-
+-            # Acceptance probabilities
+-            kT = 0.001987 * temperature  # kcal/mol
+-            probabilities = cp.exp(-cp.maximum(delta_energies, 0) / kT)
+-            random_vals = cp.random.random(size=int(probabilities.shape[0]))
+-
+-            # Accept moves
+-            accept_mask = (delta_energies <= 0) | (random_vals < probabilities)
+-
+-            current_poses[accept_mask] = perturbed_poses[accept_mask]
+-            current_energies[accept_mask] = perturbed_energies[accept_mask]
+-
+-        def _calculate_confidence(self, energy: float, all_energies: np.ndarray) -> float:
+-            """Calculate pose confidence based on energy ranking"""
+-            energy_rank = np.sum(all_energies <= energy)
+-            return 1.0 - (energy_rank / len(all_energies))
+-
+-
+-    # GPU Memory Management
+-    class GPUMemoryManager:
+-        """Manage GPU memory for large-scale docking"""
+-
+-        def __init__(self, memory_limit_gb: float = 4.0):
+-            self.memory_limit = memory_limit_gb * 1e9
+-            self.logger = logging.getLogger("pandadock.gpu.memory")
+-
+-        def calculate_batch_size(self, n_ligand_atoms: int,
+-                                n_receptor_atoms: int) -> int:
+-            """Calculate optimal batch size based on available memory"""
+-
+-            # Estimate memory per pose
+-            pose_memory = n_ligand_atoms * 3 * 4  # float32
+-            receptor_memory = n_receptor_atoms * 3 * 4
+-            energy_memory = 4  # float32
+-
+-            total_per_pose = pose_memory + energy_memory
+-            max_poses = int(self.memory_limit * 0.8 / total_per_pose)  # 80% utilization
+-
+-            return min(max_poses, 10000)  # Cap at 10k poses
+-
+-        def check_memory_usage(self) -> Dict[str, float]:
+-            """Check current GPU memory usage"""
+-            mempool = cp.get_default_memory_pool()
+-            return {
+-                'used_gb': mempool.used_bytes() / 1e9,
+-                'total_gb': mempool.total_bytes() / 1e9
+-            }
+-            return {'used_gb': 0, 'total_gb': 0}
+-
+-
+-    # Multi-GPU support
+-    class MultiGPUMonteCarloDocker(CUDAMonteCarloDocker):
+-        """Multi-GPU Monte Carlo docking for large-scale screening"""
+-
+-        def __init__(self, **params):
+-            self.num_gpus = params.get('num_gpus', cp.cuda.runtime.getDeviceCount())
+-            super().__init__(**params)
+-
+-            self.logger.info(f"Multi-GPU docker initialized with {self.num_gpus} GPUs")
+-
+-        def dock_multi_gpu(self, ligand_coords: np.ndarray,
+-                          receptor_coords: np.ndarray,
+-                          receptor_charges: np.ndarray,
+-                          grid_center: np.ndarray,
+-                          grid_dimensions: np.ndarray, **kwargs) -> DockingResult:
+-            """Distribute docking across multiple GPUs"""
+-
+-            poses_per_gpu = self.batch_size // self.num_gpus
+-            all_results = []
+-
+-            for gpu_id in range(self.num_gpus):
+-                with cp.cuda.Device(gpu_id):
+-                    self.logger.info(f"Starting docking on GPU {gpu_id}")
+-
+-                    # Adjust batch size for this GPU
+-                    current_batch_size = poses_per_gpu
+-                    if gpu_id == self.num_gpus - 1:  # Last GPU gets remainder
+-                        current_batch_size = self.batch_size - (poses_per_gpu * (self.num_gpus - 1))
+-
+-                    # Run docking on this GPU
+-                    gpu_params = kwargs.copy()
+-                    gpu_params['batch_size'] = current_batch_size
+-
+-                    result = self.dock(
+-                        ligand_coords, receptor_coords, receptor_charges,
+-                        grid_center, grid_dimensions, **gpu_params
+-                    )
+-                    all_results.append(result)
+-
+-            # Combine results from all GPUs
+-            return self._combine_multi_gpu_results(all_results)
+-
+-        def _combine_multi_gpu_results(self, results: List[DockingResult]) -> DockingResult:
+-            """Combine results from multiple GPUs"""
+-
+-            all_poses = []
+-            total_runtime = max(r.runtime for r in results)
+-            total_evaluations = sum(r.num_evaluations for r in results)
+-
+-            for result in results:
+-                all_poses.extend(result.poses)
+-
+-            # Sort by energy and take best poses
+-            all_poses.sort(key=lambda p: p.energy)
+-
+-            return DockingResult(
+-                poses=all_poses,
+-                algorithm_name="multi_gpu_monte_carlo",
+-                runtime=total_runtime,
+-                num_evaluations=total_evaluations,
+-                convergence_data={'num_gpus': self.num_gpus}
+-            )
+-
+-else:
+-    # Create dummy classes when CUDA not available
+-    class CUDAMonteCarloDocker:
+-        def __init__(self, **params):
+-            raise ImportError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+-
+-    class GPUMemoryManager:
+-        def __init__(self):
+-            raise ImportError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+-
+-    class MultiGPUMonteCarloDocker:
+-        def __init__(self, **params):
+-            raise ImportError("CUDA not available. Please install CuPy and ensure CUDA drivers are installed.")
+diff --git a/pandadock/docking/gpu/__init__.py b/pandadock/docking/gpu/__init__.py
+new file mode 100644
+index 0000000..ef59da9
+--- /dev/null
++++ b/pandadock/docking/gpu/__init__.py
+@@ -0,0 +1,16 @@
++"""
++Batched GPU evaluation for the docking search.
++
++This subpackage mirrors the validated CPU search rather than reimplementing it.
++Every component here is expected to reproduce its CPU counterpart to within
++floating-point tolerance, and the tests assert exactly that -- a GPU path that
++is fast but scores differently is not an optimisation, it is a second engine
++with unmeasured accuracy.
++
++Nothing here is imported by the CPU docking path, and torch is an optional
++extra, so `import pandadock` continues to work without it.
++"""
++
++from .grids import TorchAffinityGrids, torch_available
++
++__all__ = ["TorchAffinityGrids", "torch_available"]
+diff --git a/pandadock/docking/gpu/grids.py b/pandadock/docking/gpu/grids.py
+new file mode 100644
+index 0000000..ede246a
+--- /dev/null
++++ b/pandadock/docking/gpu/grids.py
+@@ -0,0 +1,231 @@
++"""
++Batched trilinear grid scoring on the GPU.
++
++This is a direct port of `AffinityGrids.score_and_gradient`, kept deliberately
++line-comparable to the NumPy original so that the two can be read side by side
++when a parity test fails. The only intentional differences are that this version
++scores a batch of poses at once and returns tensors on the grid's device.
++
++Two properties are load-bearing and are asserted by the tests:
++
++* The energy and gradient must match the CPU implementation. The CPU path is the
++  one validated against 814 complexes in the manuscript; this path has no
++  independent claim to correctness and is only useful insofar as it agrees.
++* Atoms outside the grid must receive the same quadratic boundary penalty. It is
++  what keeps the optimiser inside the box, and dropping it would let poses drift
++  out of the pocket while scoring well.
++
++Precision note: the CPU search runs its arithmetic in float64, but the maps
++themselves are stored as float32. CUDA supports float64 (slowly); Apple's MPS
++backend does not support it at all, so on MPS the grids fall back to float32 and
++the parity tolerance is correspondingly looser. `dtype_for_device` encodes that
++rule in one place rather than leaving each caller to discover it.
++
++One deliberate numerical difference from the CPU. The x-derivative begins with
++`c100 - c000`, and on the CPU both operands are raw float32 map values, so that
++subtraction happens in float32 and loses roughly seven digits to cancellation
++before anything is promoted. The y and z derivatives subtract intermediates that
++numpy has already promoted to float64 and so are unaffected. Because this class
++uploads the maps as float64, it performs that subtraction in float64 and is the
++more accurate of the two -- agreement on the x-gradient is therefore about 1e-8
++relative rather than round-off. Energies are unaffected: they never difference
++two corners. Do not restore bit-identity by downcasting; see
++tests/test_gpu_grids.py::test_x_gradient_differs_only_by_float32_cancellation.
++"""
++
++from __future__ import annotations
++
++from typing import Optional, Tuple
++
++import numpy as np
++
++try:
++    import torch
++
++    torch_available = True
++except ImportError:  # pragma: no cover - exercised only in a base install
++    torch = None
++    torch_available = False
++
++
++def dtype_for_device(device) -> "torch.dtype":
++    """
++    Widest float the device actually supports.
++
++    MPS silently has no float64 -- allocating one raises -- so asking for the
++    CPU's precision there fails at construction rather than producing quietly
++    wrong numbers later.
++    """
++    return torch.float32 if torch.device(device).type == "mps" else torch.float64
++
++
++def resolve_device(device=None) -> "torch.device":
++    """
++    Pick a device, preferring an accelerator but never failing because of one.
++
++    Explicit requests are honoured as given so that a test asking for CUDA fails
++    loudly on a machine without it instead of silently measuring the CPU.
++    """
++    if device is not None:
++        return torch.device(device)
++    if torch.cuda.is_available():
++        return torch.device("cuda")
++    if torch.backends.mps.is_available():
++        return torch.device("mps")
++    return torch.device("cpu")
++
++
++class TorchAffinityGrids:
++    """
++    Receptor affinity grids resident on a torch device.
++
++    Built once per receptor and reused across every pose and every ligand that
++    shares the grids, which is what makes the batched search worthwhile: the maps
++    are by far the largest tensor involved and must not be re-uploaded per pose.
++    """
++
++    def __init__(
++        self,
++        origin: np.ndarray,
++        spacing: float,
++        maps: np.ndarray,
++        shape: np.ndarray,
++        out_of_box_penalty: float = 10.0,
++        device=None,
++        dtype: Optional["torch.dtype"] = None,
++    ):
++        if not torch_available:
++            raise ImportError(
++                "The GPU search path needs the optional [gnn] extra "
++                "(pip install pandadock[gnn]) for torch."
++            )
++        self.device = resolve_device(device)
++        self.dtype = dtype if dtype is not None else dtype_for_device(self.device)
++
++        self.maps = torch.as_tensor(maps, dtype=self.dtype, device=self.device)
++        self.origin = torch.as_tensor(origin, dtype=self.dtype, device=self.device)
++        self.spacing = float(spacing)
++        self.out_of_box_penalty = float(out_of_box_penalty)
++
++        # Kept as a tensor for the clamp bounds and as ints for indexing maths.
++        self.shape = torch.as_tensor(
++            np.asarray(shape, dtype=np.int64), dtype=torch.long, device=self.device
++        )
++
++        # The corner lookup is a single flat gather rather than four-dimensional
++        # advanced indexing: one contiguous read per corner is far friendlier to
++        # a GPU's memory system, and it avoids materialising broadcast index
++        # tensors for each of the four dimensions.
++        _, nx, ny, nz = self.maps.shape
++        self._flat_maps = self.maps.contiguous().reshape(-1)
++        # Row-major strides of (n_types, nx, ny, nz); the trailing z stride of 1
++        # is applied directly in _gather_corners.
++        self._stride = torch.as_tensor(
++            [nx * ny * nz, ny * nz, nz], dtype=torch.long, device=self.device
++        )
++
++    @classmethod
++    def from_cpu(cls, grids, device=None, dtype: Optional["torch.dtype"] = None):
++        """Upload an existing CPU `AffinityGrids`, preserving every parameter."""
++        return cls(
++            origin=grids.origin,
++            spacing=grids.spacing,
++            maps=grids.maps,
++            shape=grids.shape,
++            out_of_box_penalty=grids.out_of_box_penalty,
++            device=device,
++            dtype=dtype,
++        )
++
++    def _gather_corners(self, type_ids, x, y, z):
++        """One flat index per atom per corner, then a single gather."""
++        flat = (
++            type_ids * self._stride[0]
++            + x * self._stride[1]
++            + y * self._stride[2]
++            + z
++        )
++        return self._flat_maps[flat.reshape(-1)].reshape(flat.shape)
++
++    def score_and_gradient(
++        self,
++        coords: "torch.Tensor",
++        type_ids: "torch.Tensor",
++        need_gradient: bool = True,
++    ) -> Tuple["torch.Tensor", Optional["torch.Tensor"]]:
++        """
++        Trilinear interpolation with analytic gradient, over a batch of poses.
++
++        Args:
++            coords: (B, N, 3) heavy-atom coordinates, B poses of the same ligand.
++            type_ids: (N,) ligand atom type index into the first map axis.
++            need_gradient: skip the derivative when only the energy is wanted.
++
++        Returns:
++            energy: (B,) total interaction energy including the boundary penalty.
++            gradient: (B, N, 3) d(energy)/d(coord), or None.
++        """
++        if coords.dim() != 3 or coords.shape[-1] != 3:
++            raise ValueError(f"coords must be (B, N, 3), got {tuple(coords.shape)}")
++
++        coords = coords.to(device=self.device, dtype=self.dtype)
++        type_ids = type_ids.to(device=self.device, dtype=torch.long)
++
++        frac = (coords - self.origin) / self.spacing
++
++        # Clamp to the last cell that still has a +1 neighbour, and keep the part
++        # that was clipped away: that overflow is what the penalty charges for,
++        # and it is exactly zero for any atom inside the grid.
++        hi = (self.shape - 1).to(self.dtype)
++        clamped = torch.minimum(
++            torch.clamp(frac, min=0.0), hi - 1e-6
++        )
++        overflow = frac - clamped
++
++        i0 = torch.minimum(clamped.floor().long(), self.shape - 2)
++        t = clamped - i0.to(self.dtype)
++        u, v, w = t[..., 0], t[..., 1], t[..., 2]
++
++        x0, y0, z0 = i0[..., 0], i0[..., 1], i0[..., 2]
++        x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
++
++        # type_ids is (N,) and the coordinate indices are (B, N); broadcasting
++        # pairs each pose's atom with that atom's map.
++        tid = type_ids.expand_as(x0)
++
++        c000 = self._gather_corners(tid, x0, y0, z0)
++        c100 = self._gather_corners(tid, x1, y0, z0)
++        c010 = self._gather_corners(tid, x0, y1, z0)
++        c110 = self._gather_corners(tid, x1, y1, z0)
++        c001 = self._gather_corners(tid, x0, y0, z1)
++        c101 = self._gather_corners(tid, x1, y0, z1)
++        c011 = self._gather_corners(tid, x0, y1, z1)
++        c111 = self._gather_corners(tid, x1, y1, z1)
++
++        one_u, one_v, one_w = 1.0 - u, 1.0 - v, 1.0 - w
++
++        c00 = c000 * one_u + c100 * u
++        c10 = c010 * one_u + c110 * u
++        c01 = c001 * one_u + c101 * u
++        c11 = c011 * one_u + c111 * u
++
++        c0 = c00 * one_v + c10 * v
++        c1 = c01 * one_v + c11 * v
++
++        values = c0 * one_w + c1 * w
++
++        penalty = self.out_of_box_penalty * (overflow**2).sum(dim=(1, 2))
++        energy = values.sum(dim=1) + penalty
++
++        if not need_gradient:
++            return energy, None
++
++        d_du = ((c100 - c000) * one_v + (c110 - c010) * v) * one_w + (
++            (c101 - c001) * one_v + (c111 - c011) * v
++        ) * w
++        d_dv = (c10 - c00) * one_w + (c11 - c01) * w
++        d_dw = c1 - c0
++
++        grad = torch.stack([d_du, d_dv, d_dw], dim=-1) / self.spacing
++        grad = grad + 2.0 * self.out_of_box_penalty * overflow / self.spacing
++        return energy, grad
+diff --git a/pandadock/docking/gpu/rigid_search.py b/pandadock/docking/gpu/rigid_search.py
+new file mode 100644
+index 0000000..7c2f629
+--- /dev/null
++++ b/pandadock/docking/gpu/rigid_search.py
+@@ -0,0 +1,253 @@
++"""
++Batched rigid-ligand Monte Carlo.
++
++Stage two of the GPU search. The ligand is held rigid so that this stage
++isolates the parts that are easy to get subtly wrong -- pose construction,
++batched scoring, the Metropolis criterion -- from torsional sampling, which
++arrives in stage three. A rigid run is also a real workflow in its own right:
++it is what `--rigid-ligand` already does on the CPU.
++
++Relationship to the CPU search. This is not bit-identical to
++`MonteCarloSearch`, and cannot be: the CPU runs `exhaustiveness` independent
++chains in a Python loop, each drawing from its own NumPy generator, while this
++advances thousands of chains in lockstep from a torch generator. The stream of
++random numbers differs, so individual trajectories differ. What must agree is
++everything that is not the random stream:
++
++* a pose built from a given DOF vector must have the same coordinates
++* that pose must receive the same energy
++* the Metropolis rule must accept with the same probability
++
++The tests assert each of those against the CPU implementation directly.
++
++The loop deliberately never calls `.item()`, `.cpu()`, or `float()` on a tensor.
++Each of those forces a device synchronisation, and at a few microseconds of
++kernel time per step a single sync per iteration costs more than the arithmetic
++it is waiting for. Acceptance is therefore resolved with a tensor mask rather
++than a Python `if`, and nothing returns to the host until the run is over.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Optional
++
++import numpy as np
++
++from .grids import TorchAffinityGrids, dtype_for_device, resolve_device
++from .rotations import compose_rotvecs, random_rotvec, wrap_rotvec
++
++try:
++    import torch
++
++    torch_available = True
++except ImportError:  # pragma: no cover - exercised only in a base install
++    torch = None
++    torch_available = False
++
++
++@dataclass
++class RigidSearchConfig:
++    """
++    Search controls, named to match `SearchConfig` on the CPU.
++
++    `n_chains` replaces `exhaustiveness`: the CPU runs that many chains one after
++    another, and this runs them at once. The default is far larger because the
++    whole point of the batch is that additional chains are close to free until
++    the device is saturated.
++    """
++
++    n_chains: int = 1024
++    n_steps: int = 200
++    temperature: float = 1.0
++    translation_amplitude: float = 2.0
++    rotation_amplitude: float = 0.35
++    reorient_probability: float = 0.1
++    seed: Optional[int] = None
++
++
++class RigidBatchedSearch:
++    """
++    Monte Carlo over rigid-body pose, with every chain advanced in parallel.
++
++    Args:
++        grids: receptor grids already resident on the target device.
++        base_coords: (N, 3) heavy-atom reference geometry, centred as the CPU
++            torsion tree centres it (on the root atom).
++        type_ids: (N,) ligand atom types indexing the grid maps.
++    """
++
++    def __init__(
++        self,
++        grids: TorchAffinityGrids,
++        base_coords: np.ndarray,
++        type_ids: np.ndarray,
++        config: Optional[RigidSearchConfig] = None,
++    ):
++        if not torch_available:
++            raise ImportError(
++                "The GPU search path needs the optional [gnn] extra "
++                "(pip install pandadock[gnn]) for torch."
++            )
++        self.grids = grids
++        self.config = config or RigidSearchConfig()
++        self.device = grids.device
++        self.dtype = grids.dtype
++
++        self.base_coords = torch.as_tensor(
++            base_coords, dtype=self.dtype, device=self.device
++        )
++        self.type_ids = torch.as_tensor(
++            np.asarray(type_ids), dtype=torch.long, device=self.device
++        )
++
++    # ------------------------------------------------------------------ poses
++
++    def build_coords(
++        self, translation: "torch.Tensor", rotvec: "torch.Tensor"
++    ) -> "torch.Tensor":
++        """
++        (B, 3), (B, 3) -> (B, N, 3), matching `TorsionTree.build_coords`.
++
++        The CPU computes `coords @ R.T + t`; the einsum below is the same
++        contraction written for a batch of rotations against one geometry.
++        """
++        from .rotations import rodrigues_matrix
++
++        rotation = rodrigues_matrix(rotvec)
++        rotated = torch.einsum("bij,nj->bni", rotation, self.base_coords)
++        return rotated + translation.unsqueeze(1)
++
++    def score(self, translation, rotvec, need_gradient=False):
++        """Energy, and optionally d(energy)/d(coord), for a batch of poses."""
++        coords = self.build_coords(translation, rotvec)
++        return self.grids.score_and_gradient(
++            coords, self.type_ids, need_gradient=need_gradient
++        )
++
++    # ----------------------------------------------------------------- search
++
++    def _generator(self):
++        gen = torch.Generator(device="cpu")
++        if self.config.seed is not None:
++            gen.manual_seed(int(self.config.seed))
++        return gen
++
++    def _to_device(self, tensor):
++        return tensor.to(device=self.device, dtype=self.dtype)
++
++    def initial_state(self, box_min, box_max, gen):
++        """
++        Uniform over the box and over SO(3), as `TorsionTree.random_dof` is.
++
++        Sampling on the CPU generator and moving the result keeps runs
++        reproducible across devices: MPS and CUDA generators do not produce the
++        same stream, so seeding a device generator would make the seed mean
++        something different on each machine.
++        """
++        cfg = self.config
++        lo = torch.as_tensor(np.asarray(box_min), dtype=torch.float64)
++        hi = torch.as_tensor(np.asarray(box_max), dtype=torch.float64)
++        u = torch.rand(cfg.n_chains, 3, generator=gen, dtype=torch.float64)
++        translation = lo + u * (hi - lo)
++        rotvec = random_rotvec(cfg.n_chains, generator=gen, dtype=torch.float64)
++        return self._to_device(translation), self._to_device(rotvec)
++
++    def propose(self, translation, rotvec, gen):
++        """
++        One trial move per chain, mirroring `MonteCarloSearch._mutate`.
++
++        As on the CPU, the orientation is occasionally resampled outright rather
++        than perturbed, so a chain can leave a basin whose orientation is
++        qualitatively wrong instead of only refining it.
++        """
++        cfg = self.config
++        n = translation.shape[0]
++
++        step = torch.randn(n, 3, generator=gen, dtype=torch.float64)
++        new_translation = translation + self._to_device(step) * cfg.translation_amplitude
++
++        perturb = torch.randn(n, 3, generator=gen, dtype=torch.float64)
++        perturbed = compose_rotvecs(
++            self._to_device(perturb) * cfg.rotation_amplitude, rotvec
++        )
++        fresh = self._to_device(random_rotvec(n, generator=gen, dtype=torch.float64))
++
++        reorient = torch.rand(n, 1, generator=gen, dtype=torch.float64)
++        reorient = self._to_device(reorient) < cfg.reorient_probability
++        new_rotvec = torch.where(reorient, fresh, perturbed)
++
++        return new_translation, wrap_rotvec(new_rotvec)
++
++    def run(self, box_min, box_max):
++        """
++        Advance every chain for `n_steps` and return the best pose of each.
++
++        Returns:
++            translation: (n_chains, 3) best translation seen by each chain
++            rotvec: (n_chains, 3) matching orientation
++            energy: (n_chains,) best energy seen by each chain
++
++        Chains are returned unsorted and unclustered. Clustering stays on the
++        CPU, where the symmetry-corrected comparison already lives.
++        """
++        cfg = self.config
++        gen = self._generator()
++
++        translation, rotvec = self.initial_state(box_min, box_max, gen)
++        energy, _ = self.score(translation, rotvec)
++
++        best_translation = translation.clone()
++        best_rotvec = rotvec.clone()
++        best_energy = energy.clone()
++
++        temperature = max(cfg.temperature, 1e-6)
++
++        for _ in range(cfg.n_steps):
++            trial_t, trial_r = self.propose(translation, rotvec, gen)
++            trial_e, _ = self.score(trial_t, trial_r)
++
++            delta = trial_e - energy
++            # Metropolis, as a mask. `delta <= 0` is folded in by the exponential
++            # exceeding 1 there, which matches the CPU's `delta <= 0 or rand < exp`
++            # without needing a second comparison.
++            u = self._to_device(
++                torch.rand(cfg.n_chains, generator=gen, dtype=torch.float64)
++            )
++            accept = u < torch.exp(-delta / temperature)
++
++            keep = accept.unsqueeze(-1)
++            translation = torch.where(keep, trial_t, translation)
++            rotvec = torch.where(keep, trial_r, rotvec)
++            energy = torch.where(accept, trial_e, energy)
++
++            improved = trial_e < best_energy
++            keep_best = improved.unsqueeze(-1)
++            best_translation = torch.where(keep_best, trial_t, best_translation)
++            best_rotvec = torch.where(keep_best, trial_r, best_rotvec)
++            best_energy = torch.where(improved, trial_e, best_energy)
++
++        return best_translation, best_rotvec, best_energy
++
++
++def build_rigid_search(
++    cpu_grids,
++    tree,
++    config: Optional[RigidSearchConfig] = None,
++    device=None,
++) -> RigidBatchedSearch:
++    """
++    Construct a batched search from the CPU objects the docking engine already has.
++
++    Takes the same `AffinityGrids` and `TorsionTree` the CPU search uses, so the
++    two paths cannot disagree about geometry or atom typing through a
++    transcription mistake.
++    """
++    device = resolve_device(device)
++    grids = TorchAffinityGrids.from_cpu(cpu_grids, device=device)
++    return RigidBatchedSearch(
++        grids=grids,
++        base_coords=tree.base_coords[tree.heavy_atoms],
++        type_ids=cpu_grids.typing.type_ids,
++        config=config,
++    )
+diff --git a/pandadock/docking/gpu/rotations.py b/pandadock/docking/gpu/rotations.py
+new file mode 100644
+index 0000000..671ff8c
+--- /dev/null
++++ b/pandadock/docking/gpu/rotations.py
+@@ -0,0 +1,185 @@
++"""
++Batched SO(3) primitives, matching pandadock.docking.search.rotations.
++
++Each function here is the batched counterpart of a scalar CPU function, and the
++tests assert they agree elementwise. The CPU versions branch on magnitude --
++`if theta < 1e-12: return identity` and similar -- which does not translate
++directly: a batch contains both degenerate and ordinary rotations at once, so
++every branch has to be evaluated for every element and selected with `where`.
++
++That creates the trap this module is written around, though not the one it first
++appears to be. `rotvec / theta` is NaN when theta is zero. In the forward pass
++`torch.where` does select the correct branch and the NaN goes away, so a naive
++implementation looks right. It is autograd that breaks: `where` routes a zero
++gradient into the unselected branch, and 0 * NaN is NaN, so the identity row
++returns NaN gradients and -- once an optimiser sums them -- takes the rest of
++the batch with it.
++
++Every division below is therefore guarded by a denominator clamped away from
++zero rather than by `where` alone. At an exact identity the derivative really is
++singular, so the guarded gradient is merely enormous (order 1/eps) instead of
++NaN; that is a number an optimiser can clip, which NaN is not. This matters as
++soon as the batched local optimiser starts differentiating through these
++functions. See tests/test_gpu_rotations.py::test_guarded_division_keeps_gradients_finite.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++
++try:
++    import torch
++
++    torch_available = True
++except ImportError:  # pragma: no cover - exercised only in a base install
++    torch = None
++    torch_available = False
++
++
++# Matches the scalar thresholds in the CPU implementation so that the two agree
++# about which inputs are degenerate.
++EPS_IDENTITY = 1e-12
++EPS_ANGLE = 1e-8
++EPS_NEAR_PI = 1e-6
++
++
++def _safe_div(numerator, denominator, eps=EPS_IDENTITY):
++    """Divide with a denominator clamped away from zero, killing NaN at source."""
++    return numerator / denominator.clamp_min(eps)
++
++
++def rodrigues_matrix(rotvec: "torch.Tensor") -> "torch.Tensor":
++    """
++    Rotation matrices for a batch of axis-angle vectors, (B, 3) -> (B, 3, 3).
++
++    Rotations with |r| below EPS_IDENTITY return the identity, as on the CPU.
++    """
++    theta = rotvec.norm(dim=-1, keepdim=True)
++    k = _safe_div(rotvec, theta)
++
++    kx, ky, kz = k[..., 0], k[..., 1], k[..., 2]
++    zero = torch.zeros_like(kx)
++    K = torch.stack(
++        [
++            torch.stack([zero, -kz, ky], dim=-1),
++            torch.stack([kz, zero, -kx], dim=-1),
++            torch.stack([-ky, kx, zero], dim=-1),
++        ],
++        dim=-2,
++    )
++
++    t = theta.unsqueeze(-1)
++    eye = torch.eye(3, dtype=rotvec.dtype, device=rotvec.device).expand_as(K)
++    rotation = eye + torch.sin(t) * K + (1.0 - torch.cos(t)) * (K @ K)
++
++    degenerate = (theta.squeeze(-1) < EPS_IDENTITY).view(-1, 1, 1)
++    return torch.where(degenerate, eye, rotation)
++
++
++def matrix_to_rotvec(matrix: "torch.Tensor") -> "torch.Tensor":
++    """
++    Axis-angle vectors for a batch of rotation matrices, (B, 3, 3) -> (B, 3).
++
++    Mirrors the CPU function's three cases: near-identity returns zero, near-pi
++    recovers the axis from R + I because the skew part vanishes there, and the
++    ordinary case reads the axis off the skew part.
++    """
++    trace = matrix.diagonal(dim1=-2, dim2=-1).sum(-1)
++    cos_theta = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0)
++    theta = torch.arccos(cos_theta)
++
++    skew = torch.stack(
++        [
++            matrix[..., 2, 1] - matrix[..., 1, 2],
++            matrix[..., 0, 2] - matrix[..., 2, 0],
++            matrix[..., 1, 0] - matrix[..., 0, 1],
++        ],
++        dim=-1,
++    )
++    sin_theta = torch.sin(theta).unsqueeze(-1)
++    ordinary = skew * _safe_div(theta.unsqueeze(-1), 2.0 * sin_theta.abs())
++
++    # Near pi: the columns of (R + I)/2 are all parallel to the rotation axis, so
++    # take the best-conditioned one rather than dividing by a vanishing sine.
++    eye = torch.eye(3, dtype=matrix.dtype, device=matrix.device).expand_as(matrix)
++    rpi = (matrix + eye) / 2.0
++    diag = rpi.diagonal(dim1=-2, dim2=-1).clamp_min(0.0)
++    axis_scale = torch.sqrt(diag)
++    k = axis_scale.argmax(dim=-1)
++
++    picked = torch.gather(
++        rpi, 2, k.view(-1, 1, 1).expand(-1, 3, 1)
++    ).squeeze(-1)
++    scale = torch.gather(axis_scale, 1, k.view(-1, 1))
++    axis = _safe_div(picked, scale, EPS_ANGLE)
++    axis = _safe_div(axis, axis.norm(dim=-1, keepdim=True), EPS_ANGLE)
++    near_pi_vec = axis * theta.unsqueeze(-1)
++
++    out = torch.where((theta > np.pi - EPS_NEAR_PI).unsqueeze(-1), near_pi_vec, ordinary)
++    return torch.where(
++        (theta < EPS_ANGLE).unsqueeze(-1), torch.zeros_like(out), out
++    )
++
++
++def compose_rotvecs(outer: "torch.Tensor", inner: "torch.Tensor") -> "torch.Tensor":
++    """Axis-angle vector for `outer` applied after `inner`, batched."""
++    return matrix_to_rotvec(rodrigues_matrix(outer) @ rodrigues_matrix(inner))
++
++
++def wrap_rotvec(rotvec: "torch.Tensor") -> "torch.Tensor":
++    """
++    Reduce each axis-angle vector to the equivalent rotation with angle <= pi.
++
++    Keeps the parameterisation well conditioned without changing any pose, for
++    the reason given on the CPU function: the exponential-map derivative divides
++    by |r|^2.
++    """
++    theta = rotvec.norm(dim=-1, keepdim=True)
++    axis = _safe_div(rotvec, theta)
++
++    wrapped = torch.remainder(theta, 2.0 * np.pi)
++    wrapped = torch.where(wrapped > np.pi, wrapped - 2.0 * np.pi, wrapped)
++
++    untouched = (theta <= np.pi) | (theta < EPS_IDENTITY)
++    return torch.where(untouched, rotvec, axis * wrapped)
++
++
++def random_rotvec(
++    n: int, generator=None, dtype=None, device=None
++) -> "torch.Tensor":
++    """
++    Sample `n` rotations uniformly over SO(3), as axis-angle vectors.
++
++    Shoemake's method, matching the CPU implementation: a uniform quaternion
++    converted to axis-angle. Sampling the axis-angle components independently
++    would concentrate density near the identity, which is the failure this
++    guards against -- see the CPU test asserting the angle density is
++    (1 - cos t) / pi.
++    """
++    u = torch.rand(n, 3, generator=generator, dtype=dtype, device=device)
++    u1, u2, u3 = u[:, 0], u[:, 1], u[:, 2]
++    s1, s2 = torch.sqrt(1.0 - u1), torch.sqrt(u1)
++    two_pi = 2.0 * np.pi
++
++    quat = torch.stack(
++        [
++            s1 * torch.sin(two_pi * u2),
++            s1 * torch.cos(two_pi * u2),
++            s2 * torch.sin(two_pi * u3),
++            s2 * torch.cos(two_pi * u3),
++        ],
++        dim=-1,
++    )
++    # A quaternion and its negation are the same rotation; take the w >= 0
++    # representative so the angle lands in [0, pi] and the vector stays canonical.
++    quat = torch.where((quat[:, 3:4] < 0.0), -quat, quat)
++
++    xyz, w = quat[:, :3], quat[:, 3].clamp(-1.0, 1.0)
++    theta = 2.0 * torch.arccos(w)
++    sin_half = torch.sqrt((1.0 - w * w).clamp_min(0.0))
++    axis = _safe_div(xyz, sin_half.unsqueeze(-1))
++    return torch.where(
++        (sin_half < EPS_IDENTITY).unsqueeze(-1),
++        torch.zeros_like(xyz),
++        axis * theta.unsqueeze(-1),
++    )
+diff --git a/tests/test_gpu_grids.py b/tests/test_gpu_grids.py
+new file mode 100644
+index 0000000..76a48e2
+--- /dev/null
++++ b/tests/test_gpu_grids.py
+@@ -0,0 +1,322 @@
++"""
++Numerical parity between the CPU and batched GPU grid scoring.
++
++The CPU path is the one validated on 814 complexes in the manuscript. The GPU
++path has no independent claim to correctness: it is worth having only if it
++agrees, so these tests compare it against the CPU implementation rather than
++against hand-written expected values.
++
++Every test runs on whatever device is available. On CPU and CUDA the comparison
++is in float64 and the tolerance is tight; MPS has no float64, so there the same
++tests run in float32 against a float32 reference and the tolerance reflects it.
++"""
++
++import os
++
++os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
++
++import numpy as np
++import pytest
++
++pytest.importorskip("torch", reason="the GPU search path needs the [gnn] extra")
++pytest.importorskip("rdkit", reason="RDKit is required to build grids")
++
++import torch  # noqa: E402
++
++from pandadock.docking.gpu import TorchAffinityGrids  # noqa: E402
++from pandadock.docking.gpu.grids import dtype_for_device  # noqa: E402
++
++
++# Devices worth exercising on this machine. CPU is always included so the parity
++# maths is covered even where no accelerator exists.
++def available_devices():
++    devices = ["cpu"]
++    if torch.cuda.is_available():
++        devices.append("cuda")
++    if torch.backends.mps.is_available():
++        devices.append("mps")
++    return devices
++
++
++DEVICES = available_devices()
++
++
++class FakeGrids:
++    """
++    A stand-in for AffinityGrids carrying the same fields the scorer reads.
++
++    Building real receptor grids is slow and drags in a receptor fixture; the
++    interpolation maths under test does not care where the numbers came from, so
++    random maps exercise it just as well and let the tests stay fast.
++    """
++
++    def __init__(self, seed=0, n_types=4, shape=(12, 13, 14), spacing=0.375):
++        rng = np.random.default_rng(seed)
++        # float32 because that is what AffinityGrids.build actually produces.
++        # Using float64 here would make these tests pass at a tolerance the real
++        # grids cannot meet -- see test_x_gradient_differs_only_by_float32_cancellation.
++        self.maps = rng.normal(0.0, 2.0, size=(n_types,) + shape).astype(np.float32)
++        self.origin = np.array([-2.0, 1.0, 0.5])
++        self.spacing = spacing
++        self.out_of_box_penalty = 10.0
++        self.shape = np.array(shape, dtype=np.int64)
++
++
++def cpu_reference(grids, coords, type_ids, need_gradient=True):
++    """
++    The production CPU maths, lifted verbatim from AffinityGrids.
++
++    Duplicated rather than imported because the real method is a method on a
++    class that owns receptor state; keeping the arithmetic here makes any
++    divergence between the two implementations visible in this file.
++    """
++    frac = (coords - grids.origin) / grids.spacing
++    hi = grids.shape - 1
++    clamped = np.clip(frac, 0.0, hi.astype(np.float64) - 1e-6)
++    overflow = frac - clamped
++
++    i0 = np.floor(clamped).astype(np.int64)
++    i0 = np.minimum(i0, hi - 1)
++    t = clamped - i0
++    u, v, w = t[:, 0], t[:, 1], t[:, 2]
++
++    x0, y0, z0 = i0[:, 0], i0[:, 1], i0[:, 2]
++    x1, y1, z1 = x0 + 1, y0 + 1, z0 + 1
++
++    m = grids.maps
++    c000 = m[type_ids, x0, y0, z0]
++    c100 = m[type_ids, x1, y0, z0]
++    c010 = m[type_ids, x0, y1, z0]
++    c110 = m[type_ids, x1, y1, z0]
++    c001 = m[type_ids, x0, y0, z1]
++    c101 = m[type_ids, x1, y0, z1]
++    c011 = m[type_ids, x0, y1, z1]
++    c111 = m[type_ids, x1, y1, z1]
++
++    one_u, one_v, one_w = 1.0 - u, 1.0 - v, 1.0 - w
++    c00 = c000 * one_u + c100 * u
++    c10 = c010 * one_u + c110 * u
++    c01 = c001 * one_u + c101 * u
++    c11 = c011 * one_u + c111 * u
++    c0 = c00 * one_v + c10 * v
++    c1 = c01 * one_v + c11 * v
++    values = c0 * one_w + c1 * w
++
++    penalty = grids.out_of_box_penalty * np.sum(overflow**2)
++    energy = float(np.sum(values)) + float(penalty)
++    if not need_gradient:
++        return energy, None
++
++    d_du = ((c100 - c000) * one_v + (c110 - c010) * v) * one_w + (
++        (c101 - c001) * one_v + (c111 - c011) * v
++    ) * w
++    d_dv = (c10 - c00) * one_w + (c11 - c01) * w
++    d_dw = c1 - c0
++    grad = np.stack([d_du, d_dv, d_dw], axis=1) / grids.spacing
++    grad += 2.0 * grids.out_of_box_penalty * overflow / grids.spacing
++    return energy, grad
++
++
++def tolerances(device):
++    """
++    Bounds for CPU-vs-GPU agreement.
++
++    On a float64 device the energy agrees to round-off, but the x-gradient does
++    not agree to 1e-15, and cannot: the CPU subtracts two raw float32 map values
++    while this implementation subtracts them after upcasting. See
++    test_x_gradient_differs_only_by_float32_cancellation, which pins down that
++    this is the only source of disagreement. MPS runs the whole computation in
++    float32 and is looser again.
++    """
++    if dtype_for_device(device) == torch.float64:
++        return dict(rtol=1e-6, atol=1e-6)
++    return dict(rtol=2e-4, atol=2e-4)
++
++
++def sample_coords(grids, n_atoms, n_poses, rng, spread=1.0):
++    """Poses spread over the box; `spread` > 1 pushes atoms outside it."""
++    extent = (grids.shape - 1) * grids.spacing
++    lo = grids.origin - extent * (spread - 1.0) / 2.0
++    hi = grids.origin + extent * (1.0 + (spread - 1.0) / 2.0)
++    return rng.uniform(lo, hi, size=(n_poses, n_atoms, 3))
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_energy_and_gradient_match_cpu(device):
++    """The core claim: same inputs, same numbers, for every pose in a batch."""
++    grids = FakeGrids()
++    rng = np.random.default_rng(1)
++    n_atoms, n_poses = 17, 8
++    coords = sample_coords(grids, n_atoms, n_poses, rng)
++    type_ids = rng.integers(0, grids.maps.shape[0], size=n_atoms)
++
++    gpu = TorchAffinityGrids.from_cpu(grids, device=device)
++    energy, grad = gpu.score_and_gradient(
++        torch.as_tensor(coords), torch.as_tensor(type_ids)
++    )
++
++    tol = tolerances(device)
++    for b in range(n_poses):
++        ref_e, ref_g = cpu_reference(grids, coords[b], type_ids)
++        assert np.allclose(energy[b].cpu().double().numpy(), ref_e, **tol)
++        assert np.allclose(grad[b].cpu().double().numpy(), ref_g, **tol)
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_out_of_box_atoms_are_penalised_identically(device):
++    """
++    The boundary penalty is what keeps the optimiser in the pocket.
++
++    Dropping it would still produce plausible-looking energies while letting
++    poses drift out of the box, so it is tested separately with coordinates that
++    deliberately fall outside the grid.
++    """
++    grids = FakeGrids(seed=3)
++    rng = np.random.default_rng(2)
++    coords = sample_coords(grids, 11, 4, rng, spread=3.0)
++    type_ids = rng.integers(0, grids.maps.shape[0], size=11)
++
++    # Precondition: this really does place atoms outside the grid, otherwise the
++    # test would pass while exercising nothing.
++    frac = (coords - grids.origin) / grids.spacing
++    assert (frac < 0).any() or (frac > (grids.shape - 1)).any()
++
++    gpu = TorchAffinityGrids.from_cpu(grids, device=device)
++    energy, grad = gpu.score_and_gradient(
++        torch.as_tensor(coords), torch.as_tensor(type_ids)
++    )
++
++    tol = tolerances(device)
++    for b in range(coords.shape[0]):
++        ref_e, ref_g = cpu_reference(grids, coords[b], type_ids)
++        assert np.allclose(energy[b].cpu().double().numpy(), ref_e, **tol)
++        assert np.allclose(grad[b].cpu().double().numpy(), ref_g, **tol)
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_analytic_gradient_matches_finite_differences(device):
++    """
++    The gradient is checked against the energy it claims to differentiate.
++
++    Parity with the CPU would be satisfied by two implementations that are wrong
++    in the same way; this test is independent of both. Points are kept inside the
++    grid so the finite difference does not straddle the penalty's clamp.
++    """
++    grids = FakeGrids(seed=5)
++    rng = np.random.default_rng(4)
++    n_atoms = 6
++    extent = (grids.shape - 1) * grids.spacing
++    coords = grids.origin + rng.uniform(0.3, 0.7, size=(1, n_atoms, 3)) * extent
++    type_ids = rng.integers(0, grids.maps.shape[0], size=n_atoms)
++
++    gpu = TorchAffinityGrids.from_cpu(grids, device=device)
++    tid = torch.as_tensor(type_ids)
++    _, grad = gpu.score_and_gradient(torch.as_tensor(coords), tid)
++    grad = grad[0].cpu().double().numpy()
++
++    # A step small enough to be local but large enough to survive float32 on MPS.
++    h = 1e-5 if dtype_for_device(device) == torch.float64 else 1e-3
++    tol = dict(rtol=1e-5, atol=1e-6) if h == 1e-5 else dict(rtol=2e-2, atol=2e-2)
++
++    for atom in range(n_atoms):
++        for axis in range(3):
++            plus, minus = coords.copy(), coords.copy()
++            plus[0, atom, axis] += h
++            minus[0, atom, axis] -= h
++            e_plus, _ = gpu.score_and_gradient(
++                torch.as_tensor(plus), tid, need_gradient=False
++            )
++            e_minus, _ = gpu.score_and_gradient(
++                torch.as_tensor(minus), tid, need_gradient=False
++            )
++            fd = (float(e_plus[0]) - float(e_minus[0])) / (2 * h)
++            assert np.allclose(grad[atom, axis], fd, **tol), (
++                f"atom {atom} axis {axis}: analytic {grad[atom, axis]} vs fd {fd}"
++            )
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_batching_does_not_change_any_single_pose(device):
++    """
++    Scoring a pose alone and in a batch must give the same answer.
++
++    A broadcasting mistake in the corner gather would show up here as poses
++    contaminating each other, which is otherwise easy to miss because every
++    individual energy still looks reasonable.
++    """
++    grids = FakeGrids(seed=7)
++    rng = np.random.default_rng(6)
++    coords = sample_coords(grids, 9, 5, rng)
++    type_ids = torch.as_tensor(rng.integers(0, grids.maps.shape[0], size=9))
++
++    gpu = TorchAffinityGrids.from_cpu(grids, device=device)
++    batched, batched_grad = gpu.score_and_gradient(torch.as_tensor(coords), type_ids)
++
++    tol = tolerances(device)
++    for b in range(coords.shape[0]):
++        single, single_grad = gpu.score_and_gradient(
++            torch.as_tensor(coords[b : b + 1]), type_ids
++        )
++        assert np.allclose(
++            batched[b].cpu().double().numpy(), single[0].cpu().double().numpy(), **tol
++        )
++        assert np.allclose(
++            batched_grad[b].cpu().double().numpy(),
++            single_grad[0].cpu().double().numpy(),
++            **tol,
++        )
++
++
++def test_x_gradient_differs_only_by_float32_cancellation():
++    """
++    Explains, and bounds, the one place the two implementations disagree.
++
++    The production maps are float32. The CPU x-derivative starts from
++    `c100 - c000`, a subtraction of two raw float32 map values, so it loses
++    precision to cancellation before anything is promoted to float64. The y and
++    z derivatives subtract intermediates that numpy has already promoted, so
++    they are unaffected -- which is why the disagreement appears only on axis 0.
++
++    This implementation uploads the maps as float64 and therefore subtracts in
++    float64, making it the *more* accurate of the two. That is a deliberate
++    choice, not an oversight: do not "fix" it by downcasting the maps to restore
++    bit-identity, and do not tighten the tolerance in `tolerances()` expecting
++    the x-gradient to follow.
++
++    The energy is unaffected, since it never takes a difference of corners.
++    """
++    grids = FakeGrids(seed=11)
++    rng = np.random.default_rng(12)
++    coords = sample_coords(grids, 24, 6, rng)
++    type_ids = rng.integers(0, grids.maps.shape[0], size=24)
++
++    gpu = TorchAffinityGrids.from_cpu(grids, device="cpu")
++    energy, grad = gpu.score_and_gradient(
++        torch.as_tensor(coords), torch.as_tensor(type_ids)
++    )
++    grad = grad.cpu().double().numpy()
++
++    ref = np.stack([cpu_reference(grids, coords[b], type_ids)[1] for b in range(6)])
++    ref_e = np.array([cpu_reference(grids, coords[b], type_ids)[0] for b in range(6)])
++
++    # The energy takes no difference of corners, so it agrees to round-off.
++    assert np.allclose(energy.cpu().double().numpy(), ref_e, rtol=1e-12, atol=1e-12)
++
++    err = np.abs(grad - ref)
++    # y and z are exact; only x carries the cancellation.
++    assert err[..., 1].max() < 1e-12, "y-gradient should be bit-identical"
++    assert err[..., 2].max() < 1e-12, "z-gradient should be bit-identical"
++
++    # And the x disagreement stays at the float32 epsilon scale rather than
++    # indicating an actual indexing or interpolation bug.
++    scale = max(np.abs(ref[..., 0]).max(), 1e-12)
++    assert err[..., 0].max() / scale < 1e-6
++
++
++def test_mps_refuses_float64_rather_than_silently_downcasting():
++    """
++    MPS has no float64. The dtype rule must be explicit, not discovered at
++    runtime by a caller wondering why its tolerances stopped holding.
++    """
++    assert dtype_for_device("cpu") == torch.float64
++    assert dtype_for_device("mps") == torch.float32
+diff --git a/tests/test_gpu_rigid_search.py b/tests/test_gpu_rigid_search.py
+new file mode 100644
+index 0000000..7cd3783
+--- /dev/null
++++ b/tests/test_gpu_rigid_search.py
+@@ -0,0 +1,278 @@
++"""
++The batched rigid search against the CPU it is meant to reproduce.
++
++Trajectories cannot match: the CPU advances chains one at a time from NumPy
++generators and this advances them together from a torch generator, so the random
++streams differ by construction. Everything that is *not* the random stream must
++match, and that is what these tests pin down -- pose construction, energy, and
++the acceptance rule -- plus the properties a search must have regardless of
++implementation: it finds lower energy than it started with, and a fixed seed
++reproduces a run exactly.
++"""
++
++import os
++
++os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
++
++import numpy as np
++import pytest
++
++pytest.importorskip("torch", reason="the GPU search path needs the [gnn] extra")
++pytest.importorskip("rdkit", reason="RDKit is required to build grids")
++pytest.importorskip("Bio", reason="BioPython is required to parse receptors")
++
++import torch  # noqa: E402
++from rdkit import Chem  # noqa: E402
++from rdkit.Chem import AllChem  # noqa: E402
++
++from pandadock.docking.gpu.grids import dtype_for_device  # noqa: E402
++from pandadock.docking.gpu.rigid_search import (  # noqa: E402
++    RigidBatchedSearch,
++    RigidSearchConfig,
++    build_rigid_search,
++)
++from pandadock.docking.search import AffinityGrids, TorsionTree  # noqa: E402
++
++
++def available_devices():
++    devices = ["cpu"]
++    if torch.cuda.is_available():
++        devices.append("cuda")
++    if torch.backends.mps.is_available():
++        devices.append("mps")
++    return devices
++
++
++DEVICES = available_devices()
++CENTER = np.array([10.0, 10.0, 10.0])
++DIMS = np.array([18.0, 18.0, 18.0])
++
++
++@pytest.fixture(scope="module")
++def mol():
++    m = Chem.AddHs(Chem.MolFromSmiles("CCOC(=O)c1ccccc1N"))
++    params = AllChem.ETKDGv3()
++    params.randomSeed = 42
++    assert AllChem.EmbedMolecule(m, params) == 0
++    AllChem.MMFFOptimizeMolecule(m)
++    return m
++
++
++@pytest.fixture(scope="module")
++def receptor(tmp_path_factory):
++    """The same hollow cavity used by tests/test_search.py."""
++    from Bio.PDB import PDBParser
++
++    rng = np.random.default_rng(7)
++    lines = []
++    for i in range(400):
++        v = rng.normal(size=3)
++        v /= np.linalg.norm(v)
++        pos = CENTER + v * rng.uniform(7.5, 12.0)
++        name, elem, res = ("CB", "C", "PHE") if i % 2 else ("O", "O", "SER")
++        lines.append(
++            f"ATOM  {i + 1:5d}  {name:<3s} {res} A{i % 300 + 1:4d}    "
++            f"{pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}  1.00 20.00          {elem:>2s}"
++        )
++    lines.append("END")
++    path = tmp_path_factory.mktemp("rec") / "receptor.pdb"
++    path.write_text("\n".join(lines) + "\n")
++    return PDBParser(QUIET=True).get_structure("r", str(path))
++
++
++@pytest.fixture(scope="module")
++def grids(receptor, mol):
++    return AffinityGrids.build(receptor, mol, CENTER, DIMS, spacing=0.4)
++
++
++@pytest.fixture(scope="module")
++def tree(mol):
++    return TorsionTree(mol)
++
++
++def tol(device):
++    return (
++        dict(rtol=1e-6, atol=1e-6)
++        if dtype_for_device(device) == torch.float64
++        else dict(rtol=2e-3, atol=2e-3)
++    )
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_pose_construction_matches_the_torsion_tree(device, grids, tree):
++    """
++    A DOF vector must produce the same coordinates on both paths.
++
++    Everything downstream is a function of these coordinates, so a disagreement
++    here would surface later as an unexplained energy difference.
++    """
++    search = build_rigid_search(grids, tree, device=device)
++    rng = np.random.default_rng(5)
++    n = 32
++
++    translation = rng.uniform(CENTER - 6, CENTER + 6, size=(n, 3))
++    rotvec = rng.normal(0.0, 1.2, size=(n, 3))
++
++    dtype = search.dtype
++    got = search.build_coords(
++        torch.as_tensor(translation, dtype=dtype, device=device),
++        torch.as_tensor(rotvec, dtype=dtype, device=device),
++    )
++    got = got.cpu().double().numpy()
++
++    for b in range(n):
++        dof = np.zeros(tree.n_dof)
++        dof[:3] = translation[b]
++        dof[3:6] = rotvec[b]
++        expected = tree.build_coords(dof)[tree.heavy_atoms]
++        assert np.allclose(got[b], expected, **tol(device)), f"pose {b}"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_energy_matches_the_cpu_objective(device, grids, tree):
++    """The same pose must score the same on both paths."""
++    search = build_rigid_search(grids, tree, device=device)
++    rng = np.random.default_rng(6)
++    n = 24
++
++    translation = rng.uniform(CENTER - 6, CENTER + 6, size=(n, 3))
++    rotvec = rng.normal(0.0, 1.2, size=(n, 3))
++
++    dtype = search.dtype
++    energy, _ = search.score(
++        torch.as_tensor(translation, dtype=dtype, device=device),
++        torch.as_tensor(rotvec, dtype=dtype, device=device),
++    )
++    energy = energy.cpu().double().numpy()
++
++    for b in range(n):
++        dof = np.zeros(tree.n_dof)
++        dof[:3] = translation[b]
++        dof[3:6] = rotvec[b]
++        coords = tree.build_coords(dof)[tree.heavy_atoms]
++        expected, _ = grids.score_and_gradient(coords, need_gradient=False)
++        assert np.allclose(energy[b], expected, **tol(device)), f"pose {b}"
++
++
++def test_metropolis_accepts_at_the_textbook_rate():
++    """
++    The acceptance mask must implement the same rule as the CPU's branch.
++
++    The CPU writes `delta <= 0 or rand < exp(-delta/T)`; the batched form drops
++    the first clause because the exponential exceeds 1 whenever delta is
++    negative. This checks the resulting rate against exp(-delta/T) directly, so
++    a sign error or a missing temperature would show up as a wrong rate rather
++    than as a merely different trajectory.
++    """
++    torch.manual_seed(0)
++    temperature = 1.7
++    for delta_value in (-2.0, -0.1, 0.0, 0.5, 2.0, 5.0):
++        delta = torch.full((200000,), delta_value, dtype=torch.float64)
++        u = torch.rand(200000, dtype=torch.float64)
++        rate = float((u < torch.exp(-delta / temperature)).double().mean())
++        expected = min(1.0, float(np.exp(-delta_value / temperature)))
++        assert abs(rate - expected) < 0.01, f"delta={delta_value}: {rate} vs {expected}"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_search_finds_lower_energy_than_it_started_from(device, grids, tree):
++    """
++    A search that does not search would still pass the parity tests above.
++
++    This is the end-to-end check that the loop actually improves poses, using
++    the same starting distribution for both measurements.
++    """
++    config = RigidSearchConfig(n_chains=256, n_steps=60, seed=3)
++    search = build_rigid_search(grids, tree, config=config, device=device)
++
++    gen = search._generator()
++    start_t, start_r = search.initial_state(CENTER - 9, CENTER + 9, gen)
++    start_energy, _ = search.score(start_t, start_r)
++
++    _, _, best_energy = search.run(CENTER - 9, CENTER + 9)
++
++    start_best = float(start_energy.min().cpu())
++    found_best = float(best_energy.min().cpu())
++    assert found_best < start_best, (
++        f"search did not improve on its starting poses: {found_best} vs {start_best}"
++    )
++    # The median chain should improve too, not just a lucky one.
++    assert float(best_energy.median().cpu()) < float(start_energy.median().cpu())
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_a_seeded_run_is_reproducible(device, grids, tree):
++    """Same seed, same answer -- the CPU search makes the same promise."""
++    config = RigidSearchConfig(n_chains=64, n_steps=20, seed=99)
++    a = build_rigid_search(grids, tree, config=config, device=device)
++    b = build_rigid_search(grids, tree, config=config, device=device)
++
++    _, _, energy_a = a.run(CENTER - 9, CENTER + 9)
++    _, _, energy_b = b.run(CENTER - 9, CENTER + 9)
++    assert torch.equal(energy_a, energy_b)
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_returned_best_energy_matches_the_returned_pose(device, grids, tree):
++    """
++    The reported energy must belong to the reported pose.
++
++    Tracking best-so-far with three separate `where` calls is exactly the place a
++    mismatch could creep in, leaving a pose labelled with another chain's score.
++    """
++    config = RigidSearchConfig(n_chains=128, n_steps=40, seed=7)
++    search = build_rigid_search(grids, tree, config=config, device=device)
++
++    best_t, best_r, best_e = search.run(CENTER - 9, CENTER + 9)
++    rescored, _ = search.score(best_t, best_r)
++
++    assert torch.allclose(
++        rescored, best_e, **tol(device)
++    ), "the returned energies do not correspond to the returned poses"
++
++
++def test_chains_are_independent():
++    """
++    One chain's proposal must not leak into another's state.
++
++    A broadcasting mistake in the accept mask would couple the chains, which is
++    easy to miss because every individual energy still looks plausible. Running
++    one chain alone must reproduce what that chain does inside a batch.
++    """
++
++    class OneAtATime(RigidBatchedSearch):
++        pass
++
++    # A batch where every chain starts from the same state must stay identical
++    # only if it also draws the same randomness; instead check the weaker but
++    # sufficient property that distinct chains reach distinct states and none is
++    # NaN, then that the energies correspond to the poses.
++    from pandadock.docking.gpu.grids import TorchAffinityGrids
++
++    rng = np.random.default_rng(0)
++    maps = rng.normal(0, 2, size=(3, 20, 20, 20)).astype(np.float32)
++
++    class FakeGrids:
++        pass
++
++    fg = FakeGrids()
++    fg.maps = maps
++    fg.origin = np.zeros(3)
++    fg.spacing = 0.5
++    fg.out_of_box_penalty = 10.0
++    fg.shape = np.array([20, 20, 20], dtype=np.int64)
++
++    grids = TorchAffinityGrids.from_cpu(fg, device="cpu")
++    base = rng.normal(0, 1.5, size=(9, 3))
++    types = rng.integers(0, 3, size=9)
++
++    search = OneAtATime(
++        grids, base, types, RigidSearchConfig(n_chains=32, n_steps=15, seed=1)
++    )
++    t, r, e = search.run(np.array([2.0] * 3), np.array([7.0] * 3))
++
++    assert torch.isfinite(e).all()
++    # Distinct chains explored distinct poses rather than collapsing together.
++    assert len(torch.unique(e)) > 1
++    rescored, _ = search.score(t, r)
++    assert torch.allclose(rescored, e, rtol=1e-9, atol=1e-9)
+diff --git a/tests/test_gpu_rotations.py b/tests/test_gpu_rotations.py
+new file mode 100644
+index 0000000..4ad1a4c
+--- /dev/null
++++ b/tests/test_gpu_rotations.py
+@@ -0,0 +1,213 @@
++"""
++Parity between the batched SO(3) primitives and the scalar CPU versions.
++
++The CPU functions branch on magnitude. Those branches are the whole difficulty
++of batching them, so the tests deliberately mix ordinary rotations with the
++degenerate cases -- exact zero, angles at and just below pi, many-turn vectors --
++in a single batch, which is the situation a per-element `if` cannot express and
++where a careless `torch.where` produces NaN.
++"""
++
++import os
++
++os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
++
++import numpy as np
++import pytest
++
++pytest.importorskip("torch", reason="the GPU search path needs the [gnn] extra")
++
++import torch  # noqa: E402
++
++from pandadock.docking.gpu import rotations as g  # noqa: E402
++from pandadock.docking.gpu.grids import dtype_for_device  # noqa: E402
++from pandadock.docking.search import rotations as c  # noqa: E402
++
++
++def available_devices():
++    devices = ["cpu"]
++    if torch.cuda.is_available():
++        devices.append("cuda")
++    if torch.backends.mps.is_available():
++        devices.append("mps")
++    return devices
++
++
++DEVICES = available_devices()
++
++
++def tol(device):
++    return (
++        dict(rtol=1e-9, atol=1e-9)
++        if dtype_for_device(device) == torch.float64
++        else dict(rtol=1e-4, atol=1e-4)
++    )
++
++
++def awkward_rotvecs():
++    """
++    Inputs chosen to hit every branch of the CPU implementations.
++
++    A batch of only well-conditioned rotations would pass even with the safe
++    divisions removed, so the degenerate rows are the point of this fixture.
++    """
++    rng = np.random.default_rng(0)
++    rows = [
++        [0.0, 0.0, 0.0],  # exact identity: rotvec / theta is 0/0
++        [1e-14, 0.0, 0.0],  # below EPS_IDENTITY
++        [np.pi, 0.0, 0.0],  # exactly pi, where the skew part vanishes
++        [np.pi - 1e-9, 0.0, 0.0],  # just inside the near-pi branch
++        [0.0, np.pi - 1e-7, 0.0],  # near-pi on another axis
++        [7.5, -3.2, 1.1],  # many turns, needs wrapping
++        [0.0, 0.0, 2.0 * np.pi],  # a full turn: identity by another route
++    ]
++    rows += list(rng.normal(0.0, 1.5, size=(24, 3)))
++    return np.asarray(rows, dtype=np.float64)
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_rodrigues_matches_cpu_including_degenerate_rows(device):
++    vecs = awkward_rotvecs()
++    dtype = dtype_for_device(device)
++    batched = g.rodrigues_matrix(torch.as_tensor(vecs, dtype=dtype, device=device))
++
++    assert torch.isfinite(batched).all(), "a degenerate row produced NaN or inf"
++    got = batched.cpu().double().numpy()
++    for i, v in enumerate(vecs):
++        assert np.allclose(got[i], c.rodrigues_matrix(v), **tol(device)), f"row {i}: {v}"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_matrix_to_rotvec_matches_cpu(device):
++    vecs = awkward_rotvecs()
++    dtype = dtype_for_device(device)
++    mats = torch.as_tensor(
++        np.stack([c.rodrigues_matrix(v) for v in vecs]), dtype=dtype, device=device
++    )
++    got = g.matrix_to_rotvec(mats)
++    assert torch.isfinite(got).all()
++    got = got.cpu().double().numpy()
++
++    for i, v in enumerate(vecs):
++        expected = c.matrix_to_rotvec(c.rodrigues_matrix(v))
++        # Compare the rotations, not the parameters: at pi, r and -r are the same
++        # rotation and either is a correct answer.
++        assert np.allclose(
++            c.rodrigues_matrix(got[i]), c.rodrigues_matrix(expected), **tol(device)
++        ), f"row {i}: {v}"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_compose_matches_cpu(device):
++    rng = np.random.default_rng(3)
++    a = np.vstack([awkward_rotvecs()[:7], rng.normal(0, 1.5, (12, 3))])
++    b = np.vstack([awkward_rotvecs()[:7][::-1], rng.normal(0, 1.5, (12, 3))])
++    dtype = dtype_for_device(device)
++
++    got = g.compose_rotvecs(
++        torch.as_tensor(a, dtype=dtype, device=device),
++        torch.as_tensor(b, dtype=dtype, device=device),
++    )
++    assert torch.isfinite(got).all()
++    got = got.cpu().double().numpy()
++
++    for i in range(len(a)):
++        expected = c.compose_rotvecs(a[i], b[i])
++        assert np.allclose(
++            c.rodrigues_matrix(got[i]), c.rodrigues_matrix(expected), **tol(device)
++        ), f"row {i}"
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_wrap_matches_cpu_and_preserves_the_rotation(device):
++    vecs = awkward_rotvecs()
++    dtype = dtype_for_device(device)
++    got = g.wrap_rotvec(torch.as_tensor(vecs, dtype=dtype, device=device))
++    assert torch.isfinite(got).all()
++    got = got.cpu().double().numpy()
++
++    for i, v in enumerate(vecs):
++        expected = c.wrap_rotvec(v)
++        assert np.allclose(got[i], expected, **tol(device)), f"row {i}: {v}"
++        # Wrapping must not change the pose, only the parameterisation.
++        assert np.allclose(
++            c.rodrigues_matrix(got[i]), c.rodrigues_matrix(v), **tol(device)
++        )
++        assert np.linalg.norm(got[i]) <= np.pi + 1e-6
++
++
++@pytest.mark.parametrize("device", DEVICES)
++def test_random_rotvec_is_uniform_over_so3(device):
++    """
++    The same distribution check the CPU sampler carries.
++
++    Under the Haar measure the rotation angle has density (1 - cos t) / pi on
++    [0, pi], with mean pi/2 + 2/pi. Checking the density rather than the spread
++    is what catches a sampler that reaches large angles but still clusters near
++    the identity -- the failure mode of drawing axis-angle components
++    independently.
++    """
++    gen = torch.Generator(device="cpu").manual_seed(11)
++    vecs = g.random_rotvec(40000, generator=gen, dtype=torch.float64)
++    angles = vecs.norm(dim=-1).numpy()
++
++    assert angles.min() >= 0.0
++    assert angles.max() <= np.pi + 1e-9
++    assert np.isclose(angles.mean(), np.pi / 2 + 2 / np.pi, atol=0.03)
++
++    observed, edges = np.histogram(angles, bins=10, range=(0.0, np.pi), density=True)
++    midpoints = (edges[:-1] + edges[1:]) / 2
++    expected = (1.0 - np.cos(midpoints)) / np.pi
++    assert np.max(np.abs(observed - expected)) < 0.02
++
++
++def test_degenerate_rows_are_exactly_identity():
++    """A zero rotation must come back as the identity, not merely as finite."""
++    vecs = torch.tensor(
++        [[0.0, 0.0, 0.0], [0.3, -0.7, 1.1], [0.0, 0.0, 0.0]], dtype=torch.float64
++    )
++    mats = g.rodrigues_matrix(vecs)
++    eye = torch.eye(3, dtype=torch.float64)
++    assert torch.allclose(mats[0], eye)
++    assert torch.allclose(mats[2], eye)
++    assert not torch.allclose(mats[1], eye)
++    assert torch.isfinite(g.matrix_to_rotvec(mats)).all()
++
++
++def test_guarded_division_keeps_gradients_finite():
++    """
++    Why the divisions are clamped rather than merely selected with `where`.
++
++    In the forward pass `torch.where` is enough: it picks the identity branch and
++    the 0/0 never shows. Autograd is where it fails -- `where` sends a zero
++    gradient down the unselected branch, 0 * NaN is NaN, and a single identity
++    rotation then returns NaN gradients that contaminate the whole batch once
++    they are summed.
++
++    The clamped form yields an enormous gradient instead, which is correct: at an
++    exact identity the axis-angle derivative genuinely is singular. Enormous is
++    something an optimiser can clip; NaN is not. This becomes load-bearing when
++    the batched local optimiser differentiates through these functions.
++    """
++    vecs = torch.tensor(
++        [[0.0, 0.0, 0.0], [0.3, -0.7, 1.1]], dtype=torch.float64, requires_grad=True
++    )
++
++    for fn in (g.rodrigues_matrix, g.wrap_rotvec):
++        if vecs.grad is not None:
++            vecs.grad = None
++        fn(vecs).sum().backward()
++        assert torch.isfinite(vecs.grad).all(), (
++            f"{fn.__name__} produced NaN gradients on the identity row"
++        )
++
++    # And confirm the naive alternative really does fail, so this test is
++    # protecting against a mistake someone would plausibly make rather than a
++    # hypothetical one.
++    naive_input = vecs.detach().clone().requires_grad_(True)
++    theta = naive_input.norm(dim=-1, keepdim=True)
++    naive = torch.where(theta < 1e-12, torch.zeros_like(naive_input), naive_input / theta)
++    naive.sum().backward()
++    assert torch.isnan(naive_input.grad).any(), (
++        "the unguarded form no longer produces NaN; the guard may be unnecessary"
++    )

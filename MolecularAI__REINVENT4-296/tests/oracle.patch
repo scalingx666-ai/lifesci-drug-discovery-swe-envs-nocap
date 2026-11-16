@@ -1,0 +1,178 @@
+diff --git a/configs/transfer_learning.toml b/configs/transfer_learning.toml
+index 879a10fd..9bb07a6a 100644
+--- a/configs/transfer_learning.toml
++++ b/configs/transfer_learning.toml
+@@ -9,7 +9,6 @@ device = "cuda:0"  # set torch device e.g. "cpu"
+ tb_logdir = "tb_TL"  # name of the TensorBoard logging directory
+ json_out_config = "json_transfer_learning.json"  # write this TOML to JSON
+ 
+-
+ [parameters]
+ 
+ num_epochs = 3  # number of steps to run
+@@ -18,6 +17,7 @@ batch_size = 50
+ num_refs = 100  # number of reference molecules randomly chosen for similarity
+                 # set this to zero for large datasets (>200 molecules)!
+ sample_batch_size = 100  # number of sampled molecules to compute sample loss
++tb_isim = true  # track iSIM similarity in TensorBoard
+ # Uncomment one of the comment blocks below.  Each generator needs a model
+ # file and possibly a SMILES file with seed structures.
+ 
+@@ -29,9 +29,9 @@ sample_batch_size = 100  # number of sampled molecules to compute sample loss
+ 
+ ## Mol2Mol
+ input_model_file = "priors/mol2mol_scaffold_generic.prior"
+-smiles_file = "compounds.smi"  # read 1st column
++smiles_file = "configs/mol2mol.smi"  # read 1st column (Change file names)
+ output_model_file = "TL_Mol2Mol.model"
+-validation_smiles_file = "validation_compounds.smi"  # read 1st column
++validation_smiles_file = "configs/mol2mol_valid.smi"  # read 1st column (Change file names)
+ 
+ # Define the type of similarity and its parameters
+ pairs.type = "tanimoto"
+diff --git a/reinvent/runmodes/TL/learning.py b/reinvent/runmodes/TL/learning.py
+index dea7ac7c..b3a02366 100644
+--- a/reinvent/runmodes/TL/learning.py
++++ b/reinvent/runmodes/TL/learning.py
+@@ -22,6 +22,14 @@
+ from rdkit import Chem, DataStructs
+ import tqdm
+ 
++try:
++    from iSIM.comp import calculate_isim
++    from iSIM.utils import binary_fps
++
++    have_isim = True
++except ImportError:
++    have_isim = False
++
+ from reinvent.runmodes.TL.reports import TLTBReporter, TLRemoteReporter, TLReportData
+ from reinvent.utils.logmon import get_reporter
+ from reinvent.runmodes.setup_sampler import setup_sampler
+@@ -51,6 +59,7 @@ def __init__(
+         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
+         lr_config,
+         zero_epoch,
++        tb_isim: bool = False,
+     ):
+         """Setup
+ 
+@@ -125,6 +134,13 @@ def __init__(
+ 
+         if hasattr(self._config, "clip_gradient_norm"):
+             self.clip_gradient_norm = self._config.clip_gradient_norm
++        
++        self.tb_isim = None
++
++        if have_isim:
++            self.tb_isim = tb_isim
++      
++
+ 
+     @abstractmethod
+     def prepare_dataloader(self):
+@@ -363,10 +379,26 @@ def report(
+ 
+             if mol:
+                 mols.append(mol)
+-
++        
+         intdiv = 0.0
+         sampled_fps = [Chem.RDKFingerprint(mol) for mol in mols]
+ 
++        smilies = np.array(sampled_smilies)
++
++        # Ensure isim is always defined so we don't reference it before assignment
++        isim = None
++
++        if self.tb_isim:
++            fingerprints = binary_fps(smilies, fp_type="RDKIT", n_bits=None)
++            isim = calculate_isim(fingerprints, n_ary="JT")
++
++        # Debug log: Report if iSIM was calculated or not. Also help diagnose iSIM not appearing in tensorboard
++        try:
++            logger.info(f"iSIM computed: {isim} (tb_isim={self.tb_isim}, have_isim={have_isim})")
++        except Exception:
++            logger.info(f"iSIM not computed (tb_isim={self.tb_isim}, have_isim={have_isim})")
++
++
+         if self.internal_diversity:
+             similarities = mutual_similarities(sampled_fps)
+             intdiv = internal_diversity(similarities, p=2)
+@@ -374,6 +406,7 @@ def report(
+         report_data = TLReportData(
+             epoch=epoch_no,
+             model_path=model_path,
++            isim=isim,  # Add isim to report_data
+             mean_nll=mean_nll,
+             mean_nll_validation=mean_nll_valid,
+             fingerprints=sampled_fps,
+diff --git a/reinvent/runmodes/TL/reports/data.py b/reinvent/runmodes/TL/reports/data.py
+index 270afb97..06985568 100644
+--- a/reinvent/runmodes/TL/reports/data.py
++++ b/reinvent/runmodes/TL/reports/data.py
+@@ -2,7 +2,7 @@
+ 
+ __all__ = ["TLReportData"]
+ from dataclasses import dataclass
+-from typing import Sequence
++from typing import Sequence, Optional   
+ 
+ 
+ @dataclass
+@@ -10,6 +10,7 @@ class TLReportData:
+     epoch: int
+     model_path: str
+     mean_nll: float
++    isim: Optional[float]
+     sampled_smilies: Sequence
+     sampled_nlls: Sequence
+     fingerprints: Sequence
+diff --git a/reinvent/runmodes/TL/reports/remote.py b/reinvent/runmodes/TL/reports/remote.py
+index abd3e013..220c86e9 100644
+--- a/reinvent/runmodes/TL/reports/remote.py
++++ b/reinvent/runmodes/TL/reports/remote.py
+@@ -32,6 +32,7 @@ def submit(self, data: TLReportData) -> None:
+                 "training": data.mean_nll,
+                 "validation": data.mean_nll_validation,
+                 "sampled": float(data.sampled_nlls.mean()),
++                "isim": data.isim,
+             },
+             "smiles_report": [
+                 {"legend": f"Times sampled: {smiles_counts[smiles]:d}", "smiles": smiles}
+diff --git a/reinvent/runmodes/TL/reports/tensorboard.py b/reinvent/runmodes/TL/reports/tensorboard.py
+index 3073d8c4..714997e6 100644
+--- a/reinvent/runmodes/TL/reports/tensorboard.py
++++ b/reinvent/runmodes/TL/reports/tensorboard.py
+@@ -85,3 +85,7 @@ def submit(self, data: TLReportData) -> None:
+             self.reporter.add_histogram(
+                 "Tanimoto similarity on RDKitFingerprint", similarities, data.epoch
+             )
++
++            
++            if data.isim is not None:
++                self.reporter.add_scalar(f"iSIM: Average similarity", data.isim, data.epoch)
+diff --git a/reinvent/runmodes/TL/run_transfer_learning.py b/reinvent/runmodes/TL/run_transfer_learning.py
+index 288fbe22..159789b3 100644
+--- a/reinvent/runmodes/TL/run_transfer_learning.py
++++ b/reinvent/runmodes/TL/run_transfer_learning.py
+@@ -144,6 +144,7 @@ def run_transfer_learning(
+         optimizer,
+         lr_scheduler,
+         lr_config,
++        tb_isim=parameters.tb_isim,
+         zero_epoch=parameters.training_zero_epoch_start,
+     )
+ 
+diff --git a/reinvent/runmodes/TL/validation.py b/reinvent/runmodes/TL/validation.py
+index 8a4d0a85..d232e908 100644
+--- a/reinvent/runmodes/TL/validation.py
++++ b/reinvent/runmodes/TL/validation.py
+@@ -26,6 +26,7 @@ class SectionParameters(GlobalConfig):
+     internal_diversity: bool = False
+     # learning_rate_scheduler: Optional[str] = 'StepLR'
+     # optimizer: Optional[str] = 'Adam'
++    tb_isim: Optional[bool] = False  # Add iSIM tracking as optional parameter
+     max_sequence_length: int = Field(128, ge=64)
+ 
+     # non-transformers

@@ -1,0 +1,511 @@
+diff --git a/src/lib/structure/StructureScene.svelte b/src/lib/structure/StructureScene.svelte
+index 42b150267..323fcbf6a 100644
+--- a/src/lib/structure/StructureScene.svelte
++++ b/src/lib/structure/StructureScene.svelte
+@@ -110,6 +110,7 @@
+     clear_trajectory_bond_frame_cache,
+     build_bond_pairs,
+     build_trajectory_bond_pairs,
++    conn_to_typed_topology,
+     create_hbond_state,
+     compute_hbond_connectivity,
+     build_hbond_pairs,
+@@ -2568,6 +2569,84 @@
+   let __bbp_prev_traj: unknown = null
+   let __bbp_skips = 0
+   let __bbp_was_suspended = false
++  // ═══ Typed-direct playback mode ═══
++  // During eligible trajectory playback the frame connectivity is written
++  // straight into bond_manager (replace_auto_bonds) and the BondPair object
++  // chain (bond_pairs → visible → filtered → slot map → shadow-sync diff)
++  // is left frozen — the renderer reads topology + typed atom positions and
++  // needs none of it. `typed_direct_active` gates slot_to_filtered_idx
++  // (which would otherwise rebuild its 26k-entry map on every version bump
++  // against stale filtered pairs). The shadow sync needs no gate: its deps
++  // (filtered_bond_pairs identity) don't change while the chain is frozen.
++  let typed_direct_active = $state(false)
++  let __td_prev_conn:
++    | Array<{
++      site_idx_1: number
++      site_idx_2: number
++      strength: number
++      jimage?: [number, number, number]
++    }>
++    | null = null
++  let __td_prev_pos: Float32Array | null = null
++  let __td_ctx: {
++    lat: number[][] | null
++    sites: ReadonlyArray<Site> | null
++    tol: number | undefined
++  } | null = null
++  let typed_direct_tail_timer: ReturnType<typeof setTimeout> | undefined
++  const TYPED_DIRECT_TAIL_MS = 500
++  const EMPTY_SLOT_MAP = new Int32Array(0)
++
++  function exit_typed_direct(): void {
++    if (typed_direct_tail_timer !== undefined) {
++      clearTimeout(typed_direct_tail_timer)
++      typed_direct_tail_timer = undefined
++    }
++    __td_prev_conn = null
++    __td_prev_pos = null
++    __td_ctx = null
++    if (typed_direct_active) typed_direct_active = false
++  }
++
++  // Playback pause / end tail: 500ms after the last typed-direct write,
++  // rebuild the object pipeline once for the current frame so picking,
++  // hover and box selection are exact again, then drop the gate. The
++  // shadow sync that follows diffs to a no-op (same topology), so the GPU
++  // buffers don't churn. The $effect.pre re-fires on the gate flip but
++  // early-returns via the typed memo (same conn + frame identities).
++  function schedule_typed_direct_tail_sync(): void {
++    if (typed_direct_tail_timer !== undefined) clearTimeout(typed_direct_tail_timer)
++    typed_direct_tail_timer = setTimeout(() => {
++      typed_direct_tail_timer = undefined
++      if (!typed_direct_active) return
++      const conn = __td_prev_conn
++      const pos = __td_prev_pos
++      const ctx = __td_ctx
++      if (conn !== null && pos !== null) {
++        bond_pairs = build_trajectory_bond_pairs(
++          conn,
++          pos,
++          null,
++          atom_manager,
++          ctx?.lat ?? null,
++          ctx?.sites ?? null,
++          ctx?.tol,
++        )
++      }
++      typed_direct_active = false
++    }, TYPED_DIRECT_TAIL_MS)
++  }
++
++  // Drop the tail-sync timer on unmount — the scene lives in {#if} blocks
++  // and a late firing would write $state on a destroyed component.
++  $effect(() => {
++    return () => {
++      if (typed_direct_tail_timer !== undefined) {
++        clearTimeout(typed_direct_tail_timer)
++        typed_direct_tail_timer = undefined
++      }
++    }
++  })
+   $effect.pre(() => {
+     // WebGPU overlay active: this WebGL scene is covered and not painting, and
+     // the overlay computes its own GPU bonds — so skip the per-frame trajectory
+@@ -2609,6 +2688,67 @@
+         bond_state, traj_positions, bond_input,
+         show_bonds, lattice, bonding_strategy, bonding_options,
+       )
++      const __traj_tol_v = (() => {
++        const raw = (bonding_options as Record<string, unknown> | undefined)?.tolerance
++        return typeof raw === `number` && raw > 0 ? raw : undefined
++      })()
++      // Typed-direct eligibility: every feature that consumes the BondPair
++      // object chain per frame must be inactive, otherwise fall through to
++      // the object path. All reads establish reactive subscriptions, so an
++      // eligibility flip re-fires this effect and exits the mode cleanly.
++      const typed_eligible = traj_conn != null &&
++        (bond_distance_rules?.length ?? 0) === 0 &&
++        manual_bonds.length === 0 &&
++        _deleted_bond_keys.size === 0 &&
++        _hidden_elements.size === 0 &&
++        _hidden_sites.size === 0 &&
++        _hidden_prop_vals.size === 0 &&
++        !show_polyhedra &&
++        !clip_active &&
++        !show_hydrogen_bonds &&
++        !bond_order_perception &&
++        overrides_size === 0 &&
++        !drag
++      if (typed_eligible) {
++        if (
++          !__resuming_bbp &&
++          traj_conn === __td_prev_conn &&
++          traj_positions === __td_prev_pos
++        ) return
++        const td_lat =
++          (bond_input as { lattice?: { matrix?: number[][] } } | undefined)
++            ?.lattice?.matrix ?? null
++        const td_sites =
++          (bond_input as { sites?: ReadonlyArray<Site> } | undefined)?.sites ?? null
++        const topo = conn_to_typed_topology(
++          traj_conn,
++          traj_positions,
++          td_lat,
++          td_sites,
++          __traj_tol_v,
++          MAX_BOND_LENGTH,
++        )
++        if (topo !== null) {
++          __td_prev_conn = traj_conn
++          __td_prev_pos = traj_positions
++          __td_ctx = { lat: td_lat, sites: td_sites, tol: __traj_tol_v }
++          if (!typed_direct_active) typed_direct_active = true
++          bond_manager.replace_auto_bonds(topo.pairs, topo.count, topo.jimages)
++          schedule_typed_direct_tail_sync()
++          if (import.meta.env?.DEV) {
++            const __dt = performance.now() - __t0
++            if (__dt > 5) {
++              console.log(
++                `[probe] typed_direct write: ${__dt.toFixed(1)}ms (${topo.count} bonds)`,
++              )
++            }
++          }
++          return
++        }
++      }
++      // Ineligible (or typed conversion bailed): leave typed-direct mode so
++      // the object pipeline resumes ownership of bond_manager.
++      if (__td_prev_conn !== null || typed_direct_active) exit_typed_direct()
+       // Skip if no inputs changed since last fire. `drag` and `sel` must be
+       // in the memo so drag-filter and selection highlights still update
+       // during trajectory playback when conn/lbs/traj are stable.
+@@ -2636,10 +2776,6 @@
+       __bbp_prev_sel = sel
+       __bbp_prev_overrides_size = overrides_size
+       __bbp_prev_traj = traj_positions
+-      const __traj_tol = (() => {
+-        const raw = (bonding_options as Record<string, unknown> | undefined)?.tolerance
+-        return typeof raw === `number` && raw > 0 ? raw : undefined
+-      })()
+       bond_pairs = build_trajectory_bond_pairs(
+         traj_conn,
+         traj_positions,
+@@ -2647,7 +2783,7 @@
+         atom_manager,
+         (bond_input as { lattice?: { matrix?: number[][] } } | undefined)?.lattice?.matrix ?? null,
+         (bond_input as { sites?: ReadonlyArray<Site> } | undefined)?.sites ?? null,
+-        __traj_tol,
++        __traj_tol_v,
+       )
+       if (import.meta.env?.DEV) {
+         const __dt = performance.now() - __t0
+@@ -2660,6 +2796,7 @@
+     // async resolve drops its result instead of leaking into post-trajectory
+     // state), and resets throttle slots.
+     if (__bbp_prev_traj != null && traj_positions == null) {
++      exit_typed_direct()
+       clear_trajectory_bond_frame_cache(bond_state)
+     }
+     // Re-bind for the non-trajectory path's memo + build below.
+@@ -3310,9 +3447,14 @@
+     // During trajectory playback `bond_struct.sites[].xyz` are the loaded
+     // frame, not the one on screen. Pass the animated frame positions so ruled
+     // bonds track the trajectory instead of freezing at frame 0.
++    // Read the positions ONLY when rules exist: with no rules the pass is an
++    // identity and reading `trajectory_frame_positions` here would subscribe
++    // this $derived to every frame tick — during typed-direct playback that
++    // re-filtered the FROZEN bond_pairs each frame and woke the shadow sync
++    // with stale (entry-frame) topology, overwriting the typed writes.
+     const ruled_bonds = apply_bond_distance_rules(
+       bond_struct, lat_matrix, bond_pairs, bond_distance_rules ?? [],
+-      trajectory_frame_positions ?? null,
++      _rules_len > 0 ? trajectory_frame_positions ?? null : null,
+     )
+ 
+     const is_site_visible = (site_idx: number) => {
+@@ -3477,6 +3619,12 @@
+   // hits on those return null (degraded but harmless).
+   let slot_to_filtered_idx = $derived.by((): Int32Array => {
+     void bond_manager.version
++    // Typed-direct playback: filtered_bond_pairs is frozen and slots churn
++    // every frame — a per-frame 26k-entry map against stale pairs is pure
++    // waste. Decorator hits bounds-check the length (gpu-picker-integration
++    // L418), so the shared empty map degrades picks to null. The pause
++    // tail-sync drops the gate and this re-derives with fresh pairs.
++    if (typed_direct_active) return EMPTY_SLOT_MAP
+     const count = bond_manager.count
+     const out = new Int32Array(count)
+     out.fill(-1)
+@@ -3522,6 +3670,13 @@
+   // update manual_bonds), this effect sees a new entry in filtered_bond_pairs
+   // and adds it incrementally — sparse dirty_slots, fast GPU sync.
+   $effect(() => {
++    // Typed-direct playback owns bond_manager — the object pipeline is
++    // frozen at the entry frame, so mirroring it here would overwrite the
++    // per-frame typed topology with stale bonds (stretched-bond artifacts).
++    // Reading the gate subscribes this effect: when the pause tail-sync
++    // drops it (right after publishing fresh bond_pairs), this re-fires and
++    // reconciles against the rebuilt pairs — a no-op diff.
++    if (typed_direct_active) return
+     const mgr = bond_manager
+ 
+     const pairs_list = filtered_bond_pairs
+diff --git a/src/lib/structure/bond-computation-controller.svelte.ts b/src/lib/structure/bond-computation-controller.svelte.ts
+index 427910624..3a73afb55 100644
+--- a/src/lib/structure/bond-computation-controller.svelte.ts
++++ b/src/lib/structure/bond-computation-controller.svelte.ts
+@@ -1228,6 +1228,107 @@ export function build_trajectory_bond_pairs(
+   return out
+ }
+ 
++/** Shared scratch for `conn_to_typed_topology` — grown, never shrunk. The
++ *  returned views alias these buffers, so each result is valid only until
++ *  the next call; `BondManager.replace_auto_bonds` copies synchronously. */
++let typed_topo_scratch: { pairs: Uint32Array; jimages: Int8Array } | null = null
++
++/**
++ * Typed-direct playback path: convert frame connectivity straight into the
++ * flat (pairs, jimages) topology consumed by `BondManager.replace_auto_bonds`,
++ * skipping BondPair object construction entirely.
++ *
++ * Filter parity with the object pipeline (`build_trajectory_bond_pairs` +
++ * `visible_bond_pairs`):
++ *   - stale-distance pre-filter via `get_traj_max_dists` (NaN → skip check)
++ *   - self-image starbursts (a == b with non-zero jimage) dropped
++ *   - `max_bond_length` hard cap (the caller passes MAX_BOND_LENGTH); the
++ *     squared compare also drops non-finite geometry (NaN fails `<=`)
++ *
++ * Returns null when any endpoint index is outside the frame buffer coverage
++ * (supercell-extra atoms live in the AtomManager, not the frame) — callers
++ * must fall back to the object path.
++ */
++export function conn_to_typed_topology(
++  bond_connectivity: ReadonlyArray<
++    {
++      site_idx_1: number
++      site_idx_2: number
++      strength: number
++      jimage?: [number, number, number]
++    }
++  >,
++  trajectory_frame_positions: Float32Array,
++  lattice_matrix?: number[][] | null,
++  sites?: ReadonlyArray<Site> | null,
++  bond_tolerance?: number,
++  max_bond_length?: number,
++): { pairs: Uint32Array; jimages: Int8Array; count: number } | null {
++  const n = bond_connectivity.length
++  const traj_max_site = Math.floor(trajectory_frame_positions.length / 3)
++  const tol = typeof bond_tolerance === `number` && bond_tolerance > 0
++    ? bond_tolerance
++    : DEFAULT_BOND_TOLERANCE
++  const max_dists = sites
++    ? get_traj_max_dists(bond_connectivity, sites, tol)
++    : null
++  const cap_sq = typeof max_bond_length === `number` && max_bond_length > 0
++    ? max_bond_length * max_bond_length
++    : Infinity
++  const lat = (lattice_matrix && lattice_matrix.length === 3) ? lattice_matrix : null
++
++  if (typed_topo_scratch === null || typed_topo_scratch.pairs.length < n * 2) {
++    typed_topo_scratch = {
++      pairs: new Uint32Array(Math.max(n, 1024) * 2),
++      jimages: new Int8Array(Math.max(n, 1024) * 3),
++    }
++  }
++  const pairs = typed_topo_scratch.pairs
++  const jimages = typed_topo_scratch.jimages
++  const pos = trajectory_frame_positions
++
++  let count = 0
++  for (let idx = 0; idx < n; idx++) {
++    const conn = bond_connectivity[idx]
++    const site_a = conn.site_idx_1
++    const site_b = conn.site_idx_2
++    if (site_a >= traj_max_site || site_b >= traj_max_site) return null
++    const ji = conn.jimage
++    const jx = ji ? ji[0] | 0 : 0
++    const jy = ji ? ji[1] | 0 : 0
++    const jz = ji ? ji[2] | 0 : 0
++    if (site_a === site_b && (jx | jy | jz) !== 0) continue
++    const pa = site_a * 3
++    const pb = site_b * 3
++    let bx = pos[pb]
++    let by = pos[pb + 1]
++    let bz = pos[pb + 2]
++    if ((jx | jy | jz) !== 0 && lat !== null) {
++      bx += jx * lat[0][0] + jy * lat[1][0] + jz * lat[2][0]
++      by += jx * lat[0][1] + jy * lat[1][1] + jz * lat[2][1]
++      bz += jx * lat[0][2] + jy * lat[1][2] + jz * lat[2][2]
++    }
++    const dx = bx - pos[pa]
++    const dy = by - pos[pa + 1]
++    const dz = bz - pos[pa + 2]
++    const len_sq = dx * dx + dy * dy + dz * dz
++    // NaN fails both compares → non-finite geometry is dropped by the cap.
++    if (!(len_sq <= cap_sq)) continue
++    if (max_dists !== null) {
++      const max_d = max_dists[idx]
++      // NaN max_d (radius unavailable) → comparison false → check skipped.
++      if (len_sq > max_d * max_d) continue
++    }
++    pairs[count * 2] = site_a
++    pairs[count * 2 + 1] = site_b
++    jimages[count * 3] = jx
++    jimages[count * 3 + 1] = jy
++    jimages[count * 3 + 2] = jz
++    count++
++  }
++  return { pairs, jimages, count }
++}
++
+ /**
+  * Create hydrogen bond reactive state.
+  * Must be called from component `<script>` context.
+diff --git a/src/lib/structure/bonding/BondManagerInstances.svelte b/src/lib/structure/bonding/BondManagerInstances.svelte
+index eb2cd9988..93a5e13b7 100644
+--- a/src/lib/structure/bonding/BondManagerInstances.svelte
++++ b/src/lib/structure/bonding/BondManagerInstances.svelte
+@@ -414,6 +414,7 @@
+ 
+   let last_overrides_ref: Map<string, number> | ReadonlyMap<string, number> | undefined
+   let last_periodic_op = 1
++  let last_defaults_written = false
+ 
+   $effect(() => {
+     if (!renderer) return
+@@ -426,6 +427,24 @@
+     const count = mgr.count
+     if (count === 0) return
+ 
++    // Defaults fast path. With no overrides and periodic opacity 1 every
++    // write below is a compare-noop, but each one still allocates a string
++    // bond key — ~26k short-lived strings per version bump, every frame
++    // during typed-direct trajectory playback. The all-1s buffer invariant
++    // holds across topology churn: ensure_opacity() and the capacity grow
++    // both fill(1), replace_auto_bonds never touches opacity, and this
++    // effect is the only set_opacity caller — so once a full default pass
++    // has run, later default passes can skip the loop entirely.
++    const defaults = (overrides === undefined || overrides.size === 0) &&
++      periodic_op === 1
++    if (defaults && last_defaults_written) {
++      last_overrides_ref = overrides
++      last_periodic_op = periodic_op
++      void _version
++      void _size
++      return
++    }
++
+     const pairs = mgr.pairs_buffer
+     const jimages = mgr.jimages_buffer
+     mgr.begin_opacity_batch()
+@@ -453,6 +472,7 @@
+     }
+     last_overrides_ref = overrides
+     last_periodic_op = periodic_op
++    last_defaults_written = defaults
+     void _version
+     void _size
+   })
+diff --git a/tests/vitest/structure/trajectory-bond-pairs.test.ts b/tests/vitest/structure/trajectory-bond-pairs.test.ts
+index f7dde4b97..e64d4007d 100644
+--- a/tests/vitest/structure/trajectory-bond-pairs.test.ts
++++ b/tests/vitest/structure/trajectory-bond-pairs.test.ts
+@@ -3,6 +3,7 @@
+ // radius-precompute optimization can't change observable output.
+ import {
+   build_trajectory_bond_pairs,
++  conn_to_typed_topology,
+   get_traj_atomic_numbers,
+   typed_table_to_conn,
+ } from '$lib/structure/bond-computation-controller.svelte'
+@@ -193,6 +194,105 @@ describe(`build_trajectory_bond_pairs`, () => {
+     expect(get_traj_atomic_numbers(bad)).toBeNull()
+   })
+ 
++  test(`conn_to_typed_topology builds flat topology matching the object path`, () => {
++    const lattice_matrix = [[10, 0, 0], [0, 10, 0], [0, 0, 10]]
++    const positions = new Float32Array([0.7, 0, 0, 9.3, 0, 0, 2.1, 0, 0])
++    const sites = [
++      carbon_site([0.7, 0, 0]),
++      carbon_site([9.3, 0, 0]),
++      carbon_site([2.1, 0, 0]),
++    ]
++    const connectivity = [
++      { site_idx_1: 0, site_idx_2: 2, strength: 1 },
++      {
++        site_idx_1: 0,
++        site_idx_2: 1,
++        strength: 1,
++        jimage: [-1, 0, 0] as [number, number, number],
++      },
++    ]
++    const topo = conn_to_typed_topology(connectivity, positions, lattice_matrix, sites)
++    expect(topo).not.toBeNull()
++    expect(topo!.count).toBe(2)
++    expect([...topo!.pairs.subarray(0, 4)]).toEqual([0, 2, 0, 1])
++    expect([...topo!.jimages.subarray(0, 6)]).toEqual([0, 0, 0, -1, 0, 0])
++  })
++
++  test(`conn_to_typed_topology drops stale bonds like the object path`, () => {
++    const positions = new Float32Array([0, 0, 0, 10, 0, 0, 1.4, 0, 0])
++    const sites = [
++      carbon_site([0, 0, 0]),
++      carbon_site([10, 0, 0]),
++      carbon_site([1.4, 0, 0]),
++    ]
++    const connectivity = conn([[0, 1], [0, 2]])
++    const topo = conn_to_typed_topology(connectivity, positions, null, sites)
++    expect(topo!.count).toBe(1)
++    expect([...topo!.pairs.subarray(0, 2)]).toEqual([0, 2])
++  })
++
++  test(`conn_to_typed_topology keeps unknown-radius bonds but honors the hard cap`, () => {
++    const positions = new Float32Array([0, 0, 0, 3, 0, 0, 10, 0, 0])
++    const sites = [
++      unknown_site([0, 0, 0]),
++      unknown_site([3, 0, 0]),
++      unknown_site([10, 0, 0]),
++    ]
++    // Radius unknown → stale filter skipped for both; the 10 Å bond must
++    // still fall to the caller-supplied hard cap (matches MAX_BOND_LENGTH).
++    const connectivity = conn([[0, 1], [0, 2]])
++    const topo = conn_to_typed_topology(connectivity, positions, null, sites, undefined, 4.0)
++    expect(topo!.count).toBe(1)
++    expect([...topo!.pairs.subarray(0, 2)]).toEqual([0, 1])
++  })
++
++  test(`conn_to_typed_topology skips self-image starbursts and non-finite geometry`, () => {
++    const positions = new Float32Array([0, 0, 0, 1.4, 0, 0, NaN, 0, 0])
++    const sites = [
++      carbon_site([0, 0, 0]),
++      carbon_site([1.4, 0, 0]),
++      carbon_site([0, 0, 0]),
++    ]
++    const connectivity = [
++      { site_idx_1: 0, site_idx_2: 1, strength: 1 },
++      {
++        site_idx_1: 2,
++        site_idx_2: 2,
++        strength: 1,
++        jimage: [1, 0, 0] as [number, number, number],
++      },
++      { site_idx_1: 0, site_idx_2: 2, strength: 1 },
++    ]
++    const topo = conn_to_typed_topology(
++      connectivity,
++      positions,
++      [[10, 0, 0], [0, 10, 0], [0, 0, 10]],
++      sites,
++    )
++    expect(topo!.count).toBe(1)
++    expect([...topo!.pairs.subarray(0, 2)]).toEqual([0, 1])
++  })
++
++  test(`conn_to_typed_topology bails to null on out-of-coverage site indices`, () => {
++    // Supercell-extra atom (index 5 beyond the 2-atom frame buffer) → the
++    // typed path can't resolve its position; caller must fall back.
++    const positions = new Float32Array([0, 0, 0, 1.4, 0, 0])
++    const sites = [carbon_site([0, 0, 0]), carbon_site([1.4, 0, 0])]
++    const connectivity = conn([[0, 5]])
++    expect(conn_to_typed_topology(connectivity, positions, null, sites)).toBeNull()
++  })
++
++  test(`conn_to_typed_topology reuses its scratch buffers across calls`, () => {
++    // Contract: the returned arrays are valid only until the next call —
++    // consumers must copy synchronously (replace_auto_bonds does).
++    const positions = new Float32Array([0, 0, 0, 1.4, 0, 0])
++    const sites = [carbon_site([0, 0, 0]), carbon_site([1.4, 0, 0])]
++    const first = conn_to_typed_topology(conn([[0, 1]]), positions, null, sites)
++    const second = conn_to_typed_topology(conn([[0, 1]]), positions, null, sites)
++    expect(second!.pairs).toBe(first!.pairs)
++    expect(second!.jimages).toBe(first!.jimages)
++  })
++
+   test(`overrides take precedence over trajectory positions`, () => {
+     const positions = new Float32Array([0, 0, 0, 10, 0, 0])
+     const sites = [carbon_site([0, 0, 0]), carbon_site([10, 0, 0])]

@@ -1,0 +1,1003 @@
+diff --git a/compert/data.py b/compert/data.py
+index de27fb1..2af992d 100644
+--- a/compert/data.py
++++ b/compert/data.py
+@@ -1,17 +1,17 @@
+ # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+ 
+ import warnings
++
+ import numpy as np
+ import torch
+ 
+-
+ warnings.simplefilter(action="ignore", category=FutureWarning)
+ import scanpy as sc
+ import pandas as pd
+ 
+ from sklearn.preprocessing import OneHotEncoder
+ from compert.helper import graph_from_smiles
+-from typing import Union
++from typing import Union, Optional, List
+ 
+ 
+ def ranks_to_df(data, key="rank_genes_groups"):
+@@ -42,9 +42,16 @@ def ranks_to_df(data, key="rank_genes_groups"):
+ 
+ 
+ class Dataset:
++    covariate_keys: Optional[List[str]]
++    drugs: torch.Tensor  # stores the (OneHot * dosage) encoding of drugs / combinations of drugs
++    drugs_idx: torch.Tensor  # stores the integer index of the drugs applied to each cell.
++    max_num_perturbations: int  # how many drugs are applied to each cell at the same time?
++    dosages: torch.Tensor  # shape: (dataset_size, max_num_perturbations)
++    drugs_names_unique_sorted: np.ndarray  # sorted list of all drug names in the dataset
++
+     def __init__(
+         self,
+-        fname,
++        fname: str,
+         perturbation_key=None,
+         dose_key=None,
+         covariate_keys=None,
+@@ -52,7 +59,18 @@ def __init__(
+         pert_category="cov_drug_dose_name",
+         split_key="split",
+         mol_featurizer="canonical",
++        use_drugs_idx=False,
+     ):
++        """
++        :param covariate_keys: Names of obs columns which stores covariate names (eg cell type).
++        :param perturbation_key: Name of obs column which stores perturbation name (eg drug name).
++            Combinations of perturbations are separated with `+`.
++        :param dose_key: Name of obs column which stores perturbation dose.
++            Combinations of perturbations are separated with `+`.
++        :param pert_category: Name of obs column with stores covariate + perturbation + dose.
++            Example: cell type + drug name + drug dose. This seems unused?
++        :param use_drugs_idx: Whether or not to encode drugs via their index, instead of via a OneHot encoding
++        """
+         print(f"Starting to read in data: {fname}\n...")
+         data = sc.read(fname)
+         print(f"Finished data loading.")
+@@ -65,8 +83,8 @@ def __init__(
+             covariate_keys = [covariate_keys]
+         self.covariate_keys = covariate_keys
+         self.smiles_key = smiles_key
+-        mol_featurizers = ["canonical", "AttentiveFP", "Pretrain"]
+         self.mol_featurizer = mol_featurizer
++        self.use_drugs_idx = use_drugs_idx
+ 
+         if perturbation_key is not None:
+             if dose_key is None:
+@@ -75,7 +93,6 @@ def __init__(
+                 )
+             self.pert_categories = np.array(data.obs[pert_category].values)
+             self.de_genes = data.uns["rank_genes_groups_cov"]
+-
+             self.drugs_names = np.array(data.obs[perturbation_key].values)
+             self.dose_names = np.array(data.obs[dose_key].values)
+ 
+@@ -83,62 +100,87 @@ def __init__(
+             drugs_names_unique = set()
+             for d in self.drugs_names:
+                 [drugs_names_unique.add(i) for i in d.split("+")]
+-            self.drugs_names_unique = np.array(list(drugs_names_unique))
+-
+-            # save encoder for a comparison with Mo's model
+-            # later we need to remove this part
+-            encoder_drug = OneHotEncoder(sparse=False)
+-            encoder_drug.fit(self.drugs_names_unique.reshape(-1, 1))
+-
+-            # Store as attribute for molecular featurisation
+-            self.encoder_drug = encoder_drug
+-
+-            self.atomic_drugs_dict = dict(
+-                zip(
+-                    self.drugs_names_unique,
+-                    encoder_drug.transform(self.drugs_names_unique.reshape(-1, 1)),
+-                )
++            self.drugs_names_unique_sorted = np.array(sorted(drugs_names_unique))
++            self.max_num_perturbations = max(
++                len(name.split("+")) for name in self.drugs_names
+             )
+ 
+-            # get drug combinations
+-            drugs = []
+-            for i, comb in enumerate(self.drugs_names):
+-                drugs_combos = encoder_drug.transform(
+-                    np.array(comb.split("+")).reshape(-1, 1)
++            if not use_drugs_idx:
++                # prepare a OneHot encoding for each unique drug in the dataset
++                # use the same sorted ordering of drugs as for indexing
++                self.encoder_drug = OneHotEncoder(
++                    sparse=False, categories=[list(self.drugs_names_unique_sorted)]
++                )
++                self.encoder_drug.fit(self.drugs_names_unique_sorted.reshape(-1, 1))
++                # stores a drug name -> OHE mapping (np float array)
++                self.atomic_drugs_dict = dict(
++                    zip(
++                        self.drugs_names_unique_sorted,
++                        self.encoder_drug.transform(
++                            self.drugs_names_unique_sorted.reshape(-1, 1)
++                        ),
++                    )
++                )
++                # get drug combination encoding: for each cell we calculate a single vector as:
++                # combination_encoding = dose1 * OneHot(drug1) + dose2  * OneHot(drug2) + ...
++                drugs = []
++                for i, comb in enumerate(self.drugs_names):
++                    # here (in encoder_drug.transform()) is where the init_dataset function spends most of it's time.
++                    drugs_combos = self.encoder_drug.transform(
++                        np.array(comb.split("+")).reshape(-1, 1)
++                    )
++                    dose_combos = str(data.obs[dose_key].values[i]).split("+")
++                    for j, d in enumerate(dose_combos):
++                        if j == 0:
++                            drug_ohe = float(d) * drugs_combos[j]
++                        else:
++                            drug_ohe += float(d) * drugs_combos[j]
++                    drugs.append(drug_ohe)
++                self.drugs = torch.Tensor(drugs)
++
++                # store a mapping from int -> drug_name, where the integer equals the position
++                # of the drug in the OneHot encoding. Very convoluted, should be refactored.
++                self.drug_dict = {}
++                atomic_ohe = self.encoder_drug.transform(
++                    self.drugs_names_unique_sorted.reshape(-1, 1)
++                )
++                for idrug, drug in enumerate(self.drugs_names_unique_sorted):
++                    i = np.where(atomic_ohe[idrug] == 1)[0][0]
++                    self.drug_dict[i] = drug
++            else:
++                assert (
++                    self.max_num_perturbations == 1
++                ), "Index-based drug encoding only works with single perturbations"
++                drugs_idx = [self.drug_name_to_idx(drug) for drug in self.drugs_names]
++                self.drugs_idx = torch.tensor(
++                    drugs_idx,
++                    dtype=torch.long,
++                )
++                dosages = [float(dosage) for dosage in self.dose_names]
++                self.dosages = torch.tensor(
++                    dosages,
++                    dtype=torch.float32,
+                 )
+-                dose_combos = str(data.obs[dose_key].values[i]).split("+")
+-                for j, d in enumerate(dose_combos):
+-                    if j == 0:
+-                        drug_ohe = float(d) * drugs_combos[j]
+-                    else:
+-                        drug_ohe += float(d) * drugs_combos[j]
+-                drugs.append(drug_ohe)
+-            self.drugs = torch.Tensor(drugs)
+-
+-            atomic_ohe = encoder_drug.transform(self.drugs_names_unique.reshape(-1, 1))
+-
+-            self.drug_dict = {}
+-            for idrug, drug in enumerate(self.drugs_names_unique):
+-                i = np.where(atomic_ohe[idrug] == 1)[0][0]
+-                self.drug_dict[i] = drug
++
+         else:
+             self.pert_categories = None
+             self.de_genes = None
+             self.drugs_names = None
+             self.dose_names = None
+-            self.drugs_names_unique = None
++            self.drugs_names_unique_sorted = None
+             self.atomic_drugs_dict = None
+             self.drug_dict = None
+             self.drugs = None
+ 
+         if smiles_key is not None:
++            mol_featurizers = ["canonical", "AttentiveFP", "Pretrain"]
+             if mol_featurizer not in mol_featurizers:
+                 raise ValueError(f"mol_featurizer must be one of {mol_featurizers}")
+             graph_tuple = graph_from_smiles(
+                 data.obs[[self.perturbation_key, self.smiles_key]],
+                 self.perturbation_key,
+                 self.smiles_key,
+-                self.encoder_drug,
++                self.drugs_names_unique_sorted,
+                 mol_featuriser=self.mol_featurizer,
+             )
+             self.batched_graph_collection = graph_tuple[0]
+@@ -194,7 +236,11 @@ def __init__(
+         else:
+             self.num_covariates = [0]
+         self.num_genes = self.genes.shape[1]
+-        self.num_drugs = len(self.drugs_names_unique) if self.drugs is not None else 0
++        self.num_drugs = (
++            len(self.drugs_names_unique_sorted)
++            if self.drugs_names_unique_sorted is not None
++            else 0
++        )
+ 
+         self.indices = {
+             "all": list(range(len(self.genes))),
+@@ -209,12 +255,27 @@ def subset(self, split, condition="all"):
+         idx = list(set(self.indices[split]) & set(self.indices[condition]))
+         return SubDataset(self, idx)
+ 
++    def drug_name_to_idx(self, drug_name: str):
++        """
++        For the given drug, return it's index. The index will be persistent for each dataset (since the list is sorted).
++        Raises ValueError if the drug doesn't exist in the dataset.
++        """
++        return list(self.drugs_names_unique_sorted).index(drug_name)
++
+     def __getitem__(self, i):
+-        return (
+-            self.genes[i],
+-            indx(self.drugs, i),
+-            *[indx(cov, i) for cov in self.covariates],
+-        )
++        if self.use_drugs_idx:
++            return (
++                self.genes[i],
++                indx(self.drugs_idx, i),
++                indx(self.dosages, i),
++                *[indx(cov, i) for cov in self.covariates],
++            )
++        else:
++            return (
++                self.genes[i],
++                indx(self.drugs, i),
++                *[indx(cov, i) for cov in self.covariates],
++            )
+ 
+     def __len__(self):
+         return len(self.genes)
+@@ -225,7 +286,7 @@ class SubDataset:
+     Subsets a `Dataset` by selecting the examples given by `indices`.
+     """
+ 
+-    def __init__(self, dataset, indices):
++    def __init__(self, dataset: Dataset, indices):
+         self.perturbation_key = dataset.perturbation_key
+         self.dose_key = dataset.dose_key
+         self.covariate_keys = dataset.covariate_keys
+@@ -235,11 +296,16 @@ def __init__(self, dataset, indices):
+         self.idx_wo_smiles = dataset.idx_wo_smiles
+         self.graph_feats_shape = dataset.graph_feats_shape
+ 
+-        self.perts_dict = dataset.atomic_drugs_dict
+         self.covars_dict = dataset.atomic_сovars_dict
+ 
+         self.genes = dataset.genes[indices]
+-        self.drugs = indx(dataset.drugs, indices)
++        self.use_drugs_idx = dataset.use_drugs_idx
++        if self.use_drugs_idx:
++            self.drugs_idx = indx(dataset.drugs_idx, indices)
++            self.dosages = indx(dataset.dosages, indices)
++        else:
++            self.perts_dict = dataset.atomic_drugs_dict
++            self.drugs = indx(dataset.drugs, indices)
+         self.covariates = [indx(cov, indices) for cov in dataset.covariates]
+ 
+         self.drugs_names = indx(dataset.drugs_names, indices)
+@@ -257,11 +323,19 @@ def __init__(self, dataset, indices):
+         self.num_drugs = dataset.num_drugs
+ 
+     def __getitem__(self, i):
+-        return (
+-            self.genes[i],
+-            indx(self.drugs, i),
+-            *[indx(cov, i) for cov in self.covariates],
+-        )
++        if self.use_drugs_idx:
++            return (
++                self.genes[i],
++                indx(self.drugs_idx, i),
++                indx(self.dosages, i),
++                *[indx(cov, i) for cov in self.covariates],
++            )
++        else:
++            return (
++                self.genes[i],
++                indx(self.drugs, i),
++                *[indx(cov, i) for cov in self.covariates],
++            )
+ 
+     def __len__(self):
+         return len(self.genes)
+@@ -277,6 +351,7 @@ def load_dataset_splits(
+     split_key: str = "split",
+     mol_featurizer: str = "canonical",
+     return_dataset: bool = False,
++    use_drugs_idx=False,
+ ):
+ 
+     dataset = Dataset(
+@@ -288,6 +363,7 @@ def load_dataset_splits(
+         pert_category,
+         split_key,
+         mol_featurizer,
++        use_drugs_idx,
+     )
+ 
+     splits = {
+diff --git a/compert/helper.py b/compert/helper.py
+index 1d53109..f9c11c6 100644
+--- a/compert/helper.py
++++ b/compert/helper.py
+@@ -109,7 +109,7 @@ def graph_from_smiles(
+     drug_smiles_df,
+     perturbation_key,
+     smiles_key,
+-    pert_ohe,
++    drugs_ordering,
+     mol_featuriser="canonical",
+ ):
+     """Translates molecular graph information from the drug SMILES and outputs the graph tuple.
+@@ -122,8 +122,8 @@ def graph_from_smiles(
+         Column name in `drug_smiles_df` with compound names
+     smiles_key : str
+         Column name in `drug_smiles_df` with SMILES
+-    pert_ohe : sklearn.preprocessing.OneHotEncoder
+-        OHE that is used to order perturbations in `drug_smiles_df`
++    drugs_ordering : list of drugnames
++        the ordering of the drugs in the list is used to order perturbations in `drug_smiles_df`
+     mol_featuriser : str
+         Molecule featurizer. Must be one of `['canonical', 'AttentiveFP', 'Pretrain']`.
+ 
+@@ -137,9 +137,10 @@ def graph_from_smiles(
+         The tuple that indicates the shape of the batched graph collection.
+     """
+ 
+-    # Order drugs as in pert_ohe
++    # Order drugs as in drugs_ordering
+     df = drug_smiles_df.drop_duplicates(subset=[perturbation_key])
+-    df = df.set_index(perturbation_key).reindex(pert_ohe.categories_[0]).reset_index()
++    df = df.set_index(perturbation_key).reindex(drugs_ordering).reset_index()
++    assert df[perturbation_key].isna().sum() == 0
+ 
+     # Define featurisers
+     featurisers, graph_feats_shape = get_featurisers(mol_featuriser, return_shape=True)
+diff --git a/compert/model.py b/compert/model.py
+index 1009ca4..93d6a0f 100644
+--- a/compert/model.py
++++ b/compert/model.py
+@@ -1,12 +1,23 @@
+ # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+ 
+-from compert.graph_model.graph_model import Drugemb
+ import json
+-import torch
+-import numpy as np
+-from sklearn.preprocessing import KBinsDiscretizer
+ from typing import Union
+ 
++import numpy as np
++import torch
++
++from compert.graph_model.graph_model import Drugemb
++
++
++def _move_inputs(*inputs, device="cuda"):
++    def mv_input(x):
++        if type(x) == list:
++            return [mv_input(y) for y in x]
++        else:
++            return x.to(device) if x is not None else None
++
++    return [mv_input(x) for x in inputs]
++
+ 
+ class NBLoss(torch.nn.Module):
+     def __init__(self):
+@@ -130,6 +141,7 @@ def __init__(self, dim, device, nonlin="sigm"):
+             One of logsigm, sigm.
+         """
+         super(GeneralizedSigmoid, self).__init__()
++        assert nonlin in ("sigm", "logsigm", None)
+         self.nonlin = nonlin
+         self.beta = torch.nn.Parameter(
+             torch.ones(1, dim, device=device), requires_grad=True
+@@ -138,13 +150,25 @@ def __init__(self, dim, device, nonlin="sigm"):
+             torch.zeros(1, dim, device=device), requires_grad=True
+         )
+ 
+-    def forward(self, x):
++    def forward(self, x, idx=None):
+         if self.nonlin == "logsigm":
+-            c0 = self.bias.sigmoid()
+-            return (torch.log1p(x) * self.beta + self.bias).sigmoid() - c0
++            if idx is None:
++                c0 = self.bias.sigmoid()
++                return (torch.log1p(x) * self.beta + self.bias).sigmoid() - c0
++            else:
++                bias = self.bias[0][idx]
++                beta = self.beta[0][idx]
++                c0 = bias.sigmoid()
++                return (torch.log1p(x) * beta + bias).sigmoid() - c0
+         elif self.nonlin == "sigm":
+-            c0 = self.bias.sigmoid()
+-            return (x * self.beta + self.bias).sigmoid() - c0
++            if idx is None:
++                c0 = self.bias.sigmoid()
++                return (x * self.beta + self.bias).sigmoid() - c0
++            else:
++                bias = self.bias[0][idx]
++                beta = self.beta[0][idx]
++                c0 = bias.sigmoid()
++                return (x * beta + bias).sigmoid() - c0
+         else:
+             return x
+ 
+@@ -164,11 +188,14 @@ class ComPert(torch.nn.Module):
+     Our main module, the ComPert autoencoder
+     """
+ 
++    num_drugs: int  # number of unique drugs in the dataset, including control
++    use_drugs_idx: bool  # whether to except drugs coded by index or by OneHotEncoding
++
+     def __init__(
+         self,
+-        num_genes,
+-        num_drugs,
+-        num_covariates,
++        num_genes: int,
++        num_drugs: int,
++        num_covariates: int,
+         device="cpu",
+         seed=0,
+         patience=5,
+@@ -177,6 +204,7 @@ def __init__(
+         decoder_activation="linear",
+         hparams="",
+         drug_embeddings: Union[None, Drugemb] = None,
++        use_drugs_idx=False,
+     ):
+         super(ComPert, self).__init__()
+         # set generic attributes
+@@ -190,6 +218,7 @@ def __init__(
+         self.patience = patience
+         self.best_score = -1e3
+         self.patience_trials = 0
++        self.use_drugs_idx = use_drugs_idx
+ 
+         # set hyperparameters
+         if isinstance(hparams, dict):
+@@ -224,7 +253,14 @@ def __init__(
+                 )
+             else:
+                 self.drug_embeddings = drug_embeddings
+-            self.loss_adversary_drugs = torch.nn.BCEWithLogitsLoss()
++
++            if use_drugs_idx:
++                # there will only ever be a single drug, so no binary cross entropy needed
++                # careful: when the model is finetuned later with One-hot encodings, we'll have to
++                # retrained the adversary classifiers.
++                self.loss_adversary_drugs = torch.nn.CrossEntropyLoss()
++            else:
++                self.loss_adversary_drugs = torch.nn.BCEWithLogitsLoss()
+             # set dosers
+             if doser_type == "mlp":
+                 self.dosers = torch.nn.ModuleList()
+@@ -380,52 +416,82 @@ def set_hparams_(self, seed, hparams):
+ 
+         return self.hparams
+ 
+-    def move_inputs_(self, genes, drugs, covariates):
+-        """
+-        Move minibatch tensors to CPU/GPU.
+-        """
+-        genes = genes.to(self.device)
+-        if drugs is not None:
+-            drugs = drugs.to(self.device)
+-        if covariates is not None:
+-            covariates = [cov.to(self.device) for cov in covariates]
+-        return (genes, drugs, covariates)
+-
+-    def compute_drug_embeddings_(self, drugs):
++    def compute_drug_embeddings_(self, drugs=None, drugs_idx=None, dosages=None):
+         """
+         Compute sum of drug embeddings, each of them multiplied by its
+         dose-response curve.
++
++        Returns a tensor of shape [batch_size, drug_embedding_dimension]
+         """
++        assert (drugs is not None) or (drugs_idx is not None and dosages is not None)
++
++        drugs, drugs_idx, dosages = _move_inputs(
++            drugs, drugs_idx, dosages, device=self.device
++        )
++
+         if isinstance(self.drug_embeddings, Drugemb):
+             # drug embedding matrix
+             latent_drugs = self.drug_embeddings()
+         else:
+             latent_drugs = self.drug_embeddings.weight
+ 
++        if drugs_idx is not None:
++            assert drugs_idx.shape == dosages.shape and len(drugs_idx.shape) == 1
++            # results in a tensor of shape [batchsize, drug_embedding_dimension]
++            latent_drugs = latent_drugs[drugs_idx]
++
+         if self.doser_type == "mlp":
+-            doses = []
+-            for d in range(drugs.size(1)):
+-                this_drug = drugs[:, d].view(-1, 1)
+-                doses.append(self.dosers[d](this_drug).sigmoid() * this_drug.gt(0))
+-            return torch.cat(doses, 1) @ latent_drugs
++            if drugs_idx is None:
++                doses = []
++                for d in range(drugs.size(1)):
++                    this_drug = drugs[:, d].view(-1, 1)
++                    doses.append(self.dosers[d](this_drug).sigmoid() * this_drug.gt(0))
++                scaled_dosages = torch.cat(doses, 1)
++            else:
++                scaled_dosages = []
++                for idx, dosage in zip(drugs_idx, dosages):
++                    scaled_dosages.append(
++                        self.dosers[idx](dosage.unsqueeze(0)).sigmoid()
++                    )
++                scaled_dosages = torch.cat(scaled_dosages, 0)
++        else:
++            if drugs_idx is None:
++                scaled_dosages = self.dosers(drugs)
++            else:
++                scaled_dosages = self.dosers(dosages, drugs_idx)
++
++        if drugs_idx is None:
++            return scaled_dosages @ latent_drugs
+         else:
+-            return self.dosers(drugs) @ latent_drugs
++            return torch.einsum("b,be->be", [scaled_dosages, latent_drugs])
+ 
+-    def predict(self, genes, drugs, covariates, return_latent_basal=False):
++    def predict(
++        self,
++        genes,
++        drugs=None,
++        drugs_idx=None,
++        dosages=None,
++        covariates=None,
++        return_latent_basal=False,
++    ):
+         """
+         Predict "what would have the gene expression `genes` been, had the
+         cells in `genes` with cell types `cell_types` been treated with
+         combination of drugs `drugs`.
+         """
+-
+-        genes, drugs, covariates = self.move_inputs_(genes, drugs, covariates)
++        assert (drugs is not None) or (drugs_idx is not None and dosages is not None)
++        genes, drugs, drugs_idx, dosages, covariates = _move_inputs(
++            genes, drugs, drugs_idx, dosages, covariates, device=self.device
++        )
+ 
+         latent_basal = self.encoder(genes)
+ 
+         latent_treated = latent_basal
+ 
+         if self.num_drugs > 0:
+-            latent_treated = latent_treated + self.compute_drug_embeddings_(drugs)
++            latent_treated = latent_treated + self.compute_drug_embeddings_(
++                drugs=drugs, drugs_idx=drugs_idx, dosages=dosages
++            )
+         if self.num_covariates[0] > 0:
+             for cov_type, emb_cov in enumerate(self.covariates_embeddings):
+                 emb_cov = emb_cov.to(self.device)
+@@ -469,28 +535,34 @@ def early_stopping(self, score):
+ 
+         return self.patience_trials > self.patience
+ 
+-    def update(self, genes, drugs, covariates):
++    def update(self, genes, drugs=None, drugs_idx=None, dosages=None, covariates=None):
+         """
+         Update ComPert's parameters given a minibatch of genes, drugs, and
+         cell types.
+         """
+-        genes, drugs, covariates = self.move_inputs_(genes, drugs, covariates)
++        assert (drugs is not None) or (drugs_idx is not None and dosages is not None)
+ 
+         gene_reconstructions, latent_basal = self.predict(
+-            genes,
+-            drugs,
+-            covariates,
++            genes=genes,
++            drugs=drugs,
++            drugs_idx=drugs_idx,
++            dosages=dosages,
++            covariates=covariates,
+             return_latent_basal=True,
+         )
+-
+         reconstruction_loss = self.loss_autoencoder(gene_reconstructions, genes)
+ 
+         adversary_drugs_loss = torch.tensor([0.0], device=self.device)
+         if self.num_drugs > 0:
+             adversary_drugs_predictions = self.adversary_drugs(latent_basal)
+-            adversary_drugs_loss = self.loss_adversary_drugs(
+-                adversary_drugs_predictions, drugs.gt(0).float()
+-            )
++            if self.use_drugs_idx:
++                adversary_drugs_loss = self.loss_adversary_drugs(
++                    adversary_drugs_predictions, drugs_idx
++                )
++            else:
++                adversary_drugs_loss = self.loss_adversary_drugs(
++                    adversary_drugs_predictions, drugs.gt(0).float()
++                )
+ 
+         adversary_covariates_loss = torch.tensor([0.0], device=self.device)
+         if self.num_covariates[0] > 0:
+diff --git a/compert/seml_sweep_icb.py b/compert/seml_sweep_icb.py
+index ef2f203..27d6977 100644
+--- a/compert/seml_sweep_icb.py
++++ b/compert/seml_sweep_icb.py
+@@ -55,15 +55,7 @@ def init_dataset(self, dataset_type: str, data_params: dict):
+         """
+         from compert.data import load_dataset_splits
+ 
+-        if dataset_type == "kang":
+-            self.datasets, self.dataset = load_dataset_splits(
+-                **data_params, return_dataset=True
+-            )
+-        elif dataset_type == "trapnell":
+-            self.datasets, self.dataset = load_dataset_splits(
+-                **data_params, return_dataset=True
+-            )
+-        elif dataset_type == "lincs":
++        if dataset_type in ("kang", "trapnell", "lincs"):
+             self.datasets, self.dataset = load_dataset_splits(
+                 **data_params, return_dataset=True
+             )
+@@ -109,6 +101,7 @@ def init_model(self, hparams: dict, additional_params: dict):
+             **additional_params,
+             hparams=hparams,
+             drug_embeddings=self.drug_embeddings,
++            use_drugs_idx=self.dataset.use_drugs_idx,
+         )
+ 
+     def update_datasets(self):
+@@ -131,7 +124,7 @@ def update_datasets(self):
+         # pjson({"autoencoder_params": self.autoencoder.hparams})
+ 
+     @ex.capture
+-    def init_all(self, seed):
++    def init_all(self, seed: int):
+         """
+         Sequentially run the sub-initializers of the experiment.
+         """
+@@ -156,19 +149,37 @@ def train(
+ 
+         print(f"CWD: {os.getcwd()}")
+         print(f"Save dir: {save_dir}")
+-        print(f"Is path?: {os.path.exists(save_dir) if save_dir else None}")
++        assert not save_checkpoints or (
++            save_dir is not None and os.path.exists(save_dir)
++        ), f"save_dir ({save_dir}) doesn't exist, create it first."
++
+         start_time = time.time()
+         for epoch in range(num_epochs):
+             epoch_training_stats = defaultdict(float)
+ 
+             for data in self.datasets["loader_tr"]:
+-                genes, drugs, covariates = data[0], data[1], data[2:]
+-                # data is moved to GPU in the update function
+-                minibatch_training_stats = self.autoencoder.update(
+-                    genes, drugs, covariates
+-                )
++                if self.dataset.use_drugs_idx:
++                    genes, drugs_idx, dosages, covariates = (
++                        data[0],
++                        data[1],
++                        data[2],
++                        data[3:],
++                    )
++                    training_stats = self.autoencoder.update(
++                        genes=genes,
++                        drugs_idx=drugs_idx,
++                        dosages=dosages,
++                        covariates=covariates,
++                    )
++                else:
++                    genes, drugs, covariates = data[0], data[1], data[2:]
++                    training_stats = self.autoencoder.update(
++                        genes=genes,
++                        drugs=drugs,
++                        covariates=covariates,
++                    )
+ 
+-                for key, val in minibatch_training_stats.items():
++                for key, val in training_stats.items():
+                     epoch_training_stats[key] += val
+ 
+             for key, val in epoch_training_stats.items():
+@@ -234,7 +245,6 @@ def train(
+                         ),
+                         os.path.join(save_dir, file_name),
+                     )
+-
+                     pjson({"model_saved": file_name})
+ 
+                 if stop:
+diff --git a/compert/train.py b/compert/train.py
+index dcab7da..181ecc8 100644
+--- a/compert/train.py
++++ b/compert/train.py
+@@ -57,7 +57,18 @@ def compute_prediction(autoencoder: ComPert, genes, emb_drugs, emb_covs):
+     Computes the prediction of a ComPert `autoencoder` and
+     directly splits into `mean` and `variance` predictions
+     """
+-    genes_pred = autoencoder.predict(genes, emb_drugs, emb_covs).detach()
++    if autoencoder.use_drugs_idx:
++        assert len(emb_drugs) == 2
++        genes_pred = autoencoder.predict(
++            genes=genes,
++            drugs_idx=emb_drugs[0],
++            dosages=emb_drugs[1],
++            covariates=emb_covs,
++        ).detach()
++    else:
++        genes_pred = autoencoder.predict(
++            genes=genes, drugs=emb_drugs, covariates=emb_covs
++        ).detach()
+     dim = genes.size(1)
+     mean = genes_pred[:, :dim]
+     var = genes_pred[:, dim:]
+@@ -92,10 +103,16 @@ def evaluate_logfold_r2(autoencoder, ds_treated, ds_ctrl):
+         if n_idx_treated <= 5:
+             continue
+ 
+-        emb_drugs = repeat_n(ds_treated.drugs[idx_treated], n_idx_ctrl)
+         emb_covs = [
+             repeat_n(cov[idx_treated], n_idx_ctrl) for cov in ds_treated.covariates
+         ]
++        if ds_treated.use_drugs_idx:
++            emb_drugs = (
++                repeat_n(ds_treated.drugs_idx[idx_treated], n_idx_ctrl).squeeze(),
++                repeat_n(ds_treated.dosages[idx_treated], n_idx_ctrl).squeeze(),
++            )
++        else:
++            emb_drugs = repeat_n(ds_treated.drugs[idx_treated], n_idx_ctrl)
+ 
+         genes_ctrl = ds_ctrl.genes[idx_ctrl_all].to(device="cuda")
+ 
+@@ -127,12 +144,21 @@ def evaluate_disentanglement(autoencoder, dataset, nonlinear=False):
+     vectors.
+ 
+     """
+-    _, latent_basal = autoencoder.predict(
+-        dataset.genes,
+-        dataset.drugs,
+-        dataset.covariates,
+-        return_latent_basal=True,
+-    )
++    if dataset.use_drugs_idx:
++        _, latent_basal = autoencoder.predict(
++            genes=dataset.genes,
++            drugs_idx=dataset.drugs_idx,
++            dosages=dataset.dosages,
++            covariates=dataset.covariates,
++            return_latent_basal=True,
++        )
++    else:
++        _, latent_basal = autoencoder.predict(
++            genes=dataset.genes,
++            drugs=dataset.drugs,
++            covariates=dataset.covariates,
++            return_latent_basal=True,
++        )
+ 
+     latent_basal = latent_basal.detach().cpu().numpy()
+ 
+@@ -194,9 +220,14 @@ def evaluate_r2(autoencoder, dataset, genes_control):
+         if n_idx <= 5:
+             continue
+ 
+-        emb_drugs = repeat_n(dataset.drugs[idx], num)
+         emb_covs = [repeat_n(cov[idx], num) for cov in dataset.covariates]
+-
++        if dataset.use_drugs_idx:
++            emb_drugs = (
++                repeat_n(dataset.drugs_idx[idx], num).squeeze(),
++                repeat_n(dataset.dosages[idx], num).squeeze(),
++            )
++        else:
++            emb_drugs = repeat_n(dataset.drugs[idx], num)
+         mean_pred, var_pred = compute_prediction(
+             autoencoder,
+             genes_control,
+diff --git a/environment.yml b/environment.yml
+index daa1174..5a8f271 100644
+--- a/environment.yml
++++ b/environment.yml
+@@ -21,6 +21,7 @@ dependencies:
+   - dglteam::dgl
+   - dglteam::dgllife
+   - rdkit
++  - pytest
+   - pip
+   - pip:
+     - seml
+diff --git a/simon/config_sciplex3_interactive.yaml b/simon/config_sciplex3_interactive.yaml
+index 3e5d2cf..4e9f1cc 100644
+--- a/simon/config_sciplex3_interactive.yaml
++++ b/simon/config_sciplex3_interactive.yaml
+@@ -30,15 +30,17 @@ fixed:
+   model.additional_params.patience: 20 # patience for early stopping
+   model.additional_params.decoder_activation: linear # last layer of the decoder
+   model.additional_params.doser_type: sigm # non-linearity for doser function
+- 
++
+   dataset.dataset_type: trapnell
+   dataset.data_params.dataset_path: datasets/trapnell_cpa_subset.h5ad # full path to the anndata dataset
+-  dataset.data_params.perturbation_key: condition
+-  dataset.data_params.dose_key: dose
++  dataset.data_params.perturbation_key: condition # stores name of the drug
++  dataset.data_params.pert_category: cov_drug_dose_name # stores celltype_drugname_drugdose
++  dataset.data_params.dose_key: dose # stores drug dose as a float
+   dataset.data_params.covariate_keys: cell_type # necessary field for cell types. Fill it with a dummy variable if no celltypes present.
+   dataset.data_params.smiles_key: SMILES
+   dataset.data_params.split_key: split # necessary field for train, test, ood splits.
+   dataset.data_params.mol_featurizer: canonical
++  dataset.data_params.use_drugs_idx: True
+ 
+   model.hparams.dropout: 0.1
+   model.hparams.dim: 128
+@@ -65,4 +67,4 @@ gnn_model: # configures the GNN used in end-to-end training of the embedding (no
+   fixed:
+     model.gnn_model.hparams.n_layers: 2
+     model.gnn_model.GCN.hparams.n_layers: 3
+-    model.gnn_model.model_type: null
+\ No newline at end of file
++    model.gnn_model.model_type: null
+diff --git a/simon/manual_seml_sweep_icb.py b/simon/manual_seml_sweep_icb.py
+index 46f9cb8..652d185 100644
+--- a/simon/manual_seml_sweep_icb.py
++++ b/simon/manual_seml_sweep_icb.py
+@@ -1,9 +1,10 @@
+-from seml.config import read_config, generate_configs
+ from pprint import pprint
+ 
++from seml.config import read_config, generate_configs
++
+ from compert.seml_sweep_icb import ExperimentWrapper
+ 
+-if __name__ == '__main__':
++if __name__ == "__main__":
+     exp = ExperimentWrapper(init_all=False)
+ 
+     # this is how seml loads the config file internally
+@@ -11,7 +12,11 @@
+         "simon/config_sciplex3_interactive.yaml"
+     )
+     # we take the first config generated
+-    args = generate_configs(experiment_config)[0]
++    configs = generate_configs(experiment_config)
++    assert (
++        len(configs) == 1
++    ), "Careful, more than one config generated from the yaml file"
++    args = configs[0]
+     pprint(args)
+ 
+     exp.seed = 1337
+@@ -25,6 +30,7 @@
+         hparams=args["model"]["hparams"],
+         additional_params=args["model"]["additional_params"],
+     )
++    # setup the torch DataLoader
+     exp.update_datasets()
+ 
+-    exp.train(**args["training"])
+\ No newline at end of file
++    exp.train(**args["training"])
+diff --git a/tests/test_dataset.py b/tests/test_dataset.py
+new file mode 100644
+index 0000000..13096a7
+--- /dev/null
++++ b/tests/test_dataset.py
+@@ -0,0 +1,39 @@
++import numpy
++import torch.testing
++
++from compert.data import Dataset
++
++
++def test_dataset_idx_ohe():
++    kwargs = {
++        "perturbation_key": "condition",
++        "pert_category": "cov_drug_dose_name",
++        "dose_key": "dose",
++        "covariate_keys": "cell_type",
++        "smiles_key": "SMILES",
++        "mol_featurizer": "canonical",
++        "split_key": "split",
++    }
++    d_idx = Dataset(
++        fname="datasets/trapnell_cpa_subset.h5ad",
++        **kwargs,
++        use_drugs_idx=True,
++    )
++
++    d_ohe = Dataset(
++        fname="datasets/trapnell_cpa_subset.h5ad",
++        **kwargs,
++        use_drugs_idx=False,
++    )
++
++    numpy.testing.assert_equal(
++        d_ohe.encoder_drug.categories_[0], d_idx.drugs_names_unique_sorted
++    )
++
++    for i in range(len(d_idx)):
++        genes_idx, idx, dosage, cov_idx = d_idx[i]
++        genes_ohe, drug, cov_ohe = d_ohe[i]
++        torch.testing.assert_equal(genes_idx, genes_ohe)
++        # make sure the OHE and the index representation encode the same info
++        torch.testing.assert_equal(drug[idx], dosage)
++        torch.testing.assert_equal(cov_idx, cov_ohe)
+diff --git a/tests/test_dosers.py b/tests/test_dosers.py
+new file mode 100644
+index 0000000..e594ded
+--- /dev/null
++++ b/tests/test_dosers.py
+@@ -0,0 +1,64 @@
++import pytest
++import torch.nn
++import torch.nn.functional as F
++
++from compert.model import GeneralizedSigmoid, ComPert
++
++
++@pytest.mark.parametrize("nonlin", ["sigm", "logsigm"])
++def test_sigm_ohe_idx(nonlin):
++    # test to make sure the generalized sigmoid doser has the same outputs
++    # with indices and OHE
++    sigm = GeneralizedSigmoid(10, "cpu", nonlin=nonlin)
++
++    beta = torch.nn.Parameter(
++        torch.tensor(
++            [[x / 10 for x in range(0, 10)]], dtype=torch.float32, device="cpu"
++        )
++    )
++    assert sigm.beta.shape == beta.shape
++    sigm.beta = beta
++    bias = torch.nn.Parameter(
++        torch.tensor([[x / 5 for x in range(-5, 5)]], dtype=torch.float32, device="cpu")
++    )
++    assert sigm.bias.shape == bias.shape
++    sigm.bias = bias
++
++    dosages = torch.tensor([1.0, 1.0, 1.0, 1.0], device="cpu", dtype=torch.float32)
++    x = torch.tensor([0, 2, 9, 2], dtype=torch.long)
++    ohe = F.one_hot(x, num_classes=10)
++    ohe_scaled = torch.einsum("a,ab->ab", [dosages, ohe])
++    ohe_s = sigm(ohe_scaled)
++    idx_s = sigm(dosages, idx=x)
++    assert ohe_s[0][0] == idx_s[0]
++    assert ohe_s[1][2] == idx_s[1]
++    assert ohe_s[2][9] == idx_s[2]
++    assert ohe_s[3][2] == idx_s[3]
++
++
++@pytest.mark.parametrize("doser_type", ["logsigm", "sigm", "mlp"])
++def test_drug_embedding(doser_type):
++    drug_emb = torch.nn.Embedding.from_pretrained(
++        torch.tensor(list(range(10 * 10)), dtype=torch.float32, device="cpu").view(
++            10, 10
++        )
++    )
++    model = ComPert(
++        num_genes=50,
++        num_drugs=10,
++        num_covariates=[1],
++        doser_type=doser_type,
++        device="cpu",
++        drug_embeddings=drug_emb,
++        use_drugs_idx=False,
++    )
++    idx = torch.tensor([0, 2, 9, 2], dtype=torch.long, device="cpu")
++    dosages = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32, device="cpu")
++    ohe = F.one_hot(idx, num_classes=10).to(dtype=torch.float32, device="cpu")
++    ohe_scaled = torch.einsum("a,ab->ab", [dosages, ohe])
++
++    emb_ohe = model.compute_drug_embeddings_(drugs=ohe_scaled)
++    model.use_drugs_idx = True
++    emb_idx = model.compute_drug_embeddings_(drugs_idx=idx, dosages=dosages)
++
++    torch.testing.assert_close(emb_ohe, emb_idx)

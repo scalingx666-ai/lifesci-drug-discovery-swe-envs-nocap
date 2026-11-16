@@ -1,0 +1,718 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index e06bfaa..722374e 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -9,6 +9,12 @@ requires = [
+ 
+ build-backend = "setuptools.build_meta"
+ 
++[project.optional-dependencies]
++test = [
++    "pytest",
++    "cython >= 0.29.23",
++]
++
+ [tool.cibuildwheel]
+ skip = [
+     # skip pypy
+diff --git a/sella/eigensolvers.py b/sella/eigensolvers.py
+index a3cd932..c836c5f 100644
+--- a/sella/eigensolvers.py
++++ b/sella/eigensolvers.py
+@@ -127,7 +127,10 @@ def expand(V, Y, P, B, lams, vecs, shift, method='jd0', seeking=0):
+         vi = V @ vecs[:, seeking]
+         Pprojr = solve(Pshift, R[:, seeking])
+         Pprojv = solve(Pshift, vi)
+-        alpha = vi.T @ Pprojr / (vi.T @ Pprojv)
++        denom = vi.T @ Pprojv
++        if abs(denom) < 1e-12:
++            return Pprojr  # Fall back when denominator is near zero
++        alpha = vi.T @ Pprojr / denom
+         return Pprojv * alpha - Pprojr
+     elif method == 'jd0':
+         vi = V @ vecs[:, seeking]
+diff --git a/sella/hessian_update.py b/sella/hessian_update.py
+index 0759ba7..2352caa 100644
+--- a/sella/hessian_update.py
++++ b/sella/hessian_update.py
+@@ -49,7 +49,10 @@ def update_H(B, S, Y, method='TS-BFGS', symm=2, lams=None, vecs=None):
+         # Approximate B as a scaled identity matrix, where the
+         # scalar is the average Ritz value from S.T @ Y
+         thetas, _ = eigh(S.T @ Ytilde)
+-        lam0 = np.exp(np.average(np.log(np.abs(thetas))))
++        # Guard against zero eigenvalues which would give log(0) = -Inf
++        thetas_abs = np.abs(thetas)
++        thetas_abs = np.maximum(thetas_abs, 1e-12)
++        lam0 = np.exp(np.average(np.log(thetas_abs)))
+         d, _ = S.shape
+         B = lam0 * np.eye(d)
+ 
+diff --git a/sella/internal.py b/sella/internal.py
+index f3a9fbd..d413eb7 100644
+--- a/sella/internal.py
++++ b/sella/internal.py
+@@ -442,7 +442,7 @@ def __init__(
+     def __eq__(self, other: Coordinate) -> bool:
+         if not Coordinate.__eq__(self, other):
+             return False
+-        return np.all(self.refpos == other.refpos)
++        return np.all(self.kwargs['refpos'] == other.kwargs['refpos'])
+ 
+     _eval0 = staticmethod(jit(_displacement))
+     _eval1 = staticmethod(jit(_gradient(_displacement)))
+@@ -478,9 +478,9 @@ def _angle(
+ ) -> float:
+     dx1 = -(pos[1] - pos[0] + tvecs[0])
+     dx2 = pos[2] - pos[1] + tvecs[1]
+-    return jnp.arccos(
+-        dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
+-    )
++    cos_angle = dx1 @ dx2 / (jnp.linalg.norm(dx1) * jnp.linalg.norm(dx2))
++    # Clamp to [-1, 1] to prevent NaN from floating-point errors
++    return jnp.arccos(jnp.clip(cos_angle, -1.0, 1.0))
+ 
+ 
+ class Angle(Internal):
+@@ -1024,7 +1024,7 @@ def _fix_internal(
+                 return
+             raise DuplicateConstraintError(
+                 "Coordinate {} is already fixed to target {}"
+-                .format(new, self._targets[name][idx]) / conv
++                .format(new, self._targets[name][idx] / conv)
+             )
+ 
+     fix_bond = partialmethod(_fix_internal, Bond, 'bonds', 1.)
+@@ -1260,10 +1260,9 @@ def add_other(
+             self.internals['other'].index(coord)
+         except ValueError:
+             self.internals['other'].append(coord)
++            self._active['other'].append(True)
+         else:
+             raise DuplicateInternalError()
+-        self.internals['other'].append(coord)
+-        self._active['other'].append(True)
+ 
+     def forbid_translation(
+         self,
+diff --git a/sella/linalg.py b/sella/linalg.py
+index a3fb104..25c7ad9 100644
+--- a/sella/linalg.py
++++ b/sella/linalg.py
+@@ -71,7 +71,13 @@ def _matvec(self, v):
+                     sign = -1.
+                     break
+ 
+-        vnorm = np.linalg.norm(v) * sign
++        vnorm = np.linalg.norm(v)
++        if vnorm < 1e-12:
++            # Zero input vector produces zero output
++            if self.Uproj is not None:
++                return np.zeros(self.Uproj.shape[1])
++            return np.zeros_like(v)
++        vnorm *= sign
+         _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
+         if self.threepoint:
+             fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
+@@ -226,8 +232,8 @@ def _rmatmat(self, X):
+     def __add__(self, other):
+         initialized = self.initialized
+         if isinstance(other, ApproximateHessian):
+-            other = other.B
+             initialized = initialized and other.initialized
++            other = other.B
+         if not self.initialized or other is None:
+             tot = None
+             initialized = False
+@@ -321,6 +327,13 @@ def __init__(
+     def asarray(self) -> np.ndarray:
+         return np.array([hess.asarray() for hess in self.hessians])
+ 
++    def __array__(self, dtype=None):
++        """Support numpy array protocol for compatibility with np.zeros_like, etc."""
++        arr = self.asarray()
++        if dtype is not None:
++            return arr.astype(dtype)
++        return arr
++
+     def ldot(self, v: np.ndarray) -> np.ndarray:
+         M = np.zeros((self.natoms, 3, self.natoms, 3))
+         for vi, hess in zip(v, self.hessians):
+diff --git a/sella/optimize/irc.py b/sella/optimize/irc.py
+index 91011df..cf354d3 100644
+--- a/sella/optimize/irc.py
++++ b/sella/optimize/irc.py
+@@ -165,7 +165,10 @@ def step(self):
+         self.d1 *= 0.
+ 
+     def converged(self, forces=None):
+-        return self.pes.converged(self.fmax)[0] and self.pes.H.evals[0] > 0
++        evals = self.pes.H.evals
++        if evals is None:
++            return False
++        return self.pes.converged(self.fmax)[0] and evals[0] > 0
+ 
+     def get_W(self):
+         return np.diag(1. / np.sqrt(np.repeat(self.atoms.get_masses(), 3)))
+diff --git a/sella/optimize/optimize.py b/sella/optimize/optimize.py
+index f9a8089..878707a 100644
+--- a/sella/optimize/optimize.py
++++ b/sella/optimize/optimize.py
+@@ -76,6 +76,8 @@ def __init__(
+                 mode = "a" if append_trajectory else "w"
+                 trajectory = Trajectory(trajectory, mode=mode,
+                                         atoms=atoms, master=master)
++            # Register trajectory for cleanup when close() is called
++            self.closelater(trajectory)
+ 
+         asetraj = None
+         self.peskwargs = kwargs.copy()
+diff --git a/sella/optimize/restricted_step.py b/sella/optimize/restricted_step.py
+index c2bd8da..76c2dec 100644
+--- a/sella/optimize/restricted_step.py
++++ b/sella/optimize/restricted_step.py
+@@ -129,7 +129,7 @@ def cons(self, s, dsda=None):
+         if dsda is None:
+             return val
+ 
+-        dval = dsda @ s / val
++        dval = dsda @ s / max(val, 1e-12)
+         return val, dval
+ 
+ 
+@@ -170,7 +170,7 @@ def cons(self, s, dsda=None):
+             return val
+ 
+         dsda_mat = dsda.reshape((-1, 3))
+-        dval = dsda_mat[index] @ s_mat[index] / val
++        dval = dsda_mat[index] @ s_mat[index] / max(val, 1e-12)
+         return val, dval
+ 
+ 
+@@ -182,8 +182,8 @@ def __init__(
+     ):
+         if pes.int is None:
+             raise ValueError(
+-                "Internal coordinates are required for the "
+-                "{self.__class__.__name__} trust region method"
++                f"Internal coordinates are required for the "
++                f"{self.__class__.__name__} trust region method"
+             )
+         self.wx = wx
+         self.wb = wb
+diff --git a/sella/optimize/stepper.py b/sella/optimize/stepper.py
+index 84cb82e..ed97cc8 100644
+--- a/sella/optimize/stepper.py
++++ b/sella/optimize/stepper.py
+@@ -120,20 +120,29 @@ def get_s(self, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+         A = self.A * alpha
+         A[:-1, :-1] *= alpha
+         L, V = eigh(A)
+-        s = V[:-1, self.order] * alpha / V[-1, self.order]
++
++        # Regularize denominator to avoid division by near-zero eigenvector component
++        denom = V[-1, self.order]
++        if abs(denom) < 1e-12:
++            denom = np.sign(denom) * 1e-12 if denom != 0 else 1e-12
++        s = V[:-1, self.order] * alpha / denom
+ 
+         dAda = self.A.copy()
+         dAda[:-1, :-1] *= 2 * alpha
+ 
+         V1 = np.delete(V, self.order, 1)
+         L1 = np.delete(L, self.order)
+-        dVda = V1 @ ((V1.T @ dAda @ V[:, self.order])
+-                     / (L1 - L[self.order]))
+ 
+-        dsda = (V[:-1, self.order] / V[-1, self.order]
+-                + (alpha / V[-1, self.order]) * dVda[:-1]
+-                - (V[:-1, self.order] * alpha
+-                   / V[-1, self.order]**2) * dVda[-1])
++        # Regularize eigenvalue differences: clamp small values while preserving sign
++        L_diff = L1 - L[self.order]
++        L_diff = np.where(L_diff >= 0,
++                         np.maximum(L_diff, 1e-12),
++                         np.minimum(L_diff, -1e-12))
++        dVda = V1 @ ((V1.T @ dAda @ V[:, self.order]) / L_diff)
++
++        dsda = (V[:-1, self.order] / denom
++                + (alpha / denom) * dVda[:-1]
++                - (V[:-1, self.order] * alpha / denom**2) * dVda[-1])
+         return s, dsda
+ 
+ 
+diff --git a/sella/peswrapper.py b/sella/peswrapper.py
+index 7617ff3..a613cf9 100644
+--- a/sella/peswrapper.py
++++ b/sella/peswrapper.py
+@@ -106,6 +106,21 @@ def restore(self):
+         if dpos is not None:
+             self.dummies.positions = dpos
+ 
++    def close(self):
++        """Close any open file handles (e.g., trajectory file)."""
++        if self.traj is not None:
++            self.traj.close()
++            self.traj = None
++
++    def __enter__(self):
++        """Context manager entry."""
++        return self
++
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        """Context manager exit - ensures trajectory is closed."""
++        self.close()
++        return False
++
+     # Position getter/setter
+     def set_x(self, target):
+         diff = target - self.get_x()
+@@ -249,12 +264,19 @@ def diag(self, gamma=0.1, threepoint=False, maxiter=None):
+         Ufree = self.get_Ufree()
+         nfree = Ufree.shape[1]
+ 
++        # If there are no free DOF, there's nothing to diagonalize
++        if nfree == 0:
++            return
++
+         P = self.get_HL().project(Ufree)
+ 
+         if P.B is None or self.first_diag:
+             v0 = self.v0
+             if v0 is None:
+                 v0 = self.get_g() @ Ufree
++            # If v0 is near-zero, let rayleigh_ritz choose its own initial guess
++            if v0 is not None and np.linalg.norm(v0) < 1e-12:
++                v0 = None
+         else:
+             v0 = None
+ 
+diff --git a/sella/samd.py b/sella/samd.py
+index a270973..1110289 100644
+--- a/sella/samd.py
++++ b/sella/samd.py
+@@ -38,8 +38,10 @@ def bdp(func, x0, ngen, T0, Tf, dt, tau, *args, schedule=T_linear, v0=None, **kw
+         K_target = d * T / 2.
+         K = np.sum(v**2) / 2.
+         R = np.random.normal(size=d)
+-        alpha2 = edttau + K * (1 - edttau) * np.sum(R**2) / (d * K) + 2 * edttau2 * np.sqrt(K_target * (1 - edttau) / (d * K)) * R[0]
+-        v *= np.sqrt(alpha2)
++        if K > 1e-12:
++            alpha2 = edttau + K * (1 - edttau) * np.sum(R**2) / (d * K) + 2 * edttau2 * np.sqrt(K_target * (1 - edttau) / (d * K)) * R[0]
++            v *= np.sqrt(alpha2)
++        # If K is too small, skip rescaling - Verlet integration will add velocity from forces
+         print(np.average(v**2) / kB, T / kB)
+     return x
+ 
+@@ -57,7 +59,7 @@ def velocity_rescaling(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=
+     for i in range(ngen):
+         old_f = f
+         old_g = g.copy()
+-        
++
+         x += dt * v - 0.5 * dt**2 * g
+         f, g = func(x, *args, **kwargs)
+ 
+@@ -67,7 +69,9 @@ def velocity_rescaling(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=
+         K_target = d * T / 2.
+         K = np.sum(v**2) / 2.
+ 
+-        v *= np.sqrt(K_target / K)
++        if K > 1e-12:
++            v *= np.sqrt(K_target / K)
++        # If K is too small, skip rescaling - Verlet integration will add velocity from forces
+         print(np.average(v**2) / kB, T / kB)
+ 
+     return x
+@@ -86,7 +90,7 @@ def csvr(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=None, **kwargs
+     for i in range(ngen):
+         old_f = f
+         old_g = g.copy()
+-        
++
+         x += dt * v - 0.5 * dt**2 * g
+         f, g = func(x, *args, **kwargs)
+ 
+@@ -96,7 +100,9 @@ def csvr(func, x0, ngen, T0, Tf, dt, *args, schedule=T_linear, v0=None, **kwargs
+         K_target = np.random.gamma(d/2, T)
+         K = np.sum(v**2) / 2.
+ 
+-        v *= np.sqrt(K_target / K)
++        if K > 1e-12:
++            v *= np.sqrt(K_target / K)
++        # If K is too small, skip rescaling - Verlet integration will add velocity from forces
+         print(np.average(v**2) / kB, T / kB)
+ 
+     return x
+diff --git a/tests/test_core_functionality.py b/tests/test_core_functionality.py
+new file mode 100644
+index 0000000..44d734a
+--- /dev/null
++++ b/tests/test_core_functionality.py
+@@ -0,0 +1,280 @@
++"""
++General tests for core Sella functionality.
++
++These tests exercise key functionality including:
++- Hessian operations and arithmetic
++- Internal coordinate calculations
++- Trust region optimization steps
++- Eigensolvers
++"""
++import pytest
++import numpy as np
++
++from ase.build import molecule
++from ase.calculators.emt import EMT
++
++from sella.linalg import ApproximateHessian, NumericalHessian, SparseInternalHessians
++from sella.internal import Internals
++from sella.peswrapper import PES, InternalPES
++from sella.eigensolvers import exact, rayleigh_ritz
++
++
++class TestApproximateHessian:
++    """Test ApproximateHessian operations."""
++
++    def test_hessian_arithmetic(self):
++        """Test that ApproximateHessian supports addition with arrays."""
++        dim = 5
++        ncart = 5
++        rng = np.random.RandomState(42)
++
++        # Create initialized Hessian
++        H1 = ApproximateHessian(dim, ncart, update_method='BFGS')
++        # Initialize with a step
++        s = rng.normal(size=dim)
++        y = rng.normal(size=dim)
++        s /= np.linalg.norm(s)
++        y /= np.linalg.norm(y)
++        H1.update(s, y)
++        assert H1.initialized
++
++        # Add to an array
++        M = rng.normal(size=(dim, dim))
++        M = 0.5 * (M + M.T)
++
++        result = H1 + M
++        expected = H1.B + M
++        # Result is an ApproximateHessian, compare underlying matrices
++        np.testing.assert_allclose(result.B, expected, atol=1e-10)
++
++    def test_hessian_addition_with_uninitialized(self):
++        """Test adding two Hessians where one is uninitialized."""
++        dim = 5
++        ncart = 5
++        rng = np.random.RandomState(42)
++
++        H1 = ApproximateHessian(dim, ncart, update_method='BFGS')
++        H2 = ApproximateHessian(dim, ncart, update_method='BFGS')
++
++        # Initialize H1 only
++        s = rng.normal(size=dim)
++        y = rng.normal(size=dim)
++        H1.update(s, y)
++
++        # Adding uninitialized H2 should work
++        result = H1 + H2
++        # Result should be H1.B + H2.B (diagonal for uninitialized)
++        assert result is not None
++
++    def test_eigendecomposition(self):
++        """Test eigenvalue decomposition of ApproximateHessian."""
++        dim = 6
++        ncart = 6
++        rng = np.random.RandomState(42)
++
++        H = ApproximateHessian(dim, ncart, update_method='BFGS')
++
++        # Initialize with multiple updates
++        for _ in range(3):
++            s = rng.normal(size=dim)
++            y = rng.normal(size=dim)
++            H.update(s, y)
++
++        # Access eigenvalues
++        evals = H.evals
++        evecs = H.evecs
++        assert evals is not None
++        assert evecs is not None
++        assert len(evals) == dim
++
++        # Verify eigendecomposition
++        reconstructed = evecs @ np.diag(evals) @ evecs.T
++        np.testing.assert_allclose(H.B, reconstructed, atol=1e-10)
++
++
++class TestSparseInternalHessians:
++    """Test SparseInternalHessians functionality."""
++
++    def test_numpy_array_conversion(self):
++        """Test that SparseInternalHessians can be converted to numpy array."""
++        # Create a simple molecule
++        atoms = molecule('H2O')
++        internal = Internals(atoms)
++        internal.find_all_bonds()
++        internal.find_all_angles()
++
++        # Get the Hessian
++        hess = internal.hessian()
++        assert isinstance(hess, SparseInternalHessians)
++
++        # Convert to numpy array
++        arr = np.asarray(hess)
++        assert isinstance(arr, np.ndarray)
++
++        # Check shape consistency
++        n = len(internal.calc())
++        assert arr.shape == (n, 3 * len(atoms), 3 * len(atoms))
++
++
++class TestInternals:
++    """Test internal coordinate functionality."""
++
++    def test_basic_internal_coords(self):
++        """Test basic internal coordinate creation and calculation."""
++        atoms = molecule('CH4')
++        internal = Internals(atoms)
++
++        # Find standard internals
++        internal.find_all_bonds()
++        internal.find_all_angles()
++
++        # Calculate internal coords
++        q = internal.calc()
++        assert len(q) > 0
++        assert not np.any(np.isnan(q))
++
++        # Calculate Jacobian
++        jac = internal.jacobian()
++        assert jac.shape[0] == len(q)
++        assert jac.shape[1] == 3 * len(atoms)
++
++    def test_water_molecule(self):
++        """Test internal coordinates for water molecule."""
++        atoms = molecule('H2O')
++        internal = Internals(atoms)
++
++        internal.find_all_bonds()
++        internal.find_all_angles()
++
++        q = internal.calc()
++        jac = internal.jacobian()
++
++        # Should have 2 bonds and 1 angle
++        assert len(q) >= 3
++
++        # Values should be finite
++        assert np.all(np.isfinite(q))
++        assert np.all(np.isfinite(jac))
++
++
++class TestPES:
++    """Test PES wrapper functionality."""
++
++    def test_pes_basic_operations(self):
++        """Test basic PES operations."""
++        atoms = molecule('H2O')
++        atoms.calc = EMT()
++
++        pes = PES(atoms)
++        pes.kick(0., diag=True, gamma=0.1)
++
++        # Should be able to get gradient and Hessian
++        g = pes.get_g()
++        assert g is not None
++        assert len(g) == 3 * len(atoms)
++
++        H = pes.get_H()
++        assert H is not None
++
++    def test_internal_pes_operations(self):
++        """Test InternalPES operations."""
++        atoms = molecule('H2O')
++        atoms.calc = EMT()
++
++        # Create internals first
++        internal = Internals(atoms)
++        internal.find_all_bonds()
++        internal.find_all_angles()
++
++        pes = InternalPES(atoms, internal)
++        pes.kick(0., diag=True, gamma=0.1)
++
++        # Get projection matrices
++        Ufree = pes.get_Ufree()
++        Ucons = pes.get_Ucons()
++
++        # Free and constrained spaces should be orthogonal
++        overlap = Ufree.T @ Ucons
++        np.testing.assert_allclose(overlap, 0, atol=1e-10)
++
++
++class TestEigensolvers:
++    """Test eigensolver functionality."""
++
++    def test_exact_eigensolver(self):
++        """Test exact diagonalization."""
++        dim = 5
++        rng = np.random.RandomState(42)
++
++        # Create symmetric matrix
++        A = rng.normal(size=(dim, dim))
++        A = 0.5 * (A + A.T)
++
++        lams, vecs, Avecs = exact(A)
++
++        # Check eigenvalue equation
++        for i in range(dim):
++            np.testing.assert_allclose(
++                A @ vecs[:, i], lams[i] * vecs[:, i], atol=1e-10
++            )
++
++        # Check that Avecs is correct
++        np.testing.assert_allclose(Avecs, lams[np.newaxis, :] * vecs, atol=1e-10)
++
++    def test_rayleigh_ritz_small_gamma(self):
++        """Test Rayleigh-Ritz eigensolver with reasonable parameters."""
++        dim = 6
++        rng = np.random.RandomState(42)
++
++        # Create positive definite matrix (easier for convergence)
++        A = rng.normal(size=(dim, dim))
++        A = A.T @ A + 0.1 * np.eye(dim)
++
++        P = np.eye(dim)
++        gamma = 0.1  # Larger gamma for easier convergence
++
++        lams, vecs, Avecs = rayleigh_ritz(A, gamma, P, maxiter=20)
++
++        # Should have found some eigenvalues
++        assert len(lams) > 0
++
++
++class TestNumericalHessian:
++    """Test numerical Hessian functionality."""
++
++    def test_matvec_with_zero_vector(self):
++        """Test that matvec handles zero input correctly."""
++        def simple_func(x):
++            return 0.5 * np.sum(x**2), x
++
++        x0 = np.array([1.0, 2.0, 3.0])
++        g0 = x0.copy()
++
++        H = NumericalHessian(simple_func, x0, g0, eta=1e-5)
++
++        # Apply to zero vector
++        result = H @ np.zeros(3)
++        np.testing.assert_allclose(result, np.zeros(3), atol=1e-14)
++
++    def test_matvec_symmetry(self):
++        """Test that numerical Hessian is approximately symmetric."""
++        def quadratic_func(x):
++            A = np.array([[2.0, 0.5], [0.5, 3.0]])
++            return 0.5 * x @ A @ x, A @ x
++
++        x0 = np.array([1.0, 1.0])
++        _, g0 = quadratic_func(x0)
++
++        H = NumericalHessian(quadratic_func, x0, g0, eta=1e-5, threepoint=True)
++
++        # Build full matrix
++        e1 = np.array([1.0, 0.0])
++        e2 = np.array([0.0, 1.0])
++
++        H11 = (H @ e1)[0]
++        H12 = (H @ e1)[1]
++        H21 = (H @ e2)[0]
++        H22 = (H @ e2)[1]
++
++        # Check symmetry
++        np.testing.assert_allclose(H12, H21, rtol=1e-5)
+diff --git a/tests/test_utils/poly_factory.py b/tests/test_utils/poly_factory.py
+index 84aa485..2dbb2a0 100644
+--- a/tests/test_utils/poly_factory.py
++++ b/tests/test_utils/poly_factory.py
+@@ -1,3 +1,5 @@
++import math
++
+ import numpy as np
+ 
+ from itertools import permutations
+@@ -14,7 +16,7 @@ def poly_factory(dim, order, rng=None):
+         coeff = np.zeros_like(tmp)
+         for n, permute in enumerate(permutations(range(i))):
+             coeff += np.transpose(tmp, permute)
+-        coeffs.append(coeff / ((n + 1) * np.math.factorial(i)))
++        coeffs.append(coeff / ((n + 1) * math.factorial(i)))
+ 
+     def poly(x):
+         res = 0
+diff --git a/tests/utilities/test_math.py b/tests/utilities/test_math.py
+index d297f9e..aa241f7 100644
+--- a/tests/utilities/test_math.py
++++ b/tests/utilities/test_math.py
+@@ -5,9 +5,15 @@
+ 
+ from test_utils import get_matrix
+ 
+-import pyximport
+-pyximport.install(language_level=3)
+-from math_wrappers import wrappers
++# Try to import Cython-based wrappers - skip tests if not available
++try:
++    import pyximport
++    pyximport.install(language_level=3)
++    from math_wrappers import wrappers
++    HAS_CYTHON = True
++except ImportError:
++    HAS_CYTHON = False
++    wrappers = None
+ 
+ # TODO: figure out why m > n crashes
+ @pytest.mark.parametrize("n,m,eps",
+@@ -69,6 +75,7 @@ def test_modified_gram_schmidt(n, mx, my, eps1, eps2, maxiter):
+     np.testing.assert_allclose(Xout2.T @ Xout2, np.eye(nxout2), **tol)
+ 
+ 
++@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
+ @pytest.mark.parametrize('rngstate,length',
+                          [(0, 1),
+                           (1, 2),
+@@ -83,6 +90,7 @@ def test_normalize(rngstate, length):
+     if length > 0:
+         assert abs(np.linalg.norm(x) - 1.) < 1e-14
+ 
++@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
+ @pytest.mark.parametrize('rngstate,length,scale',
+                          [(0, 1, 1.),
+                           (1, 3, 0.5),
+@@ -102,6 +110,7 @@ def test_vec_sum(rngstate, length, scale):
+         assert wrappers['vec_sum'](x, y[:length-1], z, scale) == -1
+         assert wrappers['vec_sum'](x, y, z[:length-1], scale) == -1
+ 
++@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
+ @pytest.mark.parametrize('rngstate,n,m',
+                          [(0, 1, 1),
+                           (1, 5, 5),
+@@ -117,6 +126,7 @@ def test_symmetrize(rngstate, n, m):
+     np.testing.assert_allclose(Y, Y.T)
+ 
+ 
++@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
+ @pytest.mark.parametrize('rngstate,scale',
+                          [(0, 1.),
+                           (1, 0.1),
+@@ -128,6 +138,7 @@ def test_skew(rngstate, scale):
+     wrappers['skew'](x, Y, scale)
+     np.testing.assert_allclose(scale * np.cross(np.eye(3), x), Y)
+ 
++@pytest.mark.skipif(not HAS_CYTHON, reason="Cython/pyximport not available")
+ @pytest.mark.parametrize('rngstate,n,mx,my',
+                          [(2, 10, 2, 4)])
+ def test_mgs(rngstate, n, mx, my):
+@@ -152,4 +163,3 @@ def test_mgs(rngstate, n, mx, my):
+     np.testing.assert_allclose(X[:, :mx2].T @ Y[:, :my2], np.zeros((mx2, my2)),
+                                atol=1e-10)
+     assert wrappers['mgs'](X, Y[:n-1]) < 0
+-

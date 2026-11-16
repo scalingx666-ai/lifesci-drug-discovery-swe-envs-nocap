@@ -1,0 +1,208 @@
+diff --git a/qubekit/cli/combine.py b/qubekit/cli/combine.py
+index 846f98d1..ca8a4c7a 100644
+--- a/qubekit/cli/combine.py
++++ b/qubekit/cli/combine.py
+@@ -228,36 +228,31 @@ def _combine_molecules_offxml(
+             molecule._build_offxml_rb_torsions(offxml=offxml)
+         molecule._build_offxml_charges(offxml=offxml)
+         molecule._build_offxml_vs(offxml=offxml)
+-
+-        atom_types = {}
+-        rdkit_mol = molecule.to_rdkit()
+-
+-        for atom_index, cip_type in molecule.atom_types.items():
+-            atom_types.setdefault(cip_type, []).append((atom_index,))
+-        for sym_set in atom_types.values():
+-            graph = ClusterGraph(
+-                mols=[rdkit_mol], smirks_atoms_lists=[sym_set], layers="all"
+-            )
+-            qube_non_bond = molecule.NonbondedForce[sym_set[0]]
+-            rfree_code = _get_parameter_code(
+-                molecule=molecule, atom_index=sym_set[0][0]
+-            )
+-            atom_data = {
+-                "smirks": graph.as_smirks(),
+-            }
+-
+-            if rfree_code in parameters or fit_ab:
+-                # keep track of present codes to optimise
+-                rfree_codes.add(rfree_code)
+-            if using_plugin:
+-                # this is to be refit
+-                atom = molecule.atoms[qube_non_bond.atoms[0]]
+-                atom_data["volume"] = atom.aim.volume * unit.bohr**3
+-            else:
+-                atom_data["epsilon"] = qube_non_bond.epsilon * unit.kilojoule_per_mole
+-                atom_data["sigma"] = qube_non_bond.sigma * unit.nanometers
+-
+-            vdw_handler.add_parameter(parameter_kwargs=atom_data)
++        if using_plugin:
++            molecule._build_offxml_volumes(offxml=offxml)
++            for i in range(molecule.n_atoms):
++                rfree_code = _get_parameter_code(molecule=molecule, atom_index=i)
++                if rfree_code in parameters or fit_ab:
++                    rfree_codes.add(rfree_code)
++        else:
++            # we need a smirks per atom type for the sigma and epsilon
++            atom_types = {}
++            rdkit_mol = molecule.to_rdkit()
++
++            for atom_index, cip_type in molecule.atom_types.items():
++                atom_types.setdefault(cip_type, []).append((atom_index,))
++            for sym_set in atom_types.values():
++                graph = ClusterGraph(
++                    mols=[rdkit_mol], smirks_atoms_lists=[sym_set], layers="all"
++                )
++                qube_non_bond = molecule.NonbondedForce[sym_set[0]]
++                atom_data = {
++                    "smirks": graph.as_smirks(),
++                    "epsilon": qube_non_bond.epsilon * unit.kilojoule_per_mole,
++                    "sigma": qube_non_bond.sigma * unit.nanometers,
++                }
++
++                vdw_handler.add_parameter(parameter_kwargs=atom_data)
+ 
+     # now loop over all the parameters to be fit and add them as cosmetic attributes
+     to_parameterize = []
+diff --git a/qubekit/cli/utils.py b/qubekit/cli/utils.py
+index 4ace633d..b9e3958d 100644
+--- a/qubekit/cli/utils.py
++++ b/qubekit/cli/utils.py
+@@ -24,7 +24,8 @@
+     _allow_only,
+     vdWHandler,
+ )
+-from openff.toolkit.utils.exceptions import NotBondedError
++from openff.toolkit.utils.exceptions import NotBondedError, SMIRNOFFSpecError
++from openff.toolkit.utils.toolkits import GLOBAL_TOOLKIT_REGISTRY
+ from openmm import openmm, unit
+ 
+ from qubekit.molecules import Ligand
+@@ -93,7 +94,19 @@ class QUBEKitvdWType(ParameterType):
+         _VALENCE_TYPE = "Atom"  # ChemicalEnvironment valence type expected for SMARTS
+         _ELEMENT_NAME = "Atom"
+ 
+-        volume = ParameterAttribute(unit=unit.bohr**3)
++        name = ParameterAttribute(default=None)
++        volume = IndexedParameterAttribute(unit=unit.bohr**3)
++
++        def __init__(self, **kwargs):
++            super().__init__(**kwargs)
++            unique_tags, connectivity = GLOBAL_TOOLKIT_REGISTRY.call(
++                "get_tagged_smarts_connectivity", self.smirks
++            )
++            if len(self.volume) != len(unique_tags):
++                raise SMIRNOFFSpecError(
++                    f"QUBEKitHandler {self} was initialized with unequal number of "
++                    f"tagged atoms and volumes"
++                )
+ 
+     _TAGNAME = "QUBEKitvdWTS"
+     _INFOTYPE = QUBEKitvdWType
+@@ -163,14 +176,20 @@ def create_force(self, system, topology, **kwargs):
+                 ref_mol.generate_conformers(n_conformers=1)
+ 
+             qb_mol = Ligand.from_rdkit(ref_mol.to_rdkit())
++            # each parameter should cover the whole molecule
+             for parameter in self.parameters:
+                 matches = ref_mol.chemical_environment_matches(
+-                    parameter.smirks, unique=False
++                    parameter.smirks, unique=True
+                 )
+-                for match in matches:
+-                    qb_mol.atoms[match[0]].aim.volume = parameter.volume.value_in_unit(
+-                        unit.bohr**3
++                if matches and len(matches[0]) != qb_mol.n_atoms:
++                    raise SMIRNOFFSpecError(
++                        f"Parameter {parameter.smirks} matched with {ref_mol} but the whole molecule was not covered!"
+                     )
++                if matches:
++                    for atom in matches[0]:
++                        qb_mol.atoms[atom].aim.volume = parameter.volume[
++                            atom
++                        ].value_in_unit(unit.bohr**3)
+             # make sure all atoms in the molecule have volumes, assign dummy values
+             for i in range(qb_mol.n_atoms):
+                 atom = qb_mol.atoms[i]
+diff --git a/qubekit/molecules/ligand.py b/qubekit/molecules/ligand.py
+index 0b0f2361..c7c348da 100644
+--- a/qubekit/molecules/ligand.py
++++ b/qubekit/molecules/ligand.py
+@@ -1629,6 +1629,23 @@ def _build_offxml_charges(self, offxml: ForceField):
+         charge_data["smirks"] = graph.as_smirks()
+         library_charges.add_parameter(parameter_kwargs=charge_data)
+ 
++    def _build_offxml_volumes(self, offxml: ForceField):
++        """Edit the offxml in place by adding the atomic volumes using the plugin handler"""
++
++        rdkit_mol = self.to_rdkit()
++        qube_handler = offxml.get_parameter_handler("QUBEKitvdWTS")
++        volume_data = dict(
++            (f"volume{atom.atom_index + 1}", atom.aim.volume * unit.bohr**3)
++            for atom in self.atoms
++        )
++        graph = ClusterGraph(
++            mols=[rdkit_mol],
++            smirks_atoms_lists=[[list([i for i in range(self.n_atoms)])]],
++            layers="all",
++        )
++        volume_data["smirks"] = graph.as_smirks()
++        qube_handler.add_parameter(parameter_kwargs=volume_data)
++
+     def _build_offxml_vs(self, offxml: ForceField):
+         """Edit the offxml in place adding any virtual sites via our custom plugin handler."""
+ 
+diff --git a/qubekit/tests/cli/test_combine.py b/qubekit/tests/cli/test_combine.py
+index da0bc324..e57dbc77 100644
+--- a/qubekit/tests/cli/test_combine.py
++++ b/qubekit/tests/cli/test_combine.py
+@@ -335,7 +335,7 @@ def test_combine_cli_all_offxml(
+             )
+             # make sure we have used the plugin method
+             vdw_handler = ff.get_parameter_handler("QUBEKitvdWTS")
+-            assert len(vdw_handler.parameters) == 32
++            assert len(vdw_handler.parameters) == 2
+             assert "parameterize" in vdw_handler._cosmetic_attribs
+             assert len(getattr(vdw_handler, "_parameterize").split(",")) == expected
+         else:
+@@ -951,7 +951,7 @@ def test_combine_molecules_offxml_plugin_deepdiff(tmpdir, coumarin, rfree_data):
+         vdw = offxml.get_parameter_handler("QUBEKitvdWTS")
+         # make sure we have the parameterize tags
+         assert len(vdw._cosmetic_attribs) == 1
+-        assert len(vdw.parameters) == 28
++        assert len(vdw.parameters) == 1
+ 
+         alpha = rfree_data.pop("alpha")
+         beta = rfree_data.pop("beta")
+diff --git a/qubekit/tests/cli/test_utils.py b/qubekit/tests/cli/test_utils.py
+index 54ed3bea..574cae97 100644
+--- a/qubekit/tests/cli/test_utils.py
++++ b/qubekit/tests/cli/test_utils.py
+@@ -1,7 +1,9 @@
+ import openmm
+ import pytest
++from chemper.graphs.cluster_graph import ClusterGraph
+ from openff.toolkit.topology import Molecule, Topology
+ from openff.toolkit.typing.engines.smirnoff import ForceField
++from openff.toolkit.utils.exceptions import SMIRNOFFSpecError
+ from openmm import unit
+ 
+ from qubekit.cli.combine import _add_water_model
+@@ -223,3 +225,17 @@ def test_multi_bbc_correction(openff, tmpdir):
+                 ) == charge.value_in_unit(
+                     unit.elementary_charge
+                 )
++
++
++def test_wrong_number_of_volumes(methanol):
++    """Make sure an error is raised if we make a parameter with the wrong number of volumes"""
++    ff = ForceField(load_plugins=True)
++    qube = ff.get_parameter_handler("QUBEKitvdWTS")
++    graph = ClusterGraph(
++        mols=[methanol.to_rdkit()],
++        smirks_atoms_lists=[[list([i for i in range(methanol.n_atoms)])]],
++        layers="all",
++    )
++    volume_data = {"volume1": 32 * unit.bohr**3, "smirks": graph.as_smirks()}
++    with pytest.raises(SMIRNOFFSpecError):
++        qube.add_parameter(parameter_kwargs=volume_data)

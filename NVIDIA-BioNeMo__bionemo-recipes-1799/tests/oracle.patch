@@ -1,0 +1,158 @@
+diff --git a/recipes/esm2_peft_te/dataset.py b/recipes/esm2_peft_te/dataset.py
+index 0e3b777eda..a1bf1970de 100644
+--- a/recipes/esm2_peft_te/dataset.py
++++ b/recipes/esm2_peft_te/dataset.py
+@@ -15,6 +15,7 @@
+ 
+ import csv
+ from collections import defaultdict
++from functools import partial
+ from pathlib import Path
+ 
+ import datasets
+@@ -64,6 +65,38 @@
+ }  # '~' denotes coil / unstructured
+ 
+ 
++def tokenize_function(example, *, tokenizer, tokenize_args: dict, ss_token_map: dict[str, int]):
++    """Tokenize both the input protein sequence and the secondary structure labels."""
++    result = tokenizer(example["Sequence"], **tokenize_args)
++
++    # While we can use the rust-based tokenizer for the protein sequence, we manually encode the secondary structure
++    # labels. Our goal is to return a list of integer labels with the same shape as the input_ids.
++    labels = []
++    for batch_idx in range(len(result["input_ids"])):
++        sequence_labels = []
++
++        # This array maps the possibly-chunked result["input_ids"] to the original sequence. Because of
++        # `return_overflowing_tokens`, each input sequence may be split into multiple input rows.
++        offsets = result["offset_mapping"][batch_idx]
++
++        # This gets the original secondary structure sequence for the current chunk.
++        ss_sequence = example["Secondary_structure"][result["overflow_to_sample_mapping"][batch_idx]]
++
++        for offset_start, offset_end in offsets:
++            if offset_start == offset_end:
++                sequence_labels.append(-100)  # Start and end of the sequence tokens can be ignored.
++            elif offset_end == offset_start + 1:  # All tokens are single-character.
++                ss_char = ss_sequence[offset_start]
++                ss_label_value = ss_token_map[ss_char]  # Encode the secondary structure character
++                sequence_labels.append(ss_label_value)
++            else:
++                raise ValueError(f"Invalid offset: {offset_start} {offset_end}")
++
++        labels.append(sequence_labels)
++
++    return {"input_ids": result["input_ids"], "labels": labels}
++
++
+ def create_dataloader(
+     distributed_config: DistributedConfig,
+     use_sequence_packing: bool,
+@@ -123,36 +156,7 @@ def create_dataloader(
+         "return_offsets_mapping": True,
+     }
+ 
+-    def tokenize(example):
+-        """Tokenize both the input protein sequence and the secondary structure labels."""
+-        result = tokenizer(example["Sequence"], **tokenize_args)
+-
+-        # While we can use the rust-based tokenizer for the protein sequence, we manually encode the secondary structure
+-        # labels. Our goal is to return a list of integer labels with the same shape as the input_ids.
+-        labels = []
+-        for batch_idx in range(len(result["input_ids"])):
+-            sequence_labels = []
+-
+-            # This array maps the possibly-chunked result["input_ids"] to the original sequence. Because of
+-            # `return_overflowing_tokens`, each input sequence may be split into multiple input rows.
+-            offsets = result["offset_mapping"][batch_idx]
+-
+-            # This gets the original secondary structure sequence for the current chunk.
+-            ss_sequence = example["Secondary_structure"][result["overflow_to_sample_mapping"][batch_idx]]
+-
+-            for offset_start, offset_end in offsets:
+-                if offset_start == offset_end:
+-                    sequence_labels.append(-100)  # Start and end of the sequence tokens can be ignored.
+-                elif offset_end == offset_start + 1:  # All tokens are single-character.
+-                    ss_char = ss_sequence[offset_start]
+-                    ss_label_value = ss_token_map[ss_char]  # Encode the secondary structure character
+-                    sequence_labels.append(ss_label_value)
+-                else:
+-                    raise ValueError(f"Invalid offset: {offset_start} {offset_end}")
+-
+-            labels.append(sequence_labels)
+-
+-        return {"input_ids": result["input_ids"], "labels": labels}
++    tokenize = partial(tokenize_function, tokenizer=tokenizer, tokenize_args=tokenize_args, ss_token_map=ss_token_map)
+ 
+     train_tokenized_dataset = train_dataset.map(
+         tokenize,
+@@ -191,6 +195,7 @@ def tokenize(example):
+         batch_size=batch_size,
+         collate_fn=collator,
+         num_workers=num_workers,
++        multiprocessing_context="spawn" if num_workers > 0 else None,
+         pin_memory=True,
+     )
+ 
+@@ -232,6 +237,7 @@ def tokenize(example):
+             batch_size=val_batch_size,
+             collate_fn=collator,
+             num_workers=num_workers,
++            multiprocessing_context="spawn" if num_workers > 0 else None,
+             pin_memory=True,
+         )
+     else:
+diff --git a/recipes/esm2_peft_te/tests/test_dataset.py b/recipes/esm2_peft_te/tests/test_dataset.py
+new file mode 100644
+index 0000000000..b23fba2f1e
+--- /dev/null
++++ b/recipes/esm2_peft_te/tests/test_dataset.py
+@@ -0,0 +1,47 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import pytest
++
++from dataset import create_dataloader
++from distributed_config import DistributedConfig
++
++
++@pytest.mark.parametrize("use_sequence_packing", [False, True])
++def test_dataloader_workers_use_spawn(recipe_path, use_sequence_packing):
++    """Forked workers can inherit CUDA state (e.g. a DDP Reducer) from the parent and abort when it is destroyed."""
++    train_dataloader, _, _ = create_dataloader(
++        distributed_config=DistributedConfig(),
++        use_sequence_packing=use_sequence_packing,
++        tokenizer_name=str(recipe_path / "example_8m_checkpoint"),
++        micro_batch_size=2,
++        val_micro_batch_size=2,
++        num_workers=1,
++        max_seq_length=128,
++        stride=16,
++        seed=42,
++        ss3_classification=True,
++        load_dataset_kwargs={
++            "path": "parquet",
++            "split": "train",
++            "data_files": str(recipe_path / "data" / "peft_sanity_dataset.parquet"),
++            "streaming": True,
++        },
++    )
++
++    assert train_dataloader.multiprocessing_context.get_start_method() == "spawn"
++
++    batch = next(iter(train_dataloader))
++    assert batch["input_ids"].shape == batch["labels"].shape

@@ -1,0 +1,573 @@
+diff --git a/nvidia/cheminformatics/utils/metrics.py b/nvidia/cheminformatics/utils/metrics.py
+index 822b2dc9..c0a636b3 100644
+--- a/nvidia/cheminformatics/utils/metrics.py
++++ b/nvidia/cheminformatics/utils/metrics.py
+@@ -15,15 +15,16 @@
+ # limitations under the License.
+ 
+ import math
+-import cudf
+-import cupy
+ import pandas
+ import numpy
++from math import isnan
++import cudf
++import cupy
++from numba import cuda
+ 
+ import dask
+ import dask_cudf
+ from sklearn.metrics import silhouette_score
+-from scipy.stats import spearmanr
+ 
+ import logging
+ logger = logging.getLogger(__name__)
+@@ -98,42 +99,257 @@ def _silhouette_scores(input_data):
+     return numpy.array(scores).mean()
+ 
+ 
+-def spearman_rho(data_matrix1, data_matrix2, top_k=100):
+-    """Calculate spearman's Rho, ranked correlation coefficient
++def rankdata(data, method='average', na_option='keep', axis=1, is_symmetric=False):
++    """Rank observations for a series of samples, with tie handling
++    NOTE: due to a bug with cudf ranking, data will be transposed if row-wise ranking is
++    selected
+ 
+-    Args:
+-        data_matrix1 (2D array or dataframe): matrix with samples as rows, the reference matrix
+-        data_matrix2 (2D array or dataframe): matrix with samples as rows
++    Parameters
++    ----------
++    data : array_like
++        The array of values to be ranked.
++    method : {'average', 'min', 'max', 'dense', 'ordinal'}, optional
++        The method used to assign ranks to tied elements.
++        The following methods are available (default is 'average'):
++          * 'average': The average of the ranks that would have been assigned to
++            all the tied values is assigned to each value.
++          * 'min': The minimum of the ranks that would have been assigned to all
++            the tied values is assigned to each value.  (This is also
++            referred to as "competition" ranking.)
++          * 'max': The maximum of the ranks that would have been assigned to all
++            the tied values is assigned to each value.
++          * 'dense': Like 'min', but the rank of the next highest element is
++            assigned the rank immediately after those assigned to the tied
++            elements.
++          * 'ordinal': All values are given a distinct rank, corresponding to
++            the order that the values occur in `a`.
++    axis : {None, int}, optional
++        Axis along which to perform the ranking. Default is 1 -- samples in rows,
++        observations in columns
++    is_symmetric : {False, bool}, optional
++        Will be used to avoid additional data transpose steps if axis = 1
+ 
+-    Returns:
+-        matrix: ranked correlation coeffcients for data
++    Returns
++    -------
++    ranks : cupy ndarray
++         An array of size equal to the size of `a`, containing rank
++         scores.
++         
++    See also scipy.stats.rankdata, for which this function is a replacement
+     """
+ 
+-    assert data_matrix1.shape == data_matrix2.shape
++    dtype = cupy.result_type(data.dtype, cupy.float64)
++    data = cupy.asarray(data, dtype=dtype)
++    
++    if is_symmetric:
++        assert data.ndim == 2
++        assert data.shape[0] == data.shape[1]
++    
++    if data.ndim < 2:
++        data = data[:, None]
++    elif (data.ndim == 2) & (axis == 1) & (not is_symmetric):
++        data = data.T
++    
++    ranks = cudf.DataFrame(data).rank(axis=0, method=method, na_option=na_option)
++    ranks = ranks.values
++    
++    if axis == 1:
++        ranks = ranks.T
++    return ranks
+ 
+-    data_matrix1 = cupy.asnumpy(data_matrix1)
+-    data_matrix2 = cupy.asnumpy(data_matrix2)
+ 
+-    cupy.fill_diagonal(data_matrix1, cupy.inf)
+-    cupy.fill_diagonal(data_matrix2, cupy.inf)
++@cuda.jit()
++def _get_kth_unique_kernel(data, kth_values, k, axis):
++    """Numba kernel to get the kth unique rank from a sorted array"""
+ 
+-    data_matrix1.sort(axis=1)
+-    data_matrix2.sort(axis=1)
++    i = cuda.grid(1)
++    
++    if axis == 1:
++        vector = data[i, :]
++    else:
++        vector = data[:, i]
+ 
+-    if top_k is not None:
+-        if top_k < data_matrix1.shape[1]:
+-            data_matrix1 = data_matrix1[:, :top_k]
+-            data_matrix2 = data_matrix2[:, :top_k]
++    pos = 0
++    prev_val = cupy.NaN
++    
++    for val in vector:
++        if not isnan(val):
++            if val != prev_val:
++                prev_val = val
++                pos +=1
++
++        if pos == k:
++            break
++
++    kth_values[i] = prev_val
+ 
+-    # Includes Dask and cupy and cudf
+-    if hasattr(data_matrix1, 'device'):
+-        data_matrix1 = cupy.asnumpy(data_matrix1)
+ 
+-    if hasattr(data_matrix2, 'device'):
+-        data_matrix2 = cupy.asnumpy(data_matrix2)
++def get_kth_unique_value(data, k, axis=1):
++    """Find the kth value along an axis of a matrix on the GPU
++    
++    Parameters
++    ----------
++    data : array_like
++        The array of values to be ranked.
++    k : {int} kth unique value to be found
++    axis : {None, int}, optional
++        Axis along which to perform the ranking. Default is 1 -- samples in rows,
++        observations in columns
++
++    Returns
++    -------
++    kth_values : cupy ndarray
++         An array of kth values.
++    """
++        
++    # Coerce data into array -- make a copy since it needs to be sorted
++    # TODO -- should the sort be done in Numba kernel (and how to do it)?
++    dtype = cupy.result_type(data, cupy.float64)
++    data_id = id(data)
++    data = cupy.ascontiguousarray(data, dtype=dtype)
++    
++    if data_id == id(data): # Ensure sort is being done on a copy
++        data = data.copy()
++
++    assert data.ndim <= 2
++    
++    if data.ndim < 2:
++        if axis == 0:
++            data = data[:, None]
++        else:
++            data = data[None, :]
++    
++    if axis == 0:
++        n_obs, n_samples = data.shape
++    else:
++        n_samples, n_obs = data.shape
+         
+-    rho_value = numpy.array([spearmanr(x, y).correlation 
+-                            for x,y in zip(data_matrix1, data_matrix2)])
+-    rho_value = numpy.nanmean(rho_value)
++    data.sort(axis=axis)
++    kth_values = cupy.zeros(n_samples, dtype=data.dtype)
++    _get_kth_unique_kernel.forall(n_samples, 1)(data, kth_values, k, axis)
++    
++    if axis == 0:
++        kth_values = kth_values[None, :]
++    else:
++        kth_values = kth_values[:, None]
++    
++    return kth_values
++
++
++def corr_pairwise(x, y, return_pearson=False):
++    """Covariance and Pearson product-moment correlation coefficients on the GPU for paired data with tolerance of NaNs.
++       Curently only supports rows as samples and columns as observations.
++
++    Parameters
++    ----------
++    x : array_like
++        The baseline array of values.
++    y : array_like
++        The comparison array of values.
++
++    Returns
++    -------
++    corr : cupy ndarray
++         Array of correlation values
++    """
++    
++    def _cov_pairwise(x1, x2, factor):
++        return cupy.nansum(x1 * x2, axis=1, keepdims=True) * cupy.true_divide(1, factor)
++
++    # Coerce arrays into 2D format and set dtype
++    dtype = cupy.result_type(x, y, cupy.float64)
++    x = cupy.asarray(x, dtype=dtype)
++    y = cupy.asarray(y, dtype=dtype)
++
++    assert x.shape == y.shape
++    if x.ndim < 2:
++        x = x[None, :]
++        y = y[None, :]
++    n_samples, n_obs = x.shape
++    
++    # Calculate degrees of freedom for each sample pair
++    ddof = 1
++    nan_count = (cupy.isnan(x) | cupy.isnan(y)).sum(axis=1, keepdims=True)
++    fact = n_obs - nan_count - ddof
++    
++    # Mean normalize
++    x -= cupy.nanmean(x, axis=1, keepdims=True)
++    y -= cupy.nanmean(y, axis=1, keepdims=True)
++    
++    # Calculate covariance matrix
++    corr = _cov_pairwise(x, y, fact)
++    
++    if return_pearson:
++        x_corr = _cov_pairwise(x, x, fact)
++        y_corr = _cov_pairwise(y, y, fact)
++        auto_corr = cupy.sqrt(x_corr) * cupy.sqrt(y_corr)
++        corr = corr / auto_corr
++        corr = cupy.clip(corr.real, -1, 1, out=corr.real)
++        return corr
++    
++    return corr.squeeze()
++
++
++def spearmanr(x, y, axis=1, top_k=None):
++    """GPU implementation of Spearman R correlation coefficient for paired data with NaN support
++    
++    Parameters
++    ----------
++    x : array_like
++        The baseline array of values.
++    y : array_like
++        The comparison array of values.
++    axis : {None, int}, optional
++        Axis along which to perform the ranking. Default is 1 -- samples in rows,
++        observations in columns
++    top_k : {int} kth unique value to be found
++
++    Returns
++    -------
++    spearmanr_array : cupy ndarray
++         Array of spearmanr rank correlation values
++    """
++
++    x = cupy.array(x, copy=True)
++    y = cupy.array(y, copy=True)
++
++    assert x.ndim <= 2
++    assert x.shape == y.shape
++
++    if x.ndim < 2:
++        if axis == 0:
++            x = x[:, None]
++            y = y[:, None]
++        else:
++            x = x[None, :]
++            y = y[None, :]
++
++    if axis == 0:
++        n_obs, n_samples = x.shape
++    else:
++        n_samples, n_obs = x.shape
++    
++    n_obs -= 1
++    assert n_obs > 2
++
++    # Force diagonal to be last in ranking so it can be ignored
++    cupy.fill_diagonal(x, cupy.NaN)
++    cupy.fill_diagonal(y, cupy.NaN)
++
++    ranks_x = rankdata(x, axis=axis, method='average', na_option='keep')
++    ranks_y = rankdata(y, axis=axis, method='average', na_option='keep')
++
++    # cudf does not currently preserve the NaNs, even with na_option='keep' so add them back
++    cupy.fill_diagonal(ranks_x, cupy.NaN)
++    cupy.fill_diagonal(ranks_y, cupy.NaN)
++
++    # Filter out values above top k
++    if top_k is not None:
++        if top_k <= n_obs:
++            top_k_values = get_kth_unique_value(ranks_x, top_k, axis=axis)
++            mask = ranks_x > top_k_values
++            ranks_x[mask] = cupy.NaN
++            ranks_y[mask] = cupy.NaN
+ 
+-    return rho_value
++    spearmanr_array = corr_pairwise(ranks_x, ranks_y, return_pearson=True).squeeze()
++    return spearmanr_array
+diff --git a/nvidia/cheminformatics/wf/cluster/cpukmeansumap.py b/nvidia/cheminformatics/wf/cluster/cpukmeansumap.py
+index 27d3fe31..6ffb668b 100644
+--- a/nvidia/cheminformatics/wf/cluster/cpukmeansumap.py
++++ b/nvidia/cheminformatics/wf/cluster/cpukmeansumap.py
+@@ -26,7 +26,7 @@
+ from cuml.metrics import pairwise_distances
+ 
+ from . import BaseClusterWorkflow
+-from nvidia.cheminformatics.utils.metrics import batched_silhouette_scores, spearman_rho
++from nvidia.cheminformatics.utils.metrics import batched_silhouette_scores, spearmanr
+ from nvidia.cheminformatics.utils.distance import tanimoto_calculate
+ from nvidia.cheminformatics.data import ClusterWfDAO
+ from nvidia.cheminformatics.data.cluster_wf import ChemblClusterWfDao
+@@ -66,7 +66,7 @@ def _compute_spearman_rho(self, mol_df, X_train):
+ 
+         dist_array_tani = tanimoto_calculate(fp_sample, calc_distance=True)
+         dist_array_eucl = pairwise_distances(Xt_sample)
+-        return spearman_rho(dist_array_tani, dist_array_eucl, top_k=100)
++        return cupy.nanmean(spearmanr(dist_array_tani, dist_array_eucl, top_k=100))
+ 
+     def cluster(self,
+                 df_molecular_embedding=None,
+diff --git a/nvidia/cheminformatics/wf/cluster/gpukmeansumap.py b/nvidia/cheminformatics/wf/cluster/gpukmeansumap.py
+index edb4eb39..1150bece 100644
+--- a/nvidia/cheminformatics/wf/cluster/gpukmeansumap.py
++++ b/nvidia/cheminformatics/wf/cluster/gpukmeansumap.py
+@@ -95,8 +95,7 @@ def _compute_spearman_rho(self, embedding, X_train, Xt):
+ 
+         dist_array_tani = tanimoto_calculate(fp_sample, calc_distance=True)
+         dist_array_eucl = pairwise_distances(Xt_sample)
+-
+-        return spearman_rho(dist_array_tani, dist_array_eucl, top_k=100)
++        return cupy.nanmean(spearmanr(dist_array_tani, dist_array_eucl, top_k=100))
+ 
+     def _cluster(self, embedding, n_pca):
+         """
+diff --git a/tests/test_metrics.py b/tests/test_metrics.py
+index 1b222990..a7ddc7e0 100644
+--- a/tests/test_metrics.py
++++ b/tests/test_metrics.py
+@@ -13,30 +13,33 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-
+ import pytest
+ import sys
+ import os
+ 
+ import pandas as pd
+ import numpy as np
+-import cupy
+-import cudf
++from math import isnan
++
++from scipy.stats import rankdata as rankdata_cpu
++from scipy.stats import spearmanr as spearmanr_cpu
++from sklearn.metrics import silhouette_score
+ 
+-from sklearn.metrics import silhouette_score, pairwise_distances
+-from scipy.stats import spearmanr
+ from rdkit import Chem
+ from rdkit.Chem import AllChem
+ from rdkit.DataManip.Metric import GetTanimotoDistMat
+ 
++import cupy
++import cudf
++from cuml.metrics import pairwise_distances
++
+ # Define paths
+-# _this_directory = os.path.dirname(os.path.realpath(__file__))
+-_this_directory = '/workspace/tests'
++_this_directory = os.path.dirname(os.path.realpath(__file__))
+ _parent_directory = os.path.dirname(_this_directory)
+-sys.path.insert(0, _parent_directory)  # TODO better way to add this directory to the path
++sys.path.insert(0, _parent_directory)  # TODO is there a better way to add nvidia directory to the path
+ 
++from nvidia.cheminformatics.utils.metrics import batched_silhouette_scores, rankdata, get_kth_unique_value, corr_pairwise, spearmanr
+ from nvidia.cheminformatics.utils.distance import tanimoto_calculate
+-from nvidia.cheminformatics.utils.metrics import batched_silhouette_scores, spearman_rho
+ 
+ _data_dir = os.path.join(_this_directory, 'data')
+ benchmark_approved_drugs_path = os.path.join(_data_dir, 'benchmark_approved_drugs.csv')
+@@ -46,7 +49,60 @@
+ # Test parameters
+ run_tanimoto_params = [(benchmark_approved_drugs_path, 'canonical_smiles')]
+ run_silhouette_score_params = [(pca_approved_drugs_path, 'clusters')]
+-run_spearman_rho_params = [(pca_approved_drugs_path, fingerprint_approved_drugs_path, 'clusters', 2, 10, 0.99547)]
++run_rankdata_params = [(10, 10, 5, 0), (10, 10, 5, 1), (10, 20, 10, 0), (10, 20, 10, 1)]
++run_corr_pairwise = [(10, 10, 5, 0), (10, 10, 5, 2), (10, 20, 10, 0), (10, 20, 10, 5)]
++run_get_kth_unique_value_params = [(10, 10, 5, 2, 0), (10, 10, 5, 2, 1),
++                                   (10, 20, 10, 5, 0), (10, 20, 10, 5, 1), (10, 20, 10, 100, 1)]
++run_spearman_rho_params = [(pca_approved_drugs_path, fingerprint_approved_drugs_path, 'clusters', 2, 100)]
++
++
++# Accessory functions
++def _random_nans(data1, data2, num_nans):
++    """Randomly add NaNs in identical positions to two numpy arrays"""
++    n_rows, n_cols = data1.shape
++    row_array = np.random.choice(np.arange(0, n_rows), num_nans)
++    col_array = np.random.choice(np.arange(0, n_cols), num_nans)
++    data1[row_array, col_array] = np.NaN
++    data2[row_array, col_array] = np.NaN
++
++    return data1, data2
++
++
++def _rowwise_numpy_corr(data1, data2, func):
++    """Pariwise correlation function on CPU"""
++    corr_array = []
++    for d1, d2 in zip(data1, data2):
++        mask = np.invert(np.isnan(d1) | np.isnan(d2))
++        val = func(d1[mask], d2[mask])
++        if hasattr(val, 'correlation'):
++            val = val.correlation
++        if hasattr(val, '__len__'):
++            val = val[1, 0]
++        corr_array.append(val)
++
++    return np.array(corr_array)
++
++
++def _get_kth_unique_array_cpu(data, k, axis):
++    """Return kth unique values for a sorted array along row/column"""
++    data = data.T if axis == 0 else data
++    kth_values = []
++
++    for vector in data:
++        pos = 0
++        prev_val = np.NaN
++
++        for val in vector:
++            if not isnan(val):
++                if val != prev_val:
++                    prev_val = val
++                    pos += 1
++
++            if pos == k:
++                break
++
++        kth_values.append(prev_val)
++    return np.array(kth_values)
+ 
+ 
+ # The unit tests
+@@ -90,30 +146,102 @@ def test_run_silhouette_score(pca_approved_csv, cluster_column):
+     assert np.allclose(score_cpu, score_gpu1) & np.allclose(score_cpu, score_gpu2)
+ 
+ 
+-@pytest.mark.parametrize('pca_approved_drugs_csv, fingerprint_approved_drugs_csv, cluster_column, n_dims_eucl_data, top_k, top_k_value', run_spearman_rho_params)
+-def test_run_spearman_rho(pca_approved_drugs_csv, fingerprint_approved_drugs_csv, cluster_column, n_dims_eucl_data, top_k, top_k_value):
+-    """Validate the spearman rho score"""
++@pytest.mark.parametrize('n_rows, n_cols, max_int, axis', run_rankdata_params)
++def test_run_rankdata(n_rows, n_cols, max_int, axis):
++    """Test the GPU ranking function relative to the CPU baseline"""
++    # TODO Add tests for ranking with NaNs once it's fixed in cuDF
++
++    # Use integers to ensure there will be ties
++    data = np.random.randint(0, max_int, (n_rows, n_cols)).astype(np.float)
++    rank_cpu = rankdata_cpu(data, axis=axis)
++    rank_gpu = rankdata(cupy.asarray(data), axis=axis)
++    assert np.allclose(rank_cpu, cupy.asnumpy(rank_gpu))
++
++    if n_rows == n_cols:
++        data2 = data * data.T
++        rank_cpu2 = rankdata_cpu(data2, axis=axis)
++        rank_gpu2 = rankdata(cupy.asarray(data2), axis=axis, is_symmetric=True)
++        assert np.allclose(rank_cpu2, cupy.asnumpy(rank_gpu2))
++
++
++@pytest.mark.parametrize('n_rows, n_cols, max_int, num_nans', run_corr_pairwise)
++def test_run_corr_pairwise(n_rows, n_cols, max_int, num_nans):
++    """Test the pairwise covariance matrix calculation and the Pearson correlation coefficient"""
++
++    data1c = np.random.randint(0, max_int, (n_rows, n_cols)).astype(np.float)
++    data2c = np.random.randint(0, max_int, (n_rows, n_cols)).astype(np.float)
++
++    if num_nans > 0:
++        data1c, data2c = _random_nans(data1c, data2c, num_nans)
++
++    data1g = cupy.array(data1c)
++    data2g = cupy.array(data2c)
++
++    # Covariance matrix
++    cov_cpu = _rowwise_numpy_corr(data1c, data2c, np.cov)
++    cov_gpu = corr_pairwise(data1g, data2g, False).squeeze()
++    assert np.allclose(cov_cpu, cupy.asnumpy(cov_gpu), equal_nan=True)
++
++    # Pearson correlation
++    corcoef_cpu = _rowwise_numpy_corr(data1c, data2c, np.corrcoef)
++    corcoef_gpu = corr_pairwise(data1g, data2g, True).squeeze()
++    assert np.allclose(corcoef_cpu, cupy.asnumpy(corcoef_gpu), equal_nan=True)
++
++
++@pytest.mark.parametrize('n_rows, n_cols, max_int, top_k, axis', run_get_kth_unique_value_params)
++def test_run_get_kth_unique_value(n_rows, n_cols, max_int, top_k, axis):
++    """Test the GPU function to get the kth unique value relative to the CPU baseline"""
++
++    data = np.random.randint(0, max_int, (n_rows, n_cols)).astype(np.float)
++    data = rankdata_cpu(data, axis=axis)
++    data.sort(axis=axis)
++
++    # Test without NaNs
++    kth_values_cpu = _get_kth_unique_array_cpu(data, top_k, axis)
++    kth_values_gpu = get_kth_unique_value(cupy.array(data), top_k, axis=axis).squeeze()
++    assert np.allclose(kth_values_cpu, cupy.asnumpy(kth_values_gpu), equal_nan=True)
++
++    # And with NaNs
++    np.fill_diagonal(data, np.NaN)
++    data[2, :] = np.NaN
++
++    kth_values_cpu = _get_kth_unique_array_cpu(data, top_k, axis)
++    kth_values_gpu = get_kth_unique_value(cupy.array(data), top_k, axis=axis).squeeze()
++    assert np.allclose(kth_values_cpu, cupy.asnumpy(kth_values_gpu), equal_nan=True)
++
++
++@pytest.mark.parametrize('pca_approved_drugs_csv, fingerprint_approved_drugs_csv, cluster_column, n_dims_eucl_data, top_k', run_spearman_rho_params)
++def test_run_spearman_rho(pca_approved_drugs_csv, fingerprint_approved_drugs_csv, cluster_column, n_dims_eucl_data, top_k):
++    """Validate the spearman rho scoring"""
+ 
+     # Load PCA data to use as Euclidean distances
+     pca_data = pd.read_csv(pca_approved_drugs_csv).set_index('molregno').drop(cluster_column, axis=1)
+     float_data = pca_data[pca_data.columns[:n_dims_eucl_data]]
+-    pairwise_eucl_dist = pairwise_distances(float_data)
+-    np.fill_diagonal(pairwise_eucl_dist, np.inf)
++    euclidean_dist = pairwise_distances(cupy.array(float_data))
+ 
+-    # Load fingerprints for tanimoto distances
++    # Load fingerprints and calculate tanimoto distance
+     fp_data = pd.read_csv(fingerprint_approved_drugs_csv).set_index('molregno')
+     tanimoto_dist = tanimoto_calculate(cupy.array(fp_data), calc_distance=True)
+-    cupy.fill_diagonal(tanimoto_dist, cupy.inf)
+-
+-    # Check small amount of data (top_k) for absolute value
+-    top_k_value_check = spearman_rho(pairwise_eucl_dist, tanimoto_dist, top_k=top_k)
+-    assert np.allclose(top_k_value_check, np.round(top_k_value, 5))
+ 
+     # Check all data compared to the CPU version
+-    top_k_all_data = pairwise_eucl_dist.shape[1]  # - 1
+-    all_data_gpu = spearman_rho(pairwise_eucl_dist, tanimoto_dist, top_k=top_k_all_data)
++    all_data_gpu = spearmanr(tanimoto_dist, euclidean_dist)
+ 
++    euclidean_dist_cpu = cupy.asnumpy(euclidean_dist)
+     tanimoto_dist_cpu = cupy.asnumpy(tanimoto_dist)
+-    all_data_cpu = np.array([spearmanr(x, y).correlation for x, y in zip(pairwise_eucl_dist, tanimoto_dist_cpu)])
+-    all_data_cpu = np.nanmean(all_data_cpu)
+-    # assert np.allclose(all_data_gpu, all_data_cpu) # TODO debug this
++    all_data_cpu = _rowwise_numpy_corr(tanimoto_dist_cpu, euclidean_dist_cpu, spearmanr_cpu)
++
++    cupy.allclose(cupy.array(all_data_cpu), all_data_gpu, atol=0.005, equal_nan=True)
++
++    # Check using top k calculation compared to the CPU version
++    top_k_data_gpu = spearmanr(tanimoto_dist, euclidean_dist, top_k=top_k, axis=1)
++
++    cupy.fill_diagonal(tanimoto_dist, cupy.NaN)
++    kth_lim = get_kth_unique_value(tanimoto_dist, top_k, axis=1)
++    mask = tanimoto_dist > kth_lim
++    tanimoto_dist[mask] = cupy.NaN
++    euclidean_dist[mask] = cupy.NaN
++    euclidean_dist_cpu = cupy.asnumpy(euclidean_dist)
++    tanimoto_dist_cpu = cupy.asnumpy(tanimoto_dist)
++    top_k_data_cpu = _rowwise_numpy_corr(tanimoto_dist_cpu, euclidean_dist_cpu, spearmanr_cpu)
++
++    cupy.allclose(cupy.array(top_k_data_cpu), top_k_data_gpu, atol=0.005, equal_nan=True)

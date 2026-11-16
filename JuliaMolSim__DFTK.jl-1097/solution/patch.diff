@@ -1,0 +1,230 @@
+diff --git a/src/gpu/gpu_arrays.jl b/src/gpu/gpu_arrays.jl
+index 6f71320372..a465cbc7a3 100644
+--- a/src/gpu/gpu_arrays.jl
++++ b/src/gpu/gpu_arrays.jl
+@@ -5,14 +5,6 @@ using Preferences
+ # https://github.com/JuliaGPU/CUDA.jl/issues/1565
+ LinearAlgebra.dot(x::AbstractGPUArray, D::Diagonal, y::AbstractGPUArray) = x' * (D * y)
+ 
+-function lowpass_for_symmetry!(ρ::AbstractGPUArray, basis; symmetries=basis.symmetries)
+-    all(isone, symmetries) && return ρ
+-    # lowpass_for_symmetry! currently uses scalar indexing, so we have to do this very ugly
+-    # thing for cases where ρ sits on a device (e.g. GPU)
+-    ρ_CPU = lowpass_for_symmetry!(to_cpu(ρ), basis; symmetries)
+-    ρ .= to_device(basis.architecture, ρ_CPU)
+-end
+-
+ for fun in (:potential_terms, :kernel_terms)
+     @eval function DftFunctionals.$fun(fun::DispatchFunctional, ρ::AT,
+                                        args...) where {AT <: AbstractGPUArray{Float64}}
+diff --git a/src/symmetry.jl b/src/symmetry.jl
+index 16c0621e17..8f3a19101b 100644
+--- a/src/symmetry.jl
++++ b/src/symmetry.jl
+@@ -269,48 +269,58 @@ function apply_symop(symop::SymOp, basis, ρin; kwargs...)
+ end
+ 
+ # Accumulates the symmetrized versions of the density ρin into ρout (in Fourier space).
+-# No normalization is performed
++# No normalization is performed. This function is optimized for CPU and GPU.
+ function accumulate_over_symmetries!(ρaccu, ρin, basis::PlaneWaveBasis{T}, symmetries) where {T}
+-    for symop in symmetries
+-        # Common special case, where ρin does not need to be processed
+-        if isone(symop)
+-            ρaccu .+= ρin
+-            continue
+-        end
+-
+-        # Transform ρin -> to the partial density at S * k.
+-        #
+-        # Since the eigenfunctions of the Hamiltonian at k and Sk satisfy
+-        #      u_{Sk}(x) = u_{k}(S^{-1} (x - τ))
+-        # with Fourier transform
+-        #      ̂u_{Sk}(G) = e^{-i G \cdot τ} ̂u_k(S^{-1} G)
+-        # equivalently
+-        #     ρ ̂_{Sk}(G) = e^{-i G \cdot τ} ̂ρ_k(S^{-1} G)
+-        invS = Mat3{Int}(inv(symop.S))
+-        for (ig, G) in enumerate(G_vectors_generator(basis.fft_size))
+-            igired = index_G_vectors(basis, invS * G)
+-            isnothing(igired) && continue
+-
+-            if iszero(symop.τ)
+-                @inbounds ρaccu[ig] += ρin[igired]
+-            else
+-                factor = cis2pi(-T(dot(G, symop.τ)))
+-                @inbounds ρaccu[ig] += factor * ρin[igired]
+-            end
++    # For each G vector and symmetry S:
++    # Transform ρin -> to the partial density at S * k.
++    #
++    # Since the eigenfunctions of the Hamiltonian at k and Sk satisfy
++    #      u_{Sk}(x) = u_{k}(S^{-1} (x - τ))
++    # with Fourier transform
++    #      ̂u_{Sk}(G) = e^{-i G \cdot τ} ̂u_k(S^{-1} G)
++    # equivalently
++    #     ρ ̂_{Sk}(G) = e^{-i G \cdot τ} ̂ρ_k(S^{-1} G)
++    Gs = reshape(G_vectors(basis), size(ρaccu))
++    fft_size = basis.fft_size
++
++    # Need to transfer  symmetry data to the GPU as isbit data
++    symm_invS = to_device(basis.architecture, [Mat3{Int}(inv(symop.S)) for symop in symmetries])
++    symm_τ = to_device(basis.architecture, [symop.τ for symop in symmetries])
++    n_symm = length(symmetries)
++
++    # Looping over symmetries inside of map! on G vectors allow for a single GPU kernel launch
++    map!(ρaccu, Gs) do G
++        acc = zero(complex(T))
++        # Explicit loop over indicies because AMDGPU does not support zip() in map!
++        for i_symm in 1:n_symm
++            invS = symm_invS[i_symm]
++            τ = symm_τ[i_symm]
++            idx = index_G_vectors(fft_size, invS * G)
++            acc += isnothing(idx) ? zero(complex(T)) : cis2pi(-T(dot(G, τ))) * ρin[idx]
+         end
+-    end  # symop
++        acc
++    end
+     ρaccu
+ end
+ 
+ # Low-pass filters ρ (in Fourier) so that symmetry operations acting on it stay in the grid
++# This function is optimized for CPU and GPU.
+ function lowpass_for_symmetry!(ρ::AbstractArray, basis; symmetries=basis.symmetries)
+-    for symop in symmetries
+-        isone(symop) && continue
+-        for (ig, G) in enumerate(G_vectors_generator(basis.fft_size))
+-            if index_G_vectors(basis, symop.S * G) === nothing
+-                ρ[ig] = 0
+-            end
++    all(isone, symmetries) && return ρ
++
++    Gs = reshape(G_vectors(basis), size(ρ))
++    fft_size = basis.fft_size
++
++    symm_S = to_device(basis.architecture, [symop.S for symop in symmetries])
++
++    # Loop structure optimized for both CPU and GPU
++    map!(ρ, ρ, Gs) do ρ_i, G
++        acc = ρ_i
++        for S in symm_S
++            idx = index_G_vectors(fft_size, S * G)
++            acc *= isnothing(idx) ? 0 : 1
+         end
++        acc
+     end
+     ρ
+ end
+@@ -320,7 +330,7 @@ Symmetrize a density by applying all the basis (by default) symmetries and formi
+ """
+ @views @timing function symmetrize_ρ(basis, ρ::AbstractArray{T};
+                                      symmetries=basis.symmetries, do_lowpass=true) where {T}
+-    ρin_fourier  = to_cpu(fft(basis, ρ))
++    ρin_fourier  = fft(basis, ρ)
+     ρout_fourier = zero(ρin_fourier)
+     for σ = 1:size(ρ, 4)
+         accumulate_over_symmetries!(ρout_fourier[:, :, :, σ],
+@@ -328,7 +338,7 @@ Symmetrize a density by applying all the basis (by default) symmetries and formi
+         do_lowpass && lowpass_for_symmetry!(ρout_fourier[:, :, :, σ], basis; symmetries)
+     end
+     inv_fft = T <: Real ? irfft : ifft
+-    inv_fft(basis, to_device(basis.architecture, ρout_fourier) ./ length(symmetries))
++    inv_fft(basis, ρout_fourier ./ length(symmetries))
+ end
+ 
+ """
+diff --git a/src/terms/hartree.jl b/src/terms/hartree.jl
+index bed22ab97b..b14a5715bd 100644
+--- a/src/terms/hartree.jl
++++ b/src/terms/hartree.jl
+@@ -28,19 +28,18 @@ struct TermHartree <: TermNonlinear
+ end
+ function compute_poisson_green_coeffs(basis::PlaneWaveBasis{T}, scaling_factor;
+                                       q=zero(Vec3{T})) where {T}
+-    model = basis.model
++    recip_lattice = basis.model.recip_lattice
+ 
+     # Solving the Poisson equation ΔV = -4π ρ in Fourier space
+     # is multiplying elementwise by 4π / |G|^2.
+-    poisson_green_coeffs = 4T(π) ./ [sum(abs2, model.recip_lattice * (G + q))
+-                                     for G in to_cpu(G_vectors(basis))]
++    poisson_green_coeffs = map(G -> 4T(π) / sum(abs2, recip_lattice * (G + q)),
++                               G_vectors(basis))
+     if iszero(q)
+         # Compensating charge background => Zero DC.
+         GPUArraysCore.@allowscalar poisson_green_coeffs[1] = 0
+         # Symmetrize Fourier coeffs to have real iFFT.
+         enforce_real!(poisson_green_coeffs, basis)
+     end
+-    poisson_green_coeffs = to_device(basis.architecture, poisson_green_coeffs)
+     scaling_factor .* poisson_green_coeffs
+ end
+ function TermHartree(basis::PlaneWaveBasis{T}, scaling_factor) where {T}
+diff --git a/test/symmetry_issues.jl b/test/symmetry_issues.jl
+index f104fab830..8aa6a040fb 100644
+--- a/test/symmetry_issues.jl
++++ b/test/symmetry_issues.jl
+@@ -28,49 +28,32 @@
+     @testset "Inlining" begin
+         using PseudoPotentialData
+ 
+-        # Test that the index_G_vectors function is properly inlined by comparing timing
+-        # with a locally defined function known not to be inlined. Issue initially tackled
+-        # in PR https://github.com/JuliaMolSim/DFTK.jl/pull/1025
+-        function index_G_vectors_slow(basis, G::AbstractVector{<:Integer})
+-            start = .- cld.(basis.fft_size .- 1, 2)
+-            stop  = fld.(basis.fft_size .- 1, 2)
+-            lengths = stop .- start .+ 1
+-
+-            # FFTs store wavevectors as [0 1 2 3 -2 -1] (example for N=5)
+-            function G_to_index(length, G)
+-                G >= 0 && return 1 + G
+-                return 1 + length + G
+-            end
+-            if all(start .<= G .<= stop)
+-                CartesianIndex(Tuple(G_to_index.(lengths, G)))
+-            else
+-                nothing  # Outside range of valid indices
+-            end
+-        end
++        # Test that the index_G_vectors function is properly inlined.
++        # Issue initially tackled in PR https://github.com/JuliaMolSim/DFTK.jl/pull/1025
+ 
+         # This is a bare-bone version of the accumulate_over_symmetries() function, only
+         # keeping calls to the index_G_vectors() function for which we test inlining
+-        function G_vectors_calls(basis, test_func)
++        function G_vectors_calls(basis)
+             for symop in basis.symmetries
+                 invS = Mat3{Int}(inv(symop.S))
+                 for (ig, G) in enumerate(DFTK.G_vectors_generator(basis.fft_size))
+-                    igired = test_func(basis, invS * G)
++                    igired = DFTK.index_G_vectors(basis, invS * G)
+                 end
+             end
+         end
+ 
+-        silicon = TestCases.silicon
+-        Si = ElementPsp(silicon.atnum, PseudoFamily("cp2k.nc.sr.lda.v0_1.semicore.gth"))
+-        atoms = [Si, Si]
+-        model = model_DFT(silicon.lattice, atoms, silicon.positions;
+-                          functionals=[:lda_x, :lda_c_vwn])
+-        Ecut = 32
+-        kgrid = [1, 1, 1]
+-        basis = PlaneWaveBasis(model; Ecut, kgrid)
++        # If a function is inlined, its name disappers from the output of code_typed(;optimize=true)
++        # When optimize=false, the function is not inlined and we can see its name in the output.
++        function is_inlined(optimize)
++            info = code_typed(G_vectors_calls, (DFTK.PlaneWaveBasis,), optimize=optimize)
++            codeinfo = first(info).first
++            output = sprint(show, MIME"text/plain"(), codeinfo.code)
++            return !occursin("index_G_vectors", output)
++        end
+ 
+-        actual_alloc = @allocated G_vectors_calls(basis, DFTK.index_G_vectors)
+-        slow_alloc = @allocated G_vectors_calls(basis, index_G_vectors_slow)
+-        @test slow_alloc > actual_alloc
++        # Test that the index_G_vectors function is inlined
++        @test is_inlined(true)
++        @test !is_inlined(false)
+     end
+ end
+ 

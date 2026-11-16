@@ -1,0 +1,1039 @@
+diff --git a/docs/superpowers/plans/2026-07-24-gaussian-irc-point-alignment.md b/docs/superpowers/plans/2026-07-24-gaussian-irc-point-alignment.md
+new file mode 100644
+index 000000000..7da028fcc
+--- /dev/null
++++ b/docs/superpowers/plans/2026-07-24-gaussian-irc-point-alignment.md
+@@ -0,0 +1,331 @@
++# Gaussian IRC Point Alignment Implementation Plan
++
++> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
++
++**Goal:** Make PR #539 associate every Gaussian IRC point with the final geometry and SCF energy from that point's own output interval, so correction iterations cannot shift frames or discard the endpoint.
++
++**Architecture:** Parse `Point Number` markers as interval boundaries instead of collecting geometry, energy, and markers into independent arrays. Each completed interval yields one aligned record; checkpoint TS data fills only a missing point-zero record. TypeScript and Python implement the same record model and ordering contract.
++
++**Tech Stack:** TypeScript, Python 3.11, Vitest, pytest, Gaussian text output.
++
++## Global Constraints
++
++- Preserve ordinary Gaussian orientation deduplication and Input-orientation fallback.
++- Preserve physical IRC ordering: Path 2 endpoint → transition state → Path 1 endpoint.
++- Never associate geometry, energy, and point metadata by independent global-array index.
++- For an interval with multiple correction iterations, retain its final valid geometry and final SCF energy.
++- Ignore orientation/energy blocks printed after the IRC summary.
++- Keep Python and TypeScript behavior in parity.
++- Follow strict TDD and commit after each task.
++- Every shell command starts with `rtk`.
++- Do not stage or modify `.claude/gate-approvals/`, `.claude/tmp-dump.traj`, or `.superpowers/`.
++
++---
++
++## File map
++
++- Modify `src/lib/trajectory/parsers/gaussian.ts`: marker-bound interval records and trajectory construction.
++- Modify `tests/vitest/trajectory/gaussian.test.ts`: realistic marker ordering and multi-correction regression.
++- Modify `scripts/parse_gaussian.py`: Python interval-record parity.
++- Modify `tests/test_parse_gaussian.py`: Python multi-correction regression and endpoint checks.
++
++---
++
++### Task 1: TypeScript interval-aligned IRC records
++
++**Files:**
++- Modify: `src/lib/trajectory/parsers/gaussian.ts`
++- Modify: `tests/vitest/trajectory/gaussian.test.ts`
++
++**Interfaces:**
++- Produces:
++  - `GaussianIrcRecord { point, path, geometry, energy }`
++  - `parse_irc_records(content, lines): GaussianIrcRecord[] | undefined`
++- Consumes: existing orientation and checkpoint parsers.
++
++- [ ] **Step 1: Rewrite the synthetic fixture in actual completed-point order**
++
++Add a helper that prints all geometry/SCF attempts before the marker that
++completes the point:
++
++```ts
++const completed_point = (
++  point_number: number,
++  path_number: number,
++  attempts: Array<{ x: number; energy: number }>,
++) => attempts.map(({ x, energy }) =>
++  orientation_block(`Input orientation`, x) + scf_energy(energy)
++).join(``) + point(point_number, path_number)
++```
++
++Checkpoint point zero remains a marker with no preceding orientation/SCF; it is
++filled from `Redundant internal coordinates` and `Energy From Chk`.
++
++- [ ] **Step 2: Add the failing correction-iteration regression**
++
++```ts
++it(`keeps the final correction geometry and energy inside each IRC point`, () => {
++  const content = ` IRC-IRC-IRC-IRC-IRC-
++ Redundant internal coordinates found in file.  (old form).
++ C,0,0.000000,0.000000,0.000000
++ Recover connectivity data from disk.
++ Energy From Chk = -10.00000000
++${point(0, 1)}
++${completed_point(1, 1, [
++  { x: 1.1, energy: -10.01 },
++  { x: 1.0, energy: -10.10 },
++])}
++${completed_point(2, 1, [{ x: 2.0, energy: -10.20 }])}
++${completed_point(1, 2, [{ x: -1.0, energy: -10.30 }])}
++${completed_point(2, 2, [{ x: -2.0, energy: -10.40 }])}
++${irc_summary}
++${orientation_block(`Input orientation`, 999)}
++${scf_energy(-99)}
++`
++
++  const trajectory = parse_gaussian_output(content)
++
++  expect(trajectory.frames.map((frame) => frame.structure.sites[0].xyz[0])).toEqual([
++    -2, -1, 0, 1, 2,
++  ])
++  expect(trajectory.frames.map((frame) => frame.metadata?.energy)).toEqual([
++    -10.4, -10.3, -10, -10.1, -10.2,
++  ].map((value) => value * 27.211386245988))
++  expect(trajectory.frames.some((frame) => frame.structure.sites[0].xyz[0] === 1.1)).toBe(false)
++  expect(trajectory.frames.some((frame) => frame.structure.sites[0].xyz[0] === 999)).toBe(false)
++})
++```
++
++- [ ] **Step 3: Run the test and verify RED**
++
++```bash
++rtk pnpm vitest run tests/vitest/trajectory/gaussian.test.ts
++```
++
++Expected: FAIL because global-array indexing selects the intermediate attempt,
++shifts following records, or drops the final endpoint.
++
++- [ ] **Step 4: Implement interval records**
++
++Define:
++
++```ts
++type GaussianIrcRecord = {
++  point: number
++  path: number
++  geometry: GaussianGeometry
++  energy: number
++}
++```
++
++Use `matchAll` to retain each marker's `index`. For marker `i`, inspect only the
++text after marker `i - 1` and before marker `i`; choose the final preferred
++orientation and final `SCF Done` value in that interval.
++
++```ts
++const marker_matches = [...content.matchAll(
++  /Point Number:\s*(\d+)\s+Path Number:\s*(\d+)/g,
++)]
++const irc_start = content.lastIndexOf(`IRC-IRC-IRC-`, marker_matches[0].index)
++
++for (let idx = 0; idx < marker_matches.length; idx++) {
++  const marker = marker_matches[idx]
++  const interval_start = idx === 0
++    ? Math.max(0, irc_start)
++    : marker_matches[idx - 1].index! + marker_matches[idx - 1][0].length
++  const interval = content.slice(interval_start, marker.index)
++  const geometries = parse_orientation_blocks(
++    interval.split(/\r?\n/),
++    preferred_orientation,
++  )
++  const energies = parse_scf_energies(interval)
++  let geometry = geometries.at(-1)
++  let energy = energies.at(-1)
++
++  const point = Number(marker[1])
++  const path = Number(marker[2])
++  if (point === 0) {
++    geometry ??= checkpoint_geometry
++    energy ??= checkpoint_energy
++  }
++  if (!geometry || energy === undefined) return undefined
++  records.push({ point, path, geometry, energy })
++}
++```
++
++Extract `parse_scf_energies(content)` so interval and ordinary parsing use one
++number conversion.
++
++Build frames from records, not `raw_geometries`, `raw_energies`, or
++`ordered_indices` into unrelated arrays:
++
++```ts
++const ordered_records = [
++  ...records.filter(({ path }) => path === 2).reverse(),
++  ...records.filter(({ path }) => path === 1),
++]
++```
++
++The summary is outside every completed-point interval and cannot contribute a
++geometry or energy.
++
++- [ ] **Step 5: Run TypeScript tests and verify GREEN**
++
++```bash
++rtk pnpm vitest run tests/vitest/trajectory/gaussian.test.ts
++```
++
++Expected: all Gaussian parser tests PASS.
++
++- [ ] **Step 6: Commit**
++
++```bash
++rtk git add \
++  src/lib/trajectory/parsers/gaussian.ts \
++  tests/vitest/trajectory/gaussian.test.ts
++rtk git commit -m "fix(trajectory): align Gaussian IRC point records"
++```
++
++---
++
++### Task 2: Python parser parity
++
++**Files:**
++- Modify: `scripts/parse_gaussian.py`
++- Modify: `tests/test_parse_gaussian.py`
++
++**Interfaces:**
++- Produces: `_parse_irc_records(content, orientation)` with record dictionaries.
++- Consumes: `_parse_orientation_blocks`, checkpoint parsers.
++
++- [ ] **Step 1: Add the matching failing Python test**
++
++Use the same `completed_point` helper and correction sequence as Task 1.
++Assert exact ordered X coordinates and Hartree energies:
++
++```py
++def test_keeps_final_correction_for_each_irc_point(tmp_path):
++    output = tmp_path / "irc-corrections.out"
++    output.write_text(
++        " IRC-IRC-IRC-IRC-IRC-\n"
++        " Redundant internal coordinates found in file.  (old form).\n"
++        " C,0,0.000000,0.000000,0.000000\n"
++        " Recover connectivity data from disk.\n"
++        " Energy From Chk = -10.00000000\n"
++        + _point(0, 1)
++        + _completed_point(1, 1, [(1.1, -10.01), (1.0, -10.1)])
++        + _completed_point(2, 1, [(2.0, -10.2)])
++        + _completed_point(1, 2, [(-1.0, -10.3)])
++        + _completed_point(2, 2, [(-2.0, -10.4)])
++        + " Summary of reaction path following\n"
++        + _orientation_block("Input orientation", 999)
++        + _scf_energy(-99)
++    )
++
++    energies, *_, geometries = parse_gaussian(output)
++
++    assert [frame[0][1] for frame in geometries] == [-2, -1, 0, 1, 2]
++    assert energies == [-10.4, -10.3, -10.0, -10.1, -10.2]
++```
++
++- [ ] **Step 2: Run the test and verify RED**
++
++```bash
++rtk python -m pytest tests/test_parse_gaussian.py -q
++```
++
++Expected: FAIL with shifted geometry/energy or a missing endpoint.
++
++- [ ] **Step 3: Implement the same interval model**
++
++Use `re.finditer` for marker spans. For each marker, slice from the previous
++marker end to the current marker start; select `geometries[-1]` and
++`energies[-1]`. Apply checkpoint fallback only when `point == 0` lacks a value.
++
++Return records and order them as:
++
++```py
++ordered = (
++    list(reversed([record for record in records if record["path"] == 2]))
++    + [record for record in records if record["path"] == 1]
++)
++energies = [record["energy"] for record in ordered]
++geometries = [record["geometry"] for record in ordered]
++```
++
++Delete the global-array length guard and index-based truncation.
++
++- [ ] **Step 4: Run Python and cross-language tests**
++
++```bash
++rtk python -m pytest tests/test_parse_gaussian.py -q
++rtk pnpm vitest run tests/vitest/trajectory/gaussian.test.ts
++```
++
++Expected: both suites PASS with matching coordinate and energy order.
++
++- [ ] **Step 5: Commit**
++
++```bash
++rtk git add scripts/parse_gaussian.py tests/test_parse_gaussian.py
++rtk git commit -m "fix(parser): align Python Gaussian IRC records"
++```
++
++---
++
++### Task 3: Parser acceptance gates and PR update
++
++**Files:**
++- Modify only if a verification gate exposes a regression.
++
++- [ ] **Step 1: Run all Gaussian-specific tests**
++
++```bash
++rtk python -m pytest tests/test_parse_gaussian.py -q
++rtk pnpm vitest run tests/vitest/trajectory/gaussian.test.ts
++```
++
++Expected: all tests PASS.
++
++- [ ] **Step 2: Run adjacent trajectory parser tests**
++
++```bash
++rtk pnpm vitest run tests/vitest/trajectory tests/vitest/vasprun-trajectory.test.ts
++```
++
++Expected: all tests PASS.
++
++- [ ] **Step 3: Run frontend typecheck**
++
++```bash
++rtk pnpm check
++```
++
++Expected: 0 errors.
++
++- [ ] **Step 4: Run the Python parser suite**
++
++```bash
++rtk python -m pytest tests/test_parse_gaussian.py tests/test_scripts.py -q
++```
++
++If `tests/test_scripts.py` does not exist on the PR branch, run the complete
++`tests/test_parse_gaussian.py` file plus the repository's parser test directory
++identified by `rtk rg --files tests | rtk rg 'parse|parser'`.
++
++Expected: all in-scope parser tests PASS.
++
++- [ ] **Step 5: Verify repository hygiene**
++
++```bash
++rtk git diff --check
++rtk git status --short
++```
++
++Expected: clean tracked worktree; protected paths are not staged.
++
++- [ ] **Step 6: Update PR #539**
++
++Push the local commits to `AmonB/fix/gaussian-frame-count-irc` using the
++maintainer-edit permission, update the PR verification section, and leave the
++worktree intact for review.
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+new file mode 100644
+index 000000000..b707c86cd
+--- /dev/null
++++ b/scripts/__init__.py
+@@ -0,0 +1 @@
++"""Repository maintenance and parser scripts."""
+diff --git a/scripts/parse_gaussian.py b/scripts/parse_gaussian.py
+index d641ae501..625718134 100644
+--- a/scripts/parse_gaussian.py
++++ b/scripts/parse_gaussian.py
+@@ -27,15 +27,167 @@
+ }
+ 
+ 
++def _parse_orientation_blocks(lines, orientation):
++    geometries = []
++    for i, line in enumerate(lines):
++        if orientation not in line:
++            continue
++
++        atoms = []
++        j = i + 5
++        while j < len(lines) and "-----" not in lines[j]:
++            parts = lines[j].split()
++            if len(parts) >= 6:
++                anum = int(parts[1])
++                x, y, z = float(parts[3]), float(parts[4]), float(parts[5])
++                sym = ATOMIC_SYMBOL.get(anum, f"X{anum}")
++                atoms.append((sym, x, y, z))
++            j += 1
++        if atoms:
++            geometries.append(atoms)
++
++    return geometries
++
++
++def _parse_checkpoint_geometry(content):
++    match = re.search(
++        r"Redundant internal coordinates[^\r\n]*\r?\n"
++        r"(.*?)Recover connectivity data from disk\.",
++        content,
++        re.DOTALL,
++    )
++    if not match:
++        return None
++
++    atoms = []
++    for line in match.group(1).splitlines():
++        parts = [part.strip() for part in line.split(",")]
++        element_match = re.match(r"^([A-Za-z]{1,2})", parts[0]) if parts else None
++        if not element_match or len(parts) < 5:
++            continue
++        try:
++            x, y, z = map(float, parts[2:5])
++        except ValueError:
++            continue
++        atoms.append((element_match.group(1), x, y, z))
++
++    return atoms or None
++
++
++def _parse_scf_energies(content):
++    return [
++        float(energy.replace("D", "E").replace("d", "E"))
++        for energy in re.findall(
++            r"SCF Done:\s*E\(.+?\)\s*=\s*"
++            r"([-+]?\d+(?:\.\d+)?(?:[DEde][-+]?\d+)?)",
++            content,
++        )
++    ]
++
++
++def _parse_irc_records(content, orientation):
++    marker_matches = list(
++        re.finditer(
++            r"Point Number:\s*(\d+)\s+Path Number:\s*(\d+)",
++            content,
++        )
++    )
++    if not marker_matches:
++        return None
++
++    checkpoint_geometry = _parse_checkpoint_geometry(content)
++    checkpoint_energy_match = re.search(
++        r"Energy From Chk\s*=\s*"
++        r"([-+]?\d+(?:\.\d+)?(?:[DEde][-+]?\d+)?)",
++        content,
++    )
++    checkpoint_energy = (
++        float(
++            checkpoint_energy_match.group(1).replace("D", "E").replace("d", "E")
++        )
++        if checkpoint_energy_match
++        else None
++    )
++    irc_start = content.rfind(
++        "IRC-IRC-IRC-",
++        0,
++        marker_matches[0].start(),
++    )
++
++    records = []
++    for idx, marker in enumerate(marker_matches):
++        interval_start = (
++            max(0, irc_start)
++            if idx == 0
++            else marker_matches[idx - 1].end()
++        )
++        interval = content[interval_start:marker.start()]
++        point = int(marker.group(1))
++        path = int(marker.group(2))
++        geometries = _parse_orientation_blocks(interval.splitlines(), orientation)
++        energies = _parse_scf_energies(interval)
++        geometry = geometries[-1] if geometries else None
++        energy = energies[-1] if energies else None
++        if point == 0:
++            geometry = geometry or checkpoint_geometry
++            energy = checkpoint_energy if energy is None else energy
++        if geometry is None or energy is None or path not in (1, 2):
++            return None
++
++        records.append(
++            {
++                "point": point,
++                "path": path,
++                "geometry": geometry,
++                "energy": energy,
++            }
++        )
++
++    return records
++
++
++def _parse_irc(content, lines):
++    orientation = (
++        "Input orientation:"
++        if any("Input orientation:" in line for line in lines)
++        else "Standard orientation:"
++    )
++    records = _parse_irc_records(content, orientation)
++    if not records:
++        return None
++
++    # Gaussian writes Path 1 from TS outward, then Path 2 from TS outward.
++    # Reverse Path 2 so the exported trajectory runs endpoint -> TS -> endpoint.
++    ordered = (
++        list(reversed([record for record in records if record["path"] == 2]))
++        + [record for record in records if record["path"] == 1]
++    )
++    energies = [record["energy"] for record in ordered]
++    geometries = [record["geometry"] for record in ordered]
++    return energies, geometries
++
++
+ def parse_gaussian(filename):
++    lines = []
++    is_irc = False
+     with open(filename) as f:
+-        lines = f.readlines()
++        for line in f:
++            lines.append(line)
++            if not is_irc and "IRC-IRC-IRC-" in line:
++                is_irc = True
++
++    if is_irc:
++        irc_data = _parse_irc("".join(lines), lines)
++        if irc_data:
++            energies, geometries = irc_data
++            return energies, [], [], (None, None), geometries
+ 
+     energies = []
+     max_forces = []
+     rms_forces = []
+     force_thresholds = (None, None)
+     geometries = []  # list of list-of-(symbol, x, y, z)
++    has_standard_orientation = any("Standard orientation:" in line for line in lines)
+ 
+     i = 0
+     while i < len(lines):
+@@ -62,7 +214,12 @@ def parse_gaussian(filename):
+                     force_thresholds = (float(m.group(2)), force_thresholds[1])
+ 
+         # --- geometry (prefer Standard orientation, fallback to Input orientation) ---
+-        if "Standard orientation:" in line or "Input orientation:" in line:
++        is_geometry_orientation = (
++            "Standard orientation:" in line
++            if has_standard_orientation
++            else "Input orientation:" in line
++        )
++        if is_geometry_orientation:
+             # skip header lines (dashes, columns, dashes)
+             j = i + 5  # first atom line
+             atoms = []
+diff --git a/src/lib/trajectory/parsers/gaussian.ts b/src/lib/trajectory/parsers/gaussian.ts
+index 668b6d57d..7e606b26b 100644
+--- a/src/lib/trajectory/parsers/gaussian.ts
++++ b/src/lib/trajectory/parsers/gaussian.ts
+@@ -9,25 +9,205 @@ const HARTREE_TO_EV = 27.211386245988
+ // Hartree/Bohr to eV/A conversion factor
+ const HARTREE_BOHR_TO_EV_A = 51.42206313
+ 
++type GaussianGeometry = { positions: number[][]; elements: ElementSymbol[] }
++type GaussianIrcRecord = {
++  point: number
++  path: number
++  geometry: GaussianGeometry
++  energy: number
++}
++
++const parse_orientation_blocks = (
++  lines: string[],
++  orientation: `Standard orientation:` | `Input orientation:`,
++): GaussianGeometry[] => {
++  const geometries: GaussianGeometry[] = []
++
++  for (let idx = 0; idx < lines.length; idx++) {
++    if (!lines[idx].includes(orientation)) continue
++
++    const positions: number[][] = []
++    const elements: ElementSymbol[] = []
++    let atom_idx = idx + 5
++    while (atom_idx < lines.length && !lines[atom_idx].includes(`-----`)) {
++      const parts = lines[atom_idx].trim().split(/\s+/)
++      if (parts.length >= 6) {
++        const atomic_number = parseInt(parts[1], 10)
++        elements.push((atomic_number_to_symbol[atomic_number] || `X`) as ElementSymbol)
++        positions.push([
++          parseFloat(parts[3]),
++          parseFloat(parts[4]),
++          parseFloat(parts[5]),
++        ])
++      }
++      atom_idx++
++    }
++    if (positions.length > 0) geometries.push({ positions, elements })
++  }
++
++  return geometries
++}
++
++const parse_checkpoint_geometry = (content: string): GaussianGeometry | undefined => {
++  const match = content.match(
++    /Redundant internal coordinates[^\r\n]*\r?\n([\s\S]*?)Recover connectivity data from disk\./,
++  )
++  if (!match) return undefined
++
++  const positions: number[][] = []
++  const elements: ElementSymbol[] = []
++  for (const line of match[1].split(/\r?\n/)) {
++    const parts = line.split(`,`).map((part) => part.trim())
++    const element_match = parts[0]?.match(/^([A-Za-z]{1,2})/)
++    if (!element_match || parts.length < 5) continue
++
++    const position = parts.slice(2, 5).map((value) => parseFloat(value))
++    if (position.some((value) => !Number.isFinite(value))) continue
++    elements.push(element_match[1] as ElementSymbol)
++    positions.push(position)
++  }
++
++  return positions.length > 0 ? { positions, elements } : undefined
++}
++
++const parse_scf_energies = (content: string): number[] =>
++  [...content.matchAll(
++    /SCF Done:\s*E\(.+?\)\s*=\s*([-+]?\d+(?:\.\d+)?(?:[DE][-+]?\d+)?)/gi,
++  )].map((match) => parseFloat(match[1].replace(/[dD]/, `E`)))
++
++const parse_irc_reaction_coordinates = (content: string): number[] => {
++  const summary = content.match(
++    /Summary of reaction path following([\s\S]*?)Total number of points:/,
++  )
++  if (!summary) return []
++
++  const coordinates: number[] = []
++  for (const line of summary[1].split(/\r?\n/)) {
++    const match = line.match(
++      /^\s*\d+\s+[-+]?\d+(?:\.\d+)?(?:[DE][-+]?\d+)?\s+([-+]?\d+(?:\.\d+)?(?:[DE][-+]?\d+)?)/i,
++    )
++    if (match) coordinates.push(parseFloat(match[1].replace(/[dD]/, `E`)))
++  }
++  return coordinates
++}
++
++const parse_irc_records = (
++  content: string,
++  lines: string[],
++): GaussianIrcRecord[] | undefined => {
++  const marker_matches = [...content.matchAll(
++    /Point Number:\s*(\d+)\s+Path Number:\s*(\d+)/g,
++  )]
++  if (marker_matches.length === 0) return undefined
++
++  const has_input_orientation = lines.some((line) => line.includes(`Input orientation:`))
++  const preferred_orientation = has_input_orientation
++    ? `Input orientation:`
++    : `Standard orientation:`
++  const checkpoint_geometry = parse_checkpoint_geometry(content)
++  const checkpoint_energy_match = content.match(
++    /Energy From Chk\s*=\s*([-+]?\d+(?:\.\d+)?(?:[DE][-+]?\d+)?)/i,
++  )
++  const checkpoint_energy = checkpoint_energy_match
++    ? parseFloat(checkpoint_energy_match[1].replace(/[dD]/, `E`))
++    : undefined
++  const irc_start = content.lastIndexOf(`IRC-IRC-IRC-`, marker_matches[0].index)
++
++  const records: GaussianIrcRecord[] = []
++  for (let idx = 0; idx < marker_matches.length; idx++) {
++    const marker = marker_matches[idx]
++    const previous_marker = marker_matches[idx - 1]
++    const interval_start = previous_marker?.index === undefined
++      ? Math.max(0, irc_start)
++      : previous_marker.index + previous_marker[0].length
++    if (marker.index === undefined) return undefined
++
++    const interval = content.slice(interval_start, marker.index)
++    const point = Number(marker[1])
++    const path = Number(marker[2])
++    const geometry = parse_orientation_blocks(
++      interval.split(/\r?\n/),
++      preferred_orientation,
++    ).at(-1) ?? (point === 0 ? checkpoint_geometry : undefined)
++    const energy = parse_scf_energies(interval).at(-1)
++      ?? (point === 0 ? checkpoint_energy : undefined)
++    if (!geometry || energy === undefined || (path !== 1 && path !== 2)) return undefined
++
++    records.push({ point, path, geometry, energy })
++  }
++
++  return records
++}
++
++const parse_gaussian_irc = (
++  content: string,
++  lines: string[],
++  filename?: string,
++): TrajectoryType | undefined => {
++  if (!content.includes(`IRC-IRC-IRC-`)) return undefined
++
++  const records = parse_irc_records(content, lines)
++  if (!records) return undefined
++
++  // IRC output is written as Path 1 from TS outward, followed by Path 2 from
++  // TS outward. A physical trajectory must instead run endpoint -> TS -> endpoint.
++  const path_one = records.filter(({ path }) => path === 1)
++  const path_two = records.filter(({ path }) => path === 2)
++  if (path_one.length + path_two.length !== records.length) return undefined
++
++  const ordered_records = [...path_two.reverse(), ...path_one]
++  const point_count = records.length
++  const reaction_coordinates = parse_irc_reaction_coordinates(content)
++
++  const frames = ordered_records.map((record, step) => {
++    const metadata: Record<string, unknown> = {
++      energy: record.energy * HARTREE_TO_EV,
++      irc_path: record.path,
++      irc_point: record.point,
++      is_transition_state: record.point === 0,
++    }
++    if (reaction_coordinates.length === point_count) {
++      metadata.reaction_coordinate = reaction_coordinates[step]
++    }
++
++    return create_trajectory_frame(
++      record.geometry.positions,
++      record.geometry.elements,
++      undefined,
++      undefined,
++      step,
++      metadata,
++    )
++  })
++
++  return {
++    frames,
++    metadata: {
++      source_format: `gaussian_output`,
++      calculation_type: `irc`,
++      frame_count: frames.length,
++      total_atoms: frames[0]?.structure.sites.length || 0,
++      filename,
++    },
++  }
++}
++
+ export const parse_gaussian_output = (content: string, filename?: string): TrajectoryType => {
+   const lines = content.split(/\r?\n/)
++  const irc_trajectory = parse_gaussian_irc(content, lines, filename)
++  if (irc_trajectory) return irc_trajectory
+ 
+   // Pass 1: collect all data separately
+-  const energies: number[] = []
++  const energies = parse_scf_energies(content)
+   const max_forces: number[] = []
+   const rms_forces: number[] = []
+   const geometries: { positions: number[][]; elements: ElementSymbol[] }[] = []
++  const has_standard_orientation = lines.some((line) => line.includes(`Standard orientation:`))
+ 
+   let idx = 0
+   while (idx < lines.length) {
+     const line = lines[idx]
+ 
+-    // SCF energy
+-    if (line.includes(`SCF Done`)) {
+-      const m = line.match(/=\s+([-+]?\d+\.\d+)/)
+-      if (m) energies.push(parseFloat(m[1]))
+-    }
+-
+     // Force convergence (Maximum Force / RMS Force lines with values)
+     if (line.includes(`Maximum Force`) && !line.includes(`Threshold`)) {
+       const m = line.match(/Maximum Force\s+([\d.]+)\s+([\d.]+)/)
+@@ -38,8 +218,11 @@ export const parse_gaussian_output = (content: string, filename?: string): Traje
+       if (m) rms_forces.push(parseFloat(m[1]))
+     }
+ 
+-    // Geometry blocks: "Standard orientation:" or "Input orientation:"
+-    if (line.includes(`Standard orientation:`) || line.includes(`Input orientation:`)) {
++    // Prefer Standard orientation; only use Input orientation when no Standard block exists.
++    const is_geometry_orientation = has_standard_orientation
++      ? line.includes(`Standard orientation:`)
++      : line.includes(`Input orientation:`)
++    if (is_geometry_orientation) {
+       const atom_start = idx + 5 // skip header (dashes, columns, dashes)
+       const positions: number[][] = []
+       const elements: ElementSymbol[] = []
+diff --git a/tests/test_parse_gaussian.py b/tests/test_parse_gaussian.py
+new file mode 100644
+index 000000000..38dd3e833
+--- /dev/null
++++ b/tests/test_parse_gaussian.py
+@@ -0,0 +1,112 @@
++from scripts.parse_gaussian import parse_gaussian
++
++
++def _orientation_block(name, x):
++    return f""" {name}:
++ ---------------------------------------------------------------------
++ Center     Atomic      Atomic             Coordinates (Angstroms)
++ Number     Number       Type             X           Y           Z
++ ---------------------------------------------------------------------
++      1          6           0        {x:.6f}    0.000000    0.000000
++ ---------------------------------------------------------------------
++"""
++
++
++def _scf_energy(energy):
++    return f" SCF Done:  E(RB3LYP) =  {energy:.8f}     A.U. after 10 cycles\n"
++
++
++def _point(point_number, path_number):
++    return f" Point Number: {point_number} Path Number: {path_number}\n"
++
++
++def _completed_point(point_number, path_number, attempts):
++    return "".join(
++        _orientation_block("Input orientation", x) + _scf_energy(energy)
++        for x, energy in attempts
++    ) + _point(point_number, path_number)
++
++
++def test_prefers_standard_orientation_without_duplicate_geometry(tmp_path):
++    output = tmp_path / "both-orientations.out"
++    output.write_text(
++        _orientation_block("Input orientation", 1.0)
++        + _orientation_block("Standard orientation", 2.0)
++    )
++
++    *_, geometries = parse_gaussian(output)
++
++    assert len(geometries) == 1
++    assert geometries[0][0] == ("C", 2.0, 0.0, 0.0)
++
++
++def test_falls_back_to_input_orientation(tmp_path):
++    output = tmp_path / "input-only.out"
++    output.write_text(_orientation_block("Input orientation", 1.0))
++
++    *_, geometries = parse_gaussian(output)
++
++    assert len(geometries) == 1
++    assert geometries[0][0] == ("C", 1.0, 0.0, 0.0)
++
++
++def test_orders_bidirectional_irc_and_restores_checkpoint_ts(tmp_path):
++    output = tmp_path / "irc-from-checkpoint.out"
++    output.write_text(
++        " IRC-IRC-IRC-IRC-IRC-\n"
++        " Redundant internal coordinates found in file.  (old form).\n"
++        " C,0,0.000000,0.000000,0.000000\n"
++        " Recover connectivity data from disk.\n"
++        " Energy From Chk = -10.00000000\n"
++        + _point(0, 1)
++        + _completed_point(1, 1, [(1, -10.1)])
++        + _completed_point(2, 1, [(2, -10.2)])
++        + _completed_point(1, 2, [(3, -10.3)])
++        + _completed_point(2, 2, [(4, -10.4)])
++    )
++
++    energies, *_, geometries = parse_gaussian(output)
++
++    assert [frame[0][1] for frame in geometries] == [4, 3, 0, 1, 2]
++    assert energies == [-10.4, -10.3, -10.0, -10.1, -10.2]
++
++
++def test_keeps_irc_ts_already_present_without_checkpoint(tmp_path):
++    output = tmp_path / "irc-with-input-ts.out"
++    output.write_text(
++        " IRC-IRC-IRC-IRC-IRC-\n"
++        + _completed_point(0, 1, [(0, -10.0)])
++        + _completed_point(1, 1, [(1, -10.1)])
++        + _completed_point(2, 1, [(2, -10.2)])
++        + _completed_point(1, 2, [(3, -10.3)])
++        + _completed_point(2, 2, [(4, -10.4)])
++    )
++
++    energies, *_, geometries = parse_gaussian(output)
++
++    assert [frame[0][1] for frame in geometries] == [4, 3, 0, 1, 2]
++    assert energies == [-10.4, -10.3, -10.0, -10.1, -10.2]
++
++
++def test_keeps_final_correction_for_each_irc_point(tmp_path):
++    output = tmp_path / "irc-corrections.out"
++    output.write_text(
++        " IRC-IRC-IRC-IRC-IRC-\n"
++        " Redundant internal coordinates found in file.  (old form).\n"
++        " C,0,0.000000,0.000000,0.000000\n"
++        " Recover connectivity data from disk.\n"
++        " Energy From Chk = -10.00000000\n"
++        + _point(0, 1)
++        + _completed_point(1, 1, [(1.1, -10.01), (1.0, -10.1)])
++        + _completed_point(2, 1, [(2.0, -10.2)])
++        + _completed_point(1, 2, [(-1.0, -10.3)])
++        + _completed_point(2, 2, [(-2.0, -10.4)])
++        + " Summary of reaction path following\n"
++        + _orientation_block("Input orientation", 999)
++        + _scf_energy(-99)
++    )
++
++    energies, *_, geometries = parse_gaussian(output)
++
++    assert [frame[0][1] for frame in geometries] == [-2, -1, 0, 1, 2]
++    assert energies == [-10.4, -10.3, -10.0, -10.1, -10.2]
+diff --git a/tests/vitest/trajectory/gaussian.test.ts b/tests/vitest/trajectory/gaussian.test.ts
+new file mode 100644
+index 000000000..8fe8b840d
+--- /dev/null
++++ b/tests/vitest/trajectory/gaussian.test.ts
+@@ -0,0 +1,153 @@
++import { parse_gaussian_output } from '$lib/trajectory/parsers/gaussian'
++import { describe, expect, it } from 'vitest'
++
++const orientation_block = (name: string, x: number) => ` ${name}:
++ ---------------------------------------------------------------------
++ Center     Atomic      Atomic             Coordinates (Angstroms)
++ Number     Number       Type             X           Y           Z
++ ---------------------------------------------------------------------
++      1          6           0        ${x.toFixed(6)}    0.000000    0.000000
++ ---------------------------------------------------------------------
++`
++
++const scf_energy = (energy: number) =>
++  ` SCF Done:  E(RB3LYP) =  ${energy.toFixed(8)}     A.U. after   10 cycles\n`
++
++const point = (point_number: number, path_number: number) =>
++  ` Point Number: ${point_number} Path Number: ${path_number}\n`
++
++const completed_point = (
++  point_number: number,
++  path_number: number,
++  attempts: Array<{ x: number; energy: number }>,
++) =>
++  attempts.map(({ x, energy }) =>
++    orientation_block(`Input orientation`, x) + scf_energy(energy)
++  ).join(``) + point(point_number, path_number)
++
++const irc_summary = ` Summary of reaction path following
++ --------------------------------------------------------------------------
++                         Energy    RxCoord
++   1                   -0.40000  -2.00000
++   2                   -0.30000  -1.00000
++   3                    0.00000   0.00000
++   4                   -0.10000   1.00000
++   5                   -0.20000   2.00000
++ --------------------------------------------------------------------------
++ Total number of points: 4
++`
++
++describe(`parse_gaussian_output`, () => {
++  it(`prefers Standard orientation without recording Input orientation twice`, () => {
++    const content =
++      orientation_block(`Input orientation`, 1) + orientation_block(`Standard orientation`, 2)
++
++    const trajectory = parse_gaussian_output(content)
++
++    expect(trajectory.frames).toHaveLength(1)
++    expect(trajectory.frames[0].structure.sites[0].xyz).toEqual([2, 0, 0])
++  })
++
++  it(`falls back to Input orientation when Standard orientation is absent`, () => {
++    const trajectory = parse_gaussian_output(orientation_block(`Input orientation`, 1))
++
++    expect(trajectory.frames).toHaveLength(1)
++    expect(trajectory.frames[0].structure.sites[0].xyz).toEqual([1, 0, 0])
++  })
++
++  it(`orders a bidirectional IRC as Path 2 reversed, TS, then Path 1`, () => {
++    const content = ` IRC-IRC-IRC-IRC-IRC-
++ Redundant internal coordinates found in file.  (old form).
++ C,0,0.000000,0.000000,0.000000
++ Recover connectivity data from disk.
++ Energy From Chk = -10.00000000
++${point(0, 1)}${completed_point(1, 1, [{ x: 1, energy: -10.1 }])}
++${completed_point(2, 1, [{ x: 2, energy: -10.2 }])}
++${completed_point(1, 2, [{ x: 3, energy: -10.3 }])}
++${completed_point(2, 2, [{ x: 4, energy: -10.4 }])}
++${irc_summary}
++`
++
++    const trajectory = parse_gaussian_output(content)
++
++    expect(trajectory.frames).toHaveLength(5)
++    expect(trajectory.frames.map((frame) => frame.structure.sites[0].xyz[0])).toEqual([
++      4,
++      3,
++      0,
++      1,
++      2,
++    ])
++    expect(trajectory.frames.map((frame) => frame.metadata?.reaction_coordinate)).toEqual([
++      -2,
++      -1,
++      0,
++      1,
++      2,
++    ])
++    expect(trajectory.frames[2].metadata?.is_transition_state).toBe(true)
++    expect(trajectory.frames[2].metadata?.energy).toBeCloseTo(-10 * 27.211386245988)
++  })
++
++  it(`keeps an IRC transition state already present in a non-checkpoint output`, () => {
++    const content = ` IRC-IRC-IRC-IRC-IRC-
++${completed_point(0, 1, [{ x: 0, energy: -10 }])}
++${completed_point(1, 1, [{ x: 1, energy: -10.1 }])}
++${completed_point(2, 1, [{ x: 2, energy: -10.2 }])}
++${completed_point(1, 2, [{ x: 3, energy: -10.3 }])}
++${completed_point(2, 2, [{ x: 4, energy: -10.4 }])}
++${irc_summary}
++`
++
++    const trajectory = parse_gaussian_output(content)
++
++    expect(trajectory.frames.map((frame) => frame.structure.sites[0].xyz[0])).toEqual([
++      4,
++      3,
++      0,
++      1,
++      2,
++    ])
++    expect(trajectory.frames[2].metadata?.is_transition_state).toBe(true)
++  })
++
++  it(`keeps the final correction geometry and energy inside each IRC point`, () => {
++    const content = ` IRC-IRC-IRC-IRC-IRC-
++ Redundant internal coordinates found in file.  (old form).
++ C,0,0.000000,0.000000,0.000000
++ Recover connectivity data from disk.
++ Energy From Chk = -10.00000000
++${point(0, 1)}
++${completed_point(1, 1, [
++  { x: 1.1, energy: -10.01 },
++  { x: 1, energy: -10.1 },
++])}
++${completed_point(2, 1, [{ x: 2, energy: -10.2 }])}
++${completed_point(1, 2, [{ x: -1, energy: -10.3 }])}
++${completed_point(2, 2, [{ x: -2, energy: -10.4 }])}
++${irc_summary}
++${orientation_block(`Input orientation`, 999)}${scf_energy(-99)}
++`
++
++    const trajectory = parse_gaussian_output(content)
++
++    expect(trajectory.frames.map((frame) => frame.structure.sites[0].xyz[0])).toEqual([
++      -2,
++      -1,
++      0,
++      1,
++      2,
++    ])
++    expect(trajectory.frames.map((frame) => frame.metadata?.energy)).toEqual(
++      [-10.4, -10.3, -10, -10.1, -10.2].map((energy) =>
++        energy * 27.211386245988
++      ),
++    )
++    expect(
++      trajectory.frames.some((frame) => frame.structure.sites[0].xyz[0] === 1.1),
++    ).toBe(false)
++    expect(
++      trajectory.frames.some((frame) => frame.structure.sites[0].xyz[0] === 999),
++    ).toBe(false)
++  })
++})

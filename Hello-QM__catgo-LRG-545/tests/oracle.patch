@@ -1,0 +1,174 @@
+diff --git a/scripts/__tests__/build-wasm.test.mjs b/scripts/__tests__/build-wasm.test.mjs
+index c4581a5b2..7d772ba1e 100644
+--- a/scripts/__tests__/build-wasm.test.mjs
++++ b/scripts/__tests__/build-wasm.test.mjs
+@@ -1,6 +1,14 @@
+ import assert from 'node:assert/strict'
+ import { spawnSync } from 'node:child_process'
+-import { dirname, resolve } from 'node:path'
++import {
++  chmodSync,
++  mkdtempSync,
++  readFileSync,
++  rmSync,
++  writeFileSync,
++} from 'node:fs'
++import { tmpdir } from 'node:os'
++import { dirname, join, resolve } from 'node:path'
+ import { fileURLToPath } from 'node:url'
+ import test from 'node:test'
+ 
+@@ -8,13 +16,55 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+ const SCRIPT = resolve(ROOT, 'scripts/build-wasm.mjs')
+ const VALID_LINE = '             valid targets: ferrox, chgdiff, catrender'
+ 
+-function runBuildWasm(args) {
++function runBuildWasm(args, env = {}) {
+   return spawnSync(process.execPath, [SCRIPT, ...args], {
+     encoding: 'utf8',
+-    env: { ...process.env, PATH: '' },
++    env: { ...process.env, PATH: '', ...env },
+   })
+ }
+ 
++function fakeWasmPack(t, { alwaysFail = false } = {}) {
++  const dir = mkdtempSync(join(tmpdir(), 'catgo-wasm-pack-'))
++  const state = join(dir, 'attempts.txt')
++  const script = join(dir, 'fake-wasm-pack.cjs')
++  const executable = join(dir, process.platform === 'win32' ? 'wasm-pack.cmd' : 'wasm-pack')
++
++  writeFileSync(
++    script,
++    `#!${process.execPath}
++const { readFileSync, writeFileSync } = require('node:fs')
++if (process.argv[2] === '--version') process.exit(0)
++const state = process.env.FAKE_WASM_PACK_STATE
++let attempts = 0
++try { attempts = Number(readFileSync(state, 'utf8')) } catch {}
++attempts += 1
++writeFileSync(state, String(attempts))
++if (process.env.FAKE_WASM_PACK_ALWAYS_FAIL === '1' || attempts === 1) {
++  console.error('failed to download Binaryen')
++  process.exit(73)
++}
++`,
++  )
++  if (process.platform === 'win32') {
++    writeFileSync(executable, `@"${process.execPath}" "${script}" %*\r\n`)
++  } else {
++    writeFileSync(executable, readFileSync(script))
++    chmodSync(executable, 0o755)
++  }
++  t.after(() => rmSync(dir, { recursive: true, force: true }))
++
++  return {
++    state,
++    env: {
++      PATH: `${dir}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH}`,
++      FAKE_WASM_PACK_STATE: state,
++      FAKE_WASM_PACK_ALWAYS_FAIL: alwaysFail ? '1' : '0',
++      CATGO_WASM_MAX_ATTEMPTS: '3',
++      CATGO_WASM_RETRY_DELAY_MS: '0',
++    },
++  }
++}
++
+ function assertInvalidOnly(args) {
+   const result = runBuildWasm(args)
+   assert.equal(result.status, 2)
+@@ -62,3 +112,22 @@ for (const [target, pendingNames] of routedTargets) {
+     })
+   }
+ }
++
++test('retries a failed wasm-pack target and succeeds on a later attempt', (t) => {
++  const fake = fakeWasmPack(t)
++  const result = runBuildWasm(['--only=chgdiff'], fake.env)
++
++  assert.equal(result.status, 0)
++  assert.equal(readFileSync(fake.state, 'utf8'), '2')
++  assert.match(result.stderr, /retrying chgdiff \(attempt 2\/3\)/)
++  assert.match(result.stdout, /all WASM extensions built/)
++})
++
++test('stops retrying wasm-pack after the configured attempt limit', (t) => {
++  const fake = fakeWasmPack(t, { alwaysFail: true })
++  const result = runBuildWasm(['--only=chgdiff'], fake.env)
++
++  assert.equal(result.status, 73)
++  assert.equal(readFileSync(fake.state, 'utf8'), '3')
++  assert.match(result.stderr, /FAILED: chgdiff after 3 attempts/)
++})
+diff --git a/scripts/build-wasm.mjs b/scripts/build-wasm.mjs
+index b85d3f733..db77bee2e 100644
+--- a/scripts/build-wasm.mjs
++++ b/scripts/build-wasm.mjs
+@@ -66,6 +66,15 @@ const SKIP_THREADED = process.env.CATGO_WASM_SKIP_THREADED === '1'
+ // already); the floating 'nightly' default is for local dev convenience only.
+ const NIGHTLY = process.env.CATGO_WASM_NIGHTLY_TOOLCHAIN || 'nightly'
+ const WIN = process.platform === 'win32'
++const WASM_PACK_MAX_ATTEMPTS = Number.parseInt(
++  process.env.CATGO_WASM_MAX_ATTEMPTS || '3',
++  10,
++)
++const WASM_PACK_RETRY_DELAY_MS = Number.parseInt(
++  process.env.CATGO_WASM_RETRY_DELAY_MS || '2000',
++  10,
++)
++const RETRY_WAIT = new Int32Array(new SharedArrayBuffer(4))
+ 
+ const FERROX_DIR = join(ROOT, 'extensions', 'rust')
+ const FERROX_PKG = (name) => join(ROOT, 'extensions', 'rust-wasm', name)
+@@ -252,17 +261,43 @@ if (pending.some((t) => t.threaded)) {
+   }
+ }
+ 
++function buildTarget(target) {
++  let status = 1
++  for (let attempt = 1; attempt <= WASM_PACK_MAX_ATTEMPTS; attempt++) {
++    if (attempt > 1) {
++      console.error(
++        `[build-wasm] retrying ${target.name} ` +
++          `(attempt ${attempt}/${WASM_PACK_MAX_ATTEMPTS})`,
++      )
++    }
++    const result = spawnSync(
++      'wasm-pack',
++      ['build', '--target', 'web', '--out-dir', target.outDir, ...target.extra],
++      {
++        cwd: target.cwd,
++        stdio: 'inherit',
++        shell: WIN,
++        env: target.env,
++      },
++    )
++    if (result.status === 0) return 0
++    status = result.status || 1
++    if (attempt < WASM_PACK_MAX_ATTEMPTS && WASM_PACK_RETRY_DELAY_MS > 0) {
++      Atomics.wait(RETRY_WAIT, 0, 0, WASM_PACK_RETRY_DELAY_MS)
++    }
++  }
++  return status
++}
++
+ for (const t of pending) {
+   console.log(`[build-wasm] building ${t.name} …`)
+-  const r = spawnSync('wasm-pack', ['build', '--target', 'web', '--out-dir', t.outDir, ...t.extra], {
+-    cwd: t.cwd,
+-    stdio: 'inherit',
+-    shell: WIN,
+-    env: t.env,
+-  })
+-  if (r.status !== 0) {
+-    console.error(`[build-wasm] FAILED: ${t.name} (wasm-pack exited ${r.status})`)
+-    process.exit(r.status || 1)
++  const status = buildTarget(t)
++  if (status !== 0) {
++    console.error(
++      `[build-wasm] FAILED: ${t.name} after ${WASM_PACK_MAX_ATTEMPTS} attempts ` +
++        `(wasm-pack exited ${status})`,
++    )
++    process.exit(status)
+   }
+   if (t.post) t.post()
+ }

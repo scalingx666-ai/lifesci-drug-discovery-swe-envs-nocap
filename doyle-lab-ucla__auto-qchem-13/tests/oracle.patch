@@ -1,0 +1,1733 @@
+diff --git a/autoqchem/gaussian_input_generator.py b/autoqchem/gaussian_input_generator.py
+index 8049d61..00b43a4 100644
+--- a/autoqchem/gaussian_input_generator.py
++++ b/autoqchem/gaussian_input_generator.py
+@@ -82,10 +82,10 @@ def create_gaussian_files(self) -> None:
+         os.makedirs(self.directory, exist_ok=True)
+ 
+         # resources configuration
+-        n_processors = max(1, min(config['slurm']['max_processors'],
+-                                  self.molecule.mol.GetNumAtoms() // config['slurm']['atoms_per_processor']))
+-        ram = n_processors * config['slurm']['ram_per_processor']
+-        resource_block = f"%nprocshared={n_processors}\n%Mem={ram}GB\n"
++        n_processors = max(1, min(config['resources']['max_processors'],
++                                  self.molecule.mol.GetNumAtoms() // config['resources']['atoms_per_processor']))
++        ram = n_processors * config['resources']['ram_per_processor']
++        resource_block = f"%nprocshared={n_processors}\n%mem={ram}GB\n"
+ 
+         logger.info(f"Generating Gaussian input files for {self.molecule.mol.GetNumConformers()} conformations.")
+ 
+diff --git a/autoqchem/helper_classes.py b/autoqchem/helper_classes.py
+index 61c529a..5b642df 100644
+--- a/autoqchem/helper_classes.py
++++ b/autoqchem/helper_classes.py
+@@ -23,6 +23,18 @@ class slurm_status(enum.IntEnum):
+     uploaded = 6  #: job has been uploaded to the DB succesfully
+ 
+ 
++@enum.unique
++class sge_status(enum.IntEnum):
++    """SGE job status enumerator."""
++
++    created = 1  #: job files have been created and stored locally
++    submitted = 2  #: jobs has been submitted to SGE on remote host
++    done = 3  #: job finished successfully (all gaussian steps finished) and have been retrieved from host
++    failed = 4  #: job failed
++    incomplete = 5  #: job is incomplete, it should be resubmitted
++    uploaded = 6  #: job has been uploaded to the DB succesfully
++
++
+ @dataclass
+ class slurm_job:
+     """Dataclass for slurm job.
+@@ -85,3 +97,67 @@ class slurm_job:
+     status: slurm_status
+     n_submissions: int
+     n_success_tasks: int
++
++
++@dataclass
++class sge_job:
++    """Dataclass for SGE job.
++
++    :param can: canonical smiles
++    :type can: str
++    :param inchi: inchi
++    :type inchi: str
++    :param inchikey: inchikey
++    :type inchikey: str
++    :param conformation: conformation number
++    :type conformation: int
++    :param charges: formal charges for all atoms
++    :type charges: list
++    :param connectivity_matrix: connectivity matrix
++    :type connectivity_matrix: np.ndarray
++    :param conformation: conformation number
++    :type conformation: int
++    :param max_num_conformers: max number of conformers generated for the molecule
++    :type max_num_conformers: int
++    :param conformer_engine: conformer engine
++    :type conformer_engine: str
++    :param tasks: gaussian tasks tuple
++    :type tasks: tuple
++    :param config: gaussian configuration parameters dictionary
++    :type config: dict
++    :param job_id: job id on the remote host
++    :type job_id: int
++    :param directory: job local directory
++    :type directory: str
++    :param base_name: job local base_name
++    :type base_name: str
++    :param status: sge_status of the job
++    :type status: sge_status
++    :param n_submission: number of times the job has been submitted
++    :type n_submission: int
++    :param n_success_tasks: number of successfully completed tasks
++    :type n_success_tasks: int
++    """
++
++    # molecule info
++    can: str
++    inchi: str
++    inchikey: str
++    elements: list
++    charges: list
++    connectivity_matrix: np.ndarray
++    conformation: int
++
++    # configuration info
++    max_num_conformers: int
++    conformer_engine: str
++    tasks: tuple
++    config: dict
++
++    # SGE variables
++    job_id: int
++    directory: str
++    base_name: str
++    status: sge_status
++    n_submissions: int
++    n_success_tasks: int
+diff --git a/autoqchem/helper_functions.py b/autoqchem/helper_functions.py
+index 46264e7..f3d8bee 100644
+--- a/autoqchem/helper_functions.py
++++ b/autoqchem/helper_functions.py
+@@ -39,6 +39,31 @@ def my_handler(title, instructions, prompt_list):
+     return c
+ 
+ 
++def ssh_connect_password(host, user) -> fabric.Connection:
++    """Create ssh connection using fabric and paramiko, password only (without DUO authentication).
++
++    :param host: remote host
++    :param user: username to authenticate on remote host
++    :return: fabric.Connection
++    """
++
++    client = paramiko.SSHClient()
++    client.load_system_host_keys()
++
++    try:
++        client.connect(host,username=user)
++    except paramiko.ssh_exception.SSHException:
++        pass
++
++    client.get_transport().auth_password(username=user,password=getpass.getpass(f"{user}@{host}'s password:"))
++
++    c = fabric.Connection(host)
++    c.client = client
++    c.transport = client.get_transport()
++
++    return c
++
++
+ def cleanup_directory_files(dir_path, types=()) -> None:
+     """Remove files with specific extension(s) from a directory.
+ 
+diff --git a/autoqchem/rdkit_utils.py b/autoqchem/rdkit_utils.py
+index e0fb238..485218a 100644
+--- a/autoqchem/rdkit_utils.py
++++ b/autoqchem/rdkit_utils.py
+@@ -7,7 +7,7 @@
+ from rdkit.Chem import AllChem
+ 
+ from autoqchem.molecule import GetSymbol
+-from autoqchem.helper_classes import slurm_status
++from autoqchem.helper_classes import slurm_status, sge_status
+ from autoqchem.gaussian_log_extractor import gaussian_log_extractor
+ 
+ from autoqchem.helper_classes import Hartree_in_kcal_per_mol
+@@ -215,6 +215,59 @@ def rdmol_from_slurm_jobs(jobs, postDFT=True) -> Chem.Mol:
+     return rdmol, energies
+ 
+ 
++def rdmol_from_sge_jobs(jobs, postDFT=True) -> Chem.Mol:
++    """Create and rdkit molecule from a set of sge jobs.
++
++    :param jobs: list of jobs for the molecule
++    :type jobs: list
++    :param postDFT: if the DFT calculations are already available, the optimized geomtries will be used, if not the initial geometries.
++    :type postDFT: bool
++    :return: rdkit.Chem.Mol
++    """
++
++    # check that these are jobs for the same molecule
++    assert len(set(j.inchi for j in jobs)) == 1
++    if postDFT:
++        # check that the jobs are in done status
++        assert all(j.status.value == sge_status.done.value for j in jobs)
++
++    elements, connectivity_matrix, charges = jobs[0].elements, jobs[0].connectivity_matrix, jobs[0].charges
++    conformer_coordinates = []
++    energies = []
++    for j in jobs:
++        if postDFT:
++
++            le = gaussian_log_extractor(f"{j.directory}/{j.base_name}.log")
++            le.check_for_exceptions()
++            le.get_atom_labels()
++
++            # verify that the labels are in the same order in gaussian after running it
++            assert tuple(le.labels) == tuple(elements)
++
++            le.get_geometry()
++            conformer_coordinates.append(le.geom[list('XYZ')].values)
++
++            le.get_descriptors()
++            energies.append(le.descriptors['G'] * Hartree_in_kcal_per_mol)
++
++        else:
++            with open(f"{j.directory}/{j.base_name}.gjf") as f:
++                text = f.read()
++                geom = re.findall(f"{j.base_name}\n\n\d\s\d\n(.*?)\n\n\n--Link1--", text, re.DOTALL)[0]
++                geom = map(str.split, map(str.strip, geom.splitlines()))
++                geom = np.array(list(geom))
++                geom = geom[:, 1:].astype(float)
++                conformer_coordinates.append(geom)
++
++    rdmol = get_rdkit_mol(elements, conformer_coordinates, connectivity_matrix, charges)
++    if not postDFT:
++        props = AllChem.MMFFGetMoleculeProperties(rdmol)
++        energies = [AllChem.MMFFGetMoleculeForceField(rdmol, props, confId=i).CalcEnergy()
++                    for i in range(rdmol.GetNumConformers())]
++
++    return rdmol, energies
++
++
+ def get_rmsd_rdkit(rdmol) -> np.ndarray:
+     """Calculate RMSD row-wise with RDKit. This is a computationally slower version, but takes symmetry into account (explores permutations of atom order).
+ 
+diff --git a/autoqchem/sge_manager.py b/autoqchem/sge_manager.py
+new file mode 100644
+index 0000000..69128d8
+--- /dev/null
++++ b/autoqchem/sge_manager.py
+@@ -0,0 +1,612 @@
++import hashlib
++import pickle
++from contextlib import suppress
++
++import appdirs
++
++from autoqchem.db_functions import *
++from autoqchem.gaussian_input_generator import *
++from autoqchem.gaussian_log_extractor import *
++from autoqchem.helper_functions import *
++from autoqchem.openbabel_utils import *
++
++logger = logging.getLogger(__name__)
++
++
++class sge_manager(object):
++    """SGE manager class."""
++
++    def __init__(self, user, host):
++        """Initialize sge manager and load the cache file.
++
++        :param user: username at remote host
++        :type user: str
++        :param host: remote host name
++        :type host: str
++        """
++
++        # set workdir and cache file
++        self.workdir = appdirs.user_data_dir(appauthor="autoqchem", appname=host.split('.')[0]) # filepath may include spaces on Mac so enclose in quotes when used
++        self.cache_file = os.path.join(f"{self.workdir}", "sge_manager.pkl")
++        os.makedirs(f"{self.workdir}", exist_ok=True)
++
++        self.jobs = {}  # jobs under management
++
++        # load jobs under management from cache_file (suppress exceptions, no file, empty file, etc.)
++        with suppress(Exception):  # TODO this isn't very safe because may ignore important exceptions
++            with open(self.cache_file, 'rb') as cf:
++                self.jobs = pickle.load(cf)
++
++        self.host = host
++        self.user = user
++        self.remote_dir = f"/u/scratch/{self.user[0]}/{self.user}/gaussian"
++        self.connection = None
++
++    def connect(self) -> None:
++        """Connect to remote host."""
++
++        create_new_connection = False
++        # check if connection already exists
++        if self.connection is not None:
++            # check if it went stale
++            if not self.connection.is_connected:
++                logger.info(f"Connection got disconnected, reconnecting.")
++                self.connection.close()
++                self.connection = None
++                create_new_connection = True
++        else:
++            logger.info(f"Creating connection to {self.host} as {self.user}")
++            create_new_connection = True
++        if create_new_connection:
++            self.connection = ssh_connect_password(self.host, self.user)    # hoffman2 requires connecting with password (no DUO)
++            self.connection.run(f"mkdir -p {self.remote_dir}")
++            logger.info(f"Connected to {self.host} as {self.user}.")
++
++    def create_jobs_for_molecule(self,
++                                 molecule,
++                                 workflow_type="equilibrium",
++                                 theory="APFD",
++                                 solvent="None",
++                                 light_basis_set="6-31G*",
++                                 heavy_basis_set="LANL2DZ",
++                                 generic_basis_set="genecp",
++                                 max_light_atomic_number=36,
++                                 wall_time='23:59:00') -> None:
++        """Generate sge jobs for a molecule. Gaussian input files are also generated.
++
++        :param molecule: molecule object
++        :type molecule: molecule
++        :param workflow_type: Gaussian workflow type, allowed types are: 'equilibrium' or 'transition_state'
++        :type workflow_type: str
++        :param theory: Gaussian supported Functional (e.g., B3LYP)
++        :type theory: str
++        :param solvent: Gaussian supported Solvent (e.g., TETRAHYDROFURAN)
++        :type solvent: str
++        :param light_basis_set: Gaussian supported basis set for elements up to `max_light_atomic_number` (e.g., 6-31G*)
++        :type light_basis_set: str
++        :param heavy_basis_set: Gaussin supported basis set for elements heavier than `max_light_atomic_number` (e.g., LANL2DZ)
++        :type heavy_basis_set: str
++        :param generic_basis_set: Gaussian supported basis set for generic elements (e.g., gencep)
++        :type generic_basis_set: str
++        :param max_light_atomic_number: maximum atomic number for light elements
++        :type max_light_atomic_number: int
++        :param wall_time: wall time of the job in HH:MM:SS format
++        :type wall_time: str
++        """
++
++        # create gaussian files
++        molecule_workdir = os.path.join(f"{self.workdir}", molecule.inchikey)
++        gig = gaussian_input_generator(molecule, workflow_type, molecule_workdir, theory, solvent, light_basis_set,
++                                       heavy_basis_set, generic_basis_set, max_light_atomic_number)
++        gaussian_config = {'theory': theory,
++                           'solvent': solvent,
++                           'light_basis_set': light_basis_set,
++                           'heavy_basis_set': heavy_basis_set,
++                           'generic_basis_set': generic_basis_set,
++                           'max_light_atomic_number': max_light_atomic_number}
++
++        # DB check if the same molecule with the same gaussian configuration already exists
++        exists, tags = db_check_exists(molecule.inchi, gaussian_config,
++                                       molecule.max_num_conformers, molecule.conformer_engine)
++        if exists:
++            logger.warning(f"Molecule {molecule.inchi} already exists with the same Gaussian config with tags {tags}."
++                           f" Not creating jobs.")
++            return
++
++        gig.create_gaussian_files()
++
++        # create sge files
++        for gjf_file in glob.glob(f"{molecule_workdir}/*.gjf"):
++
++            base_name = os.path.basename(os.path.splitext(gjf_file)[0])
++            self._create_sge_file_from_gaussian_file(base_name, molecule_workdir, wall_time)
++            # create job structure
++            job = sge_job(can=molecule.can,
++                            inchi=molecule.inchi,
++                            inchikey=molecule.inchikey,
++                            elements=molecule.elements,
++                            charges=molecule.charges,
++                            connectivity_matrix=molecule.connectivity_matrix,
++                            conformation=int(base_name.split("_conf_")[1]),
++                            max_num_conformers=molecule.max_num_conformers,
++                            tasks=gig.tasks,
++                            config=gaussian_config,
++                            conformer_engine=molecule.conformer_engine,
++                            job_id=-1,  # job_id (not assigned yet)
++                            directory=gig.directory,  # filesystem path
++                            base_name=base_name,  # filesystem basename
++                            status=sge_status.created,
++                            n_submissions=0,
++                            n_success_tasks=0)  # status
++
++            # create a key for the job
++            key = hashlib.md5((job.can + str(job.conformation) +
++                               str(job.max_num_conformers) + ','.join(map(str, job.tasks))).encode()).hexdigest()
++
++            # check if a job like that already exists
++            if key in self.jobs:  # a job like that is already present:
++                logger.warning(f"A job with exactly the same parameters, molecule {job.can}, conformation "
++                               f"{job.conformation}, workflow {job.tasks} already exists. "
++                               f"Not creating a duplicate")
++                continue
++
++            self.jobs[key] = job  # add job to bag
++        self._cache()
++
++    def submit_jobs(self) -> None:
++        """Submit jobs that have status 'created' to remote host."""
++
++        jobs = self.get_jobs(sge_status.created)
++        logger.info(f"Submitting {len(jobs)} jobs.")
++        self.submit_jobs_from_jobs_dict(jobs)
++
++    def submit_jobs_from_jobs_dict(self, jobs) -> None:
++        """Submit jobs to remote host.
++
++        :param jobs: dictionary of jobs to submit
++        :type jobs: dict
++        """
++
++        # check if there are any jobs to be submitted
++        if jobs:
++            # get or create connection
++            self.connect()
++
++            # check if jobs are in status created or failed
++            for name, job in jobs.items():
++                # copy .sh and .gjf file to remote_dir
++                self.connection.put(f"{job.directory}/{job.base_name}.sh", self.remote_dir)
++                self.connection.put(f"{job.directory}/{job.base_name}.gjf", self.remote_dir)
++
++                with self.connection.cd(self.remote_dir):
++                    ret = self.connection.run(f"qsub {self.remote_dir}/{job.base_name}.sh", hide=True)
++                    job.job_id = re.search(".*job\s*(\d+)\s*[(].*\n", ret.stdout).group(1)
++                    job.status = sge_status.submitted
++                    job.n_submissions = job.n_submissions + 1
++                    logger.info(f"Submitted job {name}, job_id: {job.job_id}.")
++
++            self._cache()
++
++    def retrieve_jobs(self) -> None:
++        """Retrieve finished jobs from remote host and check which finished successfully and which failed."""
++
++        ids_to_check = [j.job_id for j in self.get_jobs(sge_status.submitted).values()]
++        if not ids_to_check:
++            logger.info(f"There are no jobs submitted to cluster. Nothing to retrieve.")
++            return
++
++        # get or create connection
++        self.connect()
++
++        # retrieve job ids that are running and waiting on the server
++        ret = self.connection.run(f"qstat -u {self.user}", hide=True)
++        user_running_ids = [re.search(".* (\d{7}) .*", l).group(1) for l  in ret.stdout.splitlines()[2:]] # looking for exactly 7 digit number
++        running_ids = [id for id in user_running_ids if id in ids_to_check]
++        finished_ids = [id for id in ids_to_check if id not in running_ids]
++
++        logger.info(f"There are {len(running_ids)} running/pending jobs, {len(finished_ids)} finished jobs.")
++
++        # get finished jobs
++        finished_jobs = {name: job for name, job in self.jobs.items() if job.job_id in finished_ids}
++        done_jobs = 0
++
++        if finished_jobs:
++            logger.info(f"Retrieving log files of finished jobs.")
++            for job in finished_jobs.values():
++                status = self._retrieve_single_job(job)
++                if status.value == sge_status.done.value:
++                    done_jobs += 1
++
++            self._cache()
++            logger.info(f"{done_jobs} jobs finished successfully (all Gaussian steps finished normally)."
++                        f" {len(finished_jobs) - done_jobs} jobs failed.")
++
++    def _retrieve_single_job(self, job) -> sge_status:
++        """Retrieve single job from remote host and check its status
++
++        :param job: job
++        :return: :py:meth:`~helper_classes.helper_classes.sge_status`, resulting status
++        """
++
++        try:  # try to fetch the file
++            log_file = self.connection.get(f"{self.remote_dir}/{job.base_name}.log",
++                                           local=f"{job.directory}/{job.base_name}.log")
++
++            # initialize the log extractor, it will try to read basic info from the file
++            le = gaussian_log_extractor(log_file.local)
++            if len(job.tasks) == le.n_tasks:
++                job.status = sge_status.done
++            else:
++                try:  # look for more specific exception
++                    le.check_for_exceptions()
++
++                except NoGeometryException:
++                    job.status = sge_status.failed
++                    logger.warning(
++                        f"Job {job.base_name} failed - the log file does not contain geometry. Cannot resubmit.")
++
++                except NegativeFrequencyException:
++                    job.status = sge_status.incomplete
++                    logger.warning(
++                        f"Job {job.base_name} incomplete - log file contains negative frequencies. Resubmit job.")
++
++                except OptimizationIncompleteException:
++                    job.status = sge_status.incomplete
++                    logger.warning(f"Job {job.base_name} incomplete - geometry optimization did not complete.")
++
++                except Exception as e:
++                    job.status = sge_status.failed
++                    logger.warning(f"Job {job.base_name} failed with unhandled exception: {e}")
++
++                else:  # no exceptions were thrown, but still the job is incomplete
++                    job.status = sge_status.incomplete
++                    logger.warning(f"Job {job.base_name} incomplete.")
++
++        except FileNotFoundError:
++            job.status = sge_status.failed
++            logger.warning(f"Job {job.base_name} failed  - could not retrieve log file. Cannot resubmit.")
++
++        # clean up files on the remote site - do not cleanup anything, the /scratch/network cleans
++        # up files that are older than 15 days
++
++        return job.status
++
++    def resubmit_incomplete_jobs(self, wall_time="24:59:00") -> None:
++        """Resubmit jobs that are incomplete. If the job has failed because the optimization has not completed \
++        and a log file has been retrieved, then \
++        the last geometry will be used for the next submission. For failed jobs \
++         the job input files will need to be fixed manually and submitted using the \
++        function :py:meth:`~sge_manager.sge_manager.submit_jobs_from_jobs_dict`.\
++         Maximum number of allowed submission of the same job is 3.
++
++        :param wall_time: wall time of the job in HH:MM:SS format
++        """
++
++        incomplete_jobs = self.get_jobs(sge_status.incomplete)
++        incomplete_jobs_to_resubmit = {}
++
++        if not incomplete_jobs:
++            logger.info("There are no incomplete jobs to resubmit.")
++
++        for key, job in incomplete_jobs.items():
++
++            # put a limit on resubmissions
++            if job.n_submissions >= 3:
++                logger.warning(f"Job {job.base_name} has been already failed 3 times, not submitting again.")
++                continue
++
++            job_log = f"{job.directory}/{job.base_name}.log"
++            job_gjf = f"{job.directory}/{job.base_name}.gjf"
++
++            # replace geometry
++            le = gaussian_log_extractor(job_log)
++            le.get_atom_labels()
++            le.get_geometry()
++            # old coords block
++            with open(job_gjf, "r") as f:
++                file_string = f.read()
++            old_coords_block = re.search(f"\w+\s+({float_or_int_regex})"
++                                         f"\s+({float_or_int_regex})"
++                                         f"\s+({float_or_int_regex}).*?\n\n",
++                                         file_string, re.DOTALL).group(0)
++
++            # new coords block
++            coords = le.geom[list('XYZ')].applymap(lambda x: f"{x:.6f}")
++            coords.insert(0, 'Atom', le.labels)
++            coords_block = "\n".join(map(" ".join, coords.values)) + "\n\n"
++
++            # make sure they are the same length and replace
++            assert len(old_coords_block.splitlines()) == len(coords_block.splitlines())
++            file_string = file_string.replace(old_coords_block, coords_block)
++            with open(job_gjf, "w") as f:
++                f.write(file_string)
++
++            logger.info("Substituting last checked geometry in the new input file.")
++
++            # replacing wall time
++            job_sh = f"{job.directory}/{job.base_name}.sh"
++            with open(job_sh, "r") as f:
++                file_string = f.read()
++            old_wall_time = re.search(f".*h_rt=(\d\d:\d\d:\d\d).*", file_string).group(1)
++            file_string = file_string.replace(old_wall_time, wall_time)
++            with open(job_sh, "w") as f:
++                f.write(file_string)
++            convert_crlf_to_lf(job_sh)
++
++            logger.info(f"Substituting wall_time with new value: {wall_time}")
++            incomplete_jobs_to_resubmit[key] = job
++
++        self.submit_jobs_from_jobs_dict(incomplete_jobs_to_resubmit)
++
++    def upload_done_molecules_to_db(self, tags, RMSD_threshold=0.35) -> None:
++
++        """Upload done molecules to db. Molecules are considered done when all jobs for a given \
++         smiles are in 'done' status. The conformers are deduplicated and uploaded to database using a metadata tag.
++
++        :param tags: a list of tags to create for this molecule
++        :type tags: list(str)
++        :param RMSD_threshold: RMSD threshold (in Angstroms) to use when deduplicating multiple conformers \
++        after Gaussian has found optimal geometry
++        :type RMSD_threshold: float
++        """
++
++        done_jobs = self.get_jobs(sge_status.done)
++        if not done_jobs:
++            logger.info("There are no jobs in done status. Exiting.")
++            return
++
++        # check if there are molecules with all jobs done
++        dfj = self.get_job_stats(split_by_can=True)
++        dfj_done = dfj[dfj['done'] == dfj.sum(1)]  # only done jobs
++        done_cans = dfj_done.index.tolist()
++
++        if not done_cans:
++            logger.info("There are no molecules with all jobs done. Exiting.")
++            return
++
++        logger.info(f"There are {len(done_cans)} finished molecules {done_cans}.")
++        logger.debug(f"Deduplicating conformers if RMSD < {RMSD_threshold}.")
++
++        for done_can in done_cans:
++            (keys, jobs) = zip(*self.get_jobs(can=done_can).items())
++            rdmol, energies = rdmol_from_sge_jobs(jobs, postDFT=True)
++            keep = prune_rmsds(rdmol, RMSD_threshold)
++            logger.info(f"Molecule {done_can} has {len(keys) - len(keep)} / {len(keys)} duplicate conformers.")
++
++            # remove duplicate jobs
++            can_keys_to_remove = [key for i, key in enumerate(keys) if i not in keep]
++            to_remove_jobs = {name: job for name, job in self.jobs.items() if name in can_keys_to_remove}
++            logger.info(
++                f"Removing {len(keys) - len(keep)} / {len(keys)} jobs and log files that contain duplicate conformers.")
++            self.remove_jobs(to_remove_jobs)
++
++            # upload non-duplicate jobs
++            can_keys_to_keep = [key for i, key in enumerate(keys) if i in keep]
++            self._upload_can_to_db(can_keys_to_keep, tags)
++
++    def _upload_can_to_db(self, keys, tags) -> None:
++        """Uploading single molecule conformers to database.
++
++        :param keys: list of keys to the self.jobs dictionary to upload
++        :type keys: list
++        :param tags: tags
++        :type tags: str or list
++        """
++
++        # check if the tag(s) are properly provided
++        assert isinstance(tags, (str, list))
++        if isinstance(tags, str):
++            tags = [tags]
++        assert all(len(t.strip()) > 0 for t in tags)
++
++        # fetch jobs
++        jobs = [self.jobs[key] for key in keys]
++
++        # get molecule info
++        assert len(set(j.can for j in jobs)) == 1
++        assert len(set(j.inchi for j in jobs)) == 1
++        assert len(set(j.inchikey for j in jobs)) == 1
++        assert len(set(tuple(j.elements) for j in jobs)) == 1
++        assert len(set(tuple(j.charges) for j in jobs)) == 1
++        assert len(set(tuple(j.connectivity_matrix.flatten()) for j in jobs)) == 1
++        assert len(set(tuple(j.config) for j in jobs)) == 1
++
++        mol_data = {'can': jobs[0].can,
++                    'inchi': jobs[0].inchi,
++                    'inchikey': jobs[0].inchikey,
++                    'elements': jobs[0].elements,
++                    'charges': jobs[0].charges.tolist(),
++                    'connectivity_matrix': jobs[0].connectivity_matrix.flatten().tolist()}
++
++        metadata = {'gaussian_config': jobs[0].config,
++                    'gaussian_tasks': jobs[0].tasks,
++                    'max_num_conformers': jobs[0].max_num_conformers,
++                    'conformer_engine': jobs[0].conformer_engine}
++
++        # loop over the conformers and extract info
++        conformations = []
++        logs = []
++        for job in jobs:
++            # extract descriptors for this conformer from log file
++            log = f"{job.directory}/{job.base_name}.log"
++            le = gaussian_log_extractor(log)
++            # add descriptors to conformations list
++            conformations.append(le.get_descriptors())
++            logs.append(le.log)
++
++        # compute weights
++        free_energies = np.array(
++            [Hartree_in_kcal_per_mol * c['descriptors']['G'] for c in conformations])  # in kcal_mol
++        free_energies -= free_energies.min()  # to avoid huge exponentials
++        weights = np.exp(-free_energies / (k_in_kcal_per_mol_K * T))
++        weights /= weights.sum()
++
++        mol_id = db_upload_molecule(mol_data, tags, metadata, weights, conformations, logs)
++        logger.info(
++            f"Uploaded descriptors to DB for smiles: {mol_data['can']}, number of conformers: {len(conformations)},"
++            f" DB molecule id {mol_id}.")
++        for key in keys:
++            self.jobs[key].status = sge_status.uploaded
++        self._cache()
++
++    def get_jobs(self, status=None, can=None) -> dict:
++        """Get a dictionary of jobs, optionally filter by status and canonical smiles.
++
++        :param status: sge status of the jobs
++        :type status: sge_status
++        :param can: canonical smiles of the molecules, single string for one smiles, a list for multiple smiles
++        :type can: str or list
++        :return: dict
++        """
++
++        def match(job, status, can):
++            match = True
++            if status is not None:
++                match = match and job.status.value == status.value
++            if can is not None:
++                if isinstance(can, str):
++                    can = [can]
++                match = match and (job.can in can)
++            return match
++
++        return {name: job for name, job in self.jobs.items() if match(job, status, can)}
++
++    def get_job_stats(self, split_by_can=False) -> pd.DataFrame:
++        """Job stats for jobs currently under management, optionally split by canonical smiles.
++
++        :param split_by_can: if True each canonical smiles will be listed separately
++        :type split_by_can: bool
++        :return: pandas.core.frame.DataFrame
++        """
++
++        df = pd.DataFrame([[v.status.name, v.can] for v in self.jobs.values()], columns=['status', 'can'])
++        if split_by_can:
++            return df.groupby(['status', 'can']).size().unstack(level=1).fillna(0).astype(int).T
++        else:
++            return df.groupby('status').size().to_frame('jobs').T
++
++    def remove_jobs(self, jobs) -> None:
++        """Remove jobs.
++
++        :param jobs: dictionary of jobs to remove
++        :type jobs: dict
++        """
++
++        self.connect()
++        for name, job in jobs.items():
++            logger.debug(f"Removing job {name}.")
++            # remove local files
++            try:
++                os.remove(f"{job.directory}/{job.base_name}.sh")  # sge file
++                os.remove(f"{job.directory}/{job.base_name}.gjf")  # gaussian file
++            except:
++                pass
++            if os.path.exists(f"{job.directory}/{job.base_name}.log"):
++                os.remove(f"{job.directory}/{job.base_name}.log")  # log file
++            # remove remote files
++            self.connection.run(f"rm -f {self.remote_dir}/sge-{job.job_id}.out")
++            self.connection.run(f"rm -f {self.remote_dir}/{job.base_name}*")
++            del self.jobs[name]
++        self._cache()
++
++    def qstat(self, summary=True) -> pd.DataFrame:
++        """Run 'qstat -u $user' command on the server.
++
++        :param summary: if True only a summary frame is displayed with counts of jobs in each status
++        :return: pandas.core.frame.DataFrame
++        """
++
++        self.connect()
++        if summary:
++            ret = self.connection.run(f"qstat -u {self.user}", hide=True)
++            #user_running_ids = [l.split()[0] for l in ret.stdout.readlines()[2:]]
++            user_running_ids = [re.search(".* (\d{7}) .*", l).group(1) for l  in ret.stdout.splitlines()[2:]] # looking for exactly 7 digit number
++            running, queued = 0, 0
++            for jobid in user_running_ids:
++                try:
++                    ret = self.connection.run(f"qstat -j {jobid}", hide=True) # will error if job finsishes before able to check all in list
++                    if len([l for l in ret.stdout.splitlines()[1:-1] if 'job_state' in l]) > 0:
++                        running += 1
++                    else:
++                        queued += 1
++                except:
++                    pass
++            return pd.DataFrame([[running],[queued]],columns=['Count'],index=['running','queued'])
++        else:
++            ret = self.connection.run(f"qstat -u {self.user}", hide=True)
++            #data = np.array(list(map(str.split, ret.stdout.splitlines())))
++            if len(ret.stdout) > 0:
++                #return pd.DataFrame(data[1:], columns=data[0])
++                for l in ret.stdout.splitlines():
++                    print(l)
++            else: 
++                return "No jobs in queue"
++
++    def _qdel(self) -> None:
++        """Run 'qdel -u $user' command on the server."""
++
++        self.connect()
++        self.connection.run(f"qdel -u {self.user}")
++        self.remove_jobs(self.get_jobs(status=sge_status.submitted))
++
++    def _cache(self) -> None:
++        """save jobs under management and cleanup empty directories"""
++
++        with open(self.cache_file, 'wb') as cf:
++            pickle.dump(self.jobs, cf)
++
++        cleanup_empty_dirs(f"{self.workdir}")
++
++    def _create_sge_file_from_gaussian_file(self, base_name, directory, wall_time) -> None:
++        """Generate a single sge submission file based on the Gaussian input file.
++
++        :param base_name: base name of the Gaussian file
++        :param directory: directory location of the Gaussian file
++        :param wall_time: wall time of the job in HH:MM:SS format
++        """
++
++        # get information from gaussian file needed for submission
++        with open(f"{directory}/{base_name}.gjf") as f:
++            file_string = f.read()
++
++        host = self.host.split(".")[0]
++
++        n_processors = re.search("nprocshared=(.*?)\n", file_string).group(1)
++        mem = re.search("mem=(.*?)GB\n", file_string).group(1)
++
++        output = ""
++        output += f"#!/bin/bash\n"
++        output += f"#$ -cwd\n"      # run in same directory as where submit it
++        output += f"#$ -o {base_name}.joblog.$JOB_ID\n"   # direct output to a file
++        output += f"#$ -j y\n"      
++        output += f"#$ -l h_data={mem}g,h_rt={wall_time},arch=intel*\n"   # specifies list of resources for job
++        #output += f"#$ -l h_data={mem}g,h_rt={wall_time},arch=intel*,highp\n"   # specifies list of resources for job (highp to run only on group resources)
++        output += f"#$ -pe dc* {n_processors}\n\n"      # What about specifying n_processors? dc* means allocates computing cores on any node on cluster
++        
++        output += f"# echo job info to joblog\n" \
++                  f"echo 'Job {base_name} started on:   ' `hostname -s`\n" \
++                  f"echo 'Job {base_name} started on:   ' `date `\n\n"
++
++        output += f"# set job environment and GAUSS_SCRDIR variable\n" \
++                  f". /u/local/Modules/default/init/modules.sh\n" \
++                  f"module load gaussian/g16_sse4\n" \
++                  f"export GAUSS_SCRDIR=$TMPDIR\n\n"
++
++        output += f"# echo current module used to joblog\n" \
++                  f"module li\n" \
++                  f'echo "GAUSS_SCRDIR=$GAUSS_SCRDIR"\n' \
++                  f"# another compiled version: $g16root/16_avx/g16\n" \
++                  f"echo '/usr/bin/time -v $g16root/16_sse4/g16 < {base_name}.gjf > {base_name}.log'\n\n" \
++                  f"cd {self.remote_dir}\n" \
++                  f"# run command\n" \
++                  f"/usr/bin/time -v $g16root/16_sse4/g16 < {base_name}.gjf > {base_name}.log\n\n" 
++
++        output += f"# echo job info to joblog\n" \
++                  f"echo 'Job $JOB_ID ended on:   '' `hostname -s`\n" \
++                  f"echo 'Job $JOB_ID ended on:   ' `date `"
++
++        sh_file_path = f"{directory}/{base_name}.sh"
++        with open(sh_file_path, "w") as f:
++            f.write(output)
++        convert_crlf_to_lf(sh_file_path)
++        logger.debug(f"Created a SGE job file: {sh_file_path}")
+diff --git a/config.yml b/config.yml
+index 982aa12..2a26990 100644
+--- a/config.yml
++++ b/config.yml
+@@ -1,4 +1,4 @@
+-slurm:
++resources:
+     wall_time: "23:59:00"
+     atoms_per_processor: 6
+     max_processors: 20
+diff --git a/notebooks/Framework_functionality_test_sge.ipynb b/notebooks/Framework_functionality_test_sge.ipynb
+new file mode 100644
+index 0000000..5d09246
+--- /dev/null
++++ b/notebooks/Framework_functionality_test_sge.ipynb
+@@ -0,0 +1,236 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Import classes from autoqchem"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 1,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "from autoqchem.molecule import molecule\n",
++    "from autoqchem.sge_manager import sge_manager\n",
++    "from autoqchem.draw_utils import draw"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Set the level of logging\n",
++    "Autoqchem prints out log messages, while the logger has various verbosity levels that you can set. If you are running for the first time \"INFO\" is good, once you are comfortable you can switch it to \"WARNING\" or \"ERROR\"."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 2,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import logging\n",
++    "logging.basicConfig(level=logging.INFO)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "We will use a single smiles string for this test"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 3,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "smiles_str = \"C(C)(CP(c1ccccc1)c1ccccc1)(CP(c1ccccc1)c1ccccc1)[4CH2][1P]([2c]1ccccc1)[3c]1ccccc1\""
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Initialize the molecule from smiles"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 4,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "mol = molecule(smiles_str, num_conf=20)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Draw it!\n",
++    "It should look decent, OpenBabel performs MMFF94 optimization with a conformer search. If it doesn't look good, there might be issues with openbabel installation (this is rare, but can happen)."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 5,
++   "metadata": {},
++   "outputs": [
++    {
++     "data": {
++      "application/vnd.jupyter.widget-view+json": {
++       "model_id": "b0bc44c428e946939cbc84e0aa2ab580",
++       "version_major": 2,
++       "version_minor": 0
++      },
++      "text/plain": [
++       "interactive(children=(Dropdown(description='confId', options=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), value…"
++      ]
++     },
++     "metadata": {},
++     "output_type": "display_data"
++    },
++    {
++     "data": {
++      "text/plain": [
++       "<function autoqchem.draw_utils._graph_conf(m, confId=0, energies=[])>"
++      ]
++     },
++     "execution_count": 5,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
++   "source": [
++    "draw(mol.mol)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Test whether you can access SGE on Hoffman2 at UCLA\n",
++    "If you have an account on Hoffman2, change host to ```hoffman2.idre.ucla.edu```."
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Initialize the sge manager\n",
++    "change user parameter to your user"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 6,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sm = sge_manager(user='wgee', host='hoffman2.idre.ucla.edu')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Verify that you can create an ssh tunnel into the remote server\n",
++    "Follow prompts for password and duo authentication. This tunnel will be used to manage jobs from within the notebook"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 7,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stderr",
++     "output_type": "stream",
++     "text": [
++      "INFO:autoqchem.sge_manager:Creating connection to hoffman2.idre.ucla.edu as wgee\n",
++      "INFO:paramiko.transport:Connected (version 2.0, client OpenSSH_7.4)\n",
++      "INFO:paramiko.transport:Authentication (password) successful!\n",
++      "INFO:autoqchem.sge_manager:Connected to hoffman2.idre.ucla.edu as wgee.\n"
++     ]
++    }
++   ],
++   "source": [
++    "sm.connect()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Check that you can see your jobs on the remote server\n",
++    "If the following command returns a table with your jobs currently running on the server, it's a success. If you have no jobs running, only a header row will be displayed."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 8,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "job-ID     prior   name       user         state submit/start at     queue                          jclass                         slots ja-task-ID \n",
++      "------------------------------------------------------------------------------------------------------------------------------------------------\n",
++      "   7357811 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:23 pod_ib100_apollo2.q@n6676                                         4        \n",
++      "   7357815 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:23 pod_ib100_apollo2.q@n6676                                         4        \n",
++      "   7357819 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:30 pod_apollo_6140.q@n6643                                           4        \n",
++      "   7357824 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:30 pod_apollo_6140.q@n7672                                           4        \n",
++      "   7357828 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:30 pod_apollo_6140.q@n7670                                           4        \n",
++      "   7357833 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:38 pod_ib100_apollo3.q@n7661                                         4        \n",
++      "   7357836 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:38 pod_ib100_apollo3.q@n7672                                         4        \n",
++      "   7357841 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:38 pod_ib100_apollo3.q@n7670                                         4        \n",
++      "   7357846 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:45 pod_ib100_apollo5.q@n1841                                         4        \n",
++      "   7357850 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:45 pod_ib100_apollo5.q@n1839                                         4        \n"
++     ]
++    }
++   ],
++   "source": [
++    "sm.qstat(summary=False)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": []
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3.9.13 64-bit ('3.9.13')",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.9.13"
++  },
++  "vscode": {
++   "interpreter": {
++    "hash": "75934cf67ebde6f7dd5cca3b6d679ee9d52aabd0098557c6f9034056a96918b4"
++   }
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 2
++}
+diff --git a/notebooks/Tutorial_creating_descriptor_sets.ipynb b/notebooks/Tutorial_creating_descriptor_sets.ipynb
+index e599612..dbfcf6c 100644
+--- a/notebooks/Tutorial_creating_descriptor_sets.ipynb
++++ b/notebooks/Tutorial_creating_descriptor_sets.ipynb
+@@ -9,7 +9,7 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 10,
++   "execution_count": 1,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+@@ -17,7 +17,8 @@
+     "\n",
+     "from autoqchem.molecule import molecule\n",
+     "from autoqchem.slurm_manager import slurm_manager\n",
+-    "from autoqchem.helper_classes import slurm_status\n",
++    "from autoqchem.sge_manager import sge_manager\n",
++    "from autoqchem.helper_classes import slurm_status,sge_status\n",
+     "from autoqchem.draw_utils import draw\n",
+     "\n",
+     "import logging\n",
+@@ -28,40 +29,43 @@
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "### Initialize the slurm manager\n",
++    "### Initialize the job manager\n",
+     "\n",
+-    "Slurm manager is going to manage what jobs you have currently running, or created. It caches your information, so you can kill the notebook, turn-off your computer, go on vacation, and pick it up later. It will remember which jobs you haven't retrieved from the cluster, etc.\n",
++    "The job manager is going to manage what jobs you have currently running or waiting to run. It caches your information, so you can kill the notebook, turn-off your computer, or go on vacation, and still pick it up later. It will remember which jobs you haven't retrieved from the cluster, etc.\n",
+     "\n",
+-    "Note: it won't ask you for login unless you execute a method that requires remote access"
++    "Use the ```slurm``` manager for running jobs on ```della``` at Princeton and the ```sge``` manager for running jobs on ```hoffman2``` at UCLA.\n",
++    "\n",
++    "Note: it won't ask you to login unless you execute a method that requires remote access."
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 4,
++   "execution_count": 2,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+-    "sm=slurm_manager(user='zuranski', host='della.princeton.edu')"
++    "#sm=slurm_manager(user='zuranski', host='della.princeton.edu')\n",
++    "sm=sge_manager(user='wgee', host='hoffman2.idre.ucla.edu')"
+    ]
+   },
+   {
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "### Provide some smiles string(s)\n",
++    "### Provide some SMILES string(s)\n",
+     "\n",
+-    "and copy into them into ```my_smiles``` variable. It's a list of strings (a Python list can be of any size)"
++    "The ```my_smiles``` variable is a list of strings (a Python list can be of any size)"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 5,
++   "execution_count": 31,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+     "my_smiles=[\n",
+     "    \"C(C1C(C(C(C(O1)O)O)O)O)O\",\n",
+-    "    \"c1ccc(F)cc1\",\n",
++    "    \"c1ccc(Br)cc1\",\n",
+     "]"
+    ]
+   },
+@@ -69,12 +73,12 @@
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "For a list of smiles, you can also read them out from a csv file in this way, assumed file name ```smiles_strings.csv```, also assuming the strings are in the first column, and there are no headers"
++    "For a list of SMILES, you can also read them from a csv file, assuming that the filename is ```smiles_strings.csv```, the strings are in the first column, and there are no headers"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 6,
++   "execution_count": 7,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+@@ -88,12 +92,12 @@
+    "source": [
+     "### Initialize the molecules and generate conformations\n",
+     "\n",
+-    "We will use some ```for``` loops to loop over the smiles"
++    "We will make 3D conformations for every SMILES string using a ```for``` loop"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 7,
++   "execution_count": 32,
+    "metadata": {},
+    "outputs": [],
+    "source": [
+@@ -111,18 +115,32 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 12,
++   "execution_count": 33,
+    "metadata": {},
+    "outputs": [
+     {
+      "data": {
+       "application/vnd.jupyter.widget-view+json": {
+-       "model_id": "9dc29f65634f4957944651b8cd2caa0f",
++       "model_id": "a6de5d09b5224ef7907bd23ae6c9978a",
+        "version_major": 2,
+        "version_minor": 0
+       },
+       "text/plain": [
+-       "interactive(children=(Dropdown(description='confId', options=(0, 1, 2, 3, 4, 5, 6, 7), value=0), Output()), _d…"
++       "interactive(children=(Dropdown(description='confId', options=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), value=0), Output(…"
++      ]
++     },
++     "metadata": {},
++     "output_type": "display_data"
++    },
++    {
++     "data": {
++      "application/vnd.jupyter.widget-view+json": {
++       "model_id": "9c8b79b83d4843a9ac26a9eb714e290b",
++       "version_major": 2,
++       "version_minor": 0
++      },
++      "text/plain": [
++       "interactive(children=(Dropdown(description='confId', options=(0,), value=0), Output()), _dom_classes=('widget-…"
+       ]
+      },
+      "metadata": {},
+@@ -134,48 +152,105 @@
+        "<function autoqchem.draw_utils._graph_conf(m, confId=0, energies=[])>"
+       ]
+      },
+-     "execution_count": 12,
++     "execution_count": 33,
+      "metadata": {},
+      "output_type": "execute_result"
+     }
+    ],
+    "source": [
+-    "draw(mols[0].mol)"
++    "draw(mols[0].mol)\n",
++    "draw(mols[1].mol)"
+    ]
+   },
+   {
+    "cell_type": "markdown",
+    "metadata": {},
+    "source": [
+-    "### Create gaussian jobs for each conformation"
++    "### Create Gaussian jobs for each conformation\n",
++    "\n",
++    "Select settings such as the functional, basis set, and solvent"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 70,
++   "execution_count": 35,
+    "metadata": {},
+    "outputs": [
+     {
+      "name": "stderr",
+      "output_type": "stream",
+      "text": [
+-      "WARNING:autoqchem.slurm_manager:Molecule InChI=1S/C6H5F/c7-6-4-2-1-3-5-6/h1-5H already exists with the same Gaussian config with tags ['test_AMZ']. Not creating jobs.\n"
++      "INFO:autoqchem.gaussian_input_generator:Generating Gaussian input files for 10 conformations.\n"
+      ]
+     }
+    ],
+    "source": [
+-    "for mol in mols[1:]:\n",
+-    "    sm.create_jobs_for_molecule(mol, light_basis_set='6-31G**', solvent='Ethanol')"
++    "for mol in mols[0:2]:\n",
++    "    sm.create_jobs_for_molecule(mol, theory=\"B3LYP\", light_basis_set='6-31G**', solvent='methanol')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### View the status of all jobs in the workflow\n"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 81,
++   "execution_count": 37,
+    "metadata": {},
+-   "outputs": [],
++   "outputs": [
++    {
++     "data": {
++      "text/html": [
++       "<div>\n",
++       "<style scoped>\n",
++       "    .dataframe tbody tr th:only-of-type {\n",
++       "        vertical-align: middle;\n",
++       "    }\n",
++       "\n",
++       "    .dataframe tbody tr th {\n",
++       "        vertical-align: top;\n",
++       "    }\n",
++       "\n",
++       "    .dataframe thead th {\n",
++       "        text-align: right;\n",
++       "    }\n",
++       "</style>\n",
++       "<table border=\"1\" class=\"dataframe\">\n",
++       "  <thead>\n",
++       "    <tr style=\"text-align: right;\">\n",
++       "      <th>status</th>\n",
++       "      <th>created</th>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>can</th>\n",
++       "      <th></th>\n",
++       "    </tr>\n",
++       "  </thead>\n",
++       "  <tbody>\n",
++       "    <tr>\n",
++       "      <th>C(C1C(C(C(C(O1)O)O)O)O)O</th>\n",
++       "      <td>10</td>\n",
++       "    </tr>\n",
++       "  </tbody>\n",
++       "</table>\n",
++       "</div>"
++      ],
++      "text/plain": [
++       "status                    created\n",
++       "can                              \n",
++       "C(C1C(C(C(C(O1)O)O)O)O)O       10"
++      ]
++     },
++     "execution_count": 37,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
+    "source": [
+-    "# view the workflow status of all jobs\n",
+-    "sm.get_job_stat(split_by_can=True)"
++    "sm.get_job_stats(split_by_can=True)"
+    ]
+   },
+   {
+@@ -184,16 +259,39 @@
+    "source": [
+     "### Submit the jobs to the server \n",
+     "\n",
+-    "if you are not connected, it will ask for password + Duo"
++    "If you are not connected, it will ask for password + Duo (`della`) or password (`hoffman2`)"
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 79,
++   "execution_count": 38,
+    "metadata": {
+     "scrolled": true
+    },
+-   "outputs": [],
++   "outputs": [
++    {
++     "name": "stderr",
++     "output_type": "stream",
++     "text": [
++      "INFO:autoqchem.sge_manager:Submitting 10 jobs.\n",
++      "INFO:autoqchem.sge_manager:Creating connection to hoffman2.idre.ucla.edu as wgee\n",
++      "INFO:paramiko.transport:Connected (version 2.0, client OpenSSH_7.4)\n",
++      "INFO:paramiko.transport:Authentication (password) successful!\n",
++      "INFO:autoqchem.sge_manager:Connected to hoffman2.idre.ucla.edu as wgee.\n",
++      "INFO:paramiko.transport.sftp:[chan 1] Opened sftp connection (server version 3)\n",
++      "INFO:autoqchem.sge_manager:Submitted job f3acd84ad1cddc42b1c76dcdb37d544d, job_id: 7357811.\n",
++      "INFO:autoqchem.sge_manager:Submitted job 6a4a352e2a9423622ee71ddd8cf0979b, job_id: 7357815.\n",
++      "INFO:autoqchem.sge_manager:Submitted job 79f17c43b84edcdadd9132a09fffea3b, job_id: 7357819.\n",
++      "INFO:autoqchem.sge_manager:Submitted job c936e56c7d5c54d289a4db58f8344055, job_id: 7357824.\n",
++      "INFO:autoqchem.sge_manager:Submitted job ba77b2860aaf978eeebdc6ada1e94811, job_id: 7357828.\n",
++      "INFO:autoqchem.sge_manager:Submitted job 7176e2d87aacfcc39234439d331d614e, job_id: 7357833.\n",
++      "INFO:autoqchem.sge_manager:Submitted job 973beba512bda8a0bfaa45213ff1fa5d, job_id: 7357836.\n",
++      "INFO:autoqchem.sge_manager:Submitted job e64a36004776491b80914b89c30bfc8e, job_id: 7357841.\n",
++      "INFO:autoqchem.sge_manager:Submitted job 176edb8acf0367b53fd1ff103aa7883d, job_id: 7357846.\n",
++      "INFO:autoqchem.sge_manager:Submitted job c73e4110aee9ddac83abd14ae71caf25, job_id: 7357850.\n"
++     ]
++    }
++   ],
+    "source": [
+     "sm.submit_jobs()"
+    ]
+@@ -207,7 +305,44 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 75,
++   "execution_count": 39,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "job-ID     prior   name       user         state submit/start at     queue                          jclass                         slots ja-task-ID \n",
++      "------------------------------------------------------------------------------------------------------------------------------------------------\n",
++      "   7357811 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:23 pod_ib100_apollo2.q@n6676                                         4        \n",
++      "   7357815 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:23 pod_ib100_apollo2.q@n6676                                         4        \n",
++      "   7357819 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:30 pod_apollo_6140.q@n6643                                           4        \n",
++      "   7357824 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:30 pod_apollo_6140.q@n7672                                           4        \n",
++      "   7357828 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:30 pod_apollo_6140.q@n7670                                           4        \n",
++      "   7357833 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:38 pod_ib100_apollo3.q@n7661                                         4        \n",
++      "   7357836 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:38 pod_ib100_apollo3.q@n7672                                         4        \n",
++      "   7357841 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:38 pod_ib100_apollo3.q@n7670                                         4        \n",
++      "   7357846 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:45 pod_ib100_apollo5.q@n1841                                         4        \n",
++      "   7357850 0.50500 WQZGKKKJIJ wgee         r     05/19/2023 11:23:45 pod_ib100_apollo5.q@n1839                                         4        \n"
++     ]
++    }
++   ],
++   "source": [
++    "#sm.squeue(summary=False)   # with slurm on `della`\n",
++    "sm.qstat(summary=False)     # with sge on `hoffman2`"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Alternatively, view summary of job status on the server\n",
++    "(may take a bit longer for many jobs as asks server about each separately)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 40,
+    "metadata": {},
+    "outputs": [
+     {
+@@ -231,34 +366,100 @@
+        "  <thead>\n",
+        "    <tr style=\"text-align: right;\">\n",
+        "      <th></th>\n",
+-       "      <th>JOBID</th>\n",
+-       "      <th>PARTITION</th>\n",
+-       "      <th>NAME</th>\n",
+-       "      <th>USER</th>\n",
+-       "      <th>ST</th>\n",
+-       "      <th>TIME</th>\n",
+-       "      <th>NODES</th>\n",
+-       "      <th>NODELIST(REASON)</th>\n",
++       "      <th>Count</th>\n",
+        "    </tr>\n",
+        "  </thead>\n",
+        "  <tbody>\n",
++       "    <tr>\n",
++       "      <th>running</th>\n",
++       "      <td>10</td>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>queued</th>\n",
++       "      <td>0</td>\n",
++       "    </tr>\n",
+        "  </tbody>\n",
+        "</table>\n",
+        "</div>"
+       ],
+       "text/plain": [
+-       "Empty DataFrame\n",
+-       "Columns: [JOBID, PARTITION, NAME, USER, ST, TIME, NODES, NODELIST(REASON)]\n",
+-       "Index: []"
++       "         Count\n",
++       "running     10\n",
++       "queued       0"
+       ]
+      },
+-     "execution_count": 75,
++     "execution_count": 40,
+      "metadata": {},
+      "output_type": "execute_result"
+     }
+    ],
+    "source": [
+-    "sm.squeue(summary=False)"
++    "#sm.squeue(summary=True)    # with slurm on `della`\n",
++    "sm.qstat(summary=True)      # with sge on `hoffman2`"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Check workflow status at any time\n"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 3,
++   "metadata": {},
++   "outputs": [
++    {
++     "data": {
++      "text/html": [
++       "<div>\n",
++       "<style scoped>\n",
++       "    .dataframe tbody tr th:only-of-type {\n",
++       "        vertical-align: middle;\n",
++       "    }\n",
++       "\n",
++       "    .dataframe tbody tr th {\n",
++       "        vertical-align: top;\n",
++       "    }\n",
++       "\n",
++       "    .dataframe thead th {\n",
++       "        text-align: right;\n",
++       "    }\n",
++       "</style>\n",
++       "<table border=\"1\" class=\"dataframe\">\n",
++       "  <thead>\n",
++       "    <tr style=\"text-align: right;\">\n",
++       "      <th>status</th>\n",
++       "      <th>submitted</th>\n",
++       "    </tr>\n",
++       "    <tr>\n",
++       "      <th>can</th>\n",
++       "      <th></th>\n",
++       "    </tr>\n",
++       "  </thead>\n",
++       "  <tbody>\n",
++       "    <tr>\n",
++       "      <th>C(C1C(C(C(C(O1)O)O)O)O)O</th>\n",
++       "      <td>10</td>\n",
++       "    </tr>\n",
++       "  </tbody>\n",
++       "</table>\n",
++       "</div>"
++      ],
++      "text/plain": [
++       "status                    submitted\n",
++       "can                                \n",
++       "C(C1C(C(C(C(O1)O)O)O)O)O         10"
++      ]
++     },
++     "execution_count": 3,
++     "metadata": {},
++     "output_type": "execute_result"
++    }
++   ],
++   "source": [
++    "sm.get_job_stats(split_by_can=True)"
+    ]
+   },
+   {
+@@ -267,21 +468,26 @@
+    "source": [
+     "### Retrieve jobs\n",
+     "\n",
+-    "If there are some finished jobs the log files will be checked for completion and downloaded locally."
++    "If there are some finished jobs, the log files will be checked for completion and downloaded locally."
+    ]
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 76,
++   "execution_count": 4,
+    "metadata": {},
+    "outputs": [
+     {
+      "name": "stderr",
+      "output_type": "stream",
+      "text": [
+-      "INFO:autoqchem.slurm_manager:There are 0 running/pending jobs, 7 finished jobs.\n",
+-      "INFO:autoqchem.slurm_manager:Retrieving log files of finished jobs.\n",
+-      "INFO:autoqchem.slurm_manager:7 jobs finished successfully (all Gaussian steps finished normally). 0 jobs failed.\n"
++      "INFO:autoqchem.sge_manager:Creating connection to hoffman2.idre.ucla.edu as wgee\n",
++      "INFO:paramiko.transport:Connected (version 2.0, client OpenSSH_7.4)\n",
++      "INFO:paramiko.transport:Authentication (password) successful!\n",
++      "INFO:autoqchem.sge_manager:Connected to hoffman2.idre.ucla.edu as wgee.\n",
++      "INFO:autoqchem.sge_manager:There are 0 running/pending jobs, 10 finished jobs.\n",
++      "INFO:autoqchem.sge_manager:Retrieving log files of finished jobs.\n",
++      "INFO:paramiko.transport.sftp:[chan 2] Opened sftp connection (server version 3)\n",
++      "INFO:autoqchem.sge_manager:10 jobs finished successfully (all Gaussian steps finished normally). 0 jobs failed.\n"
+      ]
+     }
+    ],
+@@ -298,14 +504,14 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 48,
++   "execution_count": 5,
+    "metadata": {},
+    "outputs": [
+     {
+      "name": "stderr",
+      "output_type": "stream",
+      "text": [
+-      "INFO:autoqchem.slurm_manager:There are no incomplete jobs to resubmit.\n"
++      "INFO:autoqchem.sge_manager:There are no incomplete jobs to resubmit.\n"
+      ]
+     }
+    ],
+@@ -322,28 +528,111 @@
+   },
+   {
+    "cell_type": "code",
+-   "execution_count": 78,
++   "execution_count": 6,
+    "metadata": {},
+    "outputs": [
+     {
+      "name": "stderr",
+      "output_type": "stream",
+      "text": [
+-      "INFO:autoqchem.slurm_manager:There are 1 finished molecules ['C(C1C(C(C(C(O1)O)O)O)O)O'].\n",
+-      "INFO:autoqchem.slurm_manager:Molecule C(C1C(C(C(C(O1)O)O)O)O)O has 0 / 8 duplicate conformers.\n",
+-      "INFO:autoqchem.slurm_manager:Removing 0 / 8 jobs and log files that contain duplicate conformers.\n",
+-      "INFO:autoqchem.slurm_manager:Uploaded descriptors to DB for smiles: C(C1C(C(C(C(O1)O)O)O)O)O, number of conformers: 8, DB molecule id 61bbad58bb6b37fd936249b9.\n"
++      "INFO:autoqchem.sge_manager:There are 1 finished molecules ['C(C1C(C(C(C(O1)O)O)O)O)O'].\n",
++      "INFO:autoqchem.sge_manager:Molecule C(C1C(C(C(C(O1)O)O)O)O)O has 0 / 10 duplicate conformers.\n",
++      "INFO:autoqchem.sge_manager:Removing 0 / 10 jobs and log files that contain duplicate conformers.\n",
++      "INFO:autoqchem.sge_manager:Uploaded descriptors to DB for smiles: C(C1C(C(C(C(O1)O)O)O)O)O, number of conformers: 10, DB molecule id 6467cfbfded247f07276fe3c.\n"
+      ]
+     }
+    ],
+    "source": [
+-    "sm.upload_done_molecules_to_db(tags=[\"test_AMZ\"])"
++    "sm.upload_done_molecules_to_db(tags=[\"test_WCG\"])"
+    ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "You can now find the computed descriptors for your molecules at https://autoqchem.org/."
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Other helpful commands"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Remove molecules from job manager\n",
++    "\n",
++    "Useful if need to redo a molecule with same Gaussian configuration before uploading to database"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 26,
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "sm.remove_jobs(sm.get_jobs(can=\"C(C1C(C(C(C(O1)O)O)O)O)O\"))"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "### Cancel all running/queued jobs\n",
++    "\n",
++    "Beware that all of a user's jobs will be canceled (including jobs submitted independently of Auto-QChem)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": 23,
++   "metadata": {},
++   "outputs": [
++    {
++     "name": "stdout",
++     "output_type": "stream",
++     "text": [
++      "wgee has registered the job 7357214 for deletion\n",
++      "wgee has registered the job 7357215 for deletion\n",
++      "wgee has registered the job 7357217 for deletion\n",
++      "wgee has registered the job 7357218 for deletion\n",
++      "wgee has registered the job 7357219 for deletion\n",
++      "wgee has registered the job 7357220 for deletion\n",
++      "wgee has registered the job 7357221 for deletion\n",
++      "wgee has registered the job 7357222 for deletion\n",
++      "wgee has registered the job 7357290 for deletion\n",
++      "wgee has registered the job 7357291 for deletion\n",
++      "wgee has registered the job 7357292 for deletion\n",
++      "wgee has registered the job 7357293 for deletion\n",
++      "wgee has registered the job 7357294 for deletion\n",
++      "wgee has registered the job 7357295 for deletion\n",
++      "wgee has registered the job 7357296 for deletion\n",
++      "wgee has registered the job 7357297 for deletion\n",
++      "wgee has registered the job 7357298 for deletion\n",
++      "wgee has registered the job 7357299 for deletion\n"
++     ]
++    }
++   ],
++   "source": [
++    "#sm.scancel()   # with slurm on `della`\n",
++    "sm._qdel()      # with sge on `hoffman2`"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "metadata": {},
++   "outputs": [],
++   "source": []
+   }
+  ],
+  "metadata": {
+   "kernelspec": {
+-   "display_name": "Python 3 (ipykernel)",
++   "display_name": "Python 3.7.12 ('autoqchem')",
+    "language": "python",
+    "name": "python3"
+   },
+@@ -357,7 +646,12 @@
+    "name": "python",
+    "nbconvert_exporter": "python",
+    "pygments_lexer": "ipython3",
+-   "version": "3.7.11"
++   "version": "3.7.12"
++  },
++  "vscode": {
++   "interpreter": {
++    "hash": "684abc938bfc2add5f36d7d052a0aef4b60f3eff60006b82ce647595b8c2f083"
++   }
+   }
+  },
+  "nbformat": 4,

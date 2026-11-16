@@ -1,0 +1,386 @@
+diff --git a/bionemo-recipes/models/mixtral/README.md b/bionemo-recipes/models/mixtral/README.md
+new file mode 100644
+index 0000000000..b9a4cca5af
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/README.md
+@@ -0,0 +1,131 @@
++# Mixtral Optimized with NVIDIA TransformerEngine
++
++This folder contains source code and tests for Mixtral-style Mixture of Experts (MoE) models that inherit from the
++transformers `PreTrainedModel` class and use TransformerEngine layers. The implementation replaces the standard
++attention layers with TE `MultiheadAttention` and uses TE `GroupedLinear` for efficient parallel expert computation.
++
++## Feature support
++
++The Mixtral implementation natively supports the following TransformerEngine-provided optimizations:
++
++| Feature                                 | Support                                                                          |
++| --------------------------------------- | -------------------------------------------------------------------------------- |
++| **FP8**                                 | ✅ Supported on compute capacity 9.0 and above (Hopper+)                         |
++| **MXFP8**                               | ✅ Supported on compute capacity 10.0 and 10.3 (Blackwell), 12.0 support pending |
++| **Sequence Packing / THD input format** | ✅ Supported                                                                     |
++| **FP8 with THD input format**           | ✅ Supported where FP8 is supported                                              |
++| **Import from HuggingFace checkpoints** | ✅ Supported                                                                     |
++| **Export to HuggingFace checkpoints**   | ✅ Supported                                                                     |
++| **KV-cache inference**                  | ✅ Supported                                                                     |
++
++## Inference Examples
++
++### Quick start: convert and run
++
++> **Note:** The snippets below use bare imports (e.g., `from convert import ...`). Run them from the
++> `bionemo-recipes/models/mixtral` directory, or install dependencies first with `pip install -r requirements.txt`.
++
++```python
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++from convert import convert_mixtral_hf_to_te
++
++# Load the original HuggingFace Mixtral model
++model_hf = AutoModelForCausalLM.from_pretrained(
++    "mistralai/Mixtral-8x7B-v0.1", torch_dtype=torch.bfloat16
++)
++
++# Convert to TransformerEngine
++model_te = convert_mixtral_hf_to_te(model_hf)
++model_te.to("cuda")
++
++tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-v0.1")
++tokenizer.pad_token = tokenizer.eos_token
++
++inputs = tokenizer("The quick brown fox", return_tensors="pt")
++inputs = {k: v.to("cuda") for k, v in inputs.items()}
++
++with torch.no_grad():
++    output_ids = model_te.generate(**inputs, max_new_tokens=16)
++
++print(tokenizer.decode(output_ids[0], skip_special_tokens=True))
++```
++
++## Converting Between Model Formats
++
++This section explains how to convert between Hugging Face Transformers and Transformer Engine (TE) Mixtral model
++formats. The process demonstrates bidirectional conversion: from Transformers to TE format for optimized training and
++inference, and back to Hugging Face Transformers format for sharing and deployment.
++
++### Converting from HF Transformers to TE
++
++> **Note:** Run from the `bionemo-recipes/models/mixtral` directory, or install dependencies first with
++> `pip install -r requirements.txt`.
++
++```python
++from transformers import AutoModelForCausalLM
++
++from convert import convert_mixtral_hf_to_te
++
++model_hf = AutoModelForCausalLM.from_pretrained("mistralai/Mixtral-8x7B-v0.1")
++model_te = convert_mixtral_hf_to_te(model_hf)
++model_te.save_pretrained("/path/to/te_checkpoint")
++```
++
++### Converting from TE back to HF Transformers
++
++> **Note:** Run from the `bionemo-recipes/models/mixtral` directory, or install dependencies first with
++> `pip install -r requirements.txt`.
++
++```python
++from convert import convert_mixtral_te_to_hf
++from modeling_mixtral_te import NVMixtralForCausalLM
++
++model_te = NVMixtralForCausalLM.from_pretrained("/path/to/te_checkpoint")
++model_hf = convert_mixtral_te_to_hf(model_te)
++model_hf.save_pretrained("/path/to/hf_checkpoint")
++```
++
++### Validating Converted Models
++
++The golden value tests in [test_modeling_mixtral.py](tests/test_modeling_mixtral.py) verify that the converted TE model
++produces numerically equivalent outputs to the original HuggingFace model. Specifically:
++
++- `test_golden_values_bshd` — loads both models, runs a forward pass on the same input, and asserts that logits and
++  loss match within tolerance.
++- `test_round_trip_conversion` — converts HF → TE → HF and verifies the round-tripped model produces identical outputs.
++
++To run these tests locally:
++
++```bash
++./ci/scripts/recipes_local_test.py bionemo-recipes/models/mixtral/
++```
++
++## Developer Guide
++
++### Running tests
++
++To run tests locally, run `recipes_local_test.py` from the repository root with the model directory as an argument.
++
++```bash
++./ci/scripts/recipes_local_test.py bionemo-recipes/models/mixtral/
++```
++
++### Exporting to Hugging Face Hub
++
++The model directory includes an `export.py` script that bundles all files needed for Hugging Face Hub distribution. To
++create the export bundle, run from the model directory:
++
++```bash
++python export.py
++```
++
++Before publishing, validate the export by running the local test suite via
++[recipes_local_test.py](../../ci/scripts/recipes_local_test.py).
++
++### Development container
++
++To use the provided devcontainer, use "Dev Containers: Reopen in Container" from the VSCode menu, and choose the
++"BioNeMo Recipes Dev Container" option. To run the tests inside the container, first install the dependencies with
++`pip install -r requirements.txt`, then run `pytest -v .` in the model directory.
+diff --git a/bionemo-recipes/models/mixtral/convert.py b/bionemo-recipes/models/mixtral/convert.py
+index 14dc8f7253..beba1ff4cb 100644
+--- a/bionemo-recipes/models/mixtral/convert.py
++++ b/bionemo-recipes/models/mixtral/convert.py
+@@ -13,6 +13,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++"""Conversion utilities between HuggingFace Mixtral and TransformerEngine formats."""
++
+ import inspect
+ 
+ import torch
+@@ -62,8 +64,20 @@ def _split_experts_down(down_proj: torch.Tensor):
+ def _make_merge_experts_fn(num_experts: int):
+     """Create a merge function with the correct number of named parameters.
+ 
+-    The state.py transform system maps function parameter names to source keys, so we need a function
+-    with exactly `num_experts` named parameters (weight0, weight1, ...).
++    The state.py transform system maps function parameter names to source dict keys by inspecting
++    the function signature. When ``source_key`` is a tuple, it pairs each tuple element with the
++    corresponding named parameter via ``{param: source_key[i]}``. This means ``*args`` style
++    parameters do not work -- the system cannot map positional varargs to specific source keys.
++
++    Since the number of experts is dynamic (varies per model config), we use ``exec()`` to generate
++    a function with exactly ``num_experts`` named parameters (weight0, weight1, ..., weightN-1).
++
++    Args:
++        num_experts: The number of expert weight parameters the generated function will accept.
++
++    Returns:
++        A callable ``(weight0, weight1, ..., weight{N-1}) -> torch.Tensor`` that stacks the
++        per-expert weight tensors into a single tensor of shape ``[num_experts, ...]``.
+     """
+     param_names = [f"weight{i}" for i in range(num_experts)]
+     code = f"def merge_experts({', '.join(param_names)}):\n    return torch.stack([{', '.join(param_names)}])"
+diff --git a/bionemo-recipes/models/mixtral/modeling_mixtral_te.py b/bionemo-recipes/models/mixtral/modeling_mixtral_te.py
+index 0206104e08..4b66838135 100644
+--- a/bionemo-recipes/models/mixtral/modeling_mixtral_te.py
++++ b/bionemo-recipes/models/mixtral/modeling_mixtral_te.py
+@@ -13,6 +13,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++"""TransformerEngine-optimized Mixtral model with Mixture of Experts."""
++
+ from collections import OrderedDict
+ from typing import ClassVar, Unpack
+ 
+@@ -38,6 +40,9 @@
+ class NVMixtralConfig(MixtralConfig):
+     """NVMixtral configuration."""
+ 
++    # Attention input format:
++    #   "bshd" = Batch, Sequence, Head, Dimension (standard padded format)
++    #   "thd"  = Total tokens (packed/unpadded), Head, Dimension (sequence packing format)
+     attn_input_format: str = "thd"
+     self_attn_mask_type: str = "padding_causal"
+ 
+diff --git a/bionemo-recipes/models/mixtral/tests/test_export.py b/bionemo-recipes/models/mixtral/tests/test_export.py
+new file mode 100644
+index 0000000000..ca732e481a
+--- /dev/null
++++ b/bionemo-recipes/models/mixtral/tests/test_export.py
+@@ -0,0 +1,34 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: LicenseRef-Apache2
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++
++import pytest
++from transformer_engine.pytorch import MultiheadAttention
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++from export import export_hf_checkpoint
++
++
++@pytest.mark.skipif(os.getenv("CI", "false") == "true", reason="Skipping test in CI, requires Mini-Mixtral download.")
++def test_export_mixtral_checkpoint(tmp_path):
++    export_hf_checkpoint("NeuralNovel/Mini-Mixtral-v0.2", tmp_path / "checkpoint_export")
++
++    _ = AutoTokenizer.from_pretrained(tmp_path / "checkpoint_export")
++    model = AutoModelForCausalLM.from_pretrained(tmp_path / "checkpoint_export", trust_remote_code=True)
++    assert "NVMixtralForCausalLM" in model.__class__.__name__
++    assert "NVMixtralConfig" in model.config.__class__.__name__
++    # Mixtral uses custom NVMixtralDecoderLayer with TE MultiheadAttention sub-modules
++    assert isinstance(model.model.layers[0].self_attention, MultiheadAttention)
+diff --git a/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py b/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py
+index cb9c024829..08e9f30917 100644
+--- a/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py
++++ b/bionemo-recipes/models/mixtral/tests/test_modeling_mixtral.py
+@@ -37,7 +37,7 @@
+ 
+ from collator import DataCollatorWithFlattening
+ from convert import convert_mixtral_hf_to_te, convert_mixtral_te_to_hf
+-from modeling_mixtral_te import NVMixtralConfig, NVMixtralForCausalLM
++from modeling_mixtral_te import HFInferenceParams, NVMixtralConfig, NVMixtralForCausalLM
+ from tests.common import BaseModelTest, TestTolerances
+ 
+ 
+@@ -145,3 +145,136 @@ def get_tolerances(self) -> TestTolerances:
+             cp_loss_atol=0.5,
+             cp_loss_rtol=0.25,
+         )
++
++    # ==================== Mixtral-Specific KV-Cache Tests ====================
++
++    def _create_inference_params(self, config, batch_size=1, max_seq_len=256, num_beams=1):
++        """Create HFInferenceParams for the given config."""
++        past_key_values = HFInferenceParams(
++            max_batch_size=batch_size * num_beams,
++            max_sequence_length=max_seq_len,
++            num_heads_kv=config.num_key_value_heads,
++            head_dim_k=config.hidden_size // config.num_attention_heads,
++            dtype=torch.bfloat16,
++            qkv_format="thd",
++            max_ctx_len=max_seq_len,
++        )
++        for layer_number in range(1, config.num_hidden_layers + 1):
++            past_key_values.allocate_memory(layer_number)
++        return past_key_values
++
++    def test_generate_with_cache(self):
++        """Test single-prompt generation with KV-cache (THD format)."""
++        config = self.create_test_config(attn_input_format="thd", self_attn_mask_type="padding_causal")
++        model = self.get_model_class()(config).to("cuda").to(torch.bfloat16)
++        model.eval()
++
++        tokenizer = self.get_tokenizer()
++        prompt = "The quick brown fox jumps over"
++        inputs = tokenizer(prompt, return_tensors="pt")
++        inputs = {k: v.to("cuda") for k, v in inputs.items()}
++
++        past_key_values = self._create_inference_params(config, batch_size=1)
++
++        with torch.no_grad():
++            output_ids = model.generate(**inputs, max_new_tokens=16, use_cache=True, past_key_values=past_key_values)
++
++        # Verify generation produced new tokens
++        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
++
++    def test_generate_with_cache_batched(self):
++        """Test batched generation with KV-cache (left-padded BSHD converted to THD)."""
++        config = self.create_test_config(attn_input_format="thd", self_attn_mask_type="padding_causal")
++        model = self.get_model_class()(config).to("cuda").to(torch.bfloat16)
++        model.eval()
++
++        tokenizer = self.get_tokenizer()
++        prompts = (
++            "The quick brown fox jumps over the lazy dog.",
++            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
++        )
++        inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
++        inputs = {k: v.to("cuda") for k, v in inputs.items()}
++
++        past_key_values = self._create_inference_params(config, batch_size=2)
++
++        with torch.no_grad():
++            output_ids = model.generate(**inputs, max_new_tokens=16, use_cache=True, past_key_values=past_key_values)
++
++        # Verify generation produced new tokens for both sequences
++        assert output_ids.shape[0] == 2
++        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
++
++    def test_generate_with_cache_beam_search(self):
++        """Test batched generation with KV-cache and beam search."""
++        config = self.create_test_config(attn_input_format="thd", self_attn_mask_type="padding_causal")
++        model = self.get_model_class()(config).to("cuda").to(torch.bfloat16)
++        model.eval()
++
++        tokenizer = self.get_tokenizer()
++        prompts = (
++            "The quick brown fox jumps over the lazy dog.",
++            "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
++        )
++        inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
++        inputs = {k: v.to("cuda") for k, v in inputs.items()}
++
++        num_beams = 2
++        past_key_values = self._create_inference_params(config, batch_size=2, num_beams=num_beams)
++
++        with torch.no_grad():
++            output_ids = model.generate(
++                **inputs,
++                max_new_tokens=16,
++                use_cache=True,
++                past_key_values=past_key_values,
++                num_beams=num_beams,
++                do_sample=True,
++            )
++
++        # Verify generation produced new tokens for both sequences
++        assert output_ids.shape[0] == 2
++        assert output_ids.shape[1] > inputs["input_ids"].shape[1]
++
++    # ==================== Standalone Mixtral Generation Tests ====================
++
++    def test_te_mixtral_model_generate_with_cache_beam_search(self):
++        """Test Mixtral generation with KV-cache and beam search using real model weights."""
++        import gc
++
++        model_hf = self.get_reference_model()
++        model_te = convert_mixtral_hf_to_te(model_hf, attn_input_format="thd", self_attn_mask_type="padding_causal")
++        del model_hf
++        gc.collect()
++
++        model_te.to("cuda")
++        model_te.eval()
++
++        tokenizer = self.get_tokenizer()
++
++        prompts = (
++            'Licensed under the Apache License, Version 2.0 (the "License");'
++            " you may not use this file except in compliance with the License."
++            " You may obtain a copy of the License at",
++            "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore",
++        )
++        inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
++        inputs = {k: v.to("cuda") for k, v in inputs.items()}
++
++        num_beams = 2
++        config = model_te.config
++        past_key_values = self._create_inference_params(config, batch_size=2, num_beams=num_beams)
++
++        with torch.no_grad():
++            output_ids = model_te.generate(
++                **inputs,
++                max_new_tokens=16,
++                use_cache=True,
++                past_key_values=past_key_values,
++                num_beams=num_beams,
++                do_sample=False,
++            )
++
++        generated_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
++        assert "http://www.apache.org/licenses/LICENSE-2.0" in generated_text[0]
++        assert "et dolore magna aliqua" in generated_text[1]

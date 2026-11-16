@@ -1,0 +1,206 @@
+diff --git a/server/tests/test_analysis_node_wiring.py b/server/tests/test_analysis_node_wiring.py
+new file mode 100644
+index 000000000..d99224ad7
+--- /dev/null
++++ b/server/tests/test_analysis_node_wiring.py
+@@ -0,0 +1,41 @@
++"""Workflow templates that use analysis/export nodes must actually route + run.
++
++These node types had handlers (workflow.engines.analysis / workflow.engines.local)
++but were missing from the node-set routing, so the scanner sent them to "unknown"
++and the templates could not run even as teaching demos. This locks the wiring.
++"""
++
++import inspect
++
++from workflow.node_sets import ANALYSIS_NODES, LOCAL_NODES, _resolve_software
++from workflow.engines import analysis as analysis_engine
++
++
++def test_convergence_and_compare_are_routed():
++    # Handlers exist in execute_analysis_node; they must be in ANALYSIS_NODES.
++    for nt in ("convergence_check", "energy_compare", "pick_best"):
++        assert nt in ANALYSIS_NODES
++
++
++def test_export_data_is_local():
++    assert "export_data" in LOCAL_NODES
++
++
++def test_generic_analysis_resolves_to_specific_type():
++    cases = {
++        "elastic": "elastic_analysis",
++        "phonon": "phonon_analysis",
++        "eos": "eos_analysis",
++        "trajectory_analysis": "md_analysis",
++        "surface_energy": "surface_energy",
++    }
++    for atype, expected in cases.items():
++        resolved, _ = _resolve_software("analysis", {"type": atype})
++        assert resolved == expected, f"analysis type={atype} -> {resolved}"
++
++
++def test_elastic_phonon_handlers_exist_no_raise():
++    # The else-branch raises for unhandled types; elastic/phonon must be handled.
++    src = inspect.getsource(analysis_engine.execute_analysis_node)
++    assert "elastic_analysis" in src
++    assert "phonon_analysis" in src
+diff --git a/server/tests/test_analysis_produces_results.py b/server/tests/test_analysis_produces_results.py
+new file mode 100644
+index 000000000..379e239e2
+--- /dev/null
++++ b/server/tests/test_analysis_produces_results.py
+@@ -0,0 +1,56 @@
++"""The wired analysis nodes must actually PRODUCE result data (not just route).
++
++Teaching templates need to run, produce a result, and show it. This drives
++execute_analysis_node with mocked deps and asserts each wired node type writes a
++summary into step_results (which becomes result_json the frontend renders by
++analysis_type).
++"""
++
++import asyncio
++
++import pytest
++
++import catgo.utils.workflow_db as wdb
++from workflow.engines.analysis import execute_analysis_node
++
++
++def _run(node_type: str, params: dict) -> dict:
++    step_results = {
++        "p1": {"final_energy": -10.5, "structure_json": "{}"},
++        "p2": {"final_energy": -10.2, "structure_json": "{}"},
++        "p3": {"final_energy": -10.8, "structure_json": "{}"},
++    }
++
++    async def _bc(*a, **k):
++        pass
++
++    # Force the V2 path (no V1 workflow_steps row).
++    wdb.update_step = lambda *a, **k: (_ for _ in ()).throw(KeyError())
++    sid = f"step_{node_type}"
++    asyncio.run(execute_analysis_node(
++        "wf", sid, node_type, params, [], step_results, None, _bc,
++        lambda s, e: ["p1", "p2", "p3"],
++    ))
++    return step_results.get(sid, {})
++
++
++@pytest.mark.parametrize("node_type", ["elastic_analysis", "phonon_analysis"])
++def test_passthrough_analysis_produces_summary(node_type):
++    out = _run(node_type, {})
++    summary = out.get("summary", {})
++    assert summary, f"{node_type} produced no result"
++    assert summary.get("analysis_type")          # frontend renders by this key
++    assert "energies" in summary
++
++
++def test_energy_compare_ranks_energies():
++    out = _run("energy_compare", {})
++    summary = out["summary"]
++    assert summary.get("entries")                 # real comparison data
++    assert summary.get("reference_energy_eV") is not None
++
++
++def test_pick_best_selects_lowest():
++    out = _run("pick_best", {})
++    summary = out["summary"]
++    assert summary.get("best_step_id") == "p3"    # -10.8 is lowest
+diff --git a/server/workflow/engines/analysis.py b/server/workflow/engines/analysis.py
+index 9db8fb49e..f172089e8 100644
+--- a/server/workflow/engines/analysis.py
++++ b/server/workflow/engines/analysis.py
+@@ -240,6 +240,25 @@ def update_step(wf_id: str, s_id: str, data: dict) -> None:
+                 _analyze_coverage(parent_ids, step_results, params)
+             )
+ 
++        elif node_type in ("elastic_analysis", "phonon_analysis"):
++            # Lightweight collect-and-pass-through. The elastic-tensor / phonon
++            # visualization is rendered frontend-side (elastic-analysis.ts,
++            # phonon-analysis.ts) — the workflow editor is for teaching demos.
++            # Production-grade elastic/phonon analysis is done via catgo-campaign,
++            # not here. The node completes and forwards upstream structures +
++            # energies so the editor can plot them.
++            energies = [
++                step_results.get(pid, {}).get("final_energy")
++                for pid in parent_ids
++            ]
++            analysis_result.update({
++                "analysis_type": node_type.replace("_analysis", ""),
++                "n_inputs": len(parent_ids),
++                "energies": [e for e in energies if e is not None],
++                "note": "Upstream results collected; visualized in the editor "
++                        "(teaching demo). Use catgo-campaign for production runs.",
++            })
++
+         else:
+             raise RuntimeError(f"Unhandled ANALYSIS node type: {node_type}")
+ 
+diff --git a/server/workflow/node_sets.py b/server/workflow/node_sets.py
+index d72dd4386..f5dfc8351 100644
+--- a/server/workflow/node_sets.py
++++ b/server/workflow/node_sets.py
+@@ -42,6 +42,9 @@
+     "batch_adsorbate_place",
+     "condition", "loop", "merge",
+     "free_energy", "gibbs_energy",
++    # export_data is handled by workflow.engines.local (node_type=="export_data")
++    # but was missing from this set, so it routed to "unknown".
++    "export_data",
+     # High-throughput screening nodes (local orchestration)
+     "batch_generate", "batch_slab_gen", "batch_coverage_gen", "map", "aggregate",
+     # Build/transform nodes (local structure operations)
+@@ -105,6 +108,11 @@
+     "phonon_analysis", "eos_analysis", "elastic_analysis",
+     "surface_energy", "wulff_construction", "adsorption_energy",
+     "coverage_analysis",
++    # Post-processing nodes whose handlers already live in
++    # workflow.engines.analysis.execute_analysis_node but were never listed
++    # here, so the scanner routed them to "unknown" and templates using them
++    # could not run.
++    "convergence_check", "energy_compare", "pick_best", "her_analysis",
+ }
+ 
+ # HPC analysis nodes (currently empty — charge_analysis moved to ANALYSIS_NODES
+@@ -112,12 +120,40 @@
+ HPC_ANALYSIS_NODES: set[str] = set()
+ 
+ 
++# A generic "analysis" node carries the concrete kind in params["type"]; map it
++# to the specific analysis node whose handler already exists in
++# workflow.engines.analysis. Without this, templates that use an `analysis` node
++# (elastic / phonon / EOS / trajectory / surface energy) routed to "unknown".
++_ANALYSIS_TYPE_MAP = {
++    "elastic": "elastic_analysis",
++    "phonon": "phonon_analysis",
++    "eos": "eos_analysis",
++    "trajectory_analysis": "md_analysis",
++    "trajectory": "md_analysis",
++    "md": "md_analysis",
++    "dos": "dos_analysis",
++    "cohp": "cohp_analysis",
++    "charge": "charge_analysis",
++    "bader": "charge_analysis",
++    "surface_energy": "surface_energy",
++    "wulff": "wulff_construction",
++    "adsorption_energy": "adsorption_energy",
++    "coverage": "coverage_analysis",
++}
++
++
+ def _resolve_software(node_type: str, params: dict[str, object]) -> tuple[str, str]:
+     """For unified nodes, resolve (effective_node_type, software) from params.
+ 
+     Consults declarative engine specs first, then falls back to hardcoded map
+     for engines not yet migrated to YAML.
+     """
++    if node_type == "analysis":
++        atype = str(params.get("type", "")).lower()
++        mapped = _ANALYSIS_TYPE_MAP.get(atype)
++        if mapped:
++            return mapped, ""
++
+     if node_type not in UNIFIED_CALC_NODES:
+         return node_type, ""
+ 

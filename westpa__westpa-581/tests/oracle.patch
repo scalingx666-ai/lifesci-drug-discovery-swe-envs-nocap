@@ -1,0 +1,563 @@
+diff --git a/src/westpa/work_managers/processes.py b/src/westpa/work_managers/processes.py
+index 90d33b246..3e8825e5c 100644
+--- a/src/westpa/work_managers/processes.py
++++ b/src/westpa/work_managers/processes.py
+@@ -27,7 +27,7 @@ class ProcessWorkManager(WorkManager):
+     -----
+ 
+     On MacOS, as of Python 3.8 the default start method for multiprocessing launching new processes was changed from fork to spawn.
+-    On Linux, as of Python 3.14, the default start method for multiprocessing launching new processes was changed from fork to spawn.
++    On Linux, as of Python 3.14, the default start method for multiprocessing launching new processes was changed from fork to forkserver.
+     In general, spawn is more robust and efficient, however it requires serializability of everything being passed to the child process.
+     In contrast, fork is much less memory efficient, as it makes a full copy of everything in the parent process.
+     However, it does not require picklability.
+@@ -77,7 +77,10 @@ def task_loop(self):
+ 
+         while not self.shutdown_received.is_set():
+             if not self.task_queue.empty():
+-                message, task_id, fn, args, kwargs = self.task_queue.get()[:5]
++                try:
++                    message, task_id, fn, args, kwargs = self.task_queue.get()[:5]
++                except EOFError:
++                    pass  # Take into account of delays between if and get()
+ 
+                 if message == 'shutdown':
+                     break
+@@ -95,7 +98,10 @@ def task_loop(self):
+     def results_loop(self):
+         while not self.shutdown_received.is_set():
+             if not self.result_queue.empty():
+-                message, task_id, payload = self.result_queue.get()[:3]
++                try:
++                    message, task_id, payload = self.result_queue.get()[:3]
++                except EOFError:
++                    pass  # Take into account of delays between if and get()
+ 
+                 if message == 'shutdown':
+                     break
+diff --git a/src/westpa/work_managers/zeromq/core.py b/src/westpa/work_managers/zeromq/core.py
+index d51ef63dc..855798b1c 100644
+--- a/src/westpa/work_managers/zeromq/core.py
++++ b/src/westpa/work_managers/zeromq/core.py
+@@ -23,6 +23,7 @@
+ 
+ import zmq
+ import numpy as np
++from zmq import ContextTerminated
+ 
+ # Every ten seconds the master requests a status report from workers.
+ # This also notifies workers that the master is still alive
+@@ -323,6 +324,13 @@ def make_internal_endpoint(cls):
+             return cls.make_tcp_endpoint()
+ 
+     def __init__(self):
++        try:
++            if sys.platform in ['darwin', 'linux']:  # UNIX Platforms
++                multiprocessing.set_start_method('fork')
++                log.debug('setting multiprocessing start method to fork')
++        except RuntimeError:
++            log.debug('failed to set start method to fork')
++
+         # Unique identifier of this ZMQ node
+         self.node_id = uuid.uuid4()
+ 
+@@ -447,8 +455,12 @@ def recv_message(self, socket, flags=0, validate=True, timeout=None):
+                 poll_results = dict(poller.poll(timeout=timeout))
+                 if socket in poll_results:
+                     message = socket.recv_pyobj(flags)
++                elif socket.closed:
++                    raise ContextTerminated
+                 else:
+                     raise ZMQWMTimeout('recv timed out')
++            except (KeyboardInterrupt, ContextTerminated):
++                return Message(message=Message.SHUTDOWN)
+             finally:
+                 poller.unregister(socket)
+ 
+@@ -566,17 +578,25 @@ def shutdown_process(process, timeout=1.0):
+     process.join(timeout)
+     if process.is_alive():
+         log.debug('sending SIGINT to process {:d}'.format(process.pid))
+-        os.kill(process.pid, signal.SIGINT)
++        process.terminate()
+         process.join(timeout)
+         if process.is_alive():
+             log.warning('sending SIGKILL to worker process {:d}'.format(process.pid))
+-            os.kill(process.pid, signal.SIGKILL)
+-            process.join()
+-
++            process.kill()
++        process.join()
+         log.debug('process {:d} terminated with code {:d}'.format(process.pid, process.exitcode))
+     else:
+         log.debug('worker process {:d} terminated gracefully with code {:d}'.format(process.pid, process.exitcode))
+-    assert not process.is_alive()
++
++    try:
++        process.close()  # Release all resources
++    except ValueError:
++        try:
++            if process.is_alive():
++                log.debug('process {:d} unable to be closed'.format(process.pid))
++            assert not process.is_alive()
++        except ValueError:
++            pass
+ 
+ 
+ class IsNode:
+@@ -625,6 +645,11 @@ def shutdown(self):
+         except AttributeError:
+             shutdown_timeout = 1.0
+ 
++        # Graceful clean up by signaling shut down
++        for worker in self.local_workers:
++            worker.shutdown_executor()
++
++        # Messy clean up by shutting down processes
+         for process in self.local_worker_processes:
+             shutdown_process(process, shutdown_timeout)
+ 
+diff --git a/src/westpa/work_managers/zeromq/node.py b/src/westpa/work_managers/zeromq/node.py
+index 71c0808ae..61d19d66a 100644
+--- a/src/westpa/work_managers/zeromq/node.py
++++ b/src/westpa/work_managers/zeromq/node.py
+@@ -124,8 +124,12 @@ def comm_loop(self):
+             self.log.debug('exiting')
+             self.context = None
+             self.remove_ipc_endpoints()
+-            IsNode.shutdown(self)
++            self.shutdown()
+ 
+     def startup(self):
+         IsNode.startup(self)
+         super().startup()
++
++    def shutdown(self):
++        IsNode.shutdown(self)
++        super().shutdown()
+diff --git a/src/westpa/work_managers/zeromq/work_manager.py b/src/westpa/work_managers/zeromq/work_manager.py
+index ba2df69b7..674248be6 100644
+--- a/src/westpa/work_managers/zeromq/work_manager.py
++++ b/src/westpa/work_managers/zeromq/work_manager.py
+@@ -511,7 +511,7 @@ def comm_loop(self):
+                     self.send_nak(rr_socket, msg)
+ 
+         finally:
+-            self.context.destroy(linger=1)
++            self.context.destroy(linger=5)
+             self.context = None
+             self.remove_ipc_endpoints()
+ 
+diff --git a/src/westpa/work_managers/zeromq/worker.py b/src/westpa/work_managers/zeromq/worker.py
+index e0ef809af..c058a03d9 100644
+--- a/src/westpa/work_managers/zeromq/worker.py
++++ b/src/westpa/work_managers/zeromq/worker.py
+@@ -13,6 +13,7 @@
+ from .core import ZMQCore, Message, ZMQWMTimeout, PassiveMultiTimer, Task, Result, TIMEOUT_MASTER_BEACON
+ 
+ import zmq
++from zmq import ContextTerminated
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -49,6 +50,13 @@ def __init__(self, rr_endpoint, ann_endpoint):
+     def is_master(self):
+         return False
+ 
++    @property
++    def is_closed(self):
++        try:
++            return self.context.closed
++        except AttributeError:
++            return True
++
+     def update_master_info(self, msg):
+         if self.master_id is None:
+             self.master_id = msg.master_id
+@@ -213,8 +221,7 @@ def comm_loop(self):
+             self.log.error('timeout communicating with peer; shutting down')
+         finally:
+             self.shutdown_executor()
+-            self.executor_process.join()
+-            self.context.destroy(linger=1)
++            self.context.destroy(linger=5)
+             self.context = None
+             self.remove_ipc_endpoints()
+ 
+@@ -225,32 +232,41 @@ def shutdown_executor(self):
+                 task_socket = self.context.socket(zmq.PUSH)
+                 task_socket.connect(self.task_endpoint)
+                 self.send_message(task_socket, Message.SHUTDOWN)
+-                task_socket.close(linger=1)
++                task_socket.close(linger=5)
+             except Exception:
+                 pass
+ 
+-        pid = self.executor_process.pid
+-        self.executor_process.join(self.shutdown_timeout)
+-        # is_alive() is prone to a race condition so catch the case that the PID is already dead
+-        if self.executor_process.is_alive():
+-            self.log.debug('sending SIGTERM to worker process {:d}'.format(pid))
+-            self.executor_process.terminate()
+-            # try:
+-            #     os.kill(self.executor_process.pid, signal.SIGINT)
+-            # except ProcessLookupError:
+-            #     self.log.debug('worker process {:d} already dead'.format(pid))
++        try:
++            pid = self.executor_process.pid
+             self.executor_process.join(self.shutdown_timeout)
++            # is_alive() is prone to a race condition so catch the case that the PID is already dead
+             if self.executor_process.is_alive():
+-                self.executor_process.kill()
+-                self.log.warning('sending SIGKILL to worker process {:d}'.format(pid))
+-                # try:
+-                #     os.kill(self.executor_process.pid, signal.SIGKILL)
+-                # except ProcessLookupError:
+-                #     self.log.debug('worker process {:d} already dead'.format(pid))
+-            self.executor_process.join()
+-            self.log.debug('worker process {:d} terminated'.format(pid))
+-        else:
+-            self.log.debug('worker process {:d} terminated gracefully with code {:d}'.format(pid, self.executor_process.exitcode))
++                self.log.debug('sending SIGTERM to worker process {:d}'.format(pid))
++                self.executor_process.terminate()
++                self.executor_process.join(self.shutdown_timeout)
++                if self.executor_process.is_alive():
++                    self.log.warning('sending SIGKILL to worker process {:d}'.format(pid))
++                    self.executor_process.kill()
++
++                # Exiting after timeout so we can shutdown forcefully later
++                self.executor_process.join(self.shutdown_timeout)
++                if self.executor_process.exitcode == 0:
++                    self.log.debug('worker process {:d} terminated'.format(pid))
++            else:
++                self.log.debug(
++                    'worker process {:d} terminated gracefully with code {:d}'.format(pid, self.executor_process.exitcode)
++                )
++        except (ValueError, AttributeError):
++            pass  # Already closed.
++
++        try:
++            self.executor_process.close()
++        except (ValueError, AttributeError):
++            try:
++                if self.executor_process.is_alive():
++                    self.log.debug('worker process {:d} could not be closed'.format(pid))
++            except (ValueError, AttributeError):
++                pass  # Already closed.
+ 
+     def install_signal_handlers(self, signals=None):
+         if not signals:
+@@ -293,7 +309,7 @@ def comm_loop(self):
+             while True:
+                 try:
+                     msg = self.recv_message(task_socket, timeout=100)
+-                except KeyboardInterrupt:
++                except (KeyboardInterrupt, ContextTerminated):
+                     break
+                 except ZMQWMTimeout:
+                     continue
+@@ -305,8 +321,9 @@ def comm_loop(self):
+                     elif msg.message == Message.SHUTDOWN:
+                         break
+         finally:
+-            self.context.destroy(linger=0)
+-            self.context = None
++            if self.context is not None:
++                self.context.destroy(linger=5)
++                self.context = None
+ 
+     def startup(self, process_index=None):
+         if process_index is not None:
+diff --git a/tests/test_we_driver.py b/tests/test_we_driver.py
+index 7d523c35f..8d5a548d3 100644
+--- a/tests/test_we_driver.py
++++ b/tests/test_we_driver.py
+@@ -245,11 +245,10 @@ def check_populate_initial(self, prob, target_counts):
+         self.we_driver.populate_initial([istate], [prob], system=self.system)
+         assert len(self.we_driver.next_iter_binning[0]) == target_counts
+ 
+-    @pytest.mark.skip
+     def test_populate_initial(self):
+         for prob in [0.1, 1.0 / 3.0, 0.9999999999970001, 1.0]:
+             for tcount in range(30, 60):
+-                yield self.check_populate_initial, prob, tcount
++                self.check_populate_initial(prob, tcount)
+ 
+     def test_merge_by_threshold(self):
+         # Create the segments
+diff --git a/tests/test_work_managers/test_environment.py b/tests/test_work_managers/test_environment.py
+index 5b4caa7c4..a052c46c4 100644
+--- a/tests/test_work_managers/test_environment.py
++++ b/tests/test_work_managers/test_environment.py
+@@ -83,8 +83,9 @@ def testZeroMQ(self):
+         assert isinstance(work_manager, ZMQWorkManager)
+         with work_manager:
+             # Need to send enough work to start sufficient workers
+-            for _ in range(2):
++            for _ in range(3):
+                 future = work_manager.submit(will_wait)
+-                future.get_result()
++                result = future.get_result()
++                assert result
+ 
+             assert work_manager.n_workers == 3
+diff --git a/tests/test_work_managers/test_mpi.py b/tests/test_work_managers/test_mpi.py
+index f6d68f49f..8d065d268 100644
+--- a/tests/test_work_managers/test_mpi.py
++++ b/tests/test_work_managers/test_mpi.py
+@@ -1,5 +1,8 @@
++import pytest
+ import unittest
+ 
++pytest.importorskip('mpi4py')
++
+ from westpa.work_managers.mpi import MPIWorkManager
+ 
+ # from .tsupport import CommonWorkManagerTests, CommonParallelTests
+diff --git a/tests/test_work_managers/test_processes.py b/tests/test_work_managers/test_processes.py
+index ba608f874..178ad8f37 100644
+--- a/tests/test_work_managers/test_processes.py
++++ b/tests/test_work_managers/test_processes.py
+@@ -9,18 +9,20 @@
+ 
+ 
+ class TestProcessWorkManager(unittest.TestCase, CommonParallelTests, CommonWorkManagerTests):
+-    def setUp(self):
+-        self.work_manager = ProcessWorkManager()
+-        self.work_manager.startup()
++    @classmethod
++    def setUpClass(cls):
++        cls.work_manager = ProcessWorkManager(n_workers=5)
++        cls.work_manager.startup()
+ 
+-    def tearDown(self):
+-        self.work_manager.shutdown()
++    @classmethod
++    def tearDownClass(cls):
++        cls.work_manager.shutdown()
+ 
+ 
+ class TestProcessWorkManagerAux:
+     @pytest.mark.timeout(10)
+     def test_shutdown(self):
+-        work_manager = ProcessWorkManager()
++        work_manager = ProcessWorkManager(n_workers=5)
+         work_manager.startup()
+         work_manager.shutdown()
+         for worker in work_manager.workers:
+@@ -31,7 +33,7 @@ def test_shutdown(self):
+ 
+     @pytest.mark.timeout(10)
+     def test_hang_shutdown(self):
+-        work_manager = ProcessWorkManager()
++        work_manager = ProcessWorkManager(n_workers=5)
+         work_manager.shutdown_timeout = 0.1
+         work_manager.startup()
+         for _ in range(5):
+@@ -45,7 +47,7 @@ def test_hang_shutdown(self):
+ 
+     @pytest.mark.timeout(10)
+     def test_hang_shutdown_ignoring_sigint(self):
+-        work_manager = ProcessWorkManager()
++        work_manager = ProcessWorkManager(n_workers=5)
+         work_manager.shutdown_timeout = 0.1
+         work_manager.startup()
+         for _ in range(5):
+@@ -59,7 +61,7 @@ def test_hang_shutdown_ignoring_sigint(self):
+ 
+     @pytest.mark.timeout(10)
+     def test_sigint_shutdown(self):
+-        work_manager = ProcessWorkManager()
++        work_manager = ProcessWorkManager(n_workers=5)
+         work_manager.install_sigint_handler()
+         work_manager.shutdown_timeout = 0.1
+         work_manager.startup()
+@@ -77,9 +79,11 @@ def test_sigint_shutdown(self):
+                         pass  # probably closed already
+                 raise
+ 
++        work_manager.shutdown()
++
+     @pytest.mark.timeout(10)
+     def test_worker_close_fail(self, monkeypatch):
+-        work_manager = ProcessWorkManager()
++        work_manager = ProcessWorkManager(n_workers=5)
+         work_manager.install_sigint_handler()
+         work_manager.shutdown_timeout = 0.1
+         work_manager.startup()
+@@ -98,7 +102,7 @@ def test_worker_close_fail(self, monkeypatch):
+ 
+     @pytest.mark.timeout(10)
+     def test_worker_ids(self):
+-        work_manager = ProcessWorkManager()
++        work_manager = ProcessWorkManager(n_workers=5)
+         with work_manager:
+             futures = work_manager.submit_many([(get_process_index, (), {})] * work_manager.n_workers)
+             work_manager.wait_all(futures)
+diff --git a/tests/test_work_managers/test_threads.py b/tests/test_work_managers/test_threads.py
+index d3afd6d45..dd17bcdc4 100644
+--- a/tests/test_work_managers/test_threads.py
++++ b/tests/test_work_managers/test_threads.py
+@@ -5,17 +5,19 @@
+ 
+ 
+ class TestThreadsWorkManager(unittest.TestCase, CommonWorkManagerTests, CommonParallelTests):
+-    def setUp(self):
+-        self.work_manager = ThreadsWorkManager()
+-        self.work_manager.startup()
++    @classmethod
++    def setUpClass(cls):
++        cls.work_manager = ThreadsWorkManager(n_workers=5)
++        cls.work_manager.startup()
+ 
+-    def tearDown(self):
+-        self.work_manager.shutdown()
++    @classmethod
++    def tearDownClass(cls):
++        cls.work_manager.shutdown()
+ 
+ 
+ class TestThreadsWorkManagerAux:
+     def test_shutdown(self):
+-        work_manager = ThreadsWorkManager()
++        work_manager = ThreadsWorkManager(n_workers=5)
+         work_manager.startup()
+         work_manager.shutdown()
+         for worker in work_manager.workers:
+diff --git a/tests/test_work_managers/test_zeromq/test_work_manager.py b/tests/test_work_managers/test_zeromq/test_work_manager.py
+index 2b875cd58..0d1aba1e9 100644
+--- a/tests/test_work_managers/test_zeromq/test_work_manager.py
++++ b/tests/test_work_managers/test_zeromq/test_work_manager.py
+@@ -17,6 +17,12 @@
+ pytestmark = pytest.mark.flaky(reruns=5, reason='ZeroMQ tests are flaky')
+ 
+ 
++@pytest.fixture(scope="class")
++def monkeypatch_for_class(request):
++    request.cls.monkeypatch = pytest.MonkeyPatch()
++
++
++@pytest.mark.usefixtures('monkeypatch_for_class')
+ class TestZMQWorkManagerBasic(ZMQTestBase, unittest.TestCase):
+     '''Tests for the core task dispersal/retrieval and shutdown operations
+     (the parts of the WM that do not require ZMQWorker).'''
+@@ -124,12 +130,10 @@ def test_shutdown_sends_announcement(self):
+         with self.expect_announcement(Message.SHUTDOWN):
+             self.test_wm.signal_shutdown()
+ 
+-    # This won't work, because initial beacon is discarded if no clients are connected
+-    #     def test_immediate_master_beacon(self):
+-    #         with self.expect_announcement(Message.MASTER_BEACON):
+-    #             time.sleep(BEACON_WAIT)
++    def test_immediate_master_beacon(self):
++        with self.expect_announcement(Message.MASTER_BEACON):
++            time.sleep(BEACON_WAIT)
+ 
+-    @pytest.mark.skip(reason='skipping')
+     def test_delayed_master_beacon(self):
+         self.discard_announcements()
+         with self.expect_announcement(Message.MASTER_BEACON):
+@@ -167,6 +171,16 @@ def test_result_return(self):
+             self.test_core.send_message(s, Message.RESULT, result)
+         assert future.result == r
+ 
++    def test_worker_close_fail(self):
++        with self.monkeypatch.context() as m:
++            for process in self.test_wm.local_worker_processes:
++                m.setattr(process, 'close', lambda: exec('raise(ValueError)'))
++
++            self.test_wm.signal_shutdown()
++            self.test_wm.join()
++
++            assert not self.test_wm.comm_thread.is_alive()
++
+ 
+ class BaseInternal:
+     def setUp(self):
+diff --git a/tests/test_work_managers/test_zeromq/test_worker.py b/tests/test_work_managers/test_zeromq/test_worker.py
+index 3d4c52674..8968cb10f 100644
+--- a/tests/test_work_managers/test_zeromq/test_worker.py
++++ b/tests/test_work_managers/test_zeromq/test_worker.py
+@@ -53,6 +53,8 @@ def setUp(self):
+     def tearDown(self):
+         time.sleep(TEARDOWN_WAIT)
+ 
++        self.test_core.shutdown()
++
+         self.test_worker.signal_shutdown()
+         self.test_worker.comm_thread.join()
+ 
+@@ -83,12 +85,20 @@ def test_executor_alive(self):
+ 
+     def test_executor_shuts_down_immediately(self):
+         self.test_worker.shutdown_executor()
+-        assert not self.test_worker.executor_process.is_alive()
++        try:
++            assert not self.test_worker.executor_process.is_alive()
++        except ValueError:
++            # Closed processes will return ValueError instead
++            pass
+ 
+     def test_shutdown_on_announcement(self):
+         self.test_core.send_message(self.ann_socket, Message.SHUTDOWN)
+         self.test_worker.join()
+-        assert not self.test_worker.executor_process.is_alive()
++        try:
++            assert not self.test_worker.executor_process.is_alive()
++        except ValueError:
++            # Closed processes will return ValueError instead
++            pass
+ 
+     def test_responds_to_task_avail(self):
+         self.test_core.send_message(self.ann_socket, Message.TASKS_AVAILABLE)
+@@ -100,7 +110,11 @@ def test_shutdown_on_master_disappearance(self):
+         self.test_core.send_message(self.ann_socket, Message.RECONFIGURE_TIMEOUT, (TIMEOUT_MASTER_BEACON, 0.01))
+         time.sleep(0.02)
+         self.test_worker.join()
+-        assert not self.test_worker.executor_process.is_alive()
++        try:
++            assert not self.test_worker.executor_process.is_alive()
++        except ValueError:
++            # Closed processes will return ValueError instead
++            pass
+ 
+     def test_worker_processes_task(self):
+         r = random_int()
+@@ -120,9 +134,13 @@ def test_hung_worker_interruptible(self):
+         self.test_core.send_message(self.ann_socket, Message.SHUTDOWN)
+         self.test_worker.join()
+ 
++        assert self.test_worker.is_closed
++
+     def test_hung_worker_uninterruptible(self):
+         task = Task(will_busyhang_uninterruptible, (), {})
+         self.send_task(task)
+         time.sleep(1.0)
+         self.test_core.send_message(self.ann_socket, Message.SHUTDOWN)
+         self.test_worker.join()
++
++        assert self.test_worker.is_closed
+diff --git a/tests/test_work_managers/test_zeromq/zmq_tsupport.py b/tests/test_work_managers/test_zeromq/zmq_tsupport.py
+index 095666b81..81d543d81 100644
+--- a/tests/test_work_managers/test_zeromq/zmq_tsupport.py
++++ b/tests/test_work_managers/test_zeromq/zmq_tsupport.py
+@@ -91,5 +91,5 @@ def setUp(self):
+ 
+     def tearDown(self):
+         self.cleanup_endpoints()
+-        self.test_context.destroy(linger=1)
++        self.test_context.destroy(linger=5)
+         del self.test_context
+diff --git a/tests/test_work_managers/tsupport.py b/tests/test_work_managers/tsupport.py
+index 173aa58a1..d0d811fdc 100644
+--- a/tests/test_work_managers/tsupport.py
++++ b/tests/test_work_managers/tsupport.py
+@@ -20,7 +20,7 @@ def fn_interrupted():
+ def will_wait():
+     import time
+ 
+-    time.sleep(0.5)
++    time.sleep(0.1)
+     return True
+ 
+ 

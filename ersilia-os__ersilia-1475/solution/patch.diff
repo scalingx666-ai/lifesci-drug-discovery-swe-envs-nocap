@@ -1,0 +1,759 @@
+diff --git a/.github/scripts/suggest_metadata_with_llm.py b/.github/scripts/suggest_metadata_with_llm.py
+new file mode 100644
+index 000000000..ac996915c
+--- /dev/null
++++ b/.github/scripts/suggest_metadata_with_llm.py
+@@ -0,0 +1,338 @@
++import os
++import argparse
++import openai
++import requests
++import boto3
++import tempfile
++import shutil
++from dotenv import load_dotenv
++
++load_dotenv()
++OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
++openai.api_key = OPENAI_API_KEY
++MODEL_NAME = "gpt-4o"
++
++
++def read_accepted_labels(category):
++    category = category.lower().replace(" ", "_")
++    base_url = "https://raw.githubusercontent.com/ersilia-os/ersilia/refs/heads/master/ersilia/hub/content/metadata/"
++    url = os.path.join(base_url, category + ".txt")
++    response = requests.get(url)
++    if response.status_code == 200:
++        values = response.text.splitlines()
++        return [x.strip() for x in values if x]
++    else:
++        raise Exception(f"Failed to download labels from {url}")
++
++
++accepted = {}
++for category in [
++    "input",
++    "input_shape",
++    "license",
++    "mode",
++    "output",
++    "output_shape",
++    "output_type",
++    "tag",
++    "task",
++]:
++    accepted[category] = ", ".join(read_accepted_labels(category))
++
++
++PRIMARY_SYSTEM_PROMPT = """
++You are a biomedical expert and you are asked to annotate metadata for a given computational tool, for example an AI/ML model.
++You will be given the following information:
++1. A structured report (summary) of a publication. This will be labelled by the user as PUBLICATION REPORT.
++2. Some raw and potentially spurious metadata in JSON, YAML or Markdown format. This will be labeled by the user as RAW METADATA.
++
++Your task is to provide a structured metadata report for the computational tool based on the information provided.
++The metadata report should include the following information, in Markdown format:
++
++# General Information
++- Title: Suggest a title for the computational tool. This should be a concise and informative title. It should be coherent with the title of the publication, and it can be inspired by the title in the raw metadata. The title should not be longer than 100 characters.
++- Slug: Just take the slug from the publication summary.
++
++# Description
++Write a short summary of the computational tool. This should be a high-level overview of the tool based on the publication summary provided.
++You an also get inspiration from the user prompt.
++The description should have at least 200 characters. Strictly one paragraph.
++
++# Tags
++Select 1-5 tags from this list: {7}
++Give the tags as a list:
++- Tag 1
++- Tag 2
++- etc.
++
++# Input
++- Input: One of the following, depending on the type of input accepted for the model: {0}
++- Input shape: One of the following, depending on the characteristics of the minimum model input. Typically, models accept a single input. Models that require multiple inputs to do predictions, can be lists, etc.: {1}
++
++# Output
++- Output: One (ideally) or multiple of the following (comma-separated), depending on the type of output produced by the model: {2}
++- Output shape: One of the following, depending on the dimensionality of the produced output: {3}
++- Output type: One of the following: {4}
++
++# Mode and Task
++- Mode: One of the following, depending on whether the model is already pre-trained by authors, retrained by our team, or build from the data with our own tools: {5}
++- Task: AI, ML or data science task. One of the following: {6}
++
++# Interpretation
++Provide a oneliner explaining how to interpret the output of the model. Is it a probability? Is it a regression value for a particular experimental assay? etc. No more than 150 characters.
++
++# Publication and Code
++Provide a brief summary of the publication. You can use the TLDR from the publication report and the publication summary.
++This should be a high-level overview of the publication. Between 50 and 100 words. Only one paragraph. No new-line characters.
++
++In addition, provide the following URLs as a list:
++- Publication URL: Provide the URL of the publication. This is exactly the URL provided in the metadata from the user.
++- Code URL: Provide the URL of the code repository. This is exactly the URL provided in the metadata from the user.
++
++# License
++- Simply extract the license from the metadata.
++
++--
++
++Below are some general guidelines:
++- Produce a Markdown file strictly following the headers and formatting specified above.
++- Never do multiple paragraphs.
++- Be concise.
++- Do not include any special characters, boldface, or italics.
++""".format(
++    accepted["input"],
++    accepted["input_shape"],
++    accepted["output"],
++    accepted["output_shape"],
++    accepted["output_type"],
++    accepted["mode"],
++    accepted["task"],
++    accepted["tag"],
++)
++
++
++PRIMARY_USER_PROMPT = """
++Write the metadata of the following computational tool.
++
++RAW METADATA
++<RAW_METADATA>
++
++PUBLICATION REPORT
++<PUBLICATION_REPORT>
++"""
++
++POSTPROCESS_SYSTEM_PROMPT = """
++Your task is to make sure the format of a Markdown file is correct. You can slightly modify the content, but only if you find
++inconsistencies in the text, repetitions, or incoherences. Avoid boldface, italics and special characters.
++Strictly follow the format below:
++# General information
++- Title: The title. No longer than 100 characters.
++- Slug: Lower case, can use hyphenation.
++
++# Description
++At least 200 characters, ideally more. Strictly one paragraph.
++
++# Tags
++- Tag 1
++- Tag 2
++- etc. 3 to 5 tags.
++
++# Input
++- Input: As specified in the source file. Do not modify.
++- Input shape: As specified in the source file. Do not modify.
++
++# Output
++- Output: As specified in the source file. Do not modify.
++- Output shape: As specified in the source file. Do not modify.
++- Output type: As specified in the source file. Do not modify.
++
++# Mode and Task
++- Mode: As specified in the source file. Do not modify.
++- Task: As specified in the source file. Do not modify.
++
++# Interpretation
++A one-liner. No more than 150 characters. Strictly one paragraph.
++
++# Publication and Code
++A summary as specified in the source file, between 50 and 100 words. Strictly one paragraph.
++
++- Publication: A URL with the link []()
++- Code: A URL with the link []()
++
++# License
++- As specified in the source file. Do not modify.
++"""
++
++POSTPROCESS_USER_PROMPT = """
++Process the following text:
++"""
++
++
++class MetadataDownloader(object):
++    def __init__(
++        self,
++        model_id=None,
++        issue_number=None,
++    ):
++        if model_id is None and issue_number is None:
++            raise Exception("At least one argument is necessary")
++        if model_id is not None and issue_number is not None:
++            model_id = None
++        self.model_id = model_id
++        self.issue_number = issue_number
++        self.tmp_folder = tempfile.mkdtemp(prefix="ersilia-")
++        self.output_file = os.path.join(self.tmp_folder, "metadata.txt")
++
++    def download_by_model_id(self):
++        base_url = (
++            "https://raw.githubusercontent.com/ersilia-os/{0}/refs/heads/main/".format(
++                self.model_id
++            )
++        )
++        metadata_yml = os.path.join(base_url, "metadata.yml")
++        metadata_json = os.path.join(base_url, "metadata.json")
++        try:
++            url = metadata_yml
++            response = requests.get(url)
++            if response.status_code == 200:
++                with open(self.output_file, "wb") as f:
++                    f.write(response.content)
++                return self.output_file
++        except:
++            pass
++        try:
++            url = metadata_json
++            response = requests.get(url)
++            if response.status_code == 200:
++                with open(self.output_file, "wb") as f:
++                    f.write(response.content)
++                return self.output_file
++        except:
++            raise Exception("Metadata not found in model repository")
++
++    def download_by_issue_number(self):
++        # TODO extract metadata from the issue itself
++        pass
++
++    def download(self):
++        if self.model_id is not None:
++            return self.download_by_model_id()
++        if self.issue_number is not None:
++            return self.download_by_issue_number()
++        return None
++
++
++class PublicationSummaryDownloader(object):
++    def __init__(self, model_id=None, file_path=None):
++        if model_id is None and file_path is None:
++            raise Exception("At least one argument is necessary")
++        if model_id is not None and file_path is not None:
++            model_id = None
++        self.model_id = model_id
++        self.file_path = file_path
++        self.tmp_folder = tempfile.mkdtemp(prefix="ersilia-")
++        self.output_file = os.path.join(self.tmp_folder, "input_file.txt")
++
++    def download_by_model_id(self):
++        s3 = boto3.client("s3")
++        bucket_name = "publication-summaries"  # TODO check path in S3
++        key = f"{self.model_id}_summary.md"
++        try:
++            with open(self.output_file, "wb") as f:
++                s3.download_fileobj(bucket_name, key, f)
++            return self.output_file
++        except Exception as e:
++            raise Exception(f"Failed to download file from S3: {str(e)}")
++
++    def download_from_file_path(self):
++        shutil.copy(self.file_path, self.output_file)
++        return self.output_file
++
++    def download(self):
++        if self.model_id is not None:
++            return self.download_by_model_id()
++        if self.file_path is not None:
++            return self.download_from_file_path()
++        return None
++
++
++class MetadataSuggestor(object):
++    def __init__(self, metadata_txt, publication_markdown, output_markdown):
++        self.model_name = MODEL_NAME
++        self.metadata_txt = metadata_txt
++        self.publication_markdown = publication_markdown
++        self.output_markdown = output_markdown
++
++    def make_primary_request(self):
++        with open(self.metadata_txt, "r") as f:
++            metadata_txt = f.read()
++        with open(self.publication_markdown, "r") as f:
++            publication_markdown = f.read()
++        system_prompt = PRIMARY_SYSTEM_PROMPT
++        user_prompt = PRIMARY_USER_PROMPT.strip()
++        user_prompt = user_prompt.replace("<RAW_METADATA>", metadata_txt)
++        user_prompt = user_prompt.replace("<PUBLICATION_REPORT>", publication_markdown)
++        response = openai.chat.completions.create(
++            model=self.model_name,
++            messages=[
++                {"role": "system", "content": system_prompt},
++                {"role": "user", "content": user_prompt},
++            ],
++            temperature=0.7,
++        )
++        return response.choices[0].message.content
++
++    def postprocess_markdown(self, text, output_md):
++        system_prompt = POSTPROCESS_SYSTEM_PROMPT.strip()
++        user_prompt = POSTPROCESS_USER_PROMPT.strip() + "\n" + text
++        response = openai.chat.completions.create(
++            model=self.model_name,
++            messages=[
++                {"role": "system", "content": system_prompt},
++                {"role": "user", "content": user_prompt},
++            ],
++            temperature=0.7,
++        )
++        text = response.choices[0].message.content
++        with open(output_md, "w") as f:
++            f.write(text)
++
++    def run(self):
++        text = self.make_primary_request()
++        self.postprocess_markdown(text, self.output_markdown)
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description="Process arguments.")
++    parser.add_argument(
++        "-m", "--model_id", type=str, default=None, help="Ersilia Model Hub identifier"
++    )
++    parser.add_argument(
++        "-i",
++        "--issue_number",
++        type=int,
++        default=None,
++        help="GitHub issue number in the ersilia-os/ersilia repository",
++    )
++    parser.add_argument(
++        "-s", "--summary_path", type=str, default=None, help="File path"
++    )
++    parser.add_argument(
++        "-o",
++        "--output_markdown",
++        type=str,
++        default=None,
++        required=True,
++        help="Output file in Markdown format",
++    )
++    args = parser.parse_args()
++    model_id = args.model_id
++    issue_number = args.issue_number
++    summary_path = args.summary_path
++    output_markdown = args.output_markdown
++    md = MetadataDownloader(model_id, issue_number)
++    metadata_txt = md.download()
++    pd = PublicationSummaryDownloader(model_id, summary_path)
++    publication_markdown = pd.download()
++    ms = MetadataSuggestor(metadata_txt, publication_markdown, output_markdown)
++    ms.run()
+diff --git a/.github/scripts/summarize_publication_with_llm.py b/.github/scripts/summarize_publication_with_llm.py
+new file mode 100644
+index 000000000..7405b8ba6
+--- /dev/null
++++ b/.github/scripts/summarize_publication_with_llm.py
+@@ -0,0 +1,409 @@
++import os
++import argparse
++import tempfile
++import PyPDF2
++import openai
++import requests
++import boto3
++import shutil
++import json
++from typing import List
++from pydantic import BaseModel
++# from dotenv import load_dotenv
++
++# load_dotenv()
++
++# Authenticate into OpenAI
++OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
++openai.api_key = OPENAI_API_KEY
++MODEL_NAME = "gpt-4o"
++
++# Authenticate into AWS
++aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
++aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
++
++if aws_access_key_id and aws_secret_access_key:
++    boto3.setup_default_session(
++        aws_access_key_id=aws_access_key_id,
++        aws_secret_access_key=aws_secret_access_key,
++    )
++else:
++    raise Exception("AWS credentials are not set in the environment variables")
++
++
++PRIMARY_SYSTEM_PROMPT = """
++Your are a biomedical expert. You have to make a structured report of a scientific publication. The publication will be provided as a PDF file.
++Your report needs to be concise and informative. Strictly follow this structure, in Markdown format:
++
++# Publication details
++- Title: Just copy the title of the publication
++- Authors: List the authors separated by commas. For example, G. Turon, M. Duran-Frigola and D. Arora.
++- Journal: Name of the journal
++- Year: Year of publication
++- Suggested slug: A short version of the title, with hyphens instead of spaces. For example, "deep-learning-for-malaria". The slug should be all lowercase. It cannot be longer than 50 characters and should not contain more than 5 hyphens. If there is a name for the method, for example, chemprop, try to use it in the slug. Do not add dates or names of authors. If possible, do not include words such as ml (for machine learning) or ai (for artificial intelligence).
++- Suggested computational title: Suggest a title that is focused on the computational methods used in the publication. For example, "Broad-spectrum antibiotics activity prediction" or "MAIP, antimalarial activity prediction based on multiple industry datasets".
++
++# TLDR
++Write a short summary of the publication in one or two sentences. This should be a high-level overview of the publication.
++Do not use new-line characters. The TLDR should have between 100 and 200 characters.
++
++# Summary
++Write a summary of the publication. Feel free to use the information on the Abstract, if available.
++The summary should be between 100 and 200 words. Only one paragraph. No new-line characters are allowed. No special characters, boldface, links or references are allowed.
++Use a concise style.
++
++# Relevance to biomedical research
++Briefly discuss why the publication is relevant to biomedicine or drug discovery.
++If the publication is related to a particular disease or pathogen, make sure to mention it.
++If the publication is related to a particular stage of the drug discovery pipeline, make sure to mention it.
++This should be between 50 and 100 words. Only one paragraph. No new-line characters.
++Use a concise style.
++
++# Computational methods
++Write a summary of the computational methods used in this publication.
++If AI/ML methods are used, focus on those. Mention the main techniques and methods.
++Try to explain what the input and output of the methods are. In addition, try to explain how to interpret the output and what range of values are expected and relevant (if applicable).
++If training data was used, mention the size and source of the data.
++If accuracy was reported, make sure to mention it.
++The summary should be between 100 and 200 words. Only one paragraph. No new-line characters are allowed. No special characters, boldface, links or references are allowed.
++Use a concise style.
++
++# Biomedical keywords
++Suggest 3 to 5 keywords that are relevant to the publication. These keywords should be related to the biomedical or drug discovery aspects of the publication.
++If the publication is not related to biomedicine, do not suggest any keywords.
++- Keyword 1
++- Keyword 2
++- Keyword 3
++
++# Computational keywords
++Suggest 3 to 5 keywords that are relevant to the publication. These keywords should be related to the computational aspects of the publication, especially the AI/ML aspects, if applicable.
++Do not use keywords that are too generic, such as "machine learning", "deep learning" or "descriptors".
++- Keyword 1
++- Keyword 2
++- Keyword 3
++
++# Strenghts
++Discuss the strengths of the publication, especially from the perspective of the computational methods and the training dataset, if applicable.
++Why are the results of the publication important or relevant? What are the main contributions of the publication?
++This should be between 50 and 100 words. Only one paragraph. No new-line characters.
++
++# Limitations
++Discuss the limitations of the publication, especially from the perspective of the computational methods and the training dataset, if applicable.
++What could be improved in the publication? What are the main weaknesses? Are the computational methods novel? Are the results reliable? Are the conclusions valid?
++Is the dataset large enough? Is the data of high quality?
++This should be between 50 and 100 words. Only one paragraph. No new-line characters.
++
++# Overall relevance
++Try to assess the relevance of the publication in the context of the current knowledge in the field.
++In your assessment, consider the novelty of the methods, the quality of the results, and the potential impact of the publication.
++The date of publication is also important.
++The size of the dataset and the quality of the data are also important factors to consider.
++If prior art on the topic or similar articles exist in the literature, this should penalize the relevance. Novelty is important.
++Also consider the performance of the computational methods, and compare it with the performance of other methods.
++The impact factor of the journal is an important factor for relevance. Higher relevance should be given to higher impact journals.
++Do not be over-emphatic. Try to be explicit about the high, medium or low relevance of the publication. Not all publications are highly relevant, so do a fair assessment.
++This should be between 50 and 100 words. Only one paragraph. No new-line characters. Be concise.
++
++---
++
++Below are some style guidelines for the report:
++- Always use the third person and do not use personal pronouns.
++- Do not start paragraphs with sentences such as "this study", "this publication", "this report" or "the authors". Directly explain the content. For example, do not say "This study develops a method for...". Instead, say "A method was developed for..." or similar.
++- Do not include references or links.
++- Do not include any special characters, boldface, or italics.
++- Each section should be a separate paragraph (one and only one paragraph per section) or a bullet point list, as applicable.
++- Do not include any information about the number of pages of the publication.
++- Do not mention the figures or tables in the publication.
++- Do not mention other references in the publication.
++- Do not mention funding sources or acknowledgements.
++- Do not begin your answer with a sentence like: "here is a structured report of the publication". Start with the report itself.
++- Do not end your answer with a conclusion or a summary. The report should be self-contained.
++"""
++
++PRIMARY_USER_PROMPT = """
++Make a structured report of the scientific publication from the PDF file. The following is the extracted text from the PDF: 
++"""
++
++POSTPROCESS_SYSTEM_PROMPT = """
++You have to standardize the format of a structured report that may contain formatting errors or might require slight modifications.
++You will be provided with a text file with the report. You need to make sure that the report follows the correct format. Do not make drastic changes.
++The format is as follows:
++
++# Publication details
++- Title: Title of the publication
++- Authors: List of authors. For example, G. Turon, M. Duran-Frigola and D. Arora. Always abbreviate the given names.
++- Journal: Name of the journal. For example, Nature Biotechnology.
++- Year: Year of publication. For example, 2024.
++- Suggested slug: lowercase, maximum 5 hyphens and maxiumum 50 characters. No dates or author names. If possible, no generic abbreviations such as "ml" or "ai".
++
++# TLDR
++One paragraph only. Between 100 and 200 characters.
++
++# Summary
++One paragraph only. Between 100 and 200 words.
++
++# Relevance to biomedical research
++One paragraph only. Between 50 and 100 words.
++
++# Computational methods
++One paragraph only. Between 100 and 200 words.
++
++# Biomedical keywords
++Keywords as a list and without repeats or redundancy. Minim 3 and maximum 5 keywords. For example:
++- Malaria
++- Plasmodium falciparum
++- Asexual blood stage
++
++# Computational keywords
++Keywords as a list and without repeats or redundancy. Minim 3 and maximum 5 keywords. For example:
++- Physicochemical descriptors
++- Feature selection
++- Support vector machines
++
++# Strenghts
++One paragraph only. Between 50 and 100 words.
++
++# Limitations
++One paragraph only. Between 50 and 100 words.
++
++# Overall relevance
++One paragraph only. Between 50 and 100 words.
++
++---
++
++Below are a few general rules:
++- Rephrase if necessary if the content is not clear or concise, but do not make big changes. Just make the small necessary adjustments to follow the guidelines.
++- Do not include any special characters, boldface, or italics.
++- Do not include any references or links.
++- The report should be self-contained and not require additional information.
++- It is a Markdown file, so make sure to follow the Markdown syntax. All sections are title sections (#) and the lists are bullet points (-).
++- Avoid using double spaces or double new lines. Use only one space or one new line.
++- Correct any inconsistency. For example, if the model is deemed to be highly relevant in a section, and of medium relevance elsewhere, harmonize this. Be conservative.
++
++Make sure that the report follows the correct format. Do not make drastic changes.
++"""
++
++POSTPROCESS_USER_PROMPT = """
++Reformat, if necessary, the following publication report:
++"""
++
++class Summary(BaseModel):
++    title: str
++    authors: str
++    journal: str
++    year: int
++    suggested_slug: str
++    suggested_computational_title: str
++    tldr: str
++    summary: str
++    relevance_to_biomedical_research: str
++    computational_methods: str
++    biomedical_keywords: list[str]
++    computational_keywords: list[str]
++    strengths: str
++    limitations: str
++    overall_relevance: str
++
++
++class PublicationPDFDownloader:
++    def __init__(self, model_id=None, issue_number=None, url=None, file_path=None):
++        if (
++            model_id is None
++            and issue_number is None
++            and url is None
++            and file_path is None
++        ):
++            raise Exception("At least one argument is necessary")
++        if model_id is not None:
++            if issue_number is not None or url is not None or file_path is not None:
++                raise Exception("Only one argument is accepted")
++        if issue_number is not None:
++            if model_id is not None or url is not None or file_path is not None:
++                raise Exception("Only one argument is accepted")
++        if url is not None:
++            if (
++                model_id is not None
++                or issue_number is not None
++                or file_path is not None
++            ):
++                raise Exception("Only one argument is accepted")
++        if file_path is not None:
++            if model_id is not None or issue_number is not None or url is not None:
++                raise Exception("Only one argument is accepted")
++        self.model_id = model_id
++        self.issue_number = issue_number
++        self.url = url
++        self.file_path = file_path
++        self.tmp_folder = tempfile.mkdtemp(prefix="ersilia-")
++        self.output_file = os.path.join(self.tmp_folder, "publication.pdf")
++
++    def download_by_model_id(self):
++        s3 = boto3.client("s3")
++        bucket_name = "model-publications"
++        key = f"{self.model_id}_publication.pdf"
++        try:
++            with open(self.output_file, "wb") as f:
++                s3.download_fileobj(bucket_name, key, f)
++            return self.output_file
++        except Exception as e:
++            raise Exception(f"Failed to download file from S3: {str(e)}")
++
++    def download_by_issue_number(self):
++        # TODO download publication PDF from a TBD repository where publications are stored by issue number
++        pass
++
++    def download_from_url(self):
++        response = requests.get(self.url)
++        if response.status_code == 200:
++            with open(self.output_file, "wb") as f:
++                f.write(response.content)
++            return self.output_file
++        else:
++            raise Exception(
++                f"Failed to download file from URL: {self.url}, status code: {response.status_code}"
++            )
++
++    def download_from_file_path(self):
++        shutil.copy(self.file_path, self.output_file)
++        return self.output_file
++
++    def download(self):
++        if self.model_id is not None:
++            return self.download_by_model_id()
++        if self.issue_number is not None:
++            return self.download_by_issue_number()
++        if self.url is not None:
++            return self.download_from_url()
++        if self.file_path is not None:
++            return self.download_from_file_path()
++        return None
++
++class PublicationSummarizer:
++    def __init__(self, publication_pdf, output_file, format="json"):
++        self.tmp_dir = tempfile.mkdtemp(prefix="ersilia-") # TODO Unused
++        self.model_name = MODEL_NAME
++        self.publication_pdf = publication_pdf
++        self.output_file = output_file
++        self.format = format
++
++    def extract_text_from_pdf(self, pdf_path):
++        with open(pdf_path, "rb") as file:
++            reader = PyPDF2.PdfReader(file)
++            text = ""
++            for page_num in range(len(reader.pages)):
++                page = reader.pages[page_num]
++                text += page.extract_text()
++        return text
++
++    def make_primary_request(self, extracted_text):
++        system_prompt = PRIMARY_SYSTEM_PROMPT.strip()
++        user_prompt = PRIMARY_USER_PROMPT.strip() + "\n" + extracted_text
++        response = openai.chat.completions.create(
++            model=self.model_name,
++            messages=[
++                {"role": "system", "content": system_prompt},
++                {"role": "user", "content": user_prompt},
++            ],
++            temperature=0.7,
++        )
++        return response.choices[0].message.content
++
++    def postprocess_response(self, text_response, output_file):
++        system_prompt = POSTPROCESS_SYSTEM_PROMPT.strip()
++        user_prompt = POSTPROCESS_USER_PROMPT.strip() + "\n" + text_response
++        if self.format == "json":
++            response = openai.beta.chat.completions.parse(
++                model=self.model_name,
++                messages=[
++                    {"role": "system", "content": system_prompt},
++                    {"role": "user", "content": user_prompt},
++                ],
++                temperature=0.7,
++                response_format=Summary,
++            )
++            with open(output_file, "w") as f:
++                json.dump(response.choices[0].message.parsed.model_dump(), f, indent=4)
++
++        elif self.format == "markdown":
++            response = openai.chat.completions.create(
++                model=self.model_name,
++                messages=[
++                    {"role": "system", "content": system_prompt},
++                    {"role": "user", "content": user_prompt},
++                ],
++                temperature=0.7,
++            )
++            text_response = response.choices[0].message.content
++            with open(output_file, "w") as f:
++                f.write(text_response)
++        
++        else:
++            raise ValueError("Invalid format. Please choose either 'json' or 'markdown'.")
++
++    def run(self):
++        text = self.extract_text_from_pdf(self.publication_pdf)
++        text_response = self.make_primary_request(text)
++        self.postprocess_response(text_response, self.output_file)
++
++
++def serialize_json_to_md(json_file, md_file):
++    with open(json_file, "r") as f:
++        data = json.load(f)
++    with open(md_file, "w") as f:
++        for key, value in data.items():
++            f.write(f"## {str(key).title()}\n")
++            if isinstance(value, list):
++                for item in value:
++                    f.write(f"- {str(item)}\n")
++            else:
++                f.write(str(value) + "\n")
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description="Process arguments.")
++    parser.add_argument(
++        "-m", "--model_id", type=str, default=None, help="Ersilia Model Hub identifier"
++    )
++    parser.add_argument(
++        "-i",
++        "--issue_number",
++        type=int,
++        default=None,
++        help="GitHub issue number in the ersilia-os/ersilia repository",
++    )
++    parser.add_argument(
++        "-u", "--url", type=str, default=None, help="URL of the downloadable file"
++    )
++    parser.add_argument(
++        "-f",
++        "--file_path",
++        type=str,
++        default=None,
++        help="File path of the publication PDF",
++    )
++    parser.add_argument(
++        "-o",
++        "--output_file",
++        type=str,
++        default=None,
++        required=True,
++        help="Output file path for the summary",
++    )
++    parser.add_argument(
++        "-F",
++        "--format",
++        type=str,
++        default="json",
++        required=False,
++        help="File format in which to save the summary, defaults to JSON"
++    )
++    args = parser.parse_args()
++    model_id = args.model_id
++    issue_number = args.issue_number
++    url = args.url
++    file_path = args.file_path
++    output_file = args.output_file
++    output_format = args.format
++    ppd = PublicationPDFDownloader(model_id, issue_number, url, file_path)
++    publication_pdf = ppd.download()
++    ps = PublicationSummarizer(publication_pdf, output_file, output_format)
++    ps.run()

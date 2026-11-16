@@ -1,0 +1,1137 @@
+diff --git a/server/catgo/mcp_tools/server_claude_code.py b/server/catgo/mcp_tools/server_claude_code.py
+index e68e6653b..95fa57c74 100644
+--- a/server/catgo/mcp_tools/server_claude_code.py
++++ b/server/catgo/mcp_tools/server_claude_code.py
+@@ -391,18 +391,50 @@
+     Tool(
+         name="catgo_view",
+         description=(
+-            "Read CatGO viewer state. "
++            "Read CatGO viewer state and drive its atom selection. "
+             "get_state: structure summary + selection. "
+             "selection: selected atom details. "
+-            "screenshot: capture 3D view image."
++            "screenshot: capture 3D view image. "
++            "select: highlight atoms in the viewer using a selection DSL query "
++            "(returns the resolved 0-based atom indices). "
++            "Selection DSL — combine selectors with AND/OR/NOT (or & | !) and "
++            "parentheses; AND binds tighter than OR. Selectors:\n"
++            "  *                all atoms\n"
++            "  elem:O           atoms of an element (case-insensitive)\n"
++            "  label:O1         per-element 1-BASED ordinal (O1=first O); O1-5 = range\n"
++            "  label:3          bare number = 1-BASED GLOBAL site number; 3-7 = range\n"
++            "  ids:0,4,5        literal 0-BASED indices (out-of-range dropped)\n"
++            "  id:7             single 0-BASED index\n"
++            "  pos:z>10         cartesian Å on x/y/z; ops > < >= <= = == !=\n"
++            "  frac:c>0.5       fractional on a/b/c (empty if no lattice)\n"
++            "  bonded:@i        bond-neighbours of atom i (PBC-aware; excludes i)\n"
++            "  sphere:@i;R      atoms within R Å of atom i (PBC-aware; includes i)\n"
++            "Examples: 'elem:O AND frac:c>0.9'  '(elem:C OR elem:N) AND pos:z>5'  "
++            "'elem:H AND NOT bonded:@0'. "
++            "NOTE: ids:/id: are 0-based, but label: numbering is 1-based — prefer "
++            "ids: for index work. mode=replace|add|subtract controls how the result "
++            "merges with the current selection."
+         ),
+         inputSchema={
+             "type": "object",
+             "properties": {
+                 "action": {
+                     "type": "string",
+-                    "enum": ["get_state", "selection", "screenshot"],
+-                    "description": "get_state=summary, selection=atoms, screenshot=image",
++                    "enum": ["get_state", "selection", "screenshot", "select"],
++                    "description": "get_state=summary, selection=atoms, screenshot=image, select=apply DSL query",
++                },
++                "query": {
++                    "type": "string",
++                    "description": "Selection DSL query (required for action=select), e.g. 'elem:O AND frac:c>0.9'.",
++                },
++                "panel_id": {
++                    "type": "string",
++                    "description": "Target viewer/panel id (default 'default' → backend resolves the populated pane).",
++                },
++                "mode": {
++                    "type": "string",
++                    "enum": ["replace", "add", "subtract"],
++                    "description": "How the resolved indices merge with the current selection (default replace).",
+                 },
+             },
+             "required": ["action"],
+@@ -1968,7 +2000,32 @@ async def _handle_view(client: httpx.AsyncClient, args: dict) -> list[TextConten
+         data = resp.json()
+         return [T(type="text", text=f"Screenshot captured ({data.get('width')}x{data.get('height')}). Base64 image: {data.get('image', '')[:100]}...")]
+ 
+-    return [T(type="text", text=f"Unknown view action '{action}'. Valid: get_state, selection, screenshot")]
++    if action == "select":
++        query = args.get("query")
++        if not query or not str(query).strip():
++            return [T(type="text", text="catgo_view select: 'query' is required (a selection DSL string).")]
++        # Reuse the SAME per-viewer command bus catgo_pane rides — no new bridge
++        # endpoint needed. The frontend parses the DSL against the panel's CURRENT
++        # structure, applies the selection, and posts the resolved indices back.
++        payload = {
++            "viewer_id": str(args.get("panel_id", "default")) or "default",
++            "action": "select_atoms",
++            "arguments": {
++                "query": str(query),
++                "mode": str(args.get("mode", "replace") or "replace"),
++            },
++        }
++        resp = await client.post(f"{API_BASE}/view/command", json=payload)
++        if resp.status_code != 200:
++            return [T(type="text", text=f"catgo_view select failed ({resp.status_code}): {resp.text[:300]}")]
++        data = resp.json()
++        if not data.get("ok", False):
++            # Surface the bridge error verbatim (e.g. "viewer not mounted",
++            # or a DSL parse error from the frontend) rather than swallowing it.
++            return [T(type="text", text=f"catgo_view select failed: {data.get('error', 'unknown error')}")]
++        return [T(type="text", text=json.dumps(data.get("result", {}), ensure_ascii=False))]
++
++    return [T(type="text", text=f"Unknown view action '{action}'. Valid: get_state, selection, screenshot, select")]
+ 
+ 
+ async def _handle_catalysis(client: httpx.AsyncClient, args: dict) -> list[TextContent]:
+diff --git a/src/lib/structure/Structure.svelte b/src/lib/structure/Structure.svelte
+index 0a3092f24..f8312ecc5 100644
+--- a/src/lib/structure/Structure.svelte
++++ b/src/lib/structure/Structure.svelte
+@@ -146,6 +146,7 @@
+ 
+   import { add_atom, delete_atoms, move_atom, move_atoms_by_displacement, concatenate_structures, merge_structures, replace_atom } from './atom-manipulation'
+   import { build_atom_graph } from './atom-graph'
++  import { select_atoms } from './select-dsl'
+   import { scale_structure_geometry } from '$lib/trajectory/operations'
+   import OptimadeSearchModal from './OptimadeSearchModal.svelte'
+   import OptimadePreviewModal from './OptimadePreviewModal.svelte'
+@@ -2428,6 +2429,26 @@
+   function handle_structure_command(action: string, args: Record<string, unknown>) {
+     if (action === `inspect`) return { atoms: inspect_viewer_atoms() }
+     if (!structure) throw new Error(`No structure loaded.`)
++    if (action === `select_atoms`) {
++      // Pure DSL evaluation against the viewer's CURRENT structure. The parser
++      // is total — a malformed query returns {error}, which we surface as a
++      // thrown Error so the MCP bridge reports it back to the agent verbatim.
++      const query = String(args.query ?? ``)
++      const res = select_atoms(query, structure)
++      if (`error` in res) throw new Error(res.error)
++      const next = [...res.indices].sort((a, b) => a - b)
++      const mode = String(args.mode ?? `replace`)
++      if (mode === `add`) {
++        selected_sites = [...new Set([...selected_sites, ...next])].sort((a, b) => a - b)
++      } else if (mode === `subtract`) {
++        selected_sites = selected_sites.filter((i) => !res.indices.has(i))
++      } else {
++        selected_sites = next
++      }
++      // push_loop mirrors selected_sites to /view/selection so catgo_view
++      // action="selection" reads the same set back.
++      return { scope: `viewer`, query, mode, count: selected_sites.length, indices: selected_sites }
++    }
+     if (action === `add_atom`) {
+       const element = String(args.element ?? ``) as ElementSymbol
+       const position = Array.isArray(args.position) ? args.position.map(Number) : []
+diff --git a/src/lib/structure/select-dsl.ts b/src/lib/structure/select-dsl.ts
+new file mode 100644
+index 000000000..a8f9bd775
+--- /dev/null
++++ b/src/lib/structure/select-dsl.ts
+@@ -0,0 +1,576 @@
++/**
++ * CatGo selection DSL — a dependency-free, recursive-descent parser + evaluator
++ * for the textual atom-selection grammar CatBot drives the viewer with.
++ *
++ * Semantics are ported from AtomCanvas's `selection_parser.py` / `selection_ops.py`
++ * but evaluated against CatGo's `Site[]` shape (`species[0].element`, fractional
++ * `abc`, cartesian `xyz`, `label`). All resolved indices are **0-based** to match
++ * CatGo's `selected_sites`.
++ *
++ * Design invariants:
++ *  - `select_atoms` is TOTAL: it never throws. Malformed input returns
++ *    `{ error: string }`; an empty/whitespace query returns `{ indices: new Set() }`.
++ *  - No catastrophic backtracking: the tokenizer is a single linear scan and the
++ *    parser is straight LL recursive descent with a recursion-depth guard, so a
++ *    pathological query terminates in O(token count) time.
++ *  - bonded:/sphere: reuse `build_atom_graph`'s exact PBC minimum-image distance
++ *    and `get_default_bond_length(...) * 1.25` cutoff so results agree with the
++ *    viewer's atom-graph / inspect output.
++ *
++ * --- Grammar (EBNF) ---
++ *   query     := or_expr
++ *   or_expr   := and_expr  ( ('OR'  | '|') and_expr )*
++ *   and_expr  := not_expr  ( ('AND' | '&') not_expr )*   # AND binds tighter than OR
++ *   not_expr  := ('NOT' | '!') not_expr | primary
++ *   primary   := '(' or_expr ')' | selector
++ *   selector  := '*' | elem | label | ids | id | pos | frac | bonded | sphere
++ */
++
++import type { AnyStructure, ElementSymbol, Matrix3x3, Pbc, Site, Vec3 } from '$lib/structure'
++import { mat3x3_vec3_multiply, transpose_3x3_matrix } from '$lib/math'
++import { get_default_bond_length } from './atom-manipulation'
++import { build_atom_graph } from './atom-graph'
++
++export type SelectResult = { indices: Set<number> } | { error: string }
++
++// Float-equality epsilon for the '='/'==' comparison operators.
++const EPS = 1e-6
++
++// Hard ceiling on parser recursion to defuse adversarial deeply-nested input.
++const MAX_DEPTH = 512
++
++// ---------------------------------------------------------------------------
++// Tokenizer
++// ---------------------------------------------------------------------------
++
++type TokKind = 'AND' | 'OR' | 'NOT' | 'LPAREN' | 'RPAREN' | 'SELECTOR'
++
++interface Token {
++  kind: TokKind
++  // For SELECTOR tokens: the raw selector text (e.g. "elem:O", "pos:z>10",
++  // "bonded:@0", "sphere:@1;3.5", "*"). For operators/parens: the literal.
++  text: string
++  pos: number
++}
++
++class ParseError extends Error {}
++
++/** Split a query string into tokens. A selector token greedily consumes a
++ *  contiguous run of non-whitespace, non-paren characters that is not itself a
++ *  bare boolean operator. `&`, `|`, `!` are single-char operators; `(`/`)` are
++ *  structural. Keywords AND/OR/NOT are recognised case-insensitively only when
++ *  they stand alone (whitespace/paren-delimited), so `elem:Na` is never split. */
++function tokenize(input: string): Token[] {
++  const tokens: Token[] = []
++  const n = input.length
++  let i = 0
++
++  const isSpace = (c: string) => c === ' ' || c === '\t' || c === '\n' || c === '\r'
++
++  while (i < n) {
++    const c = input[i]
++
++    if (isSpace(c)) {
++      i++
++      continue
++    }
++
++    if (c === '(') {
++      tokens.push({ kind: 'LPAREN', text: '(', pos: i })
++      i++
++      continue
++    }
++    if (c === ')') {
++      tokens.push({ kind: 'RPAREN', text: ')', pos: i })
++      i++
++      continue
++    }
++    if (c === '&') {
++      tokens.push({ kind: 'AND', text: '&', pos: i })
++      i++
++      continue
++    }
++    if (c === '|') {
++      tokens.push({ kind: 'OR', text: '|', pos: i })
++      i++
++      continue
++    }
++    // `!` is the NOT operator, but `!=` is the comparison operator inside a
++    // selector (e.g. `pos:y!=5`). Only treat a bare `!` (not followed by `=`)
++    // as NOT here; an embedded `!=` is consumed as part of the selector word.
++    if (c === '!' && input[i + 1] !== '=') {
++      tokens.push({ kind: 'NOT', text: '!', pos: i })
++      i++
++      continue
++    }
++
++    // Otherwise consume a word: a run up to the next whitespace, paren, or
++    // bare boolean operator. A `!` only breaks the word when standalone (not
++    // part of `!=`), so comparison ops survive inside the selector token.
++    const start = i
++    while (i < n) {
++      const ch = input[i]
++      if (isSpace(ch) || ch === '(' || ch === ')' || ch === '&' || ch === '|') {
++        break
++      }
++      if (ch === '!' && input[i + 1] !== '=') {
++        break
++      }
++      i++
++    }
++    const word = input.slice(start, i)
++    const upper = word.toUpperCase()
++    if (upper === 'AND') tokens.push({ kind: 'AND', text: word, pos: start })
++    else if (upper === 'OR') tokens.push({ kind: 'OR', text: word, pos: start })
++    else if (upper === 'NOT') tokens.push({ kind: 'NOT', text: word, pos: start })
++    else tokens.push({ kind: 'SELECTOR', text: word, pos: start })
++  }
++
++  return tokens
++}
++
++// ---------------------------------------------------------------------------
++// AST
++// ---------------------------------------------------------------------------
++
++type Node =
++  | { type: 'and'; left: Node; right: Node }
++  | { type: 'or'; left: Node; right: Node }
++  | { type: 'not'; operand: Node }
++  | { type: 'selector'; text: string; pos: number }
++
++// ---------------------------------------------------------------------------
++// Parser (recursive descent, LL, depth-guarded)
++// ---------------------------------------------------------------------------
++
++class Parser {
++  private toks: Token[]
++  private idx = 0
++  private depth = 0
++
++  constructor(toks: Token[]) {
++    this.toks = toks
++  }
++
++  private peek(): Token | undefined {
++    return this.toks[this.idx]
++  }
++
++  private next(): Token | undefined {
++    return this.toks[this.idx++]
++  }
++
++  private enter() {
++    if (++this.depth > MAX_DEPTH) {
++      throw new ParseError('expression nested too deeply')
++    }
++  }
++  private leave() {
++    this.depth--
++  }
++
++  parse(): Node {
++    const node = this.parseOr()
++    if (this.idx < this.toks.length) {
++      const t = this.toks[this.idx]
++      throw new ParseError(`unexpected token '${t.text}' at position ${t.pos}`)
++    }
++    return node
++  }
++
++  private parseOr(): Node {
++    this.enter()
++    let left = this.parseAnd()
++    for (;;) {
++      const t = this.peek()
++      if (t && t.kind === 'OR') {
++        this.next()
++        const right = this.parseAnd()
++        left = { type: 'or', left, right }
++      } else break
++    }
++    this.leave()
++    return left
++  }
++
++  private parseAnd(): Node {
++    this.enter()
++    let left = this.parseNot()
++    for (;;) {
++      const t = this.peek()
++      if (t && t.kind === 'AND') {
++        this.next()
++        const right = this.parseNot()
++        left = { type: 'and', left, right }
++      } else break
++    }
++    this.leave()
++    return left
++  }
++
++  private parseNot(): Node {
++    this.enter()
++    const t = this.peek()
++    if (t && t.kind === 'NOT') {
++      this.next()
++      const operand = this.parseNot()
++      this.leave()
++      return { type: 'not', operand }
++    }
++    const node = this.parsePrimary()
++    this.leave()
++    return node
++  }
++
++  private parsePrimary(): Node {
++    const t = this.next()
++    if (!t) throw new ParseError('unexpected end of expression')
++    if (t.kind === 'LPAREN') {
++      const inner = this.parseOr()
++      const close = this.next()
++      if (!close || close.kind !== 'RPAREN') {
++        throw new ParseError('unbalanced parentheses')
++      }
++      return inner
++    }
++    if (t.kind === 'SELECTOR') {
++      return { type: 'selector', text: t.text, pos: t.pos }
++    }
++    // An operator / RPAREN where a primary was expected.
++    throw new ParseError(`unexpected token '${t.text}' at position ${t.pos}`)
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Selector evaluation
++// ---------------------------------------------------------------------------
++
++const COMP_OPS = ['>=', '<=', '!=', '==', '>', '<', '='] as const
++type CompOp = (typeof COMP_OPS)[number]
++
++function applyOp(op: CompOp, a: number, b: number): boolean {
++  switch (op) {
++    case '>':
++      return a > b
++    case '<':
++      return a < b
++    case '>=':
++      return a >= b
++    case '<=':
++      return a <= b
++    case '!=':
++      return Math.abs(a - b) > EPS
++    case '=':
++    case '==':
++      return Math.abs(a - b) <= EPS
++  }
++}
++
++function elementOf(site: Site): string {
++  return (site.species?.[0]?.element ?? site.label ?? '?') as string
++}
++
++/** Build a minimum-image distance function matching build_atom_graph exactly. */
++function makeDistanceFn(structure: AnyStructure): (i: number, j: number) => number {
++  const sites = structure.sites ?? []
++  const lattice = 'lattice' in structure
++    ? (structure as { lattice?: { matrix?: Matrix3x3; pbc?: Pbc } }).lattice
++    : undefined
++  const matrix_T = lattice?.matrix ? transpose_3x3_matrix(lattice.matrix) : undefined
++  const pbc: Pbc = lattice?.pbc ?? [true, true, true]
++  const use_pbc = !!matrix_T && sites.every((s) => Array.isArray(s.abc))
++
++  return (i: number, j: number): number => {
++    if (use_pbc && matrix_T) {
++      const da = sites[i].abc[0] - sites[j].abc[0]
++      const db = sites[i].abc[1] - sites[j].abc[1]
++      const dc = sites[i].abc[2] - sites[j].abc[2]
++      const wrapped: Vec3 = [
++        pbc[0] ? da - Math.round(da) : da,
++        pbc[1] ? db - Math.round(db) : db,
++        pbc[2] ? dc - Math.round(dc) : dc,
++      ]
++      const [dx, dy, dz] = mat3x3_vec3_multiply(matrix_T, wrapped)
++      return Math.hypot(dx, dy, dz)
++    }
++    return Math.hypot(
++      sites[i].xyz[0] - sites[j].xyz[0],
++      sites[i].xyz[1] - sites[j].xyz[1],
++      sites[i].xyz[2] - sites[j].xyz[2],
++    )
++  }
++}
++
++function selectElem(sites: Site[], symbolRaw: string): Set<number> {
++  if (!/^[A-Za-z]+$/.test(symbolRaw)) {
++    throw new ParseError(`elem: expects an element symbol, got '${symbolRaw}'`)
++  }
++  const target = symbolRaw.charAt(0).toUpperCase() + symbolRaw.slice(1).toLowerCase()
++  const out = new Set<number>()
++  for (let i = 0; i < sites.length; i++) {
++    if (elementOf(sites[i]) === target) out.add(i)
++  }
++  return out
++}
++
++function selectLabel(sites: Site[], body: string): Set<number> {
++  const out = new Set<number>()
++  // Pre-compute per-element ordering (site order) for the ordinal form.
++  let symbolMap: Map<string, number[]> | null = null
++  const ensureSymbolMap = () => {
++    if (symbolMap) return symbolMap
++    symbolMap = new Map<string, number[]>()
++    for (let i = 0; i < sites.length; i++) {
++      const sym = elementOf(sites[i])
++      const arr = symbolMap.get(sym)
++      if (arr) arr.push(i)
++      else symbolMap.set(sym, [i])
++    }
++    return symbolMap
++  }
++
++  const items = body.split(',')
++  for (const rawItem of items) {
++    const item = rawItem.trim()
++    if (item === '') {
++      throw new ParseError('label: empty item')
++    }
++    // Symbol + ordinal:  O1 / O1-5
++    const m = /^([A-Za-z]+)(\d+)(?:-(\d+))?$/.exec(item)
++    if (m) {
++      const sym0 = m[1]
++      const sym = sym0.charAt(0).toUpperCase() + sym0.slice(1).toLowerCase()
++      const start = parseInt(m[2], 10)
++      const end = m[3] ? parseInt(m[3], 10) : start
++      if (start > end) continue
++      const list = ensureSymbolMap().get(sym)
++      if (!list) continue
++      for (let k = start; k <= end; k++) {
++        if (k >= 1 && k <= list.length) out.add(list[k - 1])
++      }
++      continue
++    }
++    // Bare number = 1-based GLOBAL site number:  3 / 3-7
++    const mn = /^(\d+)(?:-(\d+))?$/.exec(item)
++    if (mn) {
++      const start = parseInt(mn[1], 10)
++      const end = mn[2] ? parseInt(mn[2], 10) : start
++      if (start > end) continue
++      for (let k = start; k <= end; k++) {
++        const idx0 = k - 1
++        if (idx0 >= 0 && idx0 < sites.length) out.add(idx0)
++      }
++      continue
++    }
++    throw new ParseError(`label: malformed item '${item}'`)
++  }
++  return out
++}
++
++function selectIds(sites: Site[], body: string): Set<number> {
++  const out = new Set<number>()
++  if (body.trim() === '') return out
++  for (const part of body.split(',')) {
++    const p = part.trim()
++    if (!/^-?\d+$/.test(p)) {
++      throw new ParseError(`ids: non-integer index '${p}'`)
++    }
++    const v = parseInt(p, 10)
++    if (v >= 0 && v < sites.length) out.add(v) // clamp out-of-range silently
++  }
++  return out
++}
++
++function selectId(sites: Site[], body: string): Set<number> {
++  const p = body.trim()
++  if (!/^-?\d+$/.test(p)) {
++    throw new ParseError(`id: non-integer index '${p}'`)
++  }
++  const out = new Set<number>()
++  const v = parseInt(p, 10)
++  if (v >= 0 && v < sites.length) out.add(v)
++  return out
++}
++
++function selectPosFrac(
++  sites: Site[],
++  body: string,
++  kind: 'pos' | 'frac',
++  hasLattice: boolean,
++): Set<number> {
++  // body like "z>10", "a>=0.5". First char(s) = axis, then op, then number.
++  const m = /^([A-Za-z]+)\s*(>=|<=|!=|==|>|<|=)\s*(.+)$/.exec(body)
++  if (!m) {
++    throw new ParseError(`${kind}: expected AXIS OP VALUE, got '${body}'`)
++  }
++  const axisRaw = m[1].toLowerCase()
++  const op = m[2] as CompOp
++  const valStr = m[3].trim()
++  const val = Number(valStr)
++  if (valStr === '' || !Number.isFinite(val)) {
++    throw new ParseError(`${kind}: non-numeric value '${valStr}'`)
++  }
++  let axis: number
++  if (kind === 'pos') {
++    axis = { x: 0, y: 1, z: 2 }[axisRaw] ?? -1
++    if (axis < 0) throw new ParseError(`pos: invalid axis '${m[1]}' (use x/y/z)`)
++  } else {
++    axis = { a: 0, b: 1, c: 2 }[axisRaw] ?? -1
++    if (axis < 0) throw new ParseError(`frac: invalid axis '${m[1]}' (use a/b/c)`)
++  }
++  const out = new Set<number>()
++  // frac with no lattice / no abc -> empty (graceful), never a throw.
++  if (kind === 'frac' && !hasLattice) return out
++  for (let i = 0; i < sites.length; i++) {
++    const coords = kind === 'pos' ? sites[i].xyz : sites[i].abc
++    if (!coords) continue
++    if (applyOp(op, coords[axis], val)) out.add(i)
++  }
++  return out
++}
++
++function parseAtIndex(token: string, body: string, n: number): number {
++  const m = /^@(\d+)$/.exec(body.trim())
++  if (!m) {
++    throw new ParseError(`${token}: expected @INDEX, got '${body}'`)
++  }
++  const i = parseInt(m[1], 10)
++  if (i < 0 || i >= n) {
++    throw new ParseError(`${token}: index @${i} out of range (0..${n - 1})`)
++  }
++  return i
++}
++
++function evalSelector(text: string, structure: AnyStructure): Set<number> {
++  const sites = structure.sites ?? []
++  const n = sites.length
++  const hasLattice = 'lattice' in structure &&
++    !!(structure as { lattice?: { matrix?: Matrix3x3 } }).lattice?.matrix &&
++    sites.every((s) => Array.isArray(s.abc))
++
++  if (text === '*') {
++    const out = new Set<number>()
++    for (let i = 0; i < n; i++) out.add(i)
++    return out
++  }
++
++  const colon = text.indexOf(':')
++  if (colon < 0) {
++    throw new ParseError(`unknown selector '${text}'`)
++  }
++  const tag = text.slice(0, colon).toLowerCase()
++  const body = text.slice(colon + 1)
++
++  switch (tag) {
++    case 'elem':
++      return selectElem(sites, body)
++    case 'label':
++      return selectLabel(sites, body)
++    case 'ids':
++      return selectIds(sites, body)
++    case 'id':
++      return selectId(sites, body)
++    case 'pos':
++      return selectPosFrac(sites, body, 'pos', hasLattice)
++    case 'frac':
++      return selectPosFrac(sites, body, 'frac', hasLattice)
++    case 'bonded': {
++      const i = parseAtIndex('bonded', body, n)
++      const graph = build_atom_graph(structure)
++      return new Set<number>(graph[i]?.neighbors ?? [])
++    }
++    case 'sphere': {
++      const semi = body.indexOf(';')
++      if (semi < 0) {
++        throw new ParseError(`sphere: expected @INDEX;RADIUS, got '${body}'`)
++      }
++      const i = parseAtIndex('sphere', body.slice(0, semi), n)
++      const rStr = body.slice(semi + 1).trim()
++      const r = Number(rStr)
++      if (rStr === '' || !Number.isFinite(r)) {
++        throw new ParseError(`sphere: non-numeric radius '${rStr}'`)
++      }
++      const dist = makeDistanceFn(structure)
++      const out = new Set<number>()
++      for (let j = 0; j < n; j++) {
++        if (dist(i, j) <= r) out.add(j) // includes i (dist 0)
++      }
++      return out
++    }
++    default:
++      throw new ParseError(`unknown selector tag '${tag}:'`)
++  }
++}
++
++// ---------------------------------------------------------------------------
++// AST evaluation
++// ---------------------------------------------------------------------------
++
++function evalNode(node: Node, structure: AnyStructure, all: () => Set<number>): Set<number> {
++  switch (node.type) {
++    case 'selector':
++      return evalSelector(node.text, structure)
++    case 'not': {
++      const sub = evalNode(node.operand, structure, all)
++      const out = new Set<number>()
++      for (const i of all()) {
++        if (!sub.has(i)) out.add(i)
++      }
++      return out
++    }
++    case 'and': {
++      const l = evalNode(node.left, structure, all)
++      const r = evalNode(node.right, structure, all)
++      const out = new Set<number>()
++      for (const i of l) if (r.has(i)) out.add(i)
++      return out
++    }
++    case 'or': {
++      const l = evalNode(node.left, structure, all)
++      const r = evalNode(node.right, structure, all)
++      const out = new Set<number>(l)
++      for (const i of r) out.add(i)
++      return out
++    }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Public API
++// ---------------------------------------------------------------------------
++
++/**
++ * Parse and evaluate a selection DSL query against a structure.
++ *
++ * @returns `{ indices: Set<number> }` (0-based base-site indices) on success, or
++ *   `{ error: string }` on a malformed query. Empty/whitespace query yields an
++ *   empty index set. Never throws.
++ */
++export function select_atoms(query: string, structure?: AnyStructure): SelectResult {
++  try {
++    if (!query || query.trim() === '') {
++      return { indices: new Set<number>() }
++    }
++    const struct: AnyStructure = structure ?? ({ sites: [] } as AnyStructure)
++    const tokens = tokenize(query)
++    if (tokens.length === 0) {
++      return { indices: new Set<number>() }
++    }
++    const ast = new Parser(tokens).parse()
++
++    const sites = struct.sites ?? []
++    let allCache: Set<number> | null = null
++    const all = () => {
++      if (allCache) return allCache
++      allCache = new Set<number>()
++      for (let i = 0; i < sites.length; i++) allCache.add(i)
++      return allCache
++    }
++
++    const indices = evalNode(ast, struct, all)
++    return { indices }
++  } catch (e) {
++    const msg = e instanceof Error ? e.message : String(e)
++    return { error: msg }
++  }
++}
+diff --git a/tests/vitest/select-dsl.test.ts b/tests/vitest/select-dsl.test.ts
+new file mode 100644
+index 000000000..7c920aaa7
+--- /dev/null
++++ b/tests/vitest/select-dsl.test.ts
+@@ -0,0 +1,417 @@
++import { describe, expect, it } from 'vitest'
++import { select_atoms } from '$lib/structure/select-dsl'
++import type { Matrix3x3, PymatgenMolecule, PymatgenStructure, Site } from '$lib/structure'
++
++// --- helpers -------------------------------------------------------------
++
++function site(
++  element: string,
++  abc: [number, number, number],
++  xyz: [number, number, number],
++  label: string,
++): Site {
++  return {
++    species: [{ element: element as Site['species'][0]['element'], occu: 1 }],
++    abc,
++    xyz,
++    label,
++    properties: {},
++  }
++}
++
++// A small periodic test structure: 8 atoms, a cubic 10 Å cell.
++//  idx element  frac (a,b,c)        cart (x,y,z)        label
++//   0  O        (0.00,0.00,0.05)    (0,0,0.5)           O1
++//   1  H        (0.10,0.00,0.10)    (1.0,0,1.0)         H1   (bonded to O0)
++//   2  H        (0.00,0.10,0.10)    (0,1.0,1.0)         H2   (bonded to O0)
++//   3  O        (0.50,0.50,0.95)    (5.0,5.0,9.5)       O2   (top of cell, z high)
++//   4  C        (0.50,0.50,0.50)    (5.0,5.0,5.0)       C1
++//   5  N        (0.50,0.60,0.55)    (5.0,6.0,5.5)       N1   (bonded to C4)
++//   6  O        (0.98,0.50,0.50)    (9.8,5.0,5.0)       O3   (near a-edge)
++//   7  H        (0.02,0.50,0.50)    (0.2,5.0,5.0)       H3   (wraps to O6 across a)
++const LAT: Matrix3x3 = [
++  [10, 0, 0],
++  [0, 10, 0],
++  [0, 0, 10],
++]
++
++function make_structure(): PymatgenStructure {
++  const sites: Site[] = [
++    site('O', [0.0, 0.0, 0.05], [0, 0, 0.5], 'O1'),
++    site('H', [0.1, 0.0, 0.1], [1.0, 0, 1.0], 'H1'),
++    site('H', [0.0, 0.1, 0.1], [0, 1.0, 1.0], 'H2'),
++    site('O', [0.5, 0.5, 0.95], [5.0, 5.0, 9.5], 'O2'),
++    site('C', [0.5, 0.5, 0.5], [5.0, 5.0, 5.0], 'C1'),
++    site('N', [0.5, 0.6, 0.55], [5.0, 6.0, 5.5], 'N1'),
++    site('O', [0.98, 0.5, 0.5], [9.8, 5.0, 5.0], 'O3'),
++    site('H', [0.02, 0.5, 0.5], [0.2, 5.0, 5.0], 'H3'),
++  ]
++  return {
++    sites,
++    lattice: {
++      matrix: LAT,
++      pbc: [true, true, true],
++      volume: 1000,
++      a: 10,
++      b: 10,
++      c: 10,
++      alpha: 90,
++      beta: 90,
++      gamma: 90,
++    },
++  }
++}
++
++// A 3-atom water molecule, NO lattice (for frac: graceful empty + sphere fallback).
++function make_molecule(): PymatgenMolecule {
++  return {
++    sites: [
++      site('O', [0, 0, 0], [0, 0, 0], 'O1'),
++      site('H', [0, 0, 0], [0.96, 0, 0], 'H1'),
++      site('H', [0, 0, 0], [-0.24, 0.93, 0], 'H2'),
++    ],
++  }
++}
++
++// Convenience: get sorted indices array, throwing if the parse errored.
++function idx(query: string, structure: PymatgenStructure | PymatgenMolecule): number[] {
++  const res = select_atoms(query, structure)
++  if ('error' in res) throw new Error(`unexpected error: ${res.error}`)
++  return [...res.indices].sort((a, b) => a - b)
++}
++
++// --- elem ---------------------------------------------------------------
++
++describe('elem selector', () => {
++  it('selects all atoms of an element', () => {
++    expect(idx('elem:O', make_structure())).toEqual([0, 3, 6])
++    expect(idx('elem:H', make_structure())).toEqual([1, 2, 7])
++    expect(idx('elem:C', make_structure())).toEqual([4])
++  })
++
++  it('is case-insensitive on the symbol', () => {
++    expect(idx('elem:o', make_structure())).toEqual([0, 3, 6])
++    expect(idx('ELEM:O', make_structure())).toEqual([0, 3, 6])
++  })
++
++  it('two-letter symbols capitalize correctly', () => {
++    // No Fe in structure -> empty, but must not error
++    expect(idx('elem:fe', make_structure())).toEqual([])
++  })
++})
++
++// --- label --------------------------------------------------------------
++
++describe('label selector', () => {
++  it('per-element 1-based ordinal (O1 = first O)', () => {
++    expect(idx('label:O1', make_structure())).toEqual([0])
++    expect(idx('label:O2', make_structure())).toEqual([3])
++    expect(idx('label:O3', make_structure())).toEqual([6])
++    expect(idx('label:H1', make_structure())).toEqual([1])
++  })
++
++  it('per-element ordinal range O1-3', () => {
++    expect(idx('label:O1-3', make_structure())).toEqual([0, 3, 6])
++  })
++
++  it('per-element out-of-range ordinal silently skipped', () => {
++    expect(idx('label:O5', make_structure())).toEqual([])
++    // O1-9 -> only 3 O's, so just those three, no error
++    expect(idx('label:O1-9', make_structure())).toEqual([0, 3, 6])
++  })
++
++  it('bare-number form = 1-based GLOBAL site number', () => {
++    expect(idx('label:1', make_structure())).toEqual([0]) // site #1 -> index 0
++    expect(idx('label:5', make_structure())).toEqual([4]) // site #5 -> index 4
++  })
++
++  it('bare-number range 3-5 (1-based global, inclusive)', () => {
++    expect(idx('label:3-5', make_structure())).toEqual([2, 3, 4])
++  })
++
++  it('comma list of label items', () => {
++    expect(idx('label:O1,H1', make_structure())).toEqual([0, 1])
++  })
++})
++
++// --- ids / id -----------------------------------------------------------
++
++describe('ids / id selectors (0-based)', () => {
++  it('ids: comma list of 0-based indices', () => {
++    expect(idx('ids:0,4,5', make_structure())).toEqual([0, 4, 5])
++  })
++
++  it('id: single 0-based index', () => {
++    expect(idx('id:7', make_structure())).toEqual([7])
++  })
++
++  it('out-of-range indices dropped silently', () => {
++    expect(idx('ids:0,99,3', make_structure())).toEqual([0, 3])
++    expect(idx('id:99', make_structure())).toEqual([])
++  })
++})
++
++// --- pos (cartesian) ----------------------------------------------------
++
++describe('pos selector (cartesian Å)', () => {
++  it('pos:z>5 selects high-z atoms', () => {
++    // z>5: O2(idx3, z=9.5) and N1(idx5, z=5.5)
++    expect(idx('pos:z>5', make_structure())).toEqual([3, 5])
++  })
++
++  it('pos:z>=5 includes the equal value', () => {
++    // z == 5.0 atoms are 4,5,6,7 plus z=9.5 atom 3
++    expect(idx('pos:z>=5', make_structure())).toEqual([3, 4, 5, 6, 7])
++  })
++
++  it('pos:x<1 selects low-x atoms', () => {
++    expect(idx('pos:x<1', make_structure())).toEqual([0, 2, 7])
++  })
++
++  it('pos:y=5 with float-eps equality', () => {
++    // y == 5.0 atoms: O2(idx3, [5,5,9.5]), C1(idx4), O3(idx6), H3(idx7)
++    expect(idx('pos:y=5', make_structure())).toEqual([3, 4, 6, 7])
++    expect(idx('pos:y==5', make_structure())).toEqual([3, 4, 6, 7])
++  })
++
++  it('pos:y!=5 negates', () => {
++    expect(idx('pos:y!=5', make_structure())).toEqual([0, 1, 2, 5])
++  })
++
++  it('pos:x<=1 includes equal', () => {
++    expect(idx('pos:x<=1', make_structure())).toEqual([0, 1, 2, 7])
++  })
++})
++
++// --- frac (fractional) --------------------------------------------------
++
++describe('frac selector (fractional)', () => {
++  it('frac:c>0.9 selects top-fractional atoms', () => {
++    expect(idx('frac:c>0.9', make_structure())).toEqual([3])
++  })
++
++  it('frac:c>0.5 several atoms', () => {
++    expect(idx('frac:c>0.5', make_structure())).toEqual([3, 5])
++  })
++
++  it('frac:a>=0.5', () => {
++    expect(idx('frac:a>=0.5', make_structure())).toEqual([3, 4, 5, 6])
++  })
++
++  it('molecule with no lattice -> frac is empty set, never throws', () => {
++    expect(idx('frac:c>0.5', make_molecule())).toEqual([])
++  })
++})
++
++// --- bonded -------------------------------------------------------------
++
++describe('bonded selector', () => {
++  it('bonded:@0 returns O0 neighbours (the two H), excludes O0 itself', () => {
++    expect(idx('bonded:@0', make_structure())).toEqual([1, 2])
++  })
++
++  it('bonded:@4 returns C neighbours (N)', () => {
++    const got = idx('bonded:@4', make_structure())
++    expect(got).toContain(5)
++    expect(got).not.toContain(4)
++  })
++
++  it('bonded across a cell boundary (MIC): O6 and H7 are neighbours', () => {
++    // O3(idx6) frac a=0.98, H3(idx7) frac a=0.02 -> wrapped distance ~0.4 Å
++    expect(idx('bonded:@6', make_structure())).toContain(7)
++    expect(idx('bonded:@7', make_structure())).toContain(6)
++  })
++})
++
++// --- sphere -------------------------------------------------------------
++
++describe('sphere selector', () => {
++  it('sphere:@4;2.0 includes the center atom (dist 0)', () => {
++    const got = idx('sphere:@4;2.0', make_structure())
++    expect(got).toContain(4) // includes itself
++    expect(got).toContain(5) // N at ~1.12 Å
++  })
++
++  it('sphere across cell boundary uses MIC', () => {
++    // O6<->H7 MIC distance ~0.4 Å, so a 1 Å sphere around O6 includes H7
++    const got = idx('sphere:@6;1.0', make_structure())
++    expect(got).toContain(6)
++    expect(got).toContain(7)
++  })
++
++  it('sphere on a molecule (no lattice) uses raw cartesian', () => {
++    const got = idx('sphere:@0;1.0', make_molecule())
++    expect(got).toContain(0) // self
++    expect(got).toContain(1) // H at 0.96 Å
++    expect(got).toContain(2) // H at ~0.96 Å
++  })
++})
++
++// --- '*' ----------------------------------------------------------------
++
++describe('star selector', () => {
++  it('* selects all indices', () => {
++    expect(idx('*', make_structure())).toEqual([0, 1, 2, 3, 4, 5, 6, 7])
++  })
++})
++
++// --- boolean combinators ------------------------------------------------
++
++describe('logic combinators', () => {
++  it('AND = intersection: elem:O AND pos:z>5', () => {
++    expect(idx('elem:O AND pos:z>5', make_structure())).toEqual([3])
++  })
++
++  it('OR = union: elem:C OR elem:N', () => {
++    expect(idx('elem:C OR elem:N', make_structure())).toEqual([4, 5])
++  })
++
++  it('NOT = complement: NOT elem:O', () => {
++    expect(idx('NOT elem:O', make_structure())).toEqual([1, 2, 4, 5, 7])
++  })
++
++  it('NOT bonded combo: elem:H AND NOT bonded:@0', () => {
++    // H atoms are 1,2,7; bonded:@0 = {1,2}; so result = {7}
++    expect(idx('elem:H AND NOT bonded:@0', make_structure())).toEqual([7])
++  })
++
++  it('AND binds tighter than OR', () => {
++    // elem:C OR elem:N AND pos:z>=5 == elem:C OR (elem:N AND pos:z>=5)
++    // N(idx5) z=5.5>=5 true -> {4} OR {5} = {4,5}
++    expect(idx('elem:C OR elem:N AND pos:z>=5', make_structure())).toEqual([4, 5])
++  })
++
++  it('parentheses override precedence: (elem:C OR elem:N) AND frac:c>0.5', () => {
++    // C(idx4) frac c=0.5 not >0.5; N(idx5) frac c=0.55>0.5 -> {5}
++    expect(idx('(elem:C OR elem:N) AND frac:c>0.5', make_structure())).toEqual([5])
++  })
++
++  it('symbolic operators & | !', () => {
++    expect(idx('elem:O & pos:z>5', make_structure())).toEqual([3])
++    expect(idx('elem:C | elem:N', make_structure())).toEqual([4, 5])
++    expect(idx('! elem:O', make_structure())).toEqual([1, 2, 4, 5, 7])
++  })
++
++  it('case-insensitive keywords', () => {
++    expect(idx('elem:O and pos:z>5', make_structure())).toEqual([3])
++    expect(idx('elem:C or elem:N', make_structure())).toEqual([4, 5])
++    expect(idx('not elem:O', make_structure())).toEqual([1, 2, 4, 5, 7])
++  })
++
++  it('nested parentheses', () => {
++    expect(idx('((elem:O)) AND (pos:z>5)', make_structure())).toEqual([3])
++  })
++
++  it('double NOT', () => {
++    expect(idx('NOT NOT elem:C', make_structure())).toEqual([4])
++  })
++})
++
++// --- empty / whitespace -------------------------------------------------
++
++describe('empty queries', () => {
++  it('empty string -> empty set, no error', () => {
++    const res = select_atoms('', make_structure())
++    expect('error' in res).toBe(false)
++    if (!('error' in res)) expect([...res.indices]).toEqual([])
++  })
++
++  it('whitespace-only -> empty set, no error', () => {
++    const res = select_atoms('   ', make_structure())
++    expect('error' in res).toBe(false)
++    if (!('error' in res)) expect([...res.indices]).toEqual([])
++  })
++})
++
++// --- error cases (never throw) ------------------------------------------
++
++describe('error handling (returns {error}, never throws)', () => {
++  it('unknown selector tag', () => {
++    const res = select_atoms('foo:bar', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('bad axis for pos', () => {
++    const res = select_atoms('pos:q>5', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('missing operand', () => {
++    const res = select_atoms('elem:', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('unbalanced parentheses', () => {
++    const res = select_atoms('(elem:O AND pos:z>5', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('non-numeric value for pos', () => {
++    const res = select_atoms('pos:z>abc', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('bonded @-index out of range', () => {
++    const res = select_atoms('bonded:@99', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('sphere @-index out of range', () => {
++    const res = select_atoms('sphere:@99;2.0', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('dangling operator', () => {
++    const res = select_atoms('elem:O AND', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('leading operator', () => {
++    const res = select_atoms('AND elem:O', make_structure())
++    expect('error' in res).toBe(true)
++  })
++
++  it('error result is total: never throws on garbage', () => {
++    expect(() => select_atoms(')(&|!@#$', make_structure())).not.toThrow()
++    expect(() => select_atoms('@@@@', make_structure())).not.toThrow()
++  })
++})
++
++// --- pathological input (no catastrophic backtracking / hang) -----------
++
++describe('pathological / long queries do not hang', () => {
++  it('very long deeply-nested parens resolves quickly', () => {
++    const depth = 2000
++    const query = '('.repeat(depth) + 'elem:O' + ')'.repeat(depth)
++    const start = Date.now()
++    const res = select_atoms(query, make_structure())
++    const elapsed = Date.now() - start
++    expect(elapsed).toBeLessThan(2000)
++    // Either resolves to the O set or rejects with an error (depth guard) —
++    // both are fine; the requirement is it must NOT hang or throw.
++    if (!('error' in res)) {
++      expect([...res.indices].sort((a, b) => a - b)).toEqual([0, 3, 6])
++    }
++  })
++
++  it('very long OR chain resolves quickly', () => {
++    const query = Array(1000).fill('elem:O').join(' OR ')
++    const start = Date.now()
++    const res = select_atoms(query, make_structure())
++    const elapsed = Date.now() - start
++    expect(elapsed).toBeLessThan(2000)
++    expect('error' in res).toBe(false)
++    if (!('error' in res)) {
++      expect([...res.indices].sort((a, b) => a - b)).toEqual([0, 3, 6])
++    }
++  })
++
++  it('long unbalanced garbage returns error fast (no backtracking blowup)', () => {
++    const query = 'elem:O AND '.repeat(500) + '('
++    const start = Date.now()
++    const res = select_atoms(query, make_structure())
++    const elapsed = Date.now() - start
++    expect(elapsed).toBeLessThan(2000)
++    expect('error' in res).toBe(true)
++  })
++})

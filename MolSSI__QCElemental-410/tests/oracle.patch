@@ -1,0 +1,604 @@
+diff --git a/qcelemental/models/v2/molecule.py b/qcelemental/models/v2/molecule.py
+index 76a5691c..72eea6af 100644
+--- a/qcelemental/models/v2/molecule.py
++++ b/qcelemental/models/v2/molecule.py
+@@ -18,6 +18,8 @@
+ from pydantic import Field, SerializerFunctionWrapHandler, field_validator, model_serializer
+ from typing_extensions import Annotated
+ 
++from qcelemental.molparse import mae
++
+ # molparse imports separated b/c https://github.com/python/mypy/issues/7203
+ from ...models import QCEL_V1V2_SHIM_CODE
+ from ...molparse.from_arrays import from_arrays
+@@ -52,6 +54,8 @@
+     ".psimol": "psi4",
+     ".psi4": "psi4",
+     ".msgpack": "msgpack-ext",
++    ".mae": "mae",
++    ".maegz": "mae",
+ }
+ 
+ 
+@@ -928,20 +932,20 @@ def get_molecular_formula(self, order: str = "alphabetical", chgmult: bool = Fal
+     @classmethod
+     def from_data(
+         cls,
+-        data: Union[str, Dict[str, Any], np.ndarray, bytes],
+-        dtype: Optional[str] = None,
++        data: str | dict[str, Any] | np.ndarray | bytes,
++        dtype: str | None = None,
+         *,
+         orient: bool = False,
+-        validate: bool = None,
+-        **kwargs: Dict[str, Any],
+-    ) -> "Molecule":
++        validate: bool | None = None,
++        **kwargs: Any,
++    ) -> Molecule:
+         r"""
+         Constructs a molecule object from a data structure.
+ 
+         Parameters
+         ----------
+         data
+-            Data to construct Molecule from
++            Data from which to construct a Molecule.
+         dtype
+             How to interpret the data, if not passed attempts to discover this based on input type.
+         orient
+@@ -1019,7 +1023,14 @@ def from_data(
+         return cls(orient=orient, validate=validate, **input_dict)
+ 
+     @classmethod
+-    def from_file(cls, filename: str, dtype: Optional[str] = None, *, orient: bool = False, **kwargs):
++    def from_file(
++        cls,
++        filename: str | Path,
++        dtype: str | None = None,
++        *,
++        orient: bool = False,
++        **kwargs: Any,
++    ) -> Molecule:
+         r"""
+         Constructs a molecule object from a file.
+ 
+@@ -1041,14 +1052,15 @@ def from_file(cls, filename: str, dtype: Optional[str] = None, *, orient: bool =
+ 
+         """
+ 
+-        ext = Path(filename).suffix
+-
+         if dtype is None:
+-            if ext in _extension_map:
+-                dtype = _extension_map[ext]
+-            else:
+-                # Let `from_string` try to sort it
+-                dtype = "string"
++            dtype = _extension_map.get(Path(filename).suffix.lower(), "string")
++        if dtype == "mae":
++            molecule = mae.from_mae(filename)[0]
++            if not orient and not kwargs:
++                return molecule
++            return cls.from_data(
++                molecule.model_dump(exclude={"schema_name", "schema_version"}), dtype="dict", orient=orient, **kwargs
++            )
+ 
+         # Raw string type, read and pass through
+         if dtype in ["string", "xyz", "xyz+", "psi4"]:
+@@ -1069,7 +1081,7 @@ def from_file(cls, filename: str, dtype: Optional[str] = None, *, orient: bool =
+ 
+         return cls.from_data(data, dtype, orient=orient, **kwargs)
+ 
+-    def to_file(self, filename: str, dtype: Optional[str] = None) -> None:
++    def to_file(self, filename: str | Path, dtype: str | None = None) -> None:
+         r"""Writes the Molecule to a file.
+ 
+         Parameters
+@@ -1080,15 +1092,15 @@ def to_file(self, filename: str, dtype: Optional[str] = None) -> None:
+             The type of file to write, attempts to infer dtype from the filename if not provided.
+ 
+         """
+-        ext = Path(filename).suffix
+-
+         if dtype is None:
+-            if ext in _extension_map:
+-                dtype = _extension_map[ext]
+-            else:
++            dtype = _extension_map.get(Path(filename).suffix.lower())
++            if dtype is None:
+                 raise KeyError(f"Could not infer dtype from filename: `{filename}`")
+ 
+-        if dtype in ["xyz", "xyz+", "psi4"]:
++        if dtype == "mae":
++            mae.to_mae(self, filename)
++            return
++        elif dtype in ["xyz", "xyz+", "psi4"]:
+             stringified = self.to_string(dtype)
+         elif dtype in ["json", "json-ext", "msgpack", "msgpack-ext"]:
+             stringified = self.serialize(dtype)
+diff --git a/qcelemental/molparse/__init__.py b/qcelemental/molparse/__init__.py
+index 17965624..9d48491c 100644
+--- a/qcelemental/molparse/__init__.py
++++ b/qcelemental/molparse/__init__.py
+@@ -2,6 +2,7 @@
+ from .from_arrays import from_arrays, from_input_arrays
+ from .from_schema import contiguize_from_fragment_pattern, from_schema
+ from .from_string import from_string
++from .mae import from_mae, to_mae
+ from .nucleus import parse_nucleus_label, reconcile_nucleus
+ from .to_schema import to_schema
+ from .to_string import to_string
+diff --git a/qcelemental/molparse/mae.py b/qcelemental/molparse/mae.py
+new file mode 100644
+index 00000000..da6e9663
+--- /dev/null
++++ b/qcelemental/molparse/mae.py
+@@ -0,0 +1,286 @@
++from __future__ import annotations
++
++import math
++import warnings
++from collections.abc import Mapping
++from os import PathLike
++from pathlib import Path
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++
++from ..exceptions import MoleculeFormatError
++from ..physical_constants import constants
++from ..util import which_import
++
++if TYPE_CHECKING:
++    from ..models.v2 import Molecule
++
++__all__ = ["from_mae", "to_mae"]
++
++
++_MAE_CHARGE_PROPERTY = "i_m_Molecular_charge"
++_MAE_MULTIPLICITY_PROPERTY = "i_m_Spin_multiplicity"
++
++
++def _import_schrodinger():
++    r"""Import the optional Schrodinger modules needed for Maestro I/O.
++
++    Returns
++    -------
++    tuple[module, module]
++        The :mod:`schrodinger.structure` and :mod:`schrodinger.infra.mm`
++        modules, respectively.
++
++    Raises
++    ------
++    ModuleNotFoundError
++        If the Schrodinger Python modules are unavailable.
++    """
++    which_import(
++        "schrodinger.structure",
++        raise_error=True,
++        raise_msg="Maestro support requires a Schrodinger Python environment.",
++    )
++
++    from schrodinger import structure
++    from schrodinger.infra import mm
++
++    return structure, mm
++
++
++def _validate_mae_path(filename: str | PathLike[str]) -> Path:
++    r"""Validate and normalize a Maestro file path.
++
++    Parameters
++    ----------
++    filename
++        Path whose filename must end in ``.mae`` or ``.maegz``, case-insensitively.
++
++    Returns
++    -------
++    Path
++        The normalized path object.
++
++    Raises
++    ------
++    ValueError
++        If the filename does not have a supported Maestro extension.
++    """
++    path = Path(filename)
++    lower_name = path.name.lower()
++    if not lower_name.endswith((".mae", ".maegz")):
++        raise ValueError(f"Maestro filename must end in .mae or .maegz: {filename}")
++    return path
++
++
++def _coerce_bond_order(order: float, permissive: bool) -> tuple[int, bool]:
++    r"""Convert a QCSchema bond order to an order supported by Maestro.
++
++    Parameters
++    ----------
++    order
++        QCSchema bond order to convert.
++    permissive
++        If ``True``, round half up and clamp unsupported orders to Maestro's
++        inclusive range from zero through three. If ``False``, reject
++        unsupported orders.
++
++    Returns
++    -------
++    tuple[int, bool]
++        The Maestro bond order and whether the input required a lossy
++        conversion.
++
++    Raises
++    ------
++    ValueError
++        If ``order`` is non-finite, or if it is unsupported and
++        ``permissive`` is ``False``.
++    """
++    value = float(order)
++    if not math.isfinite(value):
++        raise ValueError(f"Bond order must be finite, not {order!r}.")
++
++    rounded = math.floor(value + 0.5)
++    if value == rounded and 0 <= rounded <= 3:
++        return rounded, False
++
++    if not permissive:
++        raise ValueError(
++            f"Maestro supports integer bond orders from 0 through 3, not {order!r}. "
++            "Pass permissive=True to round to the nearest supported order."
++        )
++
++    return min(max(rounded, 0), 3), True
++
++
++def from_mae(filename: str | PathLike[str]) -> list[Molecule]:
++    r"""Read Maestro structures as QCSchema v2 Molecules.
++
++    Coordinates are converted from angstrom to bohr. Elemental atoms carrying
++    Maestro's counterpoise property become QCSchema ghost atoms with
++    ``real=False``. Unsupported non-counterpoise dummy atoms are omitted with
++    a warning.
++
++    Atom- and bond-level properties without QCSchema Molecule equivalents
++    are intentionally ignored.
++
++    Parameters
++    ----------
++    filename
++        Maestro file in ``.mae`` or ``.maegz`` format.
++
++    Returns
++    -------
++    list[Molecule]
++        One QCSchema v2 Molecule for each structure in the Maestro file.
++    """
++    from ..models.v2 import Molecule
++
++    path = _validate_mae_path(filename)
++    structure, mm = _import_schrodinger()
++
++    molecules = []
++    with structure.StructureReader(path) as reader:
++        for mae_structure in reader:
++            symbols = []
++            geometry = []
++            real = []
++            atomic_numbers = []
++            atom_index_map = {}
++            dummy_indices = []
++            for atom in mae_structure.atom:
++                is_counterpoise = bool(atom.property.get(mm.M2IO_DATA_ATOM_COUNTERPOISE, 0))
++                if atom.atomic_number <= 0 and not is_counterpoise:
++                    dummy_indices.append(atom.index)
++                    continue
++
++                atom_index_map[atom.index] = len(symbols)
++                symbols.append(atom.element)
++                geometry.append(atom.xyz)
++                real.append(not is_counterpoise)
++                atomic_numbers.append(atom.atomic_number)
++
++            if dummy_indices:
++                warnings.warn(
++                    "Maestro dummy atoms are not supported and were omitted at indices "
++                    + ", ".join(map(str, dummy_indices)),
++                    UserWarning,
++                    stacklevel=2,
++                )
++
++            connectivity = [
++                (atom_index_map[bond.atom1.index], atom_index_map[bond.atom2.index], bond.order)
++                for bond in mae_structure.bond
++                if bond.order is not None and bond.atom1.index in atom_index_map and bond.atom2.index in atom_index_map
++            ]
++
++            molecular_charge = mae_structure.property.get(_MAE_CHARGE_PROPERTY, mae_structure.formal_charge)
++            molecular_multiplicity = mae_structure.property.get(_MAE_MULTIPLICITY_PROPERTY)
++            if molecular_multiplicity is None:
++                electron_count = sum(number for number, is_real in zip(atomic_numbers, real) if is_real)
++                electron_count -= molecular_charge
++                molecular_multiplicity = int(round(electron_count)) % 2 + 1
++
++            molecules.append(
++                Molecule(
++                    symbols=symbols,
++                    geometry=np.asarray(geometry) / constants.bohr2angstroms,
++                    name=mae_structure.title or None,
++                    molecular_charge=molecular_charge,
++                    molecular_multiplicity=molecular_multiplicity,
++                    real=real,
++                    connectivity=connectivity or None,
++                )
++            )
++
++    if not molecules:
++        raise MoleculeFormatError(f"Maestro file contains no structures: {path}")
++    return molecules
++
++
++def to_mae(
++    molecule: Molecule | Mapping[str, Any],
++    filename: str | PathLike[str],
++    *,
++    overwrite: bool = True,
++    permissive: bool = False,
++) -> None:
++    r"""Write a QCSchema Molecule to a Maestro structure file.
++
++    Parameters
++    ----------
++    molecule
++        A QCSchema Molecule model or mapping. Coordinates are interpreted as
++        bohr.
++    filename
++        Maestro file in ``.mae`` or ``.maegz`` format.
++    overwrite
++        Overwrite an existing file. When ``False``, append the structure.
++    permissive
++        Round unsupported QCSchema bond orders to the nearest Maestro order
++        from 0 through 3. A warning describes every lossy conversion. By
++        default, unsupported bond orders raise ``ValueError``.
++
++    Notes
++    -----
++    QCSchema counterpoise atoms retain their element and receive Maestro's
++    ``i_m_counterpoise`` property. Arbitrary QCSchema extras and Maestro
++    visualization properties are not written.
++    """
++    from ..models.v2 import Molecule
++
++    path = _validate_mae_path(filename)
++    structure, mm = _import_schrodinger()
++
++    if isinstance(molecule, Mapping):
++        molecule = Molecule(**molecule)
++    elif not all(
++        hasattr(molecule, field)
++        for field in (
++            "symbols",
++            "geometry",
++            "real",
++            "molecular_charge",
++            "molecular_multiplicity",
++            "connectivity",
++        )
++    ):
++        raise TypeError("molecule must be a QCSchema Molecule model or mapping.")
++
++    molecular_charge = float(molecule.molecular_charge)
++    molecular_multiplicity = float(molecule.molecular_multiplicity)
++    if not molecular_charge.is_integer():
++        raise ValueError(f"Maestro requires an integer molecular charge, not {molecular_charge!r}.")
++    if not molecular_multiplicity.is_integer():
++        raise ValueError(f"Maestro requires an integer molecular multiplicity, not {molecular_multiplicity!r}.")
++
++    mae_structure = structure.create_new_structure()
++    geometry = np.asarray(molecule.geometry) * constants.bohr2angstroms
++    for symbol, xyz, is_real in zip(molecule.symbols, geometry, molecule.real):
++        atom = mae_structure.addAtom(str(symbol), *map(float, xyz))
++        if not is_real:
++            atom.property[mm.M2IO_DATA_ATOM_COUNTERPOISE] = 1
++
++    lossy_bonds = []
++    for atom1, atom2, order in molecule.connectivity or []:
++        mae_order, was_rounded = _coerce_bond_order(order, permissive)
++        mae_structure.addBond(int(atom1) + 1, int(atom2) + 1, mae_order)
++        if was_rounded:
++            lossy_bonds.append(f"({atom1}, {atom2}) {order} -> {mae_order}")
++
++    if lossy_bonds:
++        warnings.warn(
++            "Rounded unsupported bond orders for Maestro output: " + ", ".join(lossy_bonds),
++            UserWarning,
++            stacklevel=2,
++        )
++
++    if molecule.name:
++        mae_structure.title = molecule.name
++    mae_structure.property[_MAE_CHARGE_PROPERTY] = int(molecular_charge)
++    mae_structure.property[_MAE_MULTIPLICITY_PROPERTY] = int(molecular_multiplicity)
++
++    with structure.StructureWriter(path, overwrite=overwrite) as writer:
++        writer.append(mae_structure)
+diff --git a/qcelemental/tests/addons.py b/qcelemental/tests/addons.py
+index da2d9722..611a7860 100644
+--- a/qcelemental/tests/addons.py
++++ b/qcelemental/tests/addons.py
+@@ -48,6 +48,11 @@ def internet_connection():
+     reason="Not detecting module QCManyBody. Install package if necessary and add to envvar PYTHONPATH",
+ )
+ 
++using_schrodinger = pytest.mark.skipif(
++    which_import("schrodinger.structure", return_bool=True) is False,
++    reason="Not detecting the Schrodinger Python API. Run tests from a Schrodinger Python environment.",
++)
++
+ py37_skip = pytest.mark.skipif(sys.version_info.minor < 8, reason="Needs Python 3.8 features")
+ 
+ using_pydv1 = pytest.mark.skipif(sys.version_info.minor > 13, reason="QCSchema v1 models (Pyd v1 API) need Py <=3.14")
+diff --git a/qcelemental/tests/test_molparse_mae.py b/qcelemental/tests/test_molparse_mae.py
+new file mode 100644
+index 00000000..32b13e11
+--- /dev/null
++++ b/qcelemental/tests/test_molparse_mae.py
+@@ -0,0 +1,159 @@
++import numpy as np
++import pytest
++
++import qcelemental as qcel
++from qcelemental.molparse.mae import _coerce_bond_order, _import_schrodinger
++
++from .addons import using_schrodinger
++
++
++@pytest.mark.parametrize("order", [0, 1, 2, 3, 1.0])
++def test_mae_supported_bond_orders(order):
++    assert _coerce_bond_order(order, permissive=False) == (int(order), False)
++
++
++@pytest.mark.parametrize(
++    "order, expected",
++    [
++        (0.4, 0),
++        (0.5, 1),
++        (1.5, 2),
++        (2.5, 3),
++        (3.7, 3),
++        (5.0, 3),
++    ],
++)
++def test_mae_permissive_bond_orders(order, expected):
++    assert _coerce_bond_order(order, permissive=True) == (expected, True)
++
++
++def test_mae_strict_bond_order_error():
++    with pytest.raises(ValueError, match="permissive=True"):
++        _coerce_bond_order(1.5, permissive=False)
++
++
++@using_schrodinger
++def test_mae_round_trip(tmp_path):
++    molecule = qcel.models.v2.Molecule(
++        symbols=["C", "H", "O"],
++        geometry=[
++            [0.0, 0.0, 0.0],
++            [2.0, 0.0, 0.0],
++            [0.0, 0.0, 2.0],
++        ],
++        name="MAE round trip",
++        molecular_charge=1,
++        molecular_multiplicity=1,
++        real=[True, True, False],
++        connectivity=[(0, 1, 1), (0, 2, 2)],
++    )
++    mae_file = tmp_path / "round_trip.mae"
++
++    qcel.molparse.to_mae(molecule, mae_file)
++
++    structure, mm = _import_schrodinger()
++    with structure.StructureReader(mae_file) as reader:
++        [mae_structure] = list(reader)
++    assert bool(mae_structure.atom[3].property.get(mm.M2IO_DATA_ATOM_COUNTERPOISE, 0))
++
++    results = qcel.molparse.from_mae(mae_file)
++
++    [result] = results
++
++    assert result.name == molecule.name
++    assert result.symbols.tolist() == molecule.symbols.tolist()
++    assert result.real.tolist() == molecule.real.tolist()
++    assert result.molecular_charge == molecule.molecular_charge
++    assert result.molecular_multiplicity == molecule.molecular_multiplicity
++    assert result.connectivity == molecule.connectivity
++    assert np.allclose(result.geometry, molecule.geometry)
++
++
++@using_schrodinger
++def test_from_mae_omits_dummy_atoms(tmp_path):
++    structure, _ = _import_schrodinger()
++    mae_structure = structure.create_new_structure()
++    mae_structure.title = "dummy removal"
++    carbon = mae_structure.addAtom("C", 0.0, 0.0, 0.0)
++    dummy = mae_structure.addAtom("Du", 1.0, 0.0, 0.0)
++    hydrogen = mae_structure.addAtom("H", 2.0, 0.0, 0.0)
++    mae_structure.addBond(carbon.index, dummy.index, 1)
++    mae_structure.addBond(carbon.index, hydrogen.index, 1)
++
++    mae_file = tmp_path / "dummy.mae"
++    with structure.StructureWriter(mae_file) as writer:
++        writer.append(mae_structure)
++
++    with pytest.warns(UserWarning, match="dummy atoms are not supported"):
++        [result] = qcel.molparse.from_mae(mae_file)
++
++    assert result.name == mae_structure.title
++    assert result.symbols.tolist() == ["C", "H"]
++    assert result.real.tolist() == [True, True]
++    assert result.connectivity == [(0, 1, 1.0)]
++    assert np.allclose(
++        result.geometry,
++        np.asarray([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]]) / qcel.constants.bohr2angstroms,
++    )
++
++
++@using_schrodinger
++def test_mae_permissive_round_trip(tmp_path):
++    molecule = qcel.models.v2.Molecule(
++        symbols=["C", "C"],
++        geometry=[[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]],
++        connectivity=[(0, 1, 1.5)],
++    )
++    mae_file = tmp_path / "permissive.mae"
++
++    with pytest.warns(UserWarning, match=r"1\.5 -> 2"):
++        qcel.molparse.to_mae(molecule, mae_file, permissive=True)
++
++    [result] = qcel.molparse.from_mae(mae_file)
++    assert result.connectivity == [(0, 1, 2.0)]
++
++
++@using_schrodinger
++def test_mae_multiple_structures(tmp_path):
++    first = qcel.models.v2.Molecule(
++        symbols=["He"],
++        geometry=[[0.0, 0.0, 0.0]],
++        name="first",
++    )
++    second = qcel.models.v2.Molecule(
++        symbols=["H"],
++        geometry=[[1.0, 2.0, 3.0]],
++        name="second",
++        molecular_multiplicity=2,
++    )
++    mae_file = tmp_path / "multiple.mae"
++
++    qcel.molparse.to_mae(first, mae_file)
++    qcel.molparse.to_mae(second, mae_file, overwrite=False)
++
++    results = qcel.molparse.from_mae(mae_file)
++
++    assert [molecule.name for molecule in results] == ["first", "second"]
++    assert results[0].symbols.tolist() == ["He"]
++    assert results[1].symbols.tolist() == ["H"]
++    assert np.allclose(results[1].geometry, second.geometry)
++
++    from_file = qcel.models.v2.Molecule.from_file(mae_file)
++    assert from_file.name == "first"
++
++
++@using_schrodinger
++@pytest.mark.parametrize("suffix", [".mae", ".maegz"])
++def test_mae_molecule_from_file_extensions(tmp_path, suffix):
++    molecule = qcel.models.v2.Molecule(
++        symbols=["He"],
++        geometry=[[0.0, 0.0, 0.0]],
++        name="extension inference",
++    )
++    mae_file = tmp_path / f"molecule{suffix}"
++    molecule.to_file(mae_file)
++
++    result = qcel.models.v2.Molecule.from_file(mae_file)
++    assert result.name == molecule.name
++    assert result.symbols.tolist() == molecule.symbols.tolist()
++    assert np.allclose(result.geometry, molecule.geometry)

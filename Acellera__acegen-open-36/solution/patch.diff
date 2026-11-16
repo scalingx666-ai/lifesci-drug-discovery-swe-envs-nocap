@@ -1,0 +1,665 @@
+diff --git a/README.md b/README.md
+index aa81bed3..3909c394 100644
+--- a/README.md
++++ b/README.md
+@@ -151,13 +151,19 @@ We provide a variety of default priors that can be selected in the configuration
+ - A Long Short-Term Memory (LSTM) model
+   - pre-training dataset: [ChEMBL](https://www.ebi.ac.uk/chembl/)
+   - number of parameters: 5,807,909
+-    - to select set the field `model` to `lstm` in any configuration file
++  - to select set the field `model` to `lstm` in any configuration file
+  
+ 
+ - A GPT-2 model (requires installation of HuggingFace's `transformers` library)
+   - pre-training dataset: [REAL 350/3 lead-like, 613.86M cpds, CXSMILES](https://enamine.net/compound-collections/real-compounds/real-database-subsets)
+   - number of parameters: 5,030,400
+-- to select set the field `model` to `gpt2` in any configuration file
++  - to select set the field `model` to `gpt2` in any configuration file
++
++
++- A Mamba model (requires installation of mamba-ssm library)
++  - pre-training dataset: [ChEMBL](https://www.ebi.ac.uk/chembl/)
++  - number of parameters: 2,809,216
++  - to select set the field `model` to `mamba` in any configuration file
+ 
+ ### Integration of custom models
+ 
+diff --git a/acegen/models/__init__.py b/acegen/models/__init__.py
+index 996357eb..a8726393 100644
+--- a/acegen/models/__init__.py
++++ b/acegen/models/__init__.py
+@@ -18,6 +18,11 @@
+     create_lstm_actor_critic,
+     create_lstm_critic,
+ )
++from acegen.models.mamba import (
++    create_mamba_actor,
++    create_mamba_actor_critic,
++    create_mamba_critic,
++)
+ from acegen.models.utils import adapt_state_dict
+ from acegen.vocabulary.tokenizers import (
+     SMILESTokenizerChEMBL,
+@@ -71,6 +76,14 @@ def extract(path):
+         resources.files("acegen.priors") / "gpt2_enamine_real.ckpt",
+         SMILESTokenizerEnamine(),
+     ),
++    "mamba": (
++        create_mamba_actor,
++        create_mamba_critic,
++        create_mamba_actor_critic,
++        resources.files("acegen.priors") / "mamba_chembl_filtered_vocabulary.ckpt",
++        resources.files("acegen.priors") / "mamba_chembl_filtered.ckpt",
++        SMILESTokenizerChEMBL(),
++    ),
+ }
+ 
+ 
+diff --git a/acegen/models/mamba.py b/acegen/models/mamba.py
+new file mode 100644
+index 00000000..d4f33c1f
+--- /dev/null
++++ b/acegen/models/mamba.py
+@@ -0,0 +1,254 @@
++from dataclasses import dataclass
++
++import torch
++import torch.nn as nn
++from tensordict.nn import TensorDictModule, TensorDictSequential
++from torchrl.envs import ExplorationType
++from torchrl.modules import ActorValueOperator, ProbabilisticActor
++
++try:
++    from mamba_ssm.models.mixer_seq_simple import MixerModel
++
++    _has_mamba = True
++except ImportError as err:
++    _has_mamba = False
++    MAMBA_ERR = err
++
++
++class Mamba(nn.Module):
++    """Mamba model for language modelling. This model is a simple wrapper around the Mamba MixerModel."""
++
++    def __init__(self, config=None):
++        if not _has_mamba:
++            raise RuntimeError(
++                "mamba-ssm library not found, please install with pip install mamba-ssm==1.2.2 "
++                "(dependencies include: cuda, causal-conv1d>=1.2.0)."
++            ) from MAMBA_ERR
++
++        super(Mamba, self).__init__()
++
++        # Define model
++        self.config = config
++        if config:
++            self.feature_extractor = MixerModel(
++                d_model=config.n_embd,
++                n_layer=config.n_layer,
++                vocab_size=config.vocab_size,
++                ssm_cfg={"use_fast_path": True},
++                rms_norm=True,
++                residual_in_fp32=True,
++                fused_add_norm=True,
++            )
++        else:
++            self.feature_extractor = None
++
++        # Start in evaluation mode
++        self._train_mode = False
++
++    @property
++    def train_mode(self):
++        return self._train_mode
++
++    def set_train_mode(self, train_mode: bool = True):
++        if train_mode is self._train_mode:
++            return self
++        out = Mamba()
++        out.feature_extractor = self.feature_extractor
++        out._train_mode = True
++        return out
++
++    def forward(self, sequence, sequence_mask):
++        out = self.feature_extractor(input_ids=sequence)
++
++        if self.train_mode is False:  # Data collection, return only last token
++            obs_length = sequence_mask.sum(-1)
++            out = out[torch.arange(len(out)), obs_length.to(torch.int64) - 1]
++
++        return out
++
++
++@dataclass
++class MambaConfig:
++    """Simple data class for mamba configuration."""
++
++    vocab_size: int
++    n_embd: int = 128
++    n_layer: int = 24
++
++
++def create_mamba_actor(
++    vocabulary_size: int,
++    n_embd: int = 128,
++    n_layer: int = 24,
++    return_log_prob: bool = True,
++    **kwargs,
++):
++    """Create a Mamba actor for language modelling."""
++    # Define mode
++    config = MambaConfig(
++        vocab_size=vocabulary_size,
++        n_embd=n_embd,
++        n_layer=n_layer,
++    )
++    lm = Mamba(config)
++
++    # Transform into TensorDict modules
++    lm_training = TensorDictModule(
++        lm.set_train_mode(True),
++        in_keys=["sequence", "sequence_mask"],
++        out_keys=["features"],
++    )
++
++    lm_inference = TensorDictModule(
++        lm, in_keys=["sequence", "sequence_mask"], out_keys=["features"]
++    )
++
++    # Define final layer and also make it a TensorDictModule
++    lm_head = TensorDictModule(
++        nn.Linear(config.n_embd, vocabulary_size, bias=False),
++        in_keys=["features"],
++        out_keys=["logits"],
++    )
++
++    # Concatenate lm and head, similar to torch.nn.Sequential
++    policy_training = TensorDictSequential(lm_training, lm_head)
++    policy_inference = TensorDictSequential(lm_inference, lm_head)
++
++    # To make the actor probabilities, wrap the policy in a ProbabilisticActor
++    # This module will take care of sampling and computing log_probabilities
++    probabilistic_policy_training = ProbabilisticActor(
++        module=policy_training,
++        in_keys=["logits"],
++        out_keys=["action"],
++        distribution_class=torch.distributions.Categorical,
++        return_log_prob=return_log_prob,
++        default_interaction_type=ExplorationType.RANDOM,
++    )
++    probabilistic_policy_inference = ProbabilisticActor(
++        module=policy_inference,
++        in_keys=["logits"],
++        out_keys=["action"],
++        distribution_class=torch.distributions.Categorical,
++        return_log_prob=return_log_prob,
++        default_interaction_type=ExplorationType.RANDOM,
++    )
++    return probabilistic_policy_training, probabilistic_policy_inference
++
++
++def create_mamba_critic(
++    vocabulary_size: int,
++    n_positions: int = 2048,
++    n_head: int = 16,
++    n_layer: int = 24,
++    n_embd: int = 128,
++    critic_value_per_action=False,
++    **kwargs,
++):
++    """Create a Mamba critic for language modelling."""
++    # Define model
++    config = MambaConfig(
++        vocab_size=vocabulary_size,
++        n_embd=n_embd,
++        n_layer=n_layer,
++    )
++    lm = Mamba(config)
++
++    # Wrap the transformer in a TensorDictModule to make TensorDict compatible
++    lm_training = TensorDictModule(
++        lm.set_train_mode(True),
++        in_keys=["sequence", "sequence_mask"],
++        out_keys=["features"],
++    )
++    lm_inference = TensorDictModule(
++        lm, in_keys=["sequence", "sequence_mask"], out_keys=["features"]
++    )
++
++    # Define final layer and also make it a TensorDictModule
++    lm_head = TensorDictModule(
++        nn.Linear(
++            config.n_embd,
++            vocabulary_size if critic_value_per_action else 1,
++            bias=False,
++        ),
++        in_keys=["features"],
++        out_keys=["action_value"] if critic_value_per_action else ["state_value"],
++    )
++
++    # Concatenate lm and head, similar to torch.nn.Sequential
++    critic_training = TensorDictSequential(lm_training, lm_head)
++    critic_inference = TensorDictSequential(lm_inference, lm_head)
++    return critic_training, critic_inference
++
++
++def create_mamba_actor_critic(
++    vocabulary_size: int,
++    n_embd: int = 128,
++    n_layer: int = 24,
++    return_log_prob: bool = True,
++    critic_value_per_action=False,
++    **kwargs,
++):
++    """Create a Mamba actor-critic for language modelling."""
++    # Define model
++    config = MambaConfig(
++        vocab_size=vocabulary_size,
++        n_embd=n_embd,
++        n_layer=n_layer,
++    )
++    lm = Mamba(config)
++
++    # Wrap the transformer in a TensorDictModule to make TensorDict compatible
++    lm_training = TensorDictModule(
++        lm.set_train_mode(True),
++        in_keys=["sequence", "sequence_mask"],
++        out_keys=["features"],
++    )
++    lm_inference = TensorDictModule(
++        lm, in_keys=["sequence", "sequence_mask"], out_keys=["features"]
++    )
++
++    # Define actor head and also make it a TensorDictModule and Probabilistic
++    actor_head = TensorDictModule(
++        nn.Linear(config.n_embd, vocabulary_size, bias=False),
++        in_keys=["features"],
++        out_keys=["logits"],
++    )
++    actor_head = ProbabilisticActor(
++        module=actor_head,
++        in_keys=["logits"],
++        out_keys=["action"],
++        distribution_class=torch.distributions.Categorical,
++        return_log_prob=return_log_prob,
++        default_interaction_type=ExplorationType.RANDOM,
++    )
++
++    # Define critic head and also make it a TensorDictModule
++    critic_head = TensorDictModule(
++        nn.Linear(
++            config.n_embd,
++            vocabulary_size if critic_value_per_action else 1,
++            bias=False,
++        ),
++        in_keys=["features"],
++        out_keys=["action_value"] if critic_value_per_action else ["state_value"],
++    )
++
++    # Create shared actor-critic TensorDictModule
++    actor_critic_train = ActorValueOperator(
++        common_operator=lm_training,
++        policy_operator=actor_head,
++        value_operator=critic_head,
++    )
++    actor_critic_inference = ActorValueOperator(
++        common_operator=lm_inference,
++        policy_operator=actor_head,
++        value_operator=critic_head,
++    )
++
++    # Get individual operators
++    actor_training = actor_critic_train.get_policy_operator()
++    critic_training = actor_critic_train.get_value_operator()
++    actor_inference = actor_critic_inference.get_policy_operator()
++    critic_inference = actor_critic_inference.get_value_operator()
++
++    return actor_training, actor_inference, critic_training, critic_inference
+diff --git a/acegen/priors/mamba_chembl_filtered.ckpt b/acegen/priors/mamba_chembl_filtered.ckpt
+new file mode 100644
+index 00000000..0629d925
+Binary files /dev/null and b/acegen/priors/mamba_chembl_filtered.ckpt differ
+diff --git a/acegen/priors/mamba_chembl_filtered_vocabulary.ckpt b/acegen/priors/mamba_chembl_filtered_vocabulary.ckpt
+new file mode 100644
+index 00000000..90883589
+Binary files /dev/null and b/acegen/priors/mamba_chembl_filtered_vocabulary.ckpt differ
+diff --git a/scripts/a2c/a2c.py b/scripts/a2c/a2c.py
+index d8e1c63b..d3d780f0 100644
+--- a/scripts/a2c/a2c.py
++++ b/scripts/a2c/a2c.py
+@@ -199,8 +199,10 @@ def create_env_fn():
+         env = SMILESEnv(**env_kwargs)
+         env = TransformedEnv(env)
+         env.append_transform(InitTracker())
+-        env.append_transform(get_primers_from_module(actor_training))
+-        env.append_transform(get_primers_from_module(critic_training))
++        if primers := get_primers_from_module(actor_inference):
++            env.append_transform(primers)
++        if primers := get_primers_from_module(critic_inference):
++            env.append_transform(primers)
+         return env
+ 
+     env = create_env_fn()
+diff --git a/scripts/ahc/ahc.py b/scripts/ahc/ahc.py
+index d0211c66..ead8b418 100644
+--- a/scripts/ahc/ahc.py
++++ b/scripts/ahc/ahc.py
+@@ -181,7 +181,8 @@ def create_env_fn():
+         env = SMILESEnv(**env_kwargs)
+         env = TransformedEnv(env)
+         env.append_transform(InitTracker())
+-        env.append_transform(get_primers_from_module(actor_training))
++        if primers := get_primers_from_module(actor_inference):
++            env.append_transform(primers)
+         return env
+ 
+     env = create_env_fn()
+diff --git a/scripts/ppo/ppo.py b/scripts/ppo/ppo.py
+index f080b03d..2398db63 100644
+--- a/scripts/ppo/ppo.py
++++ b/scripts/ppo/ppo.py
+@@ -206,8 +206,10 @@ def create_env_fn():
+         env = SMILESEnv(**env_kwargs)
+         env = TransformedEnv(env)
+         env.append_transform(InitTracker())
+-        env.append_transform(get_primers_from_module(actor_training))
+-        env.append_transform(get_primers_from_module(critic_training))
++        if primers := get_primers_from_module(actor_inference):
++            env.append_transform(primers)
++        if primers := get_primers_from_module(critic_inference):
++            env.append_transform(primers)
+         return env
+ 
+     env = create_env_fn()
+diff --git a/scripts/pretrain/config_mamba.yaml b/scripts/pretrain/config_mamba.yaml
+new file mode 100644
+index 00000000..2cad85a4
+--- /dev/null
++++ b/scripts/pretrain/config_mamba.yaml
+@@ -0,0 +1,28 @@
++# Logging configuration
++experiment_name: mamba
++agent_name: chembl28p
++logger_backend: wandb # csv, wandb, tensorboard, or null
++seed: 101
++log_frequency: 500
++
++# Dataset configuration
++train_dataset_path: /workspace1/Priors/ChEMBL_potent/processed_data/ChEMBL28p_all_undersample-8.smi.gz
++tokenizer: SMILESTokenizerChEMBL # SMILESTokenizer, SMILESTokenizer2, SMILESTokenizer3, DeepSMILESTokenizer, SELFIESTokenizer, AISTokenizer, SAFETokenizer, SmiZipTokenizer
++#special_tokens: [".", "/", "\\", "@", "%", "*", "=", ":", "#", ">", "+", "-", "<UNK>", "<SEP>"]
++recompute_dataset: True # if False and dataset_log_dir contains a dataset, it will be used
++dataset_log_dir: /tmp/pretrain
++
++# Model configuration
++model: mamba # gru, lstm, gpt2 or mamba
++model_log_dir: mamba/chembl28p
++
++# Training configuration
++lr: 0.001
++lr_scheduler: StepLR
++lr_scheduler_kwargs:
++  step_size: 500 # Change every n epochs
++  gamma: 0.95 # 1.0 = no decay
++epochs: 25
++batch_size: 512 # 512
++randomize_smiles: True
++num_test_smiles: 100
+diff --git a/scripts/pretrain/pretrain_distributed.py b/scripts/pretrain/pretrain_distributed.py
+index de943cbb..f2d47491 100644
+--- a/scripts/pretrain/pretrain_distributed.py
++++ b/scripts/pretrain/pretrain_distributed.py
+@@ -168,7 +168,8 @@ def main(cfg: "DictConfig"):
+     )
+     test_env = TransformedEnv(test_env)
+     test_env.append_transform(InitTracker())
+-    test_env.append_transform(get_primers_from_module(actor_inference))
++    if primers := get_primers_from_module(actor_inference):
++        test_env.append_transform(primers)
+ 
+     logging.info("\nCreating test scoring function...")
+ 
+diff --git a/scripts/pretrain/pretrain_single_node.py b/scripts/pretrain/pretrain_single_node.py
+index dcae2a46..3356d812 100644
+--- a/scripts/pretrain/pretrain_single_node.py
++++ b/scripts/pretrain/pretrain_single_node.py
+@@ -113,7 +113,8 @@ def main(cfg: "DictConfig"):
+     )
+     test_env = TransformedEnv(test_env)
+     test_env.append_transform(InitTracker())
+-    test_env.append_transform(get_primers_from_module(actor_inference))
++    if primers := get_primers_from_module(actor_inference):
++        test_env.append_transform(primers)
+ 
+     logging.info("\nCreating optimizer...")
+     actor_optimizer = torch.optim.Adam(actor_training.parameters(), lr=cfg.lr)
+diff --git a/scripts/reinforce/reinforce.py b/scripts/reinforce/reinforce.py
+index 2ce8e6c6..4f599f6c 100644
+--- a/scripts/reinforce/reinforce.py
++++ b/scripts/reinforce/reinforce.py
+@@ -179,7 +179,8 @@ def create_env_fn():
+         env = SMILESEnv(**env_kwargs)
+         env = TransformedEnv(env)
+         env.append_transform(InitTracker())
+-        env.append_transform(get_primers_from_module(actor_training))
++        if primers := get_primers_from_module(actor_inference):
++            env.append_transform(primers)
+         return env
+ 
+     env = create_env_fn()
+diff --git a/scripts/reinvent/reinvent.py b/scripts/reinvent/reinvent.py
+index f0b844d0..4f045500 100644
+--- a/scripts/reinvent/reinvent.py
++++ b/scripts/reinvent/reinvent.py
+@@ -181,7 +181,8 @@ def create_env_fn():
+         env = SMILESEnv(**env_kwargs)
+         env = TransformedEnv(env)
+         env.append_transform(InitTracker())
+-        env.append_transform(get_primers_from_module(actor_training))
++        if primers := get_primers_from_module(actor_inference):
++            env.append_transform(primers)
+         return env
+ 
+     env = create_env_fn()
+diff --git a/scripts/sac/sac.py b/scripts/sac/sac.py
+index dfcfdf0e..76f381fb 100644
+--- a/scripts/sac/sac.py
++++ b/scripts/sac/sac.py
+@@ -40,6 +40,7 @@
+     UnsqueezeTransform,
+ )
+ from torchrl.modules.distributions import OneHotCategorical
++from torchrl.modules.utils import get_primers_from_module
+ from torchrl.objectives import DiscreteSACLoss, SoftUpdate
+ from torchrl.record.loggers import get_logger
+ 
+@@ -156,18 +157,6 @@ def main(cfg: "DictConfig"):
+     # Environment
+     ####################################################################################################################
+ 
+-    # Create transform to populate initial tensordict with recurrent states equal to 0.0
+-    if cfg.shared_nets:
+-        primers = actor_training.rnn_spec.expand(cfg.num_envs)
+-        rhs_primers = [TensorDictPrimer(primers)]
+-    else:
+-        actor_primers = actor_training.rnn_spec.expand(cfg.num_envs)
+-        critic_primers = critic_training.rnn_spec.expand(cfg.num_envs)
+-        rhs_primers = [
+-            TensorDictPrimer(actor_primers),
+-            TensorDictPrimer(critic_primers),
+-        ]
+-
+     env_kwargs = {
+         "start_token": vocabulary.start_token_index,
+         "end_token": vocabulary.end_token_index,
+@@ -199,8 +188,10 @@ def create_env_fn():
+         )
+         env.append_transform(StepCounter())
+         env.append_transform(InitTracker())
+-        for rhs_primer in rhs_primers:
+-            env.append_transform(rhs_primer)
++        if primers := get_primers_from_module(actor_inference):
++            env.append_transform(primers)
++        if primers := get_primers_from_module(critic_inference):
++            env.append_transform(primers)
+         return env
+ 
+     # tests env
+diff --git a/tests/test_mamba_model.py b/tests/test_mamba_model.py
+new file mode 100644
+index 00000000..bf4cb0f5
+--- /dev/null
++++ b/tests/test_mamba_model.py
+@@ -0,0 +1,152 @@
++import pytest
++import torch
++from acegen.data.utils import smiles_to_tensordict
++from acegen.models.mamba import (
++    create_mamba_actor,
++    create_mamba_actor_critic,
++    create_mamba_critic,
++)
++from tensordict import TensorDict
++from utils import get_default_devices
++
++
++def generate_valid_data_batch(
++    vocabulary_size: int, batch_size: int, sequence_length: int
++):
++    tokens = torch.randint(0, vocabulary_size, (batch_size, sequence_length + 1))
++    batch = smiles_to_tensordict(
++        tokens, replace_mask_value=0
++    )  # batch_size, sequence_length)
++    batch.set("sequence", batch.get("observation"))
++    batch.set("sequence_mask", batch.get("mask"))
++    return batch
++
++
++@pytest.mark.parametrize("vocabulary_size", [10])
++@pytest.mark.parametrize("device", get_default_devices())
++def test_mamba_actor(vocabulary_size, device, sequence_length=5, batch_size=10):
++    torch.manual_seed(0)
++    # Create the model and a data batch
++    training_actor, inference_actor = create_mamba_actor(
++        vocabulary_size,
++        n_embd=64,
++        n_layer=8,
++    )
++    training_batch = generate_valid_data_batch(
++        vocabulary_size, batch_size, sequence_length
++    )
++    inference_batch = training_batch.clone()
++    inference_batch.batch_size = [batch_size]
++
++    # Check that the inference model works
++    inference_actor = inference_actor.to(device)
++    inference_batch = inference_batch.to(device)
++    inference_batch = inference_actor(inference_batch)
++    assert "logits" in inference_batch.keys()
++    assert "action" in inference_batch.keys()
++
++    # Check that the training model works
++    training_actor = training_actor.to(device)
++    training_batch = training_batch.to(device)
++    training_batch = training_actor(training_batch)
++    assert "logits" in training_batch.keys()
++    assert "action" in training_batch.keys()
++
++
++@pytest.mark.parametrize("vocabulary_size", [10])
++@pytest.mark.parametrize("device", get_default_devices())
++@pytest.mark.parametrize("critic_value_per_action", [True, False])
++def test_mamba_critic(
++    vocabulary_size,
++    device,
++    critic_value_per_action,
++    sequence_length=5,
++    batch_size=10,
++):
++    torch.manual_seed(0)
++    # Create the model and a data batch
++    training_critic, inference_critic = create_mamba_critic(
++        vocabulary_size,
++        critic_value_per_action=critic_value_per_action,
++        n_embd=64,
++        n_layer=8,
++    )
++    training_batch = generate_valid_data_batch(
++        vocabulary_size, batch_size, sequence_length
++    )
++    inference_batch = training_batch.clone()
++    inference_batch.batch_size = [batch_size]
++
++    # Check that the inference model works
++    inference_critic = inference_critic.to(device)
++    inference_batch = inference_batch.to(device)
++    inference_batch = inference_critic(inference_batch)
++    if critic_value_per_action:
++        assert "action_value" in inference_batch.keys()
++    else:
++        assert "state_value" in inference_batch.keys()
++
++    # Check that the training model works
++    training_critic = training_critic.to(device)
++    training_batch = training_batch.to(device)
++    training_batch = training_critic(training_batch)
++    if critic_value_per_action:
++        assert "action_value" in training_batch.keys()
++    else:
++        assert "state_value" in training_batch.keys()
++
++
++@pytest.mark.parametrize("vocabulary_size", [10])
++@pytest.mark.parametrize("device", get_default_devices())
++@pytest.mark.parametrize("critic_value_per_action", [True, False])
++def test_mamba_actor_critic(
++    vocabulary_size,
++    device,
++    critic_value_per_action,
++    sequence_length=5,
++    batch_size=10,
++):
++    torch.manual_seed(0)
++    # Create the model and a data batch
++    (
++        training_actor,
++        inference_actor,
++        training_critic,
++        inference_critic,
++    ) = create_mamba_actor_critic(
++        vocabulary_size,
++        critic_value_per_action=critic_value_per_action,
++        n_embd=64,
++        n_layer=8,
++    )
++    training_batch = generate_valid_data_batch(
++        vocabulary_size, batch_size, sequence_length
++    )
++    inference_batch = training_batch.clone()
++    inference_batch.batch_size = [batch_size]
++
++    # Check that the inference model works
++    inference_actor = inference_actor.to(device)
++    inference_critic = inference_critic.to(device)
++    inference_batch = inference_batch.to(device)
++    inference_batch = inference_actor(inference_batch)
++    inference_batch = inference_critic(inference_batch)
++    assert "logits" in inference_batch.keys()
++    assert "action" in inference_batch.keys()
++    if critic_value_per_action:
++        assert "action_value" in inference_batch.keys()
++    else:
++        assert "state_value" in inference_batch.keys()
++
++    # Check that the training model works
++    training_actor = training_actor.to(device)
++    training_critic = training_critic.to(device)
++    training_batch = training_batch.to(device)
++    training_batch = training_actor(training_batch)
++    training_batch = training_critic(training_batch)
++    assert "logits" in training_batch.keys()
++    assert "action" in training_batch.keys()
++    if critic_value_per_action:
++        assert "action_value" in training_batch.keys()
++    else:
++        assert "state_value" in training_batch.keys()
