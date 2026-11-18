@@ -1,0 +1,1729 @@
+diff --git a/apps/desktop/src-tauri/Cargo.toml b/apps/desktop/src-tauri/Cargo.toml
+index 8949bb4ac..89c5a743d 100644
+--- a/apps/desktop/src-tauri/Cargo.toml
++++ b/apps/desktop/src-tauri/Cargo.toml
+@@ -37,7 +37,7 @@ tauri-plugin-http = "2.5.9"
+ tauri-plugin-single-instance = "2"
+ 
+ # Already in the graph through tauri/tao; used directly for window z-order checks, the clipboard, and
+-# the OCSR engine seam (free-disk query and CREATE_NO_WINDOW).
++# the OCSR engine seam (free-disk query, CREATE_NO_WINDOW and junction relocation).
+ [target.'cfg(windows)'.dependencies]
+ windows-sys = { version = "0.61", features = [
+   "Win32_Foundation",
+@@ -46,6 +46,9 @@ windows-sys = { version = "0.61", features = [
+   "Win32_Storage_FileSystem",
+   "Win32_System_DataExchange",
+   "Win32_System_Memory",
++  "Win32_System_IO",
++  "Win32_System_Ioctl",
++  "Win32_System_SystemServices",
+   "Win32_System_Threading",
+   "Win32_UI_WindowsAndMessaging",
+   "Win32_UI_Input_KeyboardAndMouse",
+@@ -53,10 +56,6 @@ windows-sys = { version = "0.61", features = [
+   "Win32_UI_Shell",
+ ] }
+ 
+-# Test-only: flags the OCSR tests' stand-in model file sparse (see ocsr_engine::set_sparse_len).
+-[target.'cfg(windows)'.dev-dependencies]
+-windows-sys = { version = "0.61", features = ["Win32_System_IO", "Win32_System_Ioctl"] }
+-
+ # The OCSR engine's process-group kill, waitid and statvfs; every use is behind cfg(unix).
+ [target.'cfg(unix)'.dependencies]
+ libc = "0.2"
+diff --git a/apps/desktop/src-tauri/src/local_engine/install.rs b/apps/desktop/src-tauri/src/local_engine/install.rs
+index ad6e2c787..976e2ae14 100644
+--- a/apps/desktop/src-tauri/src/local_engine/install.rs
++++ b/apps/desktop/src-tauri/src/local_engine/install.rs
+@@ -57,6 +57,8 @@ where
+ pub enum RunStep {
+     InstallPython,
+     CreateVenv,
++    #[cfg(windows)]
++    RewriteVenvLaunchers,
+     InstallPackages,
+     Extra,
+     VerifyEnvironment,
+@@ -119,11 +121,20 @@ pub trait InstallIo: Send + Sync {
+ 
+ pub struct SystemInstallIo<S: EngineSpec> {
+     spec: std::marker::PhantomData<S>,
+-    client: reqwest::blocking::Client,
++    client: Option<reqwest::blocking::Client>,
+     pub(crate) running: Arc<RunningChild>,
+ }
+ 
+ impl<S: EngineSpec> SystemInstallIo<S> {
++    /// Recovery runs local processes and must never require an HTTP client.
++    pub fn offline(running: Arc<RunningChild>) -> Self {
++        Self {
++            spec: std::marker::PhantomData,
++            client: None,
++            running,
++        }
++    }
++
+     pub fn new(running: Arc<RunningChild>) -> Result<Self, InstallError> {
+         let mut io = Self::from_builder(reqwest::blocking::Client::builder())?;
+         io.running = running;
+@@ -147,7 +158,7 @@ impl<S: EngineSpec> SystemInstallIo<S> {
+             })?;
+         Ok(Self {
+             spec: std::marker::PhantomData,
+-            client,
++            client: Some(client),
+             running: Arc::default(),
+         })
+     }
+@@ -184,6 +195,8 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
+         check_cancel::<S>(cancel)?;
+         let mut response = self
+             .client
++            .as_ref()
++            .ok_or_else(|| InstallError::network("Downloads are disabled during engine recovery"))?
+             .get(spec.url)
+             .send()
+             .and_then(reqwest::blocking::Response::error_for_status)
+@@ -268,17 +281,52 @@ impl<S: EngineSpec> InstallIo for SystemInstallIo<S> {
+             .stdin(Stdio::null())
+             .stdout(Stdio::inherit())
+             .stderr(Stdio::inherit());
++        #[cfg(windows)]
++        if _step == RunStep::RewriteVenvLaunchers {
++            command.stderr(Stdio::piped());
++        }
+         platform.configure_child(&mut command);
+         let mut child = command.spawn().map_err(|error| {
+             InstallError::failed(format!("Could not run {}: {error}", program.display()))
+         })?;
++        #[cfg(windows)]
++        if _step == RunStep::RewriteVenvLaunchers {
++            let stderr = child.stderr.take().expect("piped rewrite stderr");
++            let reader = std::thread::spawn(move || stderr_tail(stderr));
++            let outcome = self.supervise(&mut child, program, cancel, watch, None);
++            let tail = reader.join().unwrap_or_default();
++            return outcome.map_err(|mut error| {
++                if !tail.is_empty() {
++                    error.message.push_str(&format!("\nstderr: {tail}"));
++                }
++                error
++            });
++        }
+         self.supervise(&mut child, program, cancel, watch, None)
+     }
+ }
+ 
++/// Drain the pipe while retaining only the final 8 KiB, so a chatty uv cannot block or
++/// grow memory without bound and recovery failures include the useful diagnostic tail.
++#[cfg(any(windows, test))]
++pub(super) fn stderr_tail(mut reader: impl Read) -> String {
++    let mut tail = Vec::new();
++    let mut buffer = [0_u8; 4096];
++    while let Ok(read) = reader.read(&mut buffer) {
++        if read == 0 {
++            break;
++        }
++        tail.extend_from_slice(&buffer[..read]);
++        if tail.len() > 8192 {
++            tail.drain(..tail.len() - 8192);
++        }
++    }
++    String::from_utf8_lossy(&tail).trim().to_owned()
++}
++
+ /// Runs a program and returns what it wrote to stdout: the seam the in-place receipt upgrade uses
+ /// to ask the installed uv and Python what they are.
+-pub trait ProbeIo: Send + Sync {
++pub trait ProbeIo: InstallIo {
+     fn output(
+         &self,
+         platform: &dyn EnginePlatform,
+@@ -448,32 +496,9 @@ pub fn install<S: EngineSpec>(
+ 
+     let python_install_dir = partial.join("python");
+     let cache_dir = partial.join("download-cache");
+-    let python_bin_dir = partial.join("python-bin");
+-    let state_dir = partial.join("uv-state");
+     let temp_dir = partial.join("temp");
+     fs::create_dir_all(&temp_dir).map_err(S::failed_io)?;
+-    let environment = vec![
+-        (
+-            OsString::from("UV_PYTHON_INSTALL_DIR"),
+-            python_install_dir.as_os_str().to_owned(),
+-        ),
+-        (
+-            OsString::from("UV_CACHE_DIR"),
+-            cache_dir.as_os_str().to_owned(),
+-        ),
+-        (
+-            OsString::from("UV_PYTHON_BIN_DIR"),
+-            python_bin_dir.as_os_str().to_owned(),
+-        ),
+-        (
+-            OsString::from("UV_STATE_DIR"),
+-            state_dir.as_os_str().to_owned(),
+-        ),
+-        (OsString::from("UV_NO_CONFIG"), OsString::from("1")),
+-        (OsString::from("TMPDIR"), temp_dir.as_os_str().to_owned()),
+-        (OsString::from("TMP"), temp_dir.as_os_str().to_owned()),
+-        (OsString::from("TEMP"), temp_dir.as_os_str().to_owned()),
+-    ];
++    let environment = uv_environment(&partial);
+     progress.report(message(
+         InstallPhase::InstallingPython,
+         "Installing the pinned managed Python runtime.",
+@@ -594,6 +619,98 @@ pub fn install<S: EngineSpec>(
+     Ok(receipt)
+ }
+ 
++/// uv must never inherit a caller's interpreter, cache or configuration. Use the same
++/// engine-local directories before staging is swapped and when refreshing the final tree.
++fn uv_environment(root: &Path) -> Vec<(OsString, OsString)> {
++    let mut env: Vec<_> = [
++        ("UV_PYTHON_INSTALL_DIR", "python"),
++        ("UV_CACHE_DIR", "download-cache"),
++        ("UV_PYTHON_BIN_DIR", "python-bin"),
++        ("UV_STATE_DIR", "uv-state"),
++        ("TMPDIR", "temp"),
++        ("TMP", "temp"),
++        ("TEMP", "temp"),
++    ]
++    .into_iter()
++    .map(|(key, directory)| (OsString::from(key), root.join(directory).into_os_string()))
++    .collect();
++    env.push((OsString::from("UV_NO_CONFIG"), OsString::from("1")));
++    env
++}
++
++/// Windows uv launchers embed the absolute managed interpreter path, even with
++/// --relocatable, and ignore pyvenv.cfg. Regenerate both launchers after a move, preserving
++/// site-packages. The minor-version junction was already rebased by relocation.
++#[cfg(windows)]
++pub(crate) fn rewrite_venv_launchers<S: EngineSpec>(
++    root: &Path,
++    platform: &dyn EnginePlatform,
++    io: &dyn InstallIo,
++    cancel: &AtomicBool,
++) -> Result<(), InstallError> {
++    check_cancel::<S>(cancel)?;
++    // Only x64 Windows is supported. For ARM64, change the managed Python triple here
++    // alongside the Windows uv pins in local_engine/pins.rs.
++    let python = root
++        .join("python")
++        .join(format!(
++            "cpython-{}-windows-x86_64-none",
++            S::python_version()
++        ))
++        .join("python.exe");
++    // The install removed its staging temp directory before the swap. uv may need it while
++    // replacing launchers; restore it briefly and leave an existing recovery temp tree alone.
++    let temp = root.join("temp");
++    let had_temp = temp.exists();
++    fs::create_dir_all(&temp).map_err(|error| {
++        InstallError::failed(format!(
++            "Could not prepare the venv launcher rewrite: {error}"
++        ))
++    })?;
++    let result = io.run(
++        platform,
++        RunStep::RewriteVenvLaunchers,
++        &platform.uv_executable(root),
++        &[
++            OsString::from("venv"),
++            root.join("venv").into_os_string(),
++            OsString::from("--allow-existing"),
++            OsString::from("--offline"),
++            OsString::from("--python"),
++            python.into_os_string(),
++            OsString::from("--python-preference"),
++            OsString::from("only-managed"),
++            OsString::from("--relocatable"),
++        ],
++        &uv_environment(root),
++        cancel,
++        None,
++    );
++    if !had_temp {
++        let _ = fs::remove_dir_all(&temp);
++    }
++    let _ = fs::remove_dir_all(root.join("download-cache"));
++    result.map_err(|error| InstallError {
++        code: error.code,
++        message: format!(
++            "Could not rewrite the relocated venv launchers: {}",
++            error.message
++        ),
++    })?;
++    check_cancel::<S>(cancel)
++}
++
++// Unix venv interpreters are symlinks, which relocate_staged_tree already repairs.
++#[cfg(not(windows))]
++pub(crate) fn rewrite_venv_launchers<S: EngineSpec>(
++    _root: &Path,
++    _platform: &dyn EnginePlatform,
++    _io: &dyn InstallIo,
++    _cancel: &AtomicBool,
++) -> Result<(), InstallError> {
++    Ok(())
++}
++
+ /// Swaps the verified staging tree into place and proves it works there.
+ ///
+ /// uv records the interpreter by absolute path — the venv's `python` link and `pyvenv.cfg`'s
+@@ -647,14 +764,27 @@ fn commit_staged_tree<S: EngineSpec>(
+ 
+     // A set-aside tree from an interrupted swap may be the only working engine: put it back in
+     // place first if `engine/` is not, so it becomes the one this install falls back to.
+-    reconcile_previous::<S>(paths, platform);
++    if let Err(error) = reconcile_previous::<S>(paths, platform, io, cancel) {
++        if error.code == super::InstallErrorCode::Cancelled {
++            return Err(error);
++        }
++        // Recovery logged the process error, including its stderr tail. Replace these
++        // unusable trees rather than allowing them to block reinstall or become rollback.
++        eprintln!(
++            "{} discarding unusable recovery trees before reinstall: {}",
++            S::LOG_PREFIX,
++            error.message
++        );
++        remove_tree::<S>(&paths.app_data, &previous).map_err(S::failed_io)?;
++        remove_tree::<S>(&paths.app_data, &final_dir).map_err(S::failed_io)?;
++    }
+     remove_tree::<S>(&paths.app_data, &previous).map_err(S::failed_io)?;
+     let had_previous = final_dir.exists();
+     if had_previous {
+         fs::rename(&final_dir, &previous).map_err(S::failed_io)?;
+     }
+     if let Err(error) = fs::rename(&partial, &final_dir) {
+-        restore_previous::<S>(&final_dir, &previous, had_previous);
++        restore_previous::<S>(&final_dir, &previous, had_previous, platform, io, cancel);
+         return Err(S::failed_io(error));
+     }
+     // From here the staging tree is gone; a failure retires the new tree instead.
+@@ -662,6 +792,7 @@ fn commit_staged_tree<S: EngineSpec>(
+ 
+     let outcome = relocate_staged_tree(&final_dir, &rebases)
+         .map_err(S::relocation_error)
++        .and_then(|()| rewrite_venv_launchers::<S>(&final_dir, platform, io, cancel))
+         .and_then(|()| S::verify_layout(&final_dir, platform))
+         .and_then(|()| {
+             io.run(
+@@ -693,7 +824,14 @@ fn commit_staged_tree<S: EngineSpec>(
+             // mid-delete would leave a half-deleted tree where the engine belongs.
+             match retire_tree::<S>(&paths.app_data, &final_dir) {
+                 Ok(discarded) => {
+-                    restore_previous::<S>(&final_dir, &previous, had_previous);
++                    restore_previous::<S>(
++                        &final_dir,
++                        &previous,
++                        had_previous,
++                        platform,
++                        io,
++                        cancel,
++                    );
+                     if let Some(discarded) = discarded {
+                         delete_discarded::<S>(&discarded);
+                     }
+@@ -711,7 +849,14 @@ fn commit_staged_tree<S: EngineSpec>(
+     }
+ }
+ 
+-fn restore_previous<S: EngineSpec>(final_dir: &Path, previous: &Path, had_previous: bool) {
++fn restore_previous<S: EngineSpec>(
++    final_dir: &Path,
++    previous: &Path,
++    had_previous: bool,
++    platform: &dyn EnginePlatform,
++    io: &dyn InstallIo,
++    cancel: &AtomicBool,
++) {
+     if had_previous && !final_dir.exists() {
+         if let Err(error) = fs::rename(previous, final_dir) {
+             eprintln!(
+@@ -719,6 +864,16 @@ fn restore_previous<S: EngineSpec>(final_dir: &Path, previous: &Path, had_previo
+                 S::LOG_PREFIX,
+                 previous.display()
+             );
++        } else if let Err(error) = rewrite_venv_launchers::<S>(final_dir, platform, io, cancel) {
++            // The old launchers already name final_dir, so cancellation can skip the refresh
++            // safely. Never start a new child after cancellation (including app exit).
++            if error.code != super::InstallErrorCode::Cancelled {
++                eprintln!(
++                    "{} could not refresh the restored engine: {}",
++                    S::LOG_PREFIX,
++                    error.message
++                );
++            }
+         }
+     }
+ }
+@@ -820,14 +975,19 @@ pub fn remove_engine_trees<S: EngineSpec>(
+ /// is discarded. Otherwise, if it is healthy itself, it is restored: the unhealthy or missing
+ /// `engine/` is retired and the previous engine renamed back. If neither is healthy both are
+ /// left alone. Returns whether `engine.previous/` was removed from disk.
+-fn reconcile_previous<S: EngineSpec>(paths: &InstallPaths, platform: &dyn EnginePlatform) -> bool {
++fn reconcile_previous<S: EngineSpec>(
++    paths: &InstallPaths,
++    platform: &dyn EnginePlatform,
++    io: &dyn InstallIo,
++    cancel: &AtomicBool,
++) -> Result<bool, InstallError> {
+     let final_dir = paths.final_dir_for::<S>();
+     let previous = paths.previous_dir_for::<S>();
+     if !previous.exists() {
+-        return false;
++        return Ok(false);
+     }
+     if is_healthy::<S>(&final_dir, platform) {
+-        return match retire_tree::<S>(&paths.app_data, &previous) {
++        return Ok(match retire_tree::<S>(&paths.app_data, &previous) {
+             Ok(discarded) => {
+                 if let Some(discarded) = discarded {
+                     delete_discarded::<S>(&discarded);
+@@ -842,11 +1002,12 @@ fn reconcile_previous<S: EngineSpec>(paths: &InstallPaths, platform: &dyn Engine
+                 );
+                 false
+             }
+-        };
++        });
+     }
+     if !S::is_restorable(&previous, platform) {
+-        return false;
++        return Ok(false);
+     }
++    check_cancel::<S>(cancel)?;
+     let discarded = match retire_tree::<S>(&paths.app_data, &final_dir) {
+         Ok(discarded) => discarded,
+         Err(error) => {
+@@ -855,35 +1016,96 @@ fn reconcile_previous<S: EngineSpec>(paths: &InstallPaths, platform: &dyn Engine
+                 S::LOG_PREFIX,
+                 final_dir.display()
+             );
+-            return false;
++            return Ok(false);
+         }
+     };
+-    match fs::rename(&previous, &final_dir) {
+-        Ok(()) => eprintln!(
+-            "{} restored the previous engine from {}",
+-            S::LOG_PREFIX,
+-            previous.display()
+-        ),
+-        Err(error) => eprintln!(
+-            "{} could not restore the previous engine from {}: {error}",
++    let outcome = fs::rename(&previous, &final_dir)
++        .map_err(S::failed_io)
++        .and_then(|()| {
++            relocate_staged_tree(&final_dir, &[(previous.clone(), final_dir.clone())])
++                .map_err(S::relocation_error)
++        })
++        .and_then(|()| rewrite_venv_launchers::<S>(&final_dir, platform, io, cancel))
++        .and_then(|()| check_cancel::<S>(cancel));
++    if let Err(error) = outcome {
++        eprintln!(
++            "{} could not restore the previous engine: {}",
+             S::LOG_PREFIX,
+-            previous.display()
+-        ),
++            error.message
++        );
++        // Keep the only verified tree for another recovery attempt if refreshing it failed.
++        if final_dir.exists() && !previous.exists() {
++            if let Err(error) = fs::rename(&final_dir, &previous) {
++                eprintln!(
++                    "{} could not set the previous engine back: {error}",
++                    S::LOG_PREFIX
++                );
++            }
++        }
++        if let Some(discarded) = discarded {
++            if let Err(error) = fs::rename(discarded, &final_dir) {
++                eprintln!(
++                    "{} could not restore the interrupted tree: {error}",
++                    S::LOG_PREFIX
++                );
++            }
++        }
++        return Err(error);
+     }
++    eprintln!(
++        "{} restored the previous engine from {}",
++        S::LOG_PREFIX,
++        previous.display()
++    );
+     if let Some(discarded) = discarded {
+         delete_discarded::<S>(&discarded);
+     }
+     // Restored, not removed: the engine is still on disk, now as `engine/`.
+-    false
++    Ok(false)
++}
++
++/// Use the same spelling for canonicalized Windows paths and junction targets returned by read_link.
++/// Keep non-UTF-8 path data intact and leave other namespaces and relative paths alone.
++#[cfg(windows)]
++pub(super) fn normalize_verbatim_path(path: &Path) -> PathBuf {
++    use std::path::{Component, Prefix};
++
++    let mut components = path.components();
++    let mut plain = match components.next() {
++        Some(Component::Prefix(prefix)) => match prefix.kind() {
++            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
++            Prefix::VerbatimUNC(server, share) => {
++                let mut root = OsString::from(r"\\");
++                root.push(server);
++                root.push(r"\");
++                root.push(share);
++                PathBuf::from(root)
++            }
++            _ => return path.to_path_buf(),
++        },
++        _ => return path.to_path_buf(),
++    };
++    // The replacement prefix already supplies the root; pushing RootDir would replace it.
++    plain.extend(components.filter(|component| !matches!(component, Component::RootDir)));
++    plain
++}
++
++#[cfg(not(windows))]
++pub(super) fn normalize_verbatim_path(path: &Path) -> PathBuf {
++    path.to_path_buf()
+ }
+ 
+-/// Rewrites every symlink under `root` whose target lies under an old prefix, and the `home`
++/// Rewrites every symlink or junction under `root` whose target lies under an old prefix, and the `home`
+ /// entry of `venv/pyvenv.cfg`, so both point at the same place under the new prefix.
+ pub fn relocate_staged_tree(root: &Path, rebases: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+     let rebase = |target: &Path| {
+-        rebases
+-            .iter()
+-            .find_map(|(old, new)| target.strip_prefix(old).ok().map(|rest| new.join(rest)))
++        let target = normalize_verbatim_path(target);
++        rebases.iter().find_map(|(old, new)| {
++            target
++                .strip_prefix(normalize_verbatim_path(old))
++                .ok()
++                .map(|rest| normalize_verbatim_path(new).join(rest))
++        })
+     };
+     let mut pending = vec![root.to_path_buf()];
+     while let Some(directory) = pending.pop() {
+@@ -891,11 +1113,13 @@ pub fn relocate_staged_tree(root: &Path, rebases: &[(PathBuf, PathBuf)]) -> io::
+             let entry = entry?;
+             let path = entry.path();
+             let file_type = entry.file_type()?;
+-            if file_type.is_symlink() {
++            let is_link = file_type.is_symlink();
++            let junction = if is_link { is_junction(&path)? } else { false };
++            if junction || is_link {
+                 let target = fs::read_link(&path)?;
+                 if let Some(rebased) = rebase(&target) {
+                     fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))?;
+-                    create_symlink(&rebased, &path)?;
++                    create_link(&rebased, &path, junction)?;
+                 }
+             } else if file_type.is_dir() {
+                 pending.push(path);
+@@ -918,15 +1142,101 @@ pub fn relocate_staged_tree(root: &Path, rebases: &[(PathBuf, PathBuf)]) -> io::
+ }
+ 
+ #[cfg(unix)]
+-fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
++pub(super) fn create_link(target: &Path, link: &Path, _junction: bool) -> io::Result<()> {
+     std::os::unix::fs::symlink(target, link)
+ }
+ 
+-// Windows: uv links the managed Python's minor-version directory with a junction. std cannot
+-// create junctions, and symlink creation needs Developer Mode or elevation; this path is
+-// unverified until a real Windows install runs (see docs/architecture/engine.md).
++// A real Windows install confirmed uv's minor-version directory is a junction. Replacing it
++// with symlink_dir failed with error 1314 for an ordinary user. Preserve the reparse-point kind:
++// junction creation needs no symlink privilege (see docs/architecture/ocsr-engine.md).
+ #[cfg(windows)]
+-fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
++pub(super) fn create_link(target: &Path, link: &Path, junction: bool) -> io::Result<()> {
++    use std::os::windows::ffi::OsStrExt;
++    use std::os::windows::fs::OpenOptionsExt;
++    use std::os::windows::io::AsRawHandle;
++    use windows_sys::Win32::Storage::FileSystem::{
++        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
++    };
++    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
++    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
++    use windows_sys::Win32::System::IO::DeviceIoControl;
++
++    if junction {
++        let absolute: Vec<u16> = normalize_verbatim_path(&std::path::absolute(target)?)
++            .as_os_str()
++            .encode_wide()
++            .collect();
++        // Drive and UNC print names are plain absolute; the substitute uses the NT namespace.
++        let mut substitute: Vec<u16> = r"\??\".encode_utf16().collect();
++        if absolute.starts_with(&[92, 92, 63, 92]) {
++            substitute.extend_from_slice(&absolute[4..]);
++        } else if absolute.starts_with(&[92, 92]) {
++            substitute.extend("UNC\\".encode_utf16());
++            substitute.extend_from_slice(&absolute[2..]);
++        } else {
++            substitute.extend_from_slice(&absolute);
++        }
++        let size = 16 + (substitute.len() + absolute.len() + 2) * 2;
++        if size > MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "junction target is too long",
++            ));
++        }
++        // REPARSE_DATA_BUFFER: 8-byte header, 8-byte mount-point header, then two NUL-terminated
++        // UTF-16 names. Offsets and lengths count bytes from the start of PathBuffer.
++        let mut data = Vec::with_capacity(size);
++        data.extend(IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
++        for value in [
++            (size - 8) as u16,
++            0,
++            0,
++            (substitute.len() * 2) as u16,
++            ((substitute.len() + 1) * 2) as u16,
++            (absolute.len() * 2) as u16,
++        ] {
++            data.extend(value.to_le_bytes());
++        }
++        for unit in substitute
++            .iter()
++            .chain([0].iter())
++            .chain(absolute.iter())
++            .chain([0].iter())
++        {
++            data.extend(unit.to_le_bytes());
++        }
++        fs::create_dir(link)?;
++        let result = (|| {
++            let directory = fs::OpenOptions::new()
++                .write(true)
++                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
++                .open(link)?;
++            let mut returned = 0;
++            // SAFETY: the owned handle stays open; data holds a complete mount-point buffer;
++            // this synchronous call uses no output buffer or OVERLAPPED structure.
++            let ok = unsafe {
++                DeviceIoControl(
++                    directory.as_raw_handle(),
++                    FSCTL_SET_REPARSE_POINT,
++                    data.as_ptr().cast(),
++                    data.len() as u32,
++                    std::ptr::null_mut(),
++                    0,
++                    &mut returned,
++                    std::ptr::null_mut(),
++                )
++            };
++            if ok == 0 {
++                Err(io::Error::last_os_error())
++            } else {
++                Ok(())
++            }
++        })();
++        if result.is_err() {
++            let _ = fs::remove_dir(link);
++        }
++        return result;
++    }
+     if target.is_dir() {
+         std::os::windows::fs::symlink_dir(target, link)
+     } else {
+@@ -935,13 +1245,54 @@ fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
+ }
+ 
+ #[cfg(not(any(unix, windows)))]
+-fn create_symlink(_target: &Path, _link: &Path) -> io::Result<()> {
++pub(super) fn create_link(_target: &Path, _link: &Path, _junction: bool) -> io::Result<()> {
+     Err(io::Error::new(
+         io::ErrorKind::Unsupported,
+         "symlinks are unsupported on this platform",
+     ))
+ }
+ 
++#[cfg(windows)]
++pub(super) fn is_junction(path: &Path) -> io::Result<bool> {
++    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
++    use std::os::windows::io::AsRawHandle;
++    use windows_sys::Win32::Storage::FileSystem::{
++        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
++        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
++    };
++    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
++
++    if fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
++        return Ok(false);
++    }
++    let link = fs::OpenOptions::new()
++        .access_mode(0)
++        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
++        .open(path)?;
++    let mut info = FILE_ATTRIBUTE_TAG_INFO {
++        FileAttributes: 0,
++        ReparseTag: 0,
++    };
++    // SAFETY: link owns the handle and info is writable with exactly the requested size.
++    let ok = unsafe {
++        GetFileInformationByHandleEx(
++            link.as_raw_handle(),
++            FileAttributeTagInfo,
++            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
++            std::mem::size_of_val(&info) as u32,
++        )
++    };
++    if ok == 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
++}
++
++#[cfg(not(windows))]
++pub(super) fn is_junction(_path: &Path) -> io::Result<bool> {
++    Ok(false)
++}
++
+ /// Whether `root` holds an install that matches this build's pins and layout, as
+ /// the status command would report `installed`. The receipt is required, and it is written last
+ /// on install and leaves first (with the whole tree, by rename) on teardown, so a tree that is
+@@ -967,6 +1318,8 @@ pub fn is_healthy<S: EngineSpec>(root: &Path, platform: &dyn EnginePlatform) ->
+ pub fn remove_stale_staging<S: EngineSpec>(
+     paths: &InstallPaths,
+     platform: &dyn EnginePlatform,
++    io: &dyn InstallIo,
++    cancel: &AtomicBool,
+ ) -> Vec<PathBuf> {
+     let mut removed = Vec::new();
+     let partial = paths.partial_dir_for::<S>();
+@@ -980,8 +1333,14 @@ pub fn remove_stale_staging<S: EngineSpec>(
+             ),
+         }
+     }
+-    if reconcile_previous::<S>(paths, platform) {
+-        removed.push(paths.previous_dir_for::<S>());
++    match reconcile_previous::<S>(paths, platform, io, cancel) {
++        Ok(true) => removed.push(paths.previous_dir_for::<S>()),
++        Ok(false) => {}
++        Err(error) => eprintln!(
++            "{} could not reconcile the previous engine: {}",
++            S::LOG_PREFIX,
++            error.message
++        ),
+     }
+     let final_dir = paths.final_dir_for::<S>();
+     if final_dir.is_dir() && fs::symlink_metadata(final_dir.join(RECEIPT_FILE)).is_err() {
+diff --git a/apps/desktop/src-tauri/src/local_engine/tests.rs b/apps/desktop/src-tauri/src/local_engine/tests.rs
+index badfd5a04..11a3046ee 100644
+--- a/apps/desktop/src-tauri/src/local_engine/tests.rs
++++ b/apps/desktop/src-tauri/src/local_engine/tests.rs
+@@ -160,12 +160,142 @@ impl Drop for FixtureRoot {
+     }
+ }
+ 
++#[cfg(unix)]
++#[test]
++fn relocation_preserves_directory_symlink() {
++    assert_directory_link_relocation(false, false);
++}
++
++#[cfg(windows)]
++#[test]
++fn relocation_preserves_directory_junction_without_symlink_privilege() {
++    assert_directory_link_relocation(true, false);
++}
++
++#[cfg(windows)]
++#[test]
++fn relocation_rebases_directory_junction_with_only_verbatim_prefixes() {
++    assert_directory_link_relocation(true, true);
++}
++
++fn assert_directory_link_relocation(junction: bool, verbatim_rebases: bool) {
++    let fixture = FixtureRoot::new("relocate-link");
++    let canonical_root = fs::canonicalize(&fixture.0).expect("absolute fixture root");
++    let root = install::normalize_verbatim_path(&canonical_root);
++    let partial = root.join("engine.partial");
++    let installed = root.join("engine");
++    let python = Path::new("python").join("cpython-3.10.20");
++    let alias = Path::new("python").join("cpython-3.10");
++    fs::create_dir_all(partial.join(&python)).expect("managed Python directory");
++    fs::write(partial.join(&python).join("python.exe"), b"python").expect("interpreter fixture");
++    install::create_link(
++        &canonical_root.join("engine.partial").join(&python),
++        &partial.join(&alias),
++        junction,
++    )
++    .expect("directory link without elevation");
++    assert_eq!(
++        fs::read_link(partial.join(&alias)).expect("plain absolute target"),
++        partial.join(&python)
++    );
++    assert_eq!(
++        install::is_junction(&partial.join(&alias)).unwrap(),
++        junction
++    );
++    fs::rename(&partial, &installed).expect("commit staged tree");
++    assert!(
++        !installed.join(&alias).exists(),
++        "old target is now missing"
++    );
++
++    let rebases = if verbatim_rebases {
++        assert_ne!(
++            canonical_root, root,
++            "regression requires verbatim prefixes"
++        );
++        vec![(
++            canonical_root.join("engine.partial"),
++            canonical_root.join("engine"),
++        )]
++    } else {
++        vec![(partial.clone(), installed.clone())]
++    };
++    install::relocate_staged_tree(&installed, &rebases).expect("relocate directory link");
++
++    let link = installed.join(&alias);
++    assert_eq!(install::is_junction(&link).unwrap(), junction);
++    let target = fs::read_link(&link).expect("relocated target");
++    assert!(target.is_absolute());
++    assert_eq!(target, installed.join(&python));
++    assert_eq!(fs::read(link.join("python.exe")).unwrap(), b"python");
++    assert!(!partial.exists(), "relocation must not recreate staging");
++}
++
++#[cfg(windows)]
++#[test]
++fn normalize_verbatim_drive_path() {
++    assert_eq!(
++        install::normalize_verbatim_path(Path::new(r"\\?\C:\engine.partial\python")),
++        Path::new(r"C:\engine.partial\python")
++    );
++}
++
++#[cfg(windows)]
++#[test]
++fn normalize_verbatim_unc_path() {
++    assert_eq!(
++        install::normalize_verbatim_path(Path::new(r"\\?\UNC\server\share\engine.partial\python")),
++        Path::new(r"\\server\share\engine.partial\python")
++    );
++}
++
++#[cfg(windows)]
++#[test]
++fn normalize_verbatim_leaves_plain_paths_unchanged() {
++    for path in [r"C:\engine\python", r"\\server\share\engine\python"] {
++        assert_eq!(
++            install::normalize_verbatim_path(Path::new(path)),
++            Path::new(path)
++        );
++    }
++}
++
++#[cfg(windows)]
++#[test]
++fn normalize_verbatim_leaves_relative_paths_unchanged() {
++    let path = Path::new(r"engine.partial\python");
++    assert_eq!(install::normalize_verbatim_path(path), path);
++}
++
++#[cfg(not(windows))]
++#[test]
++fn normalize_verbatim_leaves_unix_paths_unchanged() {
++    for path in [
++        "/engine.partial/python",
++        "engine.partial/python",
++        r"\\?\C:\python",
++        r"\\?\UNC\server\share",
++    ] {
++        assert_eq!(
++            install::normalize_verbatim_path(Path::new(path)),
++            Path::new(path)
++        );
++    }
++}
++
+ #[derive(Default)]
+ struct FixtureIo {
+     bad_sha: bool,
+     fail_probe: bool,
+     cancel_probe: bool,
+     probes: AtomicUsize,
++    commands: Mutex<Vec<&'static str>>,
++    #[cfg(windows)]
++    fail_rewrite: bool,
++    #[cfg(windows)]
++    cancel_rewrite: bool,
++    #[cfg(windows)]
++    rewrites: AtomicUsize,
+ }
+ impl InstallIo for FixtureIo {
+     fn download(
+@@ -200,15 +330,105 @@ impl InstallIo for FixtureIo {
+         step: RunStep,
+         program: &Path,
+         args: &[OsString],
+-        _env: &[(OsString, OsString)],
++        env: &[(OsString, OsString)],
+         cancel: &AtomicBool,
+         watch: Option<RunWatch<'_>>,
+     ) -> Result<(), InstallError> {
++        let name = match step {
++            RunStep::InstallPython => "python",
++            RunStep::CreateVenv => "venv",
++            RunStep::InstallPackages => "packages",
++            RunStep::Extra => "extra",
++            RunStep::VerifyEnvironment => "probe",
++            #[cfg(windows)]
++            RunStep::RewriteVenvLaunchers => "rewrite",
++        };
++        self.commands.lock().expect("commands").push(name);
++        #[cfg(not(windows))]
++        let _ = env;
+         let partial = program.parent().expect("program parent");
+         if let RunStep::CreateVenv = step {
+             let python = platform.venv_python(partial);
+             fs::create_dir_all(python.parent().expect("python parent")).map_err(Stub::failed_io)?;
+             fs::write(python, b"python").map_err(Stub::failed_io)?;
++            fs::write(
++                partial.join("venv").join("pyvenv.cfg"),
++                format!("home = {}\n", partial.join("python").display()),
++            )
++            .map_err(Stub::failed_io)?;
++            #[cfg(windows)]
++            {
++                let managed = partial
++                    .join("python")
++                    .join("cpython-3.12.99-windows-x86_64-none");
++                fs::create_dir_all(&managed).map_err(Stub::failed_io)?;
++                fs::write(managed.join("python.exe"), b"managed python")
++                    .map_err(Stub::failed_io)?;
++                install::create_link(
++                    &managed,
++                    &partial
++                        .join("python")
++                        .join("cpython-3.12-windows-x86_64-none"),
++                    true,
++                )
++                .map_err(Stub::failed_io)?;
++            }
++        }
++        #[cfg(windows)]
++        if let RunStep::RewriteVenvLaunchers = step {
++            let root = program.parent().expect("uv parent");
++            assert!(root.ends_with(Stub::DIR_NAME), "rewrite runs after swap");
++            assert_eq!(program, StubPlatform.uv_executable(root));
++            let managed = root
++                .join("python")
++                .join("cpython-3.12-windows-x86_64-none")
++                .join("python.exe");
++            assert!(
++                managed.is_file(),
++                "junction relocation precedes launcher rewrite"
++            );
++            let config = fs::read_to_string(root.join("venv").join("pyvenv.cfg")).expect("config");
++            assert!(
++                !config.contains(".partial"),
++                "config relocation precedes launcher rewrite"
++            );
++            assert_eq!(
++                args,
++                [
++                    OsString::from("venv"),
++                    root.join("venv").into_os_string(),
++                    OsString::from("--allow-existing"),
++                    OsString::from("--offline"),
++                    OsString::from("--python"),
++                    managed.into_os_string(),
++                    OsString::from("--python-preference"),
++                    OsString::from("only-managed"),
++                    OsString::from("--relocatable"),
++                ]
++            );
++            for (key, dir) in [
++                ("UV_PYTHON_INSTALL_DIR", "python"),
++                ("UV_PYTHON_BIN_DIR", "python-bin"),
++                ("UV_STATE_DIR", "uv-state"),
++                ("UV_CACHE_DIR", "download-cache"),
++                ("TMPDIR", "temp"),
++                ("TMP", "temp"),
++                ("TEMP", "temp"),
++            ] {
++                assert!(env.contains(&(OsString::from(key), root.join(dir).into_os_string())));
++            }
++            assert!(env.contains(&(OsString::from("UV_NO_CONFIG"), OsString::from("1"))));
++            assert!(watch.is_none());
++            fs::create_dir_all(root.join("download-cache")).expect("uv cache");
++            fs::write(root.join("download-cache").join("cache"), b"scratch").expect("cache");
++            let first = self.rewrites.fetch_add(1, Ordering::SeqCst) == 0;
++            if first && self.cancel_rewrite {
++                cancel.store(true, Ordering::SeqCst);
++                return Err(Stub::cancelled());
++            }
++            if first && self.fail_rewrite {
++                return Err(InstallError::failed("launcher refused"));
++            }
+         }
+         if let RunStep::VerifyEnvironment = step {
+             self.probes.fetch_add(1, Ordering::Relaxed);
+@@ -218,6 +438,12 @@ impl InstallIo for FixtureIo {
+                 !final_dir.join(RECEIPT_FILE).exists(),
+                 "receipt written last"
+             );
++            #[cfg(windows)]
++            assert_eq!(
++                self.commands.lock().expect("commands").iter().rev().nth(1),
++                Some(&"rewrite"),
++                "launcher rewrite precedes probe",
++            );
+             assert_eq!(args, Stub::probe_args());
+             if self.cancel_probe {
+                 cancel.store(true, Ordering::SeqCst);
+@@ -245,6 +471,11 @@ fn run_install(paths: &InstallPaths, io: &FixtureIo) -> Result<serde_json::Value
+ }
+ fn assert_clean(paths: &InstallPaths) {
+     assert!(!paths.partial_dir_for::<Stub>().exists());
++    assert!(!paths
++        .final_dir_for::<Stub>()
++        .join("download-cache")
++        .exists());
++    assert!(!paths.final_dir_for::<Stub>().join("temp").exists());
+     assert!(!paths.previous_dir_for::<Stub>().exists());
+     assert!(!fs::read_dir(&paths.app_data)
+         .expect("entries")
+@@ -273,6 +504,187 @@ fn stub_transaction_stages_then_probes_in_final_location_and_writes_receipt_last
+     install::remove_engine_trees::<Stub>(&paths).expect("uninstall");
+     assert!(!paths.final_dir_for::<Stub>().exists());
+ }
++#[cfg(not(windows))]
++#[test]
++fn unix_launcher_refresh_is_a_noop_and_install_issues_no_extra_command() {
++    let fixture = FixtureRoot::new("unix-launcher");
++    let paths = fixture.paths();
++    let io = FixtureIo::default();
++    install::rewrite_venv_launchers::<Stub>(
++        Path::new("missing"),
++        &StubPlatform,
++        &io,
++        &AtomicBool::new(false),
++    )
++    .expect("Unix no-op");
++    assert!(io.commands.lock().expect("commands").is_empty());
++    run_install(&paths, &io).expect("install");
++    assert_eq!(
++        *io.commands.lock().expect("commands"),
++        ["python", "venv", "packages", "probe"]
++    );
++}
++
++#[cfg(windows)]
++#[test]
++fn windows_launcher_rewrite_uses_final_paths_after_relocation_before_probe() {
++    let fixture = FixtureRoot::new("windows-launcher");
++    let paths = fixture.paths();
++    let io = FixtureIo::default();
++    run_install(&paths, &io).expect("install");
++    assert_eq!(
++        *io.commands.lock().expect("commands"),
++        ["python", "venv", "packages", "rewrite", "probe"]
++    );
++    assert_clean(&paths);
++}
++
++#[cfg(windows)]
++#[test]
++fn windows_launcher_failure_and_cancel_roll_back_with_and_without_a_previous_install() {
++    for previous in [false, true] {
++        for cancelled in [false, true] {
++            let fixture = FixtureRoot::new("windows-launcher-rollback");
++            let paths = fixture.paths();
++            if previous {
++                run_install(&paths, &FixtureIo::default()).expect("original");
++                fs::write(paths.final_dir_for::<Stub>().join("marker"), b"old").expect("marker");
++            }
++            let io = FixtureIo {
++                fail_rewrite: !cancelled,
++                cancel_rewrite: cancelled,
++                ..Default::default()
++            };
++            let error = run_install(&paths, &io).expect_err("rewrite refused");
++            assert_eq!(
++                error.code,
++                if cancelled {
++                    InstallErrorCode::Cancelled
++                } else {
++                    InstallErrorCode::Failed
++                }
++            );
++            assert!(error.message.contains("venv launchers"), "step is named");
++            assert_eq!(
++                io.probes.load(Ordering::SeqCst),
++                0,
++                "never probe stale launchers"
++            );
++            if previous {
++                assert_eq!(
++                    fs::read(paths.final_dir_for::<Stub>().join("marker")).expect("restored"),
++                    b"old"
++                );
++                assert_eq!(
++                    io.rewrites.load(Ordering::SeqCst),
++                    if cancelled { 1 } else { 2 },
++                    "rollback refreshes launchers unless already cancelled"
++                );
++            } else {
++                assert!(!paths.final_dir_for::<Stub>().exists());
++            }
++            assert_clean(&paths);
++        }
++    }
++}
++
++#[cfg(windows)]
++#[test]
++fn windows_reconcile_refreshes_launchers_and_preserves_previous_on_failure_or_cancel() {
++    for cancelled in [false, true] {
++        let fixture = FixtureRoot::new("windows-reconcile");
++        let paths = fixture.paths();
++        run_install(&paths, &FixtureIo::default()).expect("original");
++        fs::rename(
++            paths.final_dir_for::<Stub>(),
++            paths.previous_dir_for::<Stub>(),
++        )
++        .expect("interrupted swap");
++        let io = FixtureIo {
++            fail_rewrite: !cancelled,
++            cancel_rewrite: cancelled,
++            ..Default::default()
++        };
++        install::remove_stale_staging::<Stub>(&paths, &StubPlatform, &io, &AtomicBool::new(false));
++        assert!(
++            paths
++                .previous_dir_for::<Stub>()
++                .join(RECEIPT_FILE)
++                .is_file(),
++            "previous preserved"
++        );
++        assert!(!paths.final_dir_for::<Stub>().exists());
++        let retry = FixtureIo::default();
++        install::remove_stale_staging::<Stub>(
++            &paths,
++            &StubPlatform,
++            &retry,
++            &AtomicBool::new(false),
++        );
++        assert_eq!(*retry.commands.lock().expect("commands"), ["rewrite"]);
++        assert!(install::is_healthy::<Stub>(
++            &paths.final_dir_for::<Stub>(),
++            &StubPlatform
++        ));
++        assert_clean(&paths);
++    }
++}
++
++#[cfg(windows)]
++#[test]
++fn windows_reinstall_discards_broken_recovery_but_cancel_still_aborts() {
++    for cancelled in [false, true] {
++        for fail_probe in [false, true] {
++            let fixture = FixtureRoot::new("windows-reinstall-recovery");
++            let paths = fixture.paths();
++            run_install(&paths, &FixtureIo::default()).expect("original");
++            fs::write(paths.final_dir_for::<Stub>().join("marker"), b"old").expect("marker");
++            fs::rename(
++                paths.final_dir_for::<Stub>(),
++                paths.previous_dir_for::<Stub>(),
++            )
++            .expect("interrupted swap");
++            let io = FixtureIo {
++                fail_rewrite: !cancelled,
++                cancel_rewrite: cancelled,
++                fail_probe,
++                ..Default::default()
++            };
++            let result = run_install(&paths, &io);
++            if cancelled {
++                assert_eq!(
++                    result.expect_err("cancelled").code,
++                    InstallErrorCode::Cancelled
++                );
++                assert!(paths.previous_dir_for::<Stub>().join("marker").is_file());
++                assert!(!paths.final_dir_for::<Stub>().exists());
++                assert!(!paths.partial_dir_for::<Stub>().exists());
++                assert_eq!(io.probes.load(Ordering::SeqCst), 0);
++            } else {
++                if fail_probe {
++                    assert!(result
++                        .expect_err("new probe failed")
++                        .message
++                        .contains("probe refused"));
++                    assert!(
++                        !paths.final_dir_for::<Stub>().exists(),
++                        "broken engine never restored"
++                    );
++                } else {
++                    result.expect("fresh install replaces broken recovery");
++                    assert!(install::is_healthy::<Stub>(
++                        &paths.final_dir_for::<Stub>(),
++                        &StubPlatform
++                    ));
++                    assert!(!paths.final_dir_for::<Stub>().join("marker").exists());
++                }
++                assert_eq!(io.probes.load(Ordering::SeqCst), 1);
++                assert_clean(&paths);
++            }
++        }
++    }
++}
++
+ #[test]
+ fn bad_sha_and_post_swap_probe_failure_preserve_the_previous_install() {
+     let fixture = FixtureRoot::new("rollback");
+@@ -340,7 +752,7 @@ fn stub_disk_and_cancel_refuse_before_staging_and_startup_restores_a_previous_tr
+     )
+     .expect("interrupted swap");
+     fs::create_dir_all(paths.partial_dir_for::<Stub>()).expect("stale stage");
+-    install::remove_stale_staging::<Stub>(&paths, &StubPlatform);
++    install::remove_stale_staging::<Stub>(&paths, &StubPlatform, &io, &AtomicBool::new(false));
+     assert!(install::is_healthy::<Stub>(
+         &paths.final_dir_for::<Stub>(),
+         &StubPlatform
+@@ -619,3 +1031,27 @@ fn version_dispatch_is_schema_neutral_and_rejects_invalid_values() {
+         Err("not a JSON object".into())
+     );
+ }
++
++#[test]
++fn startup_sweep_without_http_client_removes_stale_trees() {
++    let fixture = FixtureRoot::new("offline-sweep");
++    let paths = fixture.paths();
++    fs::create_dir_all(paths.partial_dir_for::<Stub>()).expect("partial");
++    fs::create_dir_all(paths.final_dir_for::<Stub>()).expect("incomplete engine");
++    let io = install::SystemInstallIo::<Stub>::offline(std::sync::Arc::default());
++    let removed =
++        install::remove_stale_staging::<Stub>(&paths, &StubPlatform, &io, &AtomicBool::new(false));
++    assert!(removed.contains(&paths.partial_dir_for::<Stub>()));
++    assert!(removed.contains(&paths.final_dir_for::<Stub>()));
++    assert!(!paths.final_dir_for::<Stub>().exists());
++    assert_clean(&paths);
++}
++
++#[test]
++fn launcher_stderr_tail_is_bounded_and_keeps_the_failure_detail() {
++    let mut output = vec![b'x'; 20_000];
++    output.extend_from_slice(b"\nlauncher refused\n");
++    let tail = install::stderr_tail(output.as_slice());
++    assert!(tail.len() <= 8192);
++    assert!(tail.ends_with("launcher refused"));
++}
+diff --git a/apps/desktop/src-tauri/src/ocsr_engine/install.rs b/apps/desktop/src-tauri/src/ocsr_engine/install.rs
+index 02aadd2ac..5885a1d16 100644
+--- a/apps/desktop/src-tauri/src/ocsr_engine/install.rs
++++ b/apps/desktop/src-tauri/src/ocsr_engine/install.rs
+@@ -306,8 +306,18 @@ pub fn install(
+     )
+ }
+ 
+-pub fn remove_stale_staging(paths: &InstallPaths, platform: &dyn EnginePlatform) -> Vec<PathBuf> {
+-    local_engine::install::remove_stale_staging::<MolScribeSpec>(&paths.shared(), platform)
++pub fn remove_stale_staging(
++    paths: &InstallPaths,
++    platform: &dyn EnginePlatform,
++    io: &dyn InstallIo,
++    cancel: &AtomicBool,
++) -> Vec<PathBuf> {
++    local_engine::install::remove_stale_staging::<MolScribeSpec>(
++        &paths.shared(),
++        platform,
++        io,
++        cancel,
++    )
+ }
+ 
+ pub fn remove_engine_trees(paths: &InstallPaths) -> Result<(), (PathBuf, std::io::Error)> {
+@@ -452,6 +462,8 @@ mod tests {
+                 RunStep::InstallPackages => "packages",
+                 RunStep::InstallMolScribe => "molscribe",
+                 RunStep::VerifyEnvironment => "verify",
++                #[cfg(windows)]
++                RunStep::RewriteVenvLaunchers => "rewrite-venv",
+             };
+             self.runs.lock().expect("runs").push((name, args.to_vec()));
+             if matches!(step, RunStep::CreateVenv) {
+@@ -557,6 +569,8 @@ mod tests {
+                 "packages",
+                 "molscribe",
+                 "model",
++                #[cfg(windows)]
++                "rewrite-venv",
+                 "verify"
+             ]
+         );
+@@ -679,7 +693,12 @@ mod tests {
+         stage(&paths.partial_dir());
+         stage(&paths.previous_dir());
+         assert_eq!(
+-            remove_stale_staging(&paths, &platform),
++            remove_stale_staging(
++                &paths,
++                &platform,
++                &FakeIo::new(None),
++                &AtomicBool::new(false)
++            ),
+             vec![paths.partial_dir()]
+         );
+         assert!(!paths.partial_dir().exists());
+@@ -690,12 +709,23 @@ mod tests {
+         stage(&paths.partial_dir());
+         stage(&paths.previous_dir());
+         assert_eq!(
+-            remove_stale_staging(&paths, &platform),
++            remove_stale_staging(
++                &paths,
++                &platform,
++                &FakeIo::new(None),
++                &AtomicBool::new(false)
++            ),
+             vec![paths.partial_dir(), paths.previous_dir()]
+         );
+         assert_no_staging(&paths);
+         assert!(is_healthy(&paths.final_dir(), &platform));
+-        assert!(remove_stale_staging(&paths, &platform).is_empty());
++        assert!(remove_stale_staging(
++            &paths,
++            &platform,
++            &FakeIo::new(None),
++            &AtomicBool::new(false)
++        )
++        .is_empty());
+         let _ = fs::remove_dir_all(root);
+     }
+ 
+@@ -987,12 +1017,23 @@ mod tests {
+         fs::write(discarded.join("venv").join("lib").join("left"), b"x").expect("discard file");
+ 
+         assert_eq!(
+-            remove_stale_staging(&paths, &platform),
++            remove_stale_staging(
++                &paths,
++                &platform,
++                &FakeIo::new(None),
++                &AtomicBool::new(false)
++            ),
+             vec![discarded.clone()]
+         );
+         assert!(!discarded.exists());
+         assert!(is_healthy(&paths.final_dir(), &platform));
+-        assert!(remove_stale_staging(&paths, &platform).is_empty());
++        assert!(remove_stale_staging(
++            &paths,
++            &platform,
++            &FakeIo::new(None),
++            &AtomicBool::new(false)
++        )
++        .is_empty());
+         let _ = fs::remove_dir_all(root);
+     }
+ 
+@@ -1005,7 +1046,13 @@ mod tests {
+         // A quit between setting the old engine aside and renaming the new one into place.
+         fs::rename(paths.final_dir(), paths.previous_dir()).expect("set aside");
+ 
+-        assert!(remove_stale_staging(&paths, &platform).is_empty());
++        assert!(remove_stale_staging(
++            &paths,
++            &platform,
++            &FakeIo::new(None),
++            &AtomicBool::new(false)
++        )
++        .is_empty());
+         assert!(is_healthy(&paths.final_dir(), &platform));
+         assert_no_staging(&paths);
+         assert_no_discards(&paths);
+@@ -1033,7 +1080,13 @@ mod tests {
+         assert!(verify_layout(&paths.final_dir(), &platform).is_ok());
+         assert!(!is_healthy(&paths.final_dir(), &platform));
+ 
+-        assert!(remove_stale_staging(&paths, &platform).is_empty());
++        assert!(remove_stale_staging(
++            &paths,
++            &platform,
++            &FakeIo::new(None),
++            &AtomicBool::new(false)
++        )
++        .is_empty());
+         assert_eq!(
+             fs::read(paths.final_dir().join("marker")).expect("previous engine restored"),
+             b"old"
+@@ -1053,7 +1106,12 @@ mod tests {
+         fs::remove_file(paths.final_dir().join(RECEIPT_FILE)).expect("unreceipted");
+ 
+         assert_eq!(
+-            remove_stale_staging(&paths, &platform),
++            remove_stale_staging(
++                &paths,
++                &platform,
++                &FakeIo::new(None),
++                &AtomicBool::new(false)
++            ),
+             vec![paths.final_dir()]
+         );
+         assert!(!paths.final_dir().exists());
+diff --git a/apps/desktop/src-tauri/src/ocsr_engine/mod.rs b/apps/desktop/src-tauri/src/ocsr_engine/mod.rs
+index e90fe2d9d..bee5cfd04 100644
+--- a/apps/desktop/src-tauri/src/ocsr_engine/mod.rs
++++ b/apps/desktop/src-tauri/src/ocsr_engine/mod.rs
+@@ -210,6 +210,8 @@ impl OcsrEngineState {
+         };
+         let staging = self.registry.staging.clone();
+         let installing = self.installing.clone();
++        let cancel = self.cancel_install.clone();
++        let running = self.install_child.clone();
+         std::thread::spawn(move || {
+             let _staging = lock_ignoring_poison(&staging);
+             // An install that has started but not yet reached the staging lock is about to
+@@ -217,7 +219,8 @@ impl OcsrEngineState {
+             if installing.load(Ordering::SeqCst) {
+                 return;
+             }
+-            for path in install::remove_stale_staging(&paths, platform.as_ref()) {
++            let io = SystemInstallIo::offline(running);
++            for path in install::remove_stale_staging(&paths, platform.as_ref(), &io, &cancel) {
+                 eprintln!(
+                     "[chemdraft ocsr] removed {} left by an interrupted install",
+                     path.display()
+diff --git a/apps/desktop/src-tauri/src/ocsr_engine/upgrade.rs b/apps/desktop/src-tauri/src/ocsr_engine/upgrade.rs
+index 549c9da89..913fba361 100644
+--- a/apps/desktop/src-tauri/src/ocsr_engine/upgrade.rs
++++ b/apps/desktop/src-tauri/src/ocsr_engine/upgrade.rs
+@@ -19,7 +19,8 @@
+ //! version on the same platform is the same wheel the lock's hashes describe.
+ //!
+ //! A failure is reported to the user as [`ENGINE_NEEDS_UPDATE`], never with the technical detail,
+-//! which goes to the log. Nothing here downloads, and nothing is written except the new receipt.
++//! which goes to the log. Nothing here downloads. On Windows the venv launchers are refreshed before the Python probe;
++//! otherwise nothing is written except the new receipt.
+ 
+ use std::collections::{BTreeMap, HashMap};
+ use std::ffi::OsString;
+@@ -128,7 +129,7 @@ pub fn upgrade_legacy_receipt(
+     Ok(receipt)
+ }
+ 
+-/// The checks alone; reads the engine and runs its uv and Python, and writes nothing.
++/// The checks alone; runs uv and Python. On Windows this also refreshes the venv launchers.
+ pub fn verify_legacy_engine(
+     root: &Path,
+     platform: &dyn EnginePlatform,
+@@ -187,6 +188,11 @@ pub fn verify_legacy_engine(
+         )));
+     }
+ 
++    crate::local_engine::install::rewrite_venv_launchers::<super::install::MolScribeSpec>(
++        root, platform, io, cancel,
++    )
++    .map_err(|error| UpgradeError::from_probe("the venv launcher rewrite failed", error))?;
++
+     // `-I` ignores the user's site and PYTHON* variables; `-B` writes no bytecode into the venv.
+     let probe = io
+         .output(
+@@ -734,6 +740,10 @@ pub(crate) mod tests {
+         pub uv_output: String,
+         pub python_output: Result<String, InstallErrorCode>,
+         pub calls: Mutex<Vec<String>>,
++        #[cfg(windows)]
++        pub rewrites: std::sync::atomic::AtomicUsize,
++        #[cfg(windows)]
++        launcher_error: Option<InstallErrorCode>,
+     }
+ 
+     impl FakeProbe {
+@@ -745,6 +755,10 @@ pub(crate) mod tests {
+                     serde_json::to_string(&mac_arm64_environment()).expect("env json")
+                 )),
+                 calls: Mutex::new(Vec::new()),
++                #[cfg(windows)]
++                rewrites: std::sync::atomic::AtomicUsize::new(0),
++                #[cfg(windows)]
++                launcher_error: None,
+             }
+         }
+ 
+@@ -753,6 +767,77 @@ pub(crate) mod tests {
+         }
+     }
+ 
++    impl super::super::install::InstallIo for FakeProbe {
++        fn download(
++            &self,
++            _spec: crate::local_engine::install::Download<'_>,
++            _destination: &Path,
++            _cancel: &AtomicBool,
++            _progress: &dyn crate::local_engine::install::ProgressReporter,
++        ) -> Result<(), InstallError> {
++            panic!("an upgrade must never download")
++        }
++
++        fn extract_uv(
++            &self,
++            _platform: &dyn EnginePlatform,
++            _archive: &Path,
++            _destination: &Path,
++        ) -> Result<(), InstallError> {
++            panic!("an upgrade must never extract uv")
++        }
++
++        fn run(
++            &self,
++            platform: &dyn EnginePlatform,
++            _step: crate::local_engine::install::RunStep,
++            program: &Path,
++            args: &[OsString],
++            env: &[(OsString, OsString)],
++            cancel: &AtomicBool,
++            watch: Option<crate::local_engine::install::RunWatch<'_>>,
++        ) -> Result<(), InstallError> {
++            let root = program.parent().expect("uv parent");
++            assert_eq!(program, platform.uv_executable(root));
++            assert_eq!(args[0], "venv");
++            assert_eq!(args[1], root.join("venv").into_os_string());
++            assert!(args.contains(&OsString::from("--allow-existing")));
++            assert!(args.contains(&OsString::from("--offline")));
++            assert!(env.contains(&(OsString::from("UV_NO_CONFIG"), OsString::from("1"))));
++            assert!(!cancel.load(Ordering::SeqCst));
++            assert!(watch.is_none());
++            #[cfg(windows)]
++            {
++                assert_eq!(
++                    self.call_count(),
++                    1,
++                    "uv checked before rewriting, Python after"
++                );
++                assert_eq!(
++                    args[5],
++                    root.join("python")
++                        .join(format!(
++                            "cpython-{}-windows-x86_64-none",
++                            pins::PYTHON_VERSION
++                        ))
++                        .join("python.exe")
++                        .into_os_string()
++                );
++                self.rewrites.fetch_add(1, Ordering::SeqCst);
++                if let Some(code) = self.launcher_error {
++                    if code == InstallErrorCode::Cancelled {
++                        cancel.store(true, Ordering::SeqCst);
++                    }
++                    return Err(InstallError {
++                        code,
++                        message: "fake launcher rewrite failure".into(),
++                    });
++                }
++            }
++            Ok(())
++        }
++    }
++
+     impl ProbeIo for FakeProbe {
+         fn output(
+             &self,
+@@ -771,6 +856,12 @@ pub(crate) mod tests {
+                 assert_eq!(args, [OsString::from("--version")]);
+                 return Ok(self.uv_output.clone());
+             }
++            #[cfg(windows)]
++            assert_eq!(
++                self.rewrites.load(Ordering::SeqCst),
++                1,
++                "rewrite precedes Python probe"
++            );
+             assert!(args.contains(&OsString::from("-I")) && args.contains(&OsString::from("-B")));
+             self.python_output.clone().map_err(|code| InstallError {
+                 code,
+@@ -937,6 +1028,36 @@ pub(crate) mod tests {
+         let _ = fs::remove_dir_all(root);
+     }
+ 
++    #[cfg(windows)]
++    #[test]
++    fn windows_upgrade_rewrite_failure_and_cancel_leave_the_receipt_and_skip_python() {
++        for cancelled in [false, true] {
++            let root = temp_root("windows-launcher");
++            let engine = fake_legacy_engine(&root);
++            let mut probe = FakeProbe::matching();
++            probe.launcher_error = Some(if cancelled {
++                InstallErrorCode::Cancelled
++            } else {
++                InstallErrorCode::Failed
++            });
++            let result = upgrade(&engine, &probe);
++            if cancelled {
++                assert_eq!(result, Err(UpgradeError::Cancelled));
++            } else {
++                assert!(
++                    matches!(result, Err(UpgradeError::Mismatch(detail)) if detail.contains("venv launcher rewrite"))
++                );
++            }
++            assert_eq!(probe.call_count(), 1, "only uv --version, no Python");
++            assert_eq!(probe.rewrites.load(Ordering::SeqCst), 1);
++            assert_eq!(
++                fs::read_to_string(engine.join(RECEIPT_FILE)).expect("receipt"),
++                OWNER_LEGACY_RECEIPT
++            );
++            let _ = fs::remove_dir_all(root);
++        }
++    }
++
+     fn assert_refused(engine: &Path, probe: &FakeProbe, expected: &str) {
+         match upgrade(engine, probe) {
+             Err(UpgradeError::Mismatch(detail)) => {
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index 2d5c8b0c6..9ddcbba6b 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -1602,7 +1602,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "10.21.14.15-opus";
++const CURRENT_BUILD_STAMP = "10.21.14.43-codex";
+ /** Whether this page load already asked the native side for a crash note from the last run. */
+ let pendingCrashNoteChecked = false;
+ const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
+diff --git a/docs/architecture/ocsr-engine.md b/docs/architecture/ocsr-engine.md
+index cebb3168a..918f774a7 100644
+--- a/docs/architecture/ocsr-engine.md
++++ b/docs/architecture/ocsr-engine.md
+@@ -120,17 +120,19 @@ waits for the sweep: all three take one staging lock before touching these direc
+    staging tree is renamed to `ocsr-engine/`. uv writes the interpreter's location as an absolute path
+    — the venv's `python` link, `pyvenv.cfg`'s `home`, and the managed Python's minor-version link —
+    so those paths still point into the staging directory, which no longer exists. The installer
+-   rewrites every symlink under the tree whose target lies in the staging prefix, and the `home` line,
+-   onto the final prefix (both the path as given and its canonical spelling).
++   rewrites symlinks and directory junctions under the tree whose target lies in the staging prefix, and the `home` line,
++   onto the final prefix (both the path as given and its canonical spelling). On Windows it then
++   re-runs the installed uv's `venv --allow-existing` against the final tree to regenerate the
++   absolute interpreter paths embedded in `python.exe` and `pythonw.exe` (see Adding Windows).
+ 9. **Prove it.** `python -c "import cv2, molscribe, numpy, torch, torchvision"` runs from the final
+    location. This is the only check that the relocation worked, so it runs after the swap, not before.
+-   If it fails or is cancelled, the new tree is deleted and `ocsr-engine.previous/` is renamed back —
++   If the launcher rewrite or probe fails or is cancelled, the new tree is deleted and `ocsr-engine.previous/` is renamed back —
+    a failed reinstall never costs the user a working engine. On success the previous tree is removed.
+ 
+ Every child process runs with inherited `UV_*`, `PIP_*`, `PYTHON*`, `VIRTUAL_ENV*` and `CONDA*`
+ variables removed and `UV_NO_CONFIG=1`, so ambient configuration cannot redirect the reviewed install
+ to another index, mirror or interpreter. uv's cache, temporary, state and executable-link directories
+-are all redirected into the staging tree. Cancellation is a flag checked between download chunks and
++are all redirected into the staging tree, or the final tree during a Windows launcher refresh. Cancellation is a flag checked between download chunks and
+ every 50 ms while a uv child runs, which is then killed **with everything it started**: each child
+ runs in its own process group on Unix, and the whole group gets SIGKILL (on Windows, `taskkill /T /F`
+ with `CREATE_NEW_PROCESS_GROUP`; unverified, see Adding Windows). Killing uv alone would leave the
+@@ -179,15 +181,16 @@ costs every existing user a 2.4 GB re-download. Instead, the first status call t
+ on its own thread and reports `installing` with phase `verifying` ("Checking the installation") while
+ it runs; the check never runs on the main thread (a synchronous Tauri command does) and never runs
+ twice. It takes the install's `installing` flag and staging lock, so a real install waits, uninstall
+-cancels it, and the startup sweep leaves the tree alone. Nothing is downloaded, and nothing is written
+-except the new receipt. In order, cheapest first (`upgrade.rs`):
++cancels it, and the startup sweep leaves the tree alone. Nothing is downloaded; Windows refreshes
++the venv launchers, and the only other write is the new receipt. In order, cheapest first (`upgrade.rs`):
+ 
+ 1. The old receipt's uv, Python, MolScribe and model pins equal the current ones.
+ 2. The bundled requirements file is the reviewed lock (`REQUIREMENTS_LOCK_SHA256`).
+ 3. The installed `uv --version` is the pinned version.
+-4. `venv/bin/python -I -B -c …` imports `cv2, molscribe, numpy, torch, torchvision` (as the post-install
+-   check does), then prints its PEP 508 marker environment; its Python must be the pinned minor
+-   version. `-B` keeps it from writing bytecode into the engine.
++4. Windows first refreshes the venv launchers using the final managed Python path (see Adding
++   Windows). The platform's venv Python then runs `-I -B -c …` and imports `cv2, molscribe, numpy,
++   torch, torchvision` (as the post-install check does), then prints its PEP 508 marker environment;
++   its Python must be the pinned minor version. `-B` keeps it from writing bytecode into the engine.
+ 5. The venv's packages, read from each `*.dist-info/METADATA`, equal the lock by `name==version`
+    exactly: every lock entry whose marker holds for that environment is installed at its version, and
+    nothing else is installed except MolScribe. A marker, variable or requirement form the evaluator
+@@ -527,7 +530,7 @@ indicator's own subscription (`subscribeActivity`), so a reading never re-render
+ 
+ `EnginePlatform` (`src/local_engine/platform.rs`) owns everything that differs by OS: the uv asset and checksum, the uv
+ and venv interpreter paths, and child-process flags. `platform::current()` picks one with `#[cfg]`;
+-nothing else in the installer or process manager branches on the OS. Free-disk queries and
++the installer's junction relocation and venv launcher refresh are the other OS-specific steps. Free-disk queries and
+ `kill_process_tree` are the other per-OS functions (`statvfs` and `killpg` on Unix,
+ `GetDiskFreeSpaceExW` and `taskkill /T /F` on Windows).
+ 
+@@ -535,26 +538,64 @@ nothing else in the installer or process manager branches on the OS. Free-disk q
+ | --- | --- | --- | --- | --- |
+ | macOS arm64 | `uv-aarch64-apple-darwin.tar.gz` | `venv/bin/python` | own process group | implemented |
+ | macOS x86_64 | `uv-x86_64-apple-darwin.tar.gz` | `venv/bin/python` | own process group | seam implemented, disabled: `unsupported` status ("The recognition engine needs a Mac with Apple silicon."), install fails with `unsupported` before anything downloads — the hash-locked pins have no torch wheel for this target (see above) |
+-| Windows x86_64 | `uv-x86_64-pc-windows-msvc.zip` | `venv/Scripts/python.exe` | `CREATE_NO_WINDOW \| CREATE_NEW_PROCESS_GROUP`; tree kill by `taskkill /T /F` | implemented, never run |
++| Windows x86_64 | `uv-x86_64-pc-windows-msvc.zip` | `venv/Scripts/python.exe` | `CREATE_NO_WINDOW \| CREATE_NEW_PROCESS_GROUP`; tree kill by `taskkill /T /F` | junction relocation and final-tree launcher refresh implemented; automated Windows validation pending |
+ | anything else | — | — | — | `unsupported` status; install fails with `unsupported` before creating anything |
+ 
+ ## Adding Windows
+ 
+-The Windows implementation compiles in the seam but has never been built or run on Windows, and CI
+-runs Rust checks only on macOS. Before calling it release-ready:
++A Windows install exposed two independent relocation problems. uv creates a directory junction for
++the managed Python's minor version; replacing it with a symlink failed with error 1314 for an ordinary
++user. Relocation preserves the junction through `FSCTL_SET_REPARSE_POINT`, using the existing
++`windows-sys` dependency, and rebases its absolute target. Real symlinks retain their type; recreating
++a junction needs neither Developer Mode nor elevation.
++
++uv also writes `venv/Scripts/python.exe` and `pythonw.exe` as trampolines with the **absolute** base
++interpreter path embedded near the end. `--relocatable` does not make that path relative, and the
++trampolines ignore `pyvenv.cfg`. After a staging rename, their embedded `.partial` path is missing:
++the post-swap check fails with "uv trampoline failed to spawn Python child process" and
++"entity not found (os error 2)". Rebasing junctions and rewriting `pyvenv.cfg` cannot fix this.
++
++After relocation and before probing, the shared commit now runs this local command (paths shown
++schematically; the Python minor comes from `EngineSpec`, 3.10 for MolScribe and 3.12 for naming):
++
++```text
++<final>/uv.exe venv <final>/venv --allow-existing --offline --python <final>/python/cpython-<minor>-windows-x86_64-none/python.exe --python-preference only-managed --relocatable
++```
++
++The platform supplies the installed uv path. `UV_PYTHON_INSTALL_DIR`, `UV_PYTHON_BIN_DIR`,
++`UV_STATE_DIR`, `UV_CACHE_DIR` and the temporary directories point into the final tree, and
++`UV_NO_CONFIG=1`; inherited uv/pip/Python environment overrides are scrubbed exactly as for other
++uv runs. The rewrite removes `download-cache/` afterwards, as well as any temporary directory
++it created. This regenerates both launchers without changing site-packages or downloading anything.
++The harmless staging reference in distribution `direct_url.json` metadata is left alone.
++The tester verified the command by hand on a real Windows machine: about one second, and the
++post-swap probe then passed. This change's Windows stub tests have not been run on the macOS host.
++
++The command uses the same `RunningChild`, cancellation, process-tree kill and `CREATE_NO_WINDOW`
++handling as all other uv runs. Failure or cancellation rolls the swap back just like a failed probe.
++Restoring `previous` during rollback or interrupted-install reconciliation refreshes the launchers
++again at the final path; a failed startup reconciliation retains the previous tree for a later retry.
++The startup sweep uses local process IO without constructing an HTTP client. During reinstall,
++a non-cancelled recovery failure is logged with its stderr tail and the unusable old trees are
++discarded so the fresh install can proceed. If that new install fails, no broken rollback is restored.
++Cancellation still aborts reinstall and preserves the previous tree.
++Rollback always renames the old engine back. If already cancelled, it skips the refresh because the
++old launchers already name the final path; no new child starts after cancellation or app exit.
++The legacy-receipt check also refreshes Windows launchers before its Python probe. Unix does nothing
++extra: symlink relocation already repairs its venv interpreter.
++
++Before calling it release-ready:
+ 
+ - Build and run `cargo clippy --all-targets -- -D warnings` and `cargo test` on Windows.
+ - Run a real clean install and uninstall, including cancellation during each external step, and quit
+   the app mid-install: no `uv.exe` or `python.exe` may survive. `taskkill /T` cannot reach a
+   descendant whose parent has already exited; a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+   would, and would also cover ChemDraft crashing, so it is the stronger fix once this can be tested.
+-- **Relocation is the open question.** On Windows, uv links the managed Python's minor-version
+-  directory with a junction, and the venv's `python.exe` is a launcher that reads `pyvenv.cfg`. The
+-  `pyvenv.cfg` rewrite should be enough for the venv, but `std` cannot create junctions, and recreating
+-  a link with `symlink_dir` needs Developer Mode or elevation, so a junction pointing into the staging
+-  directory may fail to relocate. If it does, the post-swap import check fails and the install rolls
+-  back cleanly rather than leaving a broken engine. The likely fixes are to create the junction through
+-  the Win32 API, or to install with `UV_PYTHON_INSTALL_DIR` outside the renamed tree.
++- Run the junction relocation regression test as an ordinary user with Developer Mode disabled,
++  then complete a clean engine install. Confirm the junction targets the final directory, both venv
++  launchers embed the final managed interpreter path, and the post-swap import check and real
++  recognition succeed. Exercise reinstall rollback and interrupted-swap recovery too. Failure must
++  still roll back cleanly rather than leave a broken engine.
+ - Check torch wheel resolution for Python 3.10 on Windows, and paths with spaces and non-ASCII
+   characters (the sidecar's image path must be valid Unicode).
+ - A new architecture (e.g. Windows arm64) needs an upstream uv asset and a reviewed checksum in

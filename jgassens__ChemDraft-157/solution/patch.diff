@@ -1,0 +1,581 @@
+diff --git a/apps/desktop/src-tauri/src/installed_plugins.rs b/apps/desktop/src-tauri/src/installed_plugins.rs
+index 26a731ae5..cc461a7a1 100644
+--- a/apps/desktop/src-tauri/src/installed_plugins.rs
++++ b/apps/desktop/src-tauri/src/installed_plugins.rs
+@@ -92,7 +92,8 @@ pub fn handle_tauri_request<R: Runtime>(
+ 
+     match percent_decode(path).strip_prefix(INSTALLED_PLUGINS_URL_PREFIX) {
+         Some(relative) => {
+-            let response = serve_installed_plugin_asset(app, relative);
++            let bootstrap = should_bootstrap_plugin_worker(request.uri(), cfg!(windows));
++            let response = serve_installed_plugin_asset(app, relative, bootstrap);
+             // Log every staged-plugin fetch. This is not decoration: a plugin can silently fall back to
+             // an in-thread path when a nested worker fails to load, so the *fetch log is the only thing*
+             // that distinguishes a package genuinely running from its staged location from one whose
+@@ -145,6 +146,7 @@ fn serve_app_asset<R: Runtime>(app: &AppHandle<R>, path: &str) -> Response<Cow<'
+ fn serve_installed_plugin_asset<R: Runtime>(
+     app: &AppHandle<R>,
+     relative: &str,
++    bootstrap: bool,
+ ) -> Response<Cow<'static, [u8]>> {
+     let Some(root) = installed_plugins_root(app) else {
+         return internal_error("no app data directory is available for staged plugins");
+@@ -161,6 +163,17 @@ fn serve_installed_plugin_asset<R: Runtime>(
+     match std::fs::read(&candidate) {
+         Ok(bytes) => {
+             let mime_type = MimeType::parse(&bytes, relative);
++            // Keep startup on the installed asset response's restrictive CSP. A page-created blob
++            // bootstrap would inherit the page CSP instead and grant plugins ambient networking.
++            let bytes = if bootstrap
++                && matches!(
++                    mime_type.as_str(),
++                    "text/javascript" | "application/javascript"
++                ) {
++                installed_plugin_bootstrap().into_bytes()
++            } else {
++                bytes
++            };
+             Response::builder()
+                 .status(StatusCode::OK)
+                 .header(CONTENT_TYPE, mime_type)
+@@ -178,6 +191,28 @@ fn serve_installed_plugin_asset<R: Runtime>(
+     }
+ }
+ 
++fn should_bootstrap_plugin_worker(uri: &tauri::http::Uri, windows: bool) -> bool {
++    windows
++        && uri.query().is_some_and(|query| {
++            query
++                .split('&')
++                .any(|part| part == "__chemdraft_worker_bootstrap=windows")
++        })
++}
++
++fn installed_plugin_bootstrap() -> String {
++    // Static plugin imports would run before our prelude; dynamic import guarantees installation
++    // before even the plugin's transitive dependencies execute. The original URL owns import.meta.url.
++    concat!(
++        include_str!("../../src/plugins/workers/nestedModuleWorkerShim.js"),
++        "\ninstallNestedModuleWorkerShim('windows');\n",
++        "const entry = new URL(globalThis.location.href);\n",
++        "entry.searchParams.delete('__chemdraft_worker_bootstrap');\n",
++        "await import(entry.href);\n"
++    )
++    .to_string()
++}
++
+ /// Reject anything that is not a plain, relative, non-empty path: absolute paths, `..`, drive
+ /// prefixes, and embedded NULs all fail closed rather than being normalized into something plausible.
+ fn safe_relative_path(relative: &str) -> Option<PathBuf> {
+@@ -274,6 +309,29 @@ fn internal_error(message: &str) -> Response<Cow<'static, [u8]>> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn plugin_bootstrap_is_explicit_and_windows_only() {
++        let uri = "http://tauri.localhost/installed-plugins/p/entry.js?v=1&__chemdraft_worker_bootstrap=windows"
++            .parse()
++            .expect("uri");
++        assert!(should_bootstrap_plugin_worker(&uri, true));
++        assert!(!should_bootstrap_plugin_worker(&uri, false));
++        for query in ["", "?v=1", "?__chemdraft_worker_bootstrap=macos"] {
++            let uri = format!("http://tauri.localhost/installed-plugins/p/entry.js{query}")
++                .parse()
++                .expect("uri");
++            assert!(!should_bootstrap_plugin_worker(&uri, true));
++        }
++        let source = installed_plugin_bootstrap();
++        assert!(
++            source
++                .find("installNestedModuleWorkerShim('windows');")
++                .unwrap()
++                < source.find("await import(entry.href);").unwrap()
++        );
++        assert!(source.contains("entry.searchParams.delete('__chemdraft_worker_bootstrap')"));
++    }
++
+     #[test]
+     fn request_path_is_origin_independent() {
+         for uri in [
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index 26ba97456..dd3d83d18 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -1593,7 +1593,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "10.20.09.02-opus";
++const CURRENT_BUILD_STAMP = "10.20.09.20-opus";
+ /** Whether this page load already asked the native side for a crash note from the last run. */
+ let pendingCrashNoteChecked = false;
+ const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
+diff --git a/apps/desktop/src/plugins/installedPluginAssetPath.ts b/apps/desktop/src/plugins/installedPluginAssetPath.ts
+index 8c9d29388..9e707572b 100644
+--- a/apps/desktop/src/plugins/installedPluginAssetPath.ts
++++ b/apps/desktop/src/plugins/installedPluginAssetPath.ts
+@@ -2,10 +2,10 @@
+  * The staged-plugin asset contract shared by the two servers that implement it.
+  *
+  * Installed plugin assets are served by `installed_plugins.rs` in the shipped app and by a Vite dev
+- * middleware under `./run-app --dev`. Both must refuse exactly the same paths and send exactly the
+- * same worker CSP: a dev-only gap would mean traversal is testable in one build and not the other,
+- * and a CSP drift would silently hand development workers ambient network access the packaged app
+- * denies. The decision lives here, as pure data, so both callers share it and a test can pin it.
++ * middleware under `./run-app --dev`. Both share the path-refusal rules and worker CSP, which live
++ * here as pure data and are covered by tests. The packaged Rust handler additionally substitutes a
++ * Windows worker bootstrap for the matching query; Vite dev serves the requested asset directly
++ * because its origin does not need the WebView2 workaround.
+  *
+  * This is the *second* line of defense. The archive reader (`pluginPackageArchive.ts`) already
+  * refuses unsafe entry paths at install time; this refuses them again at serve time, because the
+diff --git a/apps/desktop/src/plugins/loadPackagedPlugin.ts b/apps/desktop/src/plugins/loadPackagedPlugin.ts
+index 0cf976f30..a0ce81227 100644
+--- a/apps/desktop/src/plugins/loadPackagedPlugin.ts
++++ b/apps/desktop/src/plugins/loadPackagedPlugin.ts
+@@ -36,6 +36,7 @@ import {
+ } from "@chemdraft/plugin-api";
+ 
+ import { PluginWorkerBridge } from "./PluginWorkerBridge";
++import { pluginWorkerBootstrapUrl } from "./pluginWorkerBootstrap";
+ import { createWorkerRoutedOptions, type BundledPluginDescriptor } from "./registerBundledPlugins";
+ 
+ export interface PackagedPluginLocation {
+@@ -117,7 +118,7 @@ function defaultWorkerFactory(entryUrl: URL): PluginWorkerHandle {
+         "drive an equivalent worker handle."
+     );
+   }
+-  return new Worker(entryUrl, { type: "module" }) as unknown as PluginWorkerHandle;
++  return new Worker(pluginWorkerBootstrapUrl(entryUrl), { type: "module" }) as unknown as PluginWorkerHandle;
+ }
+ 
+ /**
+diff --git a/apps/desktop/src/plugins/nestedModuleWorkerShim.test.ts b/apps/desktop/src/plugins/nestedModuleWorkerShim.test.ts
+new file mode 100644
+index 000000000..182288faa
+--- /dev/null
++++ b/apps/desktop/src/plugins/nestedModuleWorkerShim.test.ts
+@@ -0,0 +1,178 @@
++import { readFileSync } from "node:fs";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { pluginWorkerBootstrapUrl } from "./pluginWorkerBootstrap";
++import { defaultPluginWorkerFactories } from "./registerBundledPlugins";
++import { installNestedModuleWorkerShim } from "./workers/nestedModuleWorkerShim.js";
++
++const entry = "http://tauri.localhost/installed-plugins/org.test/entry.js";
++
++function harness(href = entry) {
++  const blobs: Blob[] = [];
++  const revokeObjectURL = vi.fn();
++  class NativeWorker extends EventTarget {
++    onmessage = null;
++    onerror = null;
++    postMessage() {}
++    terminate() {}
++    constructor(readonly url: string | URL, readonly options?: WorkerOptions) {
++      super();
++      if (options?.name === "throw") throw new Error("constructor refused");
++    }
++  }
++  const scope = {
++    location: { href } as Location,
++    Worker: NativeWorker as unknown as typeof Worker,
++    Blob,
++    URL: Object.assign(class extends URL {}, {
++      createObjectURL: vi.fn((blob: Blob) => {
++        blobs.push(blob);
++        return "blob:http://tauri.localhost/wrapper";
++      }),
++      revokeObjectURL
++    })
++  };
++  return { scope, NativeWorker, blobs, revokeObjectURL };
++}
++
++afterEach(() => vi.unstubAllGlobals());
++
++describe("Windows nested module workers", () => {
++  it.each(["macos", "linux", "web"] as const)("leaves %s constructors unchanged", (platform) => {
++    const { scope, NativeWorker } = harness();
++    installNestedModuleWorkerShim(platform, scope);
++    expect(scope.Worker).toBe(NativeWorker);
++  });
++
++  it.each(["tauri://localhost/entry.js", "http://localhost:5173/entry.js", "https://example.org/entry.js"])(
++    "leaves the web build and other origins unchanged: %s", (href) => {
++      const { scope, NativeWorker } = harness(href);
++      installNestedModuleWorkerShim("windows", scope);
++      expect(scope.Worker).toBe(NativeWorker);
++    }
++  );
++
++  it("defaults to platform detection inside a worker", () => {
++    vi.stubGlobal("navigator", { platform: "Win32" });
++    const { scope, NativeWorker } = harness();
++    installNestedModuleWorkerShim(undefined, scope);
++    expect(scope.Worker).not.toBe(NativeWorker);
++  });
++
++  it.each([
++    ["./classic.js", undefined],
++    ["./classic.js", { type: "classic" }],
++    ["https://external.example/worker.js", { type: "module" }],
++    ["http://tauri.localhost:123/worker.js", { type: "module" }],
++    ["data:text/javascript,postMessage(1)", { type: "module" }],
++    ["blob:http://tauri.localhost/other", { type: "module" }],
++    ["http://user:secret@tauri.localhost/worker.js", { type: "module" }],
++    ["http://[invalid", { type: "module" }]
++  ] as const)("passes unsupported URL/options directly to native: %s %j", (url, options) => {
++    const { scope, blobs } = harness();
++    installNestedModuleWorkerShim("windows", scope);
++    const worker = new scope.Worker(url, options) as unknown as { url: string; options: WorkerOptions };
++    expect(worker.url).toBe(url);
++    expect(worker.options).toBe(options);
++    expect(blobs).toHaveLength(0);
++  });
++
++  it.each(["assets/nmrWorker.js", new URL("assets/nmrWorker.js", entry)])(
++    "imports the absolute module URL and preserves native identity, events, methods and options: %s", async (url) => {
++      const { scope, NativeWorker, blobs, revokeObjectURL } = harness();
++      installNestedModuleWorkerShim("windows", scope);
++      const options: WorkerOptions = { type: "module", name: "nmr", credentials: "include" };
++      const worker = new scope.Worker(url, options) as unknown as InstanceType<typeof NativeWorker>;
++      expect(worker).toBeInstanceOf(NativeWorker);
++      expect(worker).toBeInstanceOf(scope.Worker);
++      expect(worker.options).toBe(options);
++      expect(worker.postMessage).toBe(NativeWorker.prototype.postMessage);
++      expect(worker.terminate).toBe(NativeWorker.prototype.terminate);
++      const onmessage = vi.fn();
++      worker.addEventListener("message", onmessage);
++      worker.dispatchEvent(new MessageEvent("message", { data: "prediction" }));
++      expect(onmessage).toHaveBeenCalledOnce();
++      expect(worker.url).toBe("blob:http://tauri.localhost/wrapper");
++      expect(blobs[0]?.type).toBe("text/javascript");
++      expect(await blobs[0]!.text()).toBe(
++        'import "http://tauri.localhost/installed-plugins/org.test/assets/nmrWorker.js"; URL.revokeObjectURL(import.meta.url);'
++      );
++      expect(revokeObjectURL).not.toHaveBeenCalled();
++      worker.dispatchEvent(new Event("error"));
++      expect(revokeObjectURL).toHaveBeenCalledWith(worker.url);
++    }
++  );
++
++  it("escapes module specifiers as data and releases blobs on synchronous failure", async () => {
++    const { scope, blobs, revokeObjectURL } = harness();
++    installNestedModuleWorkerShim("windows", scope);
++    expect(() => new scope.Worker("./worker.js", { type: "module", name: "throw" })).toThrow("constructor refused");
++    expect(revokeObjectURL).toHaveBeenCalledWith("blob:http://tauri.localhost/wrapper");
++    new scope.Worker('./worker.js?x=";evil()', { type: "module" });
++    expect(await blobs[1]!.text()).toContain(JSON.stringify(new URL('./worker.js?x=";evil()', entry).href));
++  });
++});
++
++describe("plugin worker bootstrap", () => {
++  it.each([
++    ["windows", "http://tauri.localhost", "windowsMassFragmentPluginWorker.ts"],
++    ["macos", "tauri://localhost", "/massFragmentPluginWorker.ts"],
++    ["macos", "http://tauri.localhost", "/massFragmentPluginWorker.ts"],
++    ["windows", "http://localhost:5173", "/massFragmentPluginWorker.ts"]
++  ] as const)("selects the bundled entry for %s on %s", (platform, origin, suffix) => {
++    const { scope } = harness();
++    vi.stubGlobal("Worker", scope.Worker);
++    vi.stubGlobal("location", { origin });
++    const factory = defaultPluginWorkerFactories(platform).values().next().value!;
++    const worker = factory() as unknown as { url: URL; options: WorkerOptions };
++    expect(worker.url.pathname.endsWith(suffix)).toBe(true);
++    expect(worker.options).toEqual({ type: "module" });
++  });
++
++  it("selects only Windows custom-origin entries and preserves original query parameters", () => {
++    const url = new URL(`${entry}?version=2`);
++    expect(pluginWorkerBootstrapUrl(url, "windows").href).toBe(`${url.href}&__chemdraft_worker_bootstrap=windows`);
++    expect(url.search).toBe("?version=2");
++    expect(pluginWorkerBootstrapUrl(url, "macos")).toBe(url);
++    for (const href of ["tauri://localhost/plugin.js", "http://localhost:5173/plugin.js"]) {
++      const other = new URL(href);
++      expect(pluginWorkerBootstrapUrl(other, "windows")).toBe(other);
++    }
++  });
++
++  it("installs before importing plugin code in both native and bundled bootstraps", () => {
++    const rust = readFileSync(new URL("../../src-tauri/src/installed_plugins.rs", import.meta.url), "utf8");
++    const bootstrap = rust.slice(rust.indexOf("fn installed_plugin_bootstrap()"));
++    expect(bootstrap).toContain("installNestedModuleWorkerShim('windows')");
++    expect(bootstrap).toContain("await import(entry.href)");
++    expect(bootstrap.indexOf("installNestedModuleWorkerShim('windows')")).toBeLessThan(bootstrap.indexOf("await import(entry.href)"));
++    expect(bootstrap).toContain('include_str!("../../src/plugins/workers/nestedModuleWorkerShim.js")');
++    expect(bootstrap).toContain("entry.searchParams.delete('__chemdraft_worker_bootstrap')");
++    const bundled = readFileSync(new URL("./workers/windowsMassFragmentPluginWorker.ts", import.meta.url), "utf8");
++    expect(bundled).toContain('installNestedModuleWorkerShim("windows");');
++    expect(bundled).toContain('await import("./massFragmentPluginWorker")');
++    expect(bundled.indexOf('installNestedModuleWorkerShim("windows");')).toBeLessThan(bundled.indexOf('await import("./massFragmentPluginWorker")'));
++  });
++
++  it("wraps a worker created during bundled plugin module evaluation", async () => {
++    const { scope, NativeWorker, blobs } = harness();
++    vi.stubGlobal("navigator", { platform: "Win32" });
++    vi.stubGlobal("location", scope.location);
++    vi.stubGlobal("Worker", scope.Worker);
++    vi.stubGlobal("URL", scope.URL);
++    const runPluginWorker = vi.fn();
++    vi.doMock("@chemdraft/plugin-api", () => ({ runPluginWorker }));
++    vi.doMock("@chemdraft/plugin-mass-fragment", () => {
++      const nested = new Worker(new URL("./assets/nmrWorker.js", entry), { type: "module" });
++      expect(nested).toBeInstanceOf(NativeWorker);
++      expect(blobs).toHaveLength(1);
++      return { massFragmentManifest: {}, createMassRegistration: () => ({ commandHandlers: {} }) };
++    });
++    try {
++      await import("./workers/windowsMassFragmentPluginWorker");
++      expect(runPluginWorker).toHaveBeenCalledOnce();
++    } finally {
++      vi.doUnmock("@chemdraft/plugin-api");
++      vi.doUnmock("@chemdraft/plugin-mass-fragment");
++    }
++  });
++});
+diff --git a/apps/desktop/src/plugins/pluginWorkerBootstrap.ts b/apps/desktop/src/plugins/pluginWorkerBootstrap.ts
+new file mode 100644
+index 000000000..28f6af413
+--- /dev/null
++++ b/apps/desktop/src/plugins/pluginWorkerBootstrap.ts
+@@ -0,0 +1,15 @@
++import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
++import { detectDesktopShortcutPlatform } from "../keyboardShortcuts";
++
++/** Native Windows serves this request with the installed-plugin CSP, never the page's CSP. */
++export const PLUGIN_WORKER_BOOTSTRAP_QUERY = "__chemdraft_worker_bootstrap";
++
++export function pluginWorkerBootstrapUrl(
++  entry: URL,
++  platform: ShortcutPlatform = detectDesktopShortcutPlatform()
++): URL {
++  if (platform !== "windows" || entry.origin !== "http://tauri.localhost") return entry;
++  const bootstrap = new URL(entry.href);
++  bootstrap.searchParams.set(PLUGIN_WORKER_BOOTSTRAP_QUERY, "windows");
++  return bootstrap;
++}
+diff --git a/apps/desktop/src/plugins/registerBundledPlugins.ts b/apps/desktop/src/plugins/registerBundledPlugins.ts
+index d374eea3c..7fcf89e1c 100644
+--- a/apps/desktop/src/plugins/registerBundledPlugins.ts
++++ b/apps/desktop/src/plugins/registerBundledPlugins.ts
+@@ -6,7 +6,9 @@ import {
+   type PluginWorkerHandle
+ } from "@chemdraft/plugin-api";
+ import type { RegisterPluginOptions } from "@chemdraft/plugin-host";
++import type { ShortcutPlatform } from "@chemdraft/shortcut-engine";
+ 
++import { detectDesktopShortcutPlatform } from "../keyboardShortcuts";
+ import type { DesktopPluginRuntime } from "./createPluginRuntime";
+ import { PluginWorkerBridge } from "./PluginWorkerBridge";
+ import { loadDisabledPluginIds } from "./pluginPreferences";
+@@ -36,11 +38,21 @@ export interface BundledPluginRuntimeOptions {
+ 
+ /** The desktop's real module-worker factories for the worker-isolated bundled plugins. Empty where
+  *  `Worker` is unavailable, so tests and unrelated environments transparently take the in-process path. */
+-export function defaultPluginWorkerFactories(): ReadonlyMap<string, PluginWorkerFactory> {
++export function defaultPluginWorkerFactories(
++  platform: ShortcutPlatform = detectDesktopShortcutPlatform()
++): ReadonlyMap<string, PluginWorkerFactory> {
+   const factories = new Map<string, PluginWorkerFactory>();
+   if (typeof Worker === "undefined") {
+     return factories;
+   }
++  if (platform === "windows" && globalThis.location?.origin === "http://tauri.localhost") {
++    factories.set(massFragmentPluginId, () =>
++      new Worker(new URL("./workers/windowsMassFragmentPluginWorker.ts", import.meta.url), {
++        type: "module"
++      }) as unknown as PluginWorkerHandle
++    );
++    return factories;
++  }
+   factories.set(
+     massFragmentPluginId,
+     () =>
+diff --git a/apps/desktop/src/plugins/workers/nestedModuleWorkerShim.d.ts b/apps/desktop/src/plugins/workers/nestedModuleWorkerShim.d.ts
+new file mode 100644
+index 000000000..457ca0d29
+--- /dev/null
++++ b/apps/desktop/src/plugins/workers/nestedModuleWorkerShim.d.ts
+@@ -0,0 +1,4 @@
++export function installNestedModuleWorkerShim(
++  platform?: "windows" | "macos" | "linux" | "web",
++  scope?: Pick<typeof globalThis, "Worker" | "location" | "URL" | "Blob">
++): void;
+diff --git a/apps/desktop/src/plugins/workers/nestedModuleWorkerShim.js b/apps/desktop/src/plugins/workers/nestedModuleWorkerShim.js
+new file mode 100644
+index 000000000..c4f404024
+--- /dev/null
++++ b/apps/desktop/src/plugins/workers/nestedModuleWorkerShim.js
+@@ -0,0 +1,45 @@
++/**
++ * Shared verbatim with the native installed-plugin bootstrap via include_str!. Keep this module
++ * dependency-free JavaScript: the native server must not need a second compiler or a generated copy.
++ */
++export function installNestedModuleWorkerShim(
++  platform = /Win/i.test(globalThis.navigator?.platform ?? "") ? "windows" : "macos",
++  scope = globalThis
++) {
++  if (platform !== "windows" || typeof scope.Worker !== "function") return;
++  const base = new URL(scope.location.href);
++  // Only the desktop custom origin needs the workaround. Windows browser/dev builds stay native.
++  if (base.protocol !== "http:" || base.host !== "tauri.localhost") return;
++
++  const NativeWorker = scope.Worker;
++  scope.Worker = new Proxy(NativeWorker, {
++    construct(target, args, newTarget) {
++      const [input, options] = args;
++      if (options?.type !== "module") return Reflect.construct(target, args, newTarget);
++      let url;
++      try {
++        url = new URL(input, base);
++      } catch {
++        return Reflect.construct(target, args, newTarget);
++      }
++      // Do not turn opaque/cross-origin URLs or credential-bearing URLs into importable modules.
++      // The blob inherits this worker's CSP; its static import still goes through script-src 'self'.
++      if (url.origin !== base.origin || url.protocol !== base.protocol || url.username || url.password) {
++        return Reflect.construct(target, args, newTarget);
++      }
++      const blobUrl = scope.URL.createObjectURL(new scope.Blob([
++        `import ${JSON.stringify(url.href)}; URL.revokeObjectURL(import.meta.url);`
++      ], { type: "text/javascript" }));
++      try {
++        const worker = Reflect.construct(target, [blobUrl, options], newTarget);
++        // Success revokes from inside the wrapper, after static import evaluation (including TLA).
++        // A failed import never reaches that line, so release on error without consuming the event.
++        worker.addEventListener("error", () => scope.URL.revokeObjectURL(blobUrl), { once: true });
++        return worker;
++      } catch (error) {
++        scope.URL.revokeObjectURL(blobUrl);
++        throw error;
++      }
++    }
++  });
++}
+diff --git a/apps/desktop/src/plugins/workers/windowsMassFragmentPluginWorker.ts b/apps/desktop/src/plugins/workers/windowsMassFragmentPluginWorker.ts
+new file mode 100644
+index 000000000..cfd45a988
+--- /dev/null
++++ b/apps/desktop/src/plugins/workers/windowsMassFragmentPluginWorker.ts
+@@ -0,0 +1,7 @@
++import { installNestedModuleWorkerShim } from "./nestedModuleWorkerShim.js";
++
++installNestedModuleWorkerShim("windows");
++// Static imports would evaluate plugin dependencies before installing the shim.
++await import("./massFragmentPluginWorker");
++
++export {};
+diff --git a/apps/desktop/vite.config.ts b/apps/desktop/vite.config.ts
+index d07613882..ba228ec0f 100644
+--- a/apps/desktop/vite.config.ts
++++ b/apps/desktop/vite.config.ts
+@@ -88,13 +88,17 @@ function buildStamp(): string {
+  * Since a package must be same-origin with the document (report 0030), whichever server owns the
+  * document must own `/installed-plugins/` too — so in dev, that is this middleware.
+  *
+- * It mirrors the Rust handler's contract exactly: same URL prefix, same app-data root, same refusal of
+- * anything that is not a plain relative path inside it. Without it, installs would work in the shipped
+- * app and mysteriously 404 under `./run-app --dev`.
++ * It serves the same URL prefix from the corresponding app-data root and applies the shared path
++ * refusal and CSP rules. Packaged Rust serving also recognizes the Windows worker-bootstrap query
++ * and substitutes the bootstrap script; dev intentionally serves the requested asset directly, since
++ * Vite's origin does not have the WebView2 main-script abort that requires that workaround.
++ * Without this middleware, installs would work in the shipped app and mysteriously 404 under
++ * `./run-app --dev`.
+  */
+ function serveInstalledPluginsInDev(): Plugin {
+-  // Prefix, CSP, and the path-refusal rule are shared with the packaged app's contract and covered by
+-  // `installedPluginAssetPath.test.ts`, so dev and production cannot drift apart silently.
++  // Prefix, CSP, and path-refusal rules are shared with the packaged app. The Windows bootstrap query
++  // substitution is intentionally specific to the packaged Rust handler; Vite's dev origin does not
++  // need it.
+   const urlPrefix = INSTALLED_PLUGIN_URL_PREFIX;
+   const installedPluginWorkerCsp = INSTALLED_PLUGIN_WORKER_CSP;
+   // Mirrors `installed_plugins::installed_plugins_root`: app_data_dir() for the identifier the
+diff --git a/docs/architecture/plugin-runtime.md b/docs/architecture/plugin-runtime.md
+index 1303feb3a..7eb4027a1 100644
+--- a/docs/architecture/plugin-runtime.md
++++ b/docs/architecture/plugin-runtime.md
+@@ -216,6 +216,35 @@ replacement all perform that teardown. Installed worker responses allow only
+ same-origin code/data/network access; external network access cannot bypass the
+ manifest capability layer.
+ 
++On Windows/WebView2, a nested module worker's main-script request to `http://tauri.localhost`
++can be aborted even when the server returns 200. Installed plugins therefore start through a
++host bootstrap selected by `__chemdraft_worker_bootstrap=windows` on their existing entry URL.
++The native handler validates and reads that entry as usual, then serves the dependency-free
++`workers/nestedModuleWorkerShim.js` and dynamically imports the original entry after installing
++the shim. Dynamic import ensures even transitive plugin dependencies see the shim before
++executing. On Windows, the bundled plugin worker uses a separate bootstrap that installs the
++same shim before importing its original worker entry; macOS and web builds retain the original entry.
++
++The shim proxies only construction of same-origin module workers on the Windows desktop
++custom origin. It returns a real native Worker with the original options, using a blob containing
++`import "<absolute URL>"; URL.revokeObjectURL(import.meta.url);`. The imported module keeps its
++real URL for sibling assets. The blob is revoked after module evaluation; construction or load
++errors also revoke it without consuming the native error event. A worker terminated before
++evaluation can retain its blob until the creating worker exits. Platform selection is injectable
++for tests and otherwise detected. macOS and web builds keep native worker construction, as do
++classic, cross-origin, opaque, and credential-bearing URLs.
++
++On Windows this supports one nested-worker level: the plugin worker can start a nested module
++worker, but a worker started from inside that nested worker (depth 2 or greater) is not supported.
++The blob wrapper does not reinstall the shim, so deeper nesting uses native construction and may
++fail under WebView2.
++
++The bootstrap response retains `INSTALLED_PLUGIN_WORKER_CSP` verbatim. Starting the plugin
++itself from a page-created blob would inherit the page's broader CSP, so that approach is avoided.
++Nested blobs inherit the installed worker's restrictive CSP; their static imports still obey
++`script-src 'self'`, and worker construction still obeys `worker-src 'self' blob:`. Neither the
++bootstrap query nor the shim grants host capabilities or bypasses manifest permissions.
++
+ ## Panel-close lifecycle (ADR-0012)
+ 
+ `RegisterPluginOptions.onPanelClosed(panelId)` lets a plugin cancel in-flight work
+diff --git a/docs/manual-stress-checklist.md b/docs/manual-stress-checklist.md
+index 934b747b9..3dd4f9920 100644
+--- a/docs/manual-stress-checklist.md
++++ b/docs/manual-stress-checklist.md
+@@ -10,6 +10,18 @@ scaling, sparse override precedence, terminal carbon labels, hidden implicit hyd
+ hydrogens, fonts, save/reopen, undo/redo, Spin 3D, atom-label editor placement, SVG export, and ring
+ selection after tab switching/closing.
+ 
++Nested plugin workers (packaged macOS and Windows builds): install the NMR Shift Predictor package,
++select a molecule, and invoke prediction from real menu input. On Windows/WebView2, confirm the
++entry bootstrap loads with the unchanged installed-plugin CSP, the nested module imports from its
++real `http://tauri.localhost/installed-plugins/…` URL, its reference JSON resolves relative to that
++module, and prediction answers without `ERR_ABORTED` or `NMR_PROVIDER_FAILURE`. Repeat after
++disable/re-enable and uninstall/reinstall. Exercise nested worker `postMessage`, replies, name,
++credentials, error listeners, and termination; confirm blob URLs are released after module startup
++and on load failure. Probe external fetch/module imports: the installed worker and its blob child
++must still be blocked by CSP without host permission. On macOS, confirm the entry and nested
++worker still load directly from `tauri://localhost` with working prediction. In a Windows web
++preview, confirm construction remains native; classic and cross-origin calls must remain unchanged.
++
+ Plugin panel focus (both macOS and Windows): open/re-show a panel from Analyze or a plugin command;
+ click a panel button, heading, chart, empty area and title/drag area, hover its controls and scroll.
+ Buttons must run exactly once and hover feedback must work; after each ordinary click the drawing
+diff --git a/docs/plugin-architecture/AUTHORING.md b/docs/plugin-architecture/AUTHORING.md
+index 98e868f4b..b190605f0 100644
+--- a/docs/plugin-architecture/AUTHORING.md
++++ b/docs/plugin-architecture/AUTHORING.md
+@@ -300,6 +300,18 @@ module loads are blocked. `network.fetch` remains a declared future capability;
+ ambient browser network primitive. External access must eventually travel through a permission-gated
+ host broker rather than bypassing the command context.
+ 
++Nested module workers are supported on both macOS and Windows to depth 1: on Windows, a plugin
++worker can start a nested module worker, but a worker started from inside that nested worker
++(depth 2 or greater) is not supported. Use
++`new Worker(new URL("./assets/worker.js", import.meta.url), { type: "module" })` and keep the
++worker's assets co-located. On Windows, the host installs a compatibility shim before plugin
++code executes: same-origin module workers start through a small blob with a static import of
++the real absolute URL. The imported module retains its real `import.meta.url`, and worker
++options and native messaging APIs are preserved. The shim is installed in the plugin worker, but
++not reinstalled by the nested worker's blob wrapper, which is why deeper nesting still fails.
++macOS and web builds retain their native behavior. Classic workers and cross-origin URLs are not
++shimmed. This grants no additional permissions or network access.
++
+ ## Distribute
+ 
+ Two artifacts, both fail-closed on a missing license, a dirty or untracked plugin tree, an import

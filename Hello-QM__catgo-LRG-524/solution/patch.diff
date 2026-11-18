@@ -1,0 +1,938 @@
+diff --git a/src/lib/structure/StructureScene.svelte b/src/lib/structure/StructureScene.svelte
+index dd32f2a86..43338471e 100644
+--- a/src/lib/structure/StructureScene.svelte
++++ b/src/lib/structure/StructureScene.svelte
+@@ -2655,6 +2655,12 @@
+   // early-returns via the typed memo (same conn + frame identities).
+   function schedule_typed_direct_tail_sync(): void {
+     if (typed_direct_tail_timer !== undefined) clearTimeout(typed_direct_tail_timer)
++    // DEV knob: globalThis.__catgo_td_tail_ms stretches the tail window so
++    // e2e / debugging sessions can screenshot the GPU-transform path at a
++    // paused frame before the object-pipeline rebuild flips it off.
++    const tail_ms = (import.meta.env?.DEV &&
++      (globalThis as { __catgo_td_tail_ms?: number }).__catgo_td_tail_ms) ||
++      TYPED_DIRECT_TAIL_MS
+     typed_direct_tail_timer = setTimeout(() => {
+       typed_direct_tail_timer = undefined
+       if (!typed_direct_active) return
+@@ -2673,7 +2679,7 @@
+         )
+       }
+       typed_direct_active = false
+-    }, TYPED_DIRECT_TAIL_MS)
++    }, tail_ms)
+   }
+ 
+   // Drop the tail-sync timer on unmount — the scene lives in {#if} blocks
+@@ -5955,6 +5961,8 @@
+           {depth_cue_uniforms}
+           {light_dir}
+           highlight_strength={active_highlight_strength}
++          gpu_transform_active={typed_direct_active}
++          max_bond_length={MAX_BOND_LENGTH}
+         />
+       {/if}
+ 
+diff --git a/src/lib/structure/bonding/BondManagerInstances.svelte b/src/lib/structure/bonding/BondManagerInstances.svelte
+index 666c13459..a7e724e3f 100644
+--- a/src/lib/structure/bonding/BondManagerInstances.svelte
++++ b/src/lib/structure/bonding/BondManagerInstances.svelte
+@@ -2,7 +2,17 @@
+   import { untrack } from 'svelte'
+   import { T, useThrelte } from '@threlte/core'
+   import type { InstancedMesh } from 'three'
+-  import { Color, CylinderGeometry, ShaderMaterial, Vector3 } from 'three'
++  import {
++    Color,
++    CylinderGeometry,
++    DataTexture,
++    FloatType,
++    Matrix3,
++    NearestFilter,
++    RGBAFormat,
++    ShaderMaterial,
++    Vector3,
++  } from 'three'
+   import { get_bond_key } from '../bonding'
+   import { BondInstancedRenderer, type PartnerDrawnLookup } from './bond-instanced-renderer'
+   import type { BondManager } from './bond-manager.svelte'
+@@ -97,6 +107,24 @@
+      * verbatim single-cylinder (2 instances/bond) path, byte-identical to today.
+      */
+     multibond_enabled?: boolean
++    /**
++     * GPU vertex-transform playback mode (trajectory typed-direct). When true
++     * AND the current config is GPU-eligible (no multibond, no decorator
++     * image atoms), per-instance mat4
++     * composition + upload is replaced by: static topology attributes
++     * (a_site / a_jimage / a_half, written once per topology change) + a
++     * per-atom RGBA32F position texture (one ~16·N-byte upload per frame).
++     * The vertex shader reconstructs each half-cylinder transform in-shader.
++     * Ineligible configs silently stay on the CPU instanceMatrix path.
++     */
++    gpu_transform_active?: boolean
++    /**
++     * Hard cap for in-shader bond length in the GPU path. Bonds whose
++     * current-frame length exceeds this collapse to zero scale — mirrors the
++     * typed-topology conversion filter (MAX_BOND_LENGTH) and guards against
++     * stale-topology / fresh-positions races during async detection.
++     */
++    max_bond_length?: number
+   }
+ 
+   let {
+@@ -121,8 +149,29 @@
+     light_dir = new Vector3(0.4, 0.7, 0.6).normalize(),
+     highlight_strength = 1.0,
+     multibond_enabled = false,
++    gpu_transform_active = false,
++    max_bond_length = 4.0,
+   }: Props = $props()
+ 
++  // GPU-transform eligibility. v1 exclusions (all fall back to the CPU
++  // instanceMatrix path, zero regression surface):
++  //   - multibond (per-slot stride 6 + order-dependent line counts);
++  //   - non-empty decorator range (image atoms drawn — the decorator pass
++  //     writes CPU matrices past the cell-internal range).
++  // Cross-cell bonds are handled in-shader for BOTH hide_incomplete modes:
++  // collapse (hide ON) and Phase-6 paired stubs (hide OFF, uStubMode /
++  // uStubScale) — exact parity with #write_slot's periodic branch.
++  // DEV escape hatch: `globalThis.__catgo_disable_gpu_bonds = true` forces
++  // the CPU path for in-session A/B benchmarking.
++  const gpu_active = $derived(
++    gpu_transform_active &&
++      !multibond_enabled &&
++      (image_atom_layout === null || image_atom_layout.n_image_atoms === 0) &&
++      !(import.meta.env?.DEV &&
++        (globalThis as { __catgo_disable_gpu_bonds?: boolean })
++          .__catgo_disable_gpu_bonds),
++  )
++
+   let mesh = $state<InstancedMesh | undefined>()
+   let renderer: BondInstancedRenderer | undefined
+ 
+@@ -141,10 +190,47 @@
+     }
+   }
+ 
++  // Per-atom position texture geometry for the GPU-transform path. Fixed
++  // power-of-two width keeps the shader's index→texel math to two bit ops;
++  // height grows with atom count (1024 × 2048 texels = 2M atoms headroom,
++  // way past MAX_TEXTURE_SIZE concerns at realistic sizes).
++  const POS_TEX_WIDTH = 1024
++  const POS_TEX_SHIFT = 10 // log2(POS_TEX_WIDTH)
++  // Zero lattice ≡ "no lattice": uLattice·jimage adds nothing, so a bond
++  // with a non-zero jimage but no lattice renders from the base position —
++  // exact parity with #write_slot's null-lattice fallback.
++  const ZERO_LATTICE = [0, 0, 0, 0, 0, 0, 0, 0, 0]
++
++  // Vertex shader has two transform paths selected by the uGpuXform uniform
++  // (uniform branch — no recompile / material swap on playback start):
++  //   0 (default): per-instance mat4 from instanceMatrix (CPU-composed).
++  //   1 (typed-direct trajectory playback): the transform is reconstructed
++  //     in-shader from static topology attributes (a_site / a_jimage /
++  //     a_half) + a per-atom RGBA32F position texture. Per frame only the
++  //     position texture (16 bytes/atom) is uploaded — the 64-byte/instance
++  //     matrix rewrite and its CPU compose loop are skipped entirely.
++  // Position texture layout: fixed width ${POS_TEX_WIDTH}; atom i sits at
++  // texel (i % width, i / width); xyz in rgb, alpha unused. texelFetch is
++  // available because three r163+ is WebGL2-only (GLSL is compiled as
++  // "#version 300 es" with compatibility defines).
+   const vertex_shader = `
+     attribute vec3 instance_color_start;
+     attribute vec3 instance_color_end;
+     attribute float instance_opacity;
++    // GPU-transform (playback) topology attributes. Absent from the geometry
++    // until the first GPU sync -- WebGL then feeds constant 0s, and the
++    // uGpuXform=0 branch never reads them.
++    attribute vec2 a_site;    // endpoint site indices (a, b)
++    attribute vec3 a_jimage;  // lattice image of atom B (Int8, non-normalized)
++    attribute float a_half;   // 0 = half A (anchored at a), 1 = half B
++    uniform float uGpuXform;
++    uniform sampler2D uPosTex;      // RGBA32F, 1 texel per atom
++    uniform float uNAtoms;          // live atom count in uPosTex
++    uniform mat3 uLattice;          // columns = lattice vectors a, b, c; zero when no lattice
++    uniform float uHideIncomplete;  // collapse cross-cell bonds (parity with #write_slot)
++    uniform float uMaxBondLength;   // hard cap; longer bonds collapse (stale-topology guard)
++    uniform float uStubMode;        // incomplete_periodic_edge_mode (VESTA Mode 1)
++    uniform float uStubScale;       // stub length multiplier when uStubMode is on
+     varying vec3 vColorStart;
+     varying vec3 vColorEnd;
+     varying float vYPosition;
+@@ -159,19 +245,84 @@
+       vYPosition = position.y;
+       vOpacity = instance_opacity;
+ 
+-      // Compute instance normal matrix (inverse-transpose) for correct normals
+-      // under non-uniform scaling. mat3(instanceMatrix) alone squishes radial
+-      // normals toward the cylinder axis, producing flat shading.
+-      // WebGL 1 lacks inverse(), so we use the cofactor (cross-product) trick:
+-      // cofactor columns are proportional to inverse-transpose columns.
+-      mat3 m = mat3(instanceMatrix);
+-      mat3 instanceNormalMat;
+-      instanceNormalMat[0] = cross(m[1], m[2]);
+-      instanceNormalMat[1] = cross(m[2], m[0]);
+-      instanceNormalMat[2] = cross(m[0], m[1]);
+-      vNormal = normalize(normalMatrix * instanceNormalMat * normal);
+-
+-      vec4 mvPosition = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
++      vec3 transformed;
++      vec3 objectNormal;
++
++      if (uGpuXform > 0.5) {
++        int ia = int(a_site.x + 0.5);
++        int ib = int(a_site.y + 0.5);
++        vec3 pa = texelFetch(uPosTex, ivec2(ia & ${POS_TEX_WIDTH - 1}, ia >> ${POS_TEX_SHIFT}), 0).xyz;
++        vec3 pb_base = texelFetch(uPosTex, ivec2(ib & ${POS_TEX_WIDTH - 1}, ib >> ${POS_TEX_SHIFT}), 0).xyz;
++        bool periodic = dot(abs(a_jimage), vec3(1.0)) > 0.5;
++        // b_eff = pos_b + lattice * jimage (uLattice columns are the lattice
++        // rows a,b,c, so the mat*vec product matches pbc.rs / #write_slot).
++        vec3 pb = periodic ? pb_base + uLattice * a_jimage : pb_base;
++        vec3 d = pb - pa;
++        float len = length(d);
++        // Collapse to zero scale (ZERO_MATRIX parity) when: endpoint index
++        // is past the live position buffer (stale-frame safety net), length
++        // is degenerate / non-finite (!(len > eps) also catches NaN), the
++        // bond exceeds the hard cap, or it is a cross-cell bond under
++        // hide_incomplete_bonds.
++        bool collapse = a_site.x >= uNAtoms || a_site.y >= uNAtoms ||
++          !(len > 1e-6) || len > uMaxBondLength ||
++          (periodic && uHideIncomplete > 0.5);
++        if (collapse) {
++          transformed = vec3(0.0);
++          objectNormal = vec3(0.0, 0.0, 1.0);
++        } else {
++          vec3 dir = d / len;
++          // Deterministic orthonormal basis with dir as the cylinder's Y
++          // axis. Roll around the axis is arbitrary -- the cylinder is
++          // rotationally symmetric, so this matches the CPU quaternion path
++          // visually.
++          vec3 ref = abs(dir.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
++          vec3 xb = normalize(cross(ref, dir));
++          vec3 zb = cross(xb, dir);
++          float half_len = 0.5 * len;
++          vec3 mid;
++          float y_len;
++          if (periodic) {
++            // Phase 6 outward paired stubs (hide_incomplete OFF; the ON case
++            // collapsed above). Half A anchored at pa pointing toward b_eff;
++            // half B anchored at the BASE pos_b pointing -dir. Full
++            // half-length unless VESTA Mode 1 shortens it (uStubScale).
++            float stub_len = half_len * (uStubMode > 0.5 ? uStubScale : 1.0);
++            y_len = stub_len;
++            mid = a_half < 0.5
++              ? pa + dir * (0.5 * stub_len)
++              : pb_base - dir * (0.5 * stub_len);
++          } else {
++            // Intra-cell: half A center = 0.75*pa + 0.25*pb; half B =
++            // 0.25*pa + 0.75*pb; unit-height cylinder scales to half_length
++            // along the axis. Radius is baked into the geometry
++            // (radius_scale = 1 on the single-line path).
++            y_len = half_len;
++            mid = mix(pa, pb, 0.25 + 0.5 * a_half);
++          }
++          transformed = xb * position.x + dir * (position.y * y_len) +
++            zb * position.z + mid;
++          // Basis is orthonormal and radial/cap normals are invariant under
++          // the axis-only scale, so no inverse-transpose is needed.
++          objectNormal = xb * normal.x + dir * normal.y + zb * normal.z;
++        }
++      } else {
++        // Compute instance normal matrix (inverse-transpose) for correct normals
++        // under non-uniform scaling. mat3(instanceMatrix) alone squishes radial
++        // normals toward the cylinder axis, producing flat shading.
++        // We use the cofactor (cross-product) trick: cofactor columns are
++        // proportional to inverse-transpose columns.
++        mat3 m = mat3(instanceMatrix);
++        mat3 instanceNormalMat;
++        instanceNormalMat[0] = cross(m[1], m[2]);
++        instanceNormalMat[1] = cross(m[2], m[0]);
++        instanceNormalMat[2] = cross(m[0], m[1]);
++        objectNormal = instanceNormalMat * normal;
++        transformed = (instanceMatrix * vec4(position, 1.0)).xyz;
++      }
++
++      vNormal = normalize(normalMatrix * objectNormal);
++      vec4 mvPosition = modelViewMatrix * vec4(transformed, 1.0);
+       vViewPosition = mvPosition.xyz;
+       gl_Position = projectionMatrix * mvPosition;
+       vDepthCueZ = -mvPosition.z;
+@@ -312,9 +463,155 @@
+       uDepthFar: depth_cue_uniforms?.uDepthFar ?? { value: 10 },
+       uDepthCueBgColor: depth_cue_uniforms?.uDepthCueBgColor ?? { value: new Color(0xffffff) },
+       uBondOutlineStrength: depth_cue_uniforms?.uBondOutlineStrength ?? { value: 0 },
++      // GPU-transform playback path (kept in sync by the effects below).
++      uGpuXform: { value: 0 },
++      uPosTex: { value: null },
++      uNAtoms: { value: 0 },
++      uLattice: { value: new Matrix3().fromArray(ZERO_LATTICE) },
++      uHideIncomplete: { value: hide_incomplete_bonds ? 1 : 0 },
++      uMaxBondLength: { value: max_bond_length },
++      uStubMode: { value: incomplete_periodic_edge_mode ? 1 : 0 },
++      uStubScale: { value: incomplete_edge_length_scale },
+     },
+   }))
+ 
++  // ── GPU-transform position texture ────────────────────────────────────────
++  // RGBA32F DataTexture, one texel per atom (xyz in rgb). Rewritten in place
++  // + re-uploaded each playback frame (~16·N bytes) — replaces the CPU mat4
++  // compose loop + 64-byte/instance matrix upload. Reallocated only when the
++  // atom count outgrows the current height.
++  let pos_texture: DataTexture | null = null
++
++  function upload_positions(pos: Float32Array): void {
++    const n_atoms = (pos.length / 3) | 0
++    const rows = Math.max(1, Math.ceil(n_atoms / POS_TEX_WIDTH))
++    if (pos_texture === null || (pos_texture.image.height as number) < rows) {
++      pos_texture?.dispose()
++      const data = new Float32Array(POS_TEX_WIDTH * rows * 4)
++      const tex = new DataTexture(data, POS_TEX_WIDTH, rows, RGBAFormat, FloatType)
++      tex.minFilter = NearestFilter
++      tex.magFilter = NearestFilter
++      tex.generateMipmaps = false
++      pos_texture = tex
++      shader_material.uniforms.uPosTex.value = tex
++    }
++    const data = pos_texture.image.data as unknown as Float32Array
++    for (let i = 0; i < n_atoms; i++) {
++      data[i * 4] = pos[i * 3]
++      data[i * 4 + 1] = pos[i * 3 + 1]
++      data[i * 4 + 2] = pos[i * 3 + 2]
++    }
++    pos_texture.needsUpdate = true
++    shader_material.uniforms.uNAtoms.value = n_atoms
++  }
++
++  // Texture is referenced only via a uniform — Threlte's auto-dispose covers
++  // the material/geometry (created through T args) but not this.
++  $effect(() => () => {
++    pos_texture?.dispose()
++    pos_texture = null
++  })
++
++  // DEV-only debug surface: globalThis.__catgo_bond_gpu. Mirrors the shader's
++  // GPU-path math in JS over the exact GPU-bound data (topology attrs +
++  // position texture + uLattice) so a console/e2e check can programmatically
++  // verify geometry consistency (no over-max "spike" bonds, no NaN) without
++  // reading back GPU buffers. Tree-shaken from production builds.
++  $effect(() => {
++    if (!import.meta.env?.DEV) return
++    const surface = {
++      get gpu_active() {
++        return gpu_active
++      },
++      // Eligibility inputs — which v1 gate (if any) is holding the GPU path off.
++      get eligibility() {
++        return {
++          gpu_transform_active,
++          multibond_enabled,
++          n_image_atoms: image_atom_layout?.n_image_atoms ?? 0,
++          hide_incomplete_bonds,
++          has_lattice: lattice_matrix !== null,
++        }
++      },
++      get uGpuXform() {
++        return shader_material.uniforms.uGpuXform.value as number
++      },
++      get mesh_count() {
++        return mesh?.count ?? -1
++      },
++      get n_atoms() {
++        return shader_material.uniforms.uNAtoms.value as number
++      },
++      stats: () => {
++        const geo = mesh?.geometry
++        const site = geo?.getAttribute(`a_site`)?.array as Float32Array | undefined
++        const jimg = geo?.getAttribute(`a_jimage`)?.array as Int8Array | undefined
++        const tex = pos_texture?.image.data as unknown as Float32Array | undefined
++        if (!mesh || !site || !jimg || !tex) return null
++        const n_atoms = shader_material.uniforms.uNAtoms.value as number
++        const hide = (shader_material.uniforms.uHideIncomplete.value as number) > 0.5
++        const max_len = shader_material.uniforms.uMaxBondLength.value as number
++        const lat = (shader_material.uniforms.uLattice.value as Matrix3).elements
++        const n_inst = mesh.count
++        let over_max = 0
++        let non_finite = 0
++        let oob = 0
++        let collapsed_periodic = 0
++        let drawn = 0
++        let min_len = Infinity
++        let max_seen = 0
++        for (let i = 0; i < n_inst; i += 2) { // one check per slot (halves share)
++          const a = site[i * 2]
++          const b = site[i * 2 + 1]
++          if (a >= n_atoms || b >= n_atoms) {
++            oob++
++            continue
++          }
++          const dx = jimg[i * 3]
++          const dy = jimg[i * 3 + 1]
++          const dz = jimg[i * 3 + 2]
++          const periodic = (dx | dy | dz) !== 0
++          if (periodic && hide) {
++            collapsed_periodic++
++            continue
++          }
++          const ax = tex[a * 4], ay = tex[a * 4 + 1], az = tex[a * 4 + 2]
++          // Column-major mat3: col0 = elements[0..2] = lattice vector a, etc.
++          const bx = tex[b * 4] + dx * lat[0] + dy * lat[3] + dz * lat[6]
++          const by = tex[b * 4 + 1] + dx * lat[1] + dy * lat[4] + dz * lat[7]
++          const bz = tex[b * 4 + 2] + dx * lat[2] + dy * lat[5] + dz * lat[8]
++          const len = Math.hypot(bx - ax, by - ay, bz - az)
++          if (!Number.isFinite(len)) {
++            non_finite++
++            continue
++          }
++          if (len > max_len) {
++            over_max++
++            continue
++          }
++          drawn++
++          if (len < min_len) min_len = len
++          if (len > max_seen) max_seen = len
++        }
++        return {
++          slots: n_inst / 2,
++          drawn,
++          over_max,
++          non_finite,
++          oob,
++          collapsed_periodic,
++          min_len,
++          max_drawn_len: max_seen,
++        }
++      },
++    }
++    ;(globalThis as unknown as { __catgo_bond_gpu?: typeof surface })
++      .__catgo_bond_gpu = surface
++    return () => {
++      delete (globalThis as { __catgo_bond_gpu?: unknown }).__catgo_bond_gpu
++    }
++  })
++
+   // Update uniforms when props change — no material recreation needed
+   $effect(() => {
+     shader_material.uniforms.uOpacity.value = opacity
+@@ -344,6 +641,50 @@
+     mark_dirty()
+   })
+ 
++  // GPU-path scalar/matrix uniforms. lattice_matrix identity is stable
++  // during playback (the per-frame structure cascade is cut), so this fires
++  // on load / lattice edits, not per frame.
++  $effect(() => {
++    const lat = lattice_matrix
++    const m = shader_material.uniforms.uLattice.value as Matrix3
++    if (lat) m.fromArray(lat as unknown as number[])
++    else m.fromArray(ZERO_LATTICE)
++    shader_material.uniforms.uHideIncomplete.value = hide_incomplete_bonds ? 1 : 0
++    shader_material.uniforms.uMaxBondLength.value = max_bond_length
++    shader_material.uniforms.uStubMode.value = incomplete_periodic_edge_mode ? 1 : 0
++    shader_material.uniforms.uStubScale.value = incomplete_edge_length_scale
++    // mark_dirty: imperative ShaderMaterial uniform write bypasses <T.> prop chain
++    mark_dirty()
++  })
++
++  // GPU-transform mode transitions. Tracks ONLY the eligibility boolean; the
++  // body runs untracked (renderer methods read manager $state — see the
++  // mount-effect discipline note below). Entering: flip the shader to the
++  // texture path, upload current positions, write topology attrs. Exiting:
++  // flip back and force_full_resync — instanceMatrix is stale after any
++  // GPU-mode window and must be rebuilt before the CPU path draws again.
++  let last_gpu_active = false
++  $effect(() => {
++    const active = gpu_active
++    if (!renderer) {
++      // Renderer not up yet — the mount effect applies the current mode when
++      // it constructs the renderer (and records it in last_gpu_active).
++      return
++    }
++    if (active === last_gpu_active) return
++    last_gpu_active = active
++    untrack(() => {
++      shader_material.uniforms.uGpuXform.value = active ? 1 : 0
++      if (active) {
++        upload_positions(atom_positions)
++        renderer!.sync_gpu_topology()
++      } else {
++        renderer!.force_full_resync()
++      }
++      mark_dirty()
++    })
++  })
++
+   // Geometry rebuilds reactively when bond_radius changes. Threlte's
+   // `args` reconciliation reconstructs the InstancedMesh, which drops the
+   // mesh ref — the renderer effect below then reinitialises and
+@@ -386,7 +727,18 @@
+       // layout uses the correct per-slot stride.
+       r.set_multibond(multibond_enabled, bond_radius)
+       renderer = r
+-      r.force_full_resync()
++      // Apply the current transform mode: the mode-transition effect only
++      // fires on gpu_active CHANGES and may have already run (renderer was
++      // undefined), so a mesh (re)mount mid-playback must self-serve.
++      const active = gpu_active
++      last_gpu_active = active
++      shader_material.uniforms.uGpuXform.value = active ? 1 : 0
++      if (active) {
++        upload_positions(atom_positions)
++        r.sync_gpu_topology()
++      } else {
++        r.force_full_resync()
++      }
+       mark_dirty()
+       return () => {
+         r.dispose()
+@@ -421,9 +773,15 @@
+     // Untracked: force_full_resync reads manager $state (version/count);
+     // tracked it would subscribe this effect to every per-frame version
+     // bump and duplicate the version-sync effect's full pass.
++    // Note: during typed-direct playback with image atoms off,
++    // image_atom_layout re-derives to the EMPTY_LAYOUT singleton (stable
++    // identity), so this effect does NOT fire per frame.
+     untrack(() => {
+       renderer!.set_multibond(mb, br)
+-      renderer!.force_full_resync()
++      // GPU-transform mode owns the mesh: refresh its buffers (colors are
++      // rewritten in the topology loop) instead of composing stale matrices.
++      if (gpu_active) renderer!.sync_gpu_topology()
++      else renderer!.force_full_resync()
+       mark_dirty()
+     })
+   })
+@@ -513,12 +871,21 @@
+     mgr.set_opacity(slot, op)
+   }
+ 
++  // Topology version sync. In GPU-transform mode the per-frame
++  // replace_auto_bonds bump routes to sync_gpu_topology (topology attrs +
++  // kind/color/opacity — no matrix math); otherwise the classic dirty-slot
++  // matrix sync. gpu_active is read untracked: mode transitions are owned by
++  // the dedicated effect above, which fully rebuilds the incoming mode's
++  // buffers — tracking it here would only duplicate that pass.
+   $effect(() => {
+     const version = bond_manager.version
+     void version
+     if (!renderer) return
+-    renderer.sync()
+-    mark_dirty()
++    untrack(() => {
++      if (gpu_active) renderer!.sync_gpu_topology()
++      else renderer!.sync()
++      mark_dirty()
++    })
+   })
+ 
+   $effect(() => {
+@@ -529,7 +896,13 @@
+     // tracked it would re-fire this effect on every version bump on top of
+     // the positions-identity dep above — a duplicate full matrix pass.
+     untrack(() => {
+-      renderer!.force_full_resync()
++      if (gpu_active) {
++        // GPU-transform mode: per-frame positions land in the per-atom
++        // texture (~16·N bytes) instead of a full per-instance matrix pass.
++        upload_positions(atom_positions)
++      } else {
++        renderer!.force_full_resync()
++      }
+       mark_dirty()
+     })
+   })
+diff --git a/src/lib/structure/bonding/bond-instanced-renderer.ts b/src/lib/structure/bonding/bond-instanced-renderer.ts
+index 3843edea6..d233c57cc 100644
+--- a/src/lib/structure/bonding/bond-instanced-renderer.ts
++++ b/src/lib/structure/bonding/bond-instanced-renderer.ts
+@@ -142,6 +142,14 @@ export class BondInstancedRenderer {
+ 
+ 	#opacity_attr: THREE.InstancedBufferAttribute | null = null;
+ 
++	// GPU-transform playback path (see sync_gpu_topology): static per-instance
++	// topology attributes consumed by the vertex shader's texture-fetch branch.
++	// Lazy-allocated on first GPU sync so the default (CPU-matrix) path pays
++	// zero memory cost.
++	#site_attr: THREE.InstancedBufferAttribute | null = null; // vec2 (a, b) as f32
++	#gpu_jimage_attr: THREE.InstancedBufferAttribute | null = null; // ivec3 as i8, non-normalized
++	#half_attr: THREE.InstancedBufferAttribute | null = null; // 0 = half A, 1 = half B
++
+ 	#last_synced_version = -1;
+ 	#last_synced_count = 0;
+ 
+@@ -390,11 +398,199 @@ export class BondInstancedRenderer {
+ 		this.#last_synced_count = manager.count;
+ 	}
+ 
++	/**
++	 * GPU-transform playback sync. Instead of composing a mat4 per instance on
++	 * the CPU (the `#write_slot` path), write only the STATIC topology of each
++	 * half-bond — endpoint site indices, the bond's jimage, and which half the
++	 * instance is — as small per-instance attributes. The vertex shader
++	 * (BondManagerInstances' `uGpuXform` branch) fetches both endpoint
++	 * positions from a per-atom RGBA32F texture and reconstructs the
++	 * half-cylinder transform in the vertex stage, so per-frame position
++	 * changes need only a texture upload, not a 64-byte-per-instance matrix
++	 * rewrite.
++	 *
++	 * Caller contract (BondManagerInstances gates all of these):
++	 *   - multibond OFF (stride must be 2 — one instance per half);
++	 *   - no decorator pass (image_atom_layout empty) — mesh.count is set to
++	 *     the cell-internal range only;
++	 *   - cross-cell bonds are handled in-shader: collapsed via
++	 *     `uHideIncomplete` (hide_incomplete_bonds ON) or rendered as Phase 6
++	 *     paired stubs (`uStubMode` / `uStubScale`) when OFF;
++	 *   - `instanceMatrix` is NOT written — it is stale while this mode is
++	 *     active, and the caller MUST `force_full_resync()` on mode exit.
++	 *
++	 * Always performs a full rewrite: during playback `replace_auto_bonds`
++	 * promotes to dirty_all anyway (span >= threshold), and the write is a
++	 * memcpy-level loop (~6 numeric stores per instance).
++	 */
++	sync_gpu_topology(): void {
++		const manager = this.#manager;
++
++		if (import.meta.env?.DEV && this.#multibond_enabled) {
++			console.warn(
++				'[BondInstancedRenderer] sync_gpu_topology called with multibond enabled — caller must gate the GPU path off when multibond is on.',
++			);
++		}
++
++		this.#ensure_color_attrs();
++		this.#ensure_opacity_attr();
++		this.#ensure_gpu_attrs();
++
++		const mesh = this.#mesh;
++		const capacity = mesh.instanceMatrix.count;
++		const count = manager.count;
++		const instance_count = count * 2;
++
++		if (instance_count > capacity) {
++			throw new Error(
++				`BondInstancedRenderer: instance count (${instance_count}) exceeds mesh capacity (${capacity}). Caller must reconstruct the mesh at a larger capacity.`,
++			);
++		}
++
++		const site_attr = this.#site_attr!;
++		const jimage_attr = this.#gpu_jimage_attr!;
++		site_attr.clearUpdateRanges();
++		jimage_attr.clearUpdateRanges();
++		this.#kind_attr.clearUpdateRanges();
++		this.#color_start_attr?.clearUpdateRanges();
++		this.#color_end_attr?.clearUpdateRanges();
++		this.#opacity_attr?.clearUpdateRanges();
++
++		const pairs = manager.pairs_buffer;
++		const kinds = manager.kinds_buffer;
++		const jimages = manager.jimages_buffer;
++		const opacity = manager.opacity_buffer;
++		const atom_colors = this.#get_atom_colors ? this.#get_atom_colors() : null;
++
++		const site_buf = site_attr.array as Float32Array;
++		const jimage_buf = jimage_attr.array as Int8Array;
++		const kind_buf = this.#kind_buf;
++		const cb_start = this.#color_start_attr !== null
++			? this.#color_start_attr.array as Float32Array
++			: null;
++		const cb_end = this.#color_end_attr !== null
++			? this.#color_end_attr.array as Float32Array
++			: null;
++		const op_buf = this.#opacity_attr !== null
++			? this.#opacity_attr.array as Float32Array
++			: null;
++		const ac_len = atom_colors !== null ? atom_colors.length : 0;
++
++		for (let slot = 0; slot < count; slot++) {
++			const a = pairs[slot * 2];
++			const b = pairs[slot * 2 + 1];
++			const i0 = slot * 2; // half A instance
++			const i1 = i0 + 1; // half B instance
++
++			site_buf[i0 * 2] = a;
++			site_buf[i0 * 2 + 1] = b;
++			site_buf[i1 * 2] = a;
++			site_buf[i1 * 2 + 1] = b;
++
++			const ji = slot * 3;
++			const dx = jimages[ji];
++			const dy = jimages[ji + 1];
++			const dz = jimages[ji + 2];
++			jimage_buf[i0 * 3] = dx;
++			jimage_buf[i0 * 3 + 1] = dy;
++			jimage_buf[i0 * 3 + 2] = dz;
++			jimage_buf[i1 * 3] = dx;
++			jimage_buf[i1 * 3 + 1] = dy;
++			jimage_buf[i1 * 3 + 2] = dz;
++
++			const kind = kinds[slot];
++			kind_buf[i0] = kind;
++			kind_buf[i1] = kind;
++
++			// Per-half solid color, mirroring #write_slot: half A = atom A's
++			// color, half B = atom B's (start == end → solid).
++			if (atom_colors !== null && cb_start !== null && cb_end !== null) {
++				const a3 = a * 3;
++				const b3 = b * 3;
++				if (a3 + 2 < ac_len && b3 + 2 < ac_len) {
++					const d0 = i0 * 3;
++					const d1 = i1 * 3;
++					const ar = atom_colors[a3], ag = atom_colors[a3 + 1], ab = atom_colors[a3 + 2];
++					const br = atom_colors[b3], bg = atom_colors[b3 + 1], bb = atom_colors[b3 + 2];
++					cb_start[d0] = ar; cb_start[d0 + 1] = ag; cb_start[d0 + 2] = ab;
++					cb_end[d0] = ar; cb_end[d0 + 1] = ag; cb_end[d0 + 2] = ab;
++					cb_start[d1] = br; cb_start[d1 + 1] = bg; cb_start[d1 + 2] = bb;
++					cb_end[d1] = br; cb_end[d1 + 1] = bg; cb_end[d1 + 2] = bb;
++				}
++			}
++
++			if (opacity !== null && op_buf !== null) {
++				const op = opacity[slot];
++				op_buf[i0] = op;
++				op_buf[i1] = op;
++			}
++		}
++
++		if (instance_count > 0) {
++			site_attr.addUpdateRange(0, instance_count * 2);
++			jimage_attr.addUpdateRange(0, instance_count * 3);
++			this.#kind_attr.addUpdateRange(0, instance_count);
++			this.#color_start_attr?.addUpdateRange(0, instance_count * 3);
++			this.#color_end_attr?.addUpdateRange(0, instance_count * 3);
++			this.#opacity_attr?.addUpdateRange(0, instance_count);
++		}
++
++		mesh.count = instance_count;
++		site_attr.needsUpdate = true;
++		jimage_attr.needsUpdate = true;
++		this.#kind_attr.needsUpdate = true;
++		if (this.#color_start_attr !== null) this.#color_start_attr.needsUpdate = true;
++		if (this.#color_end_attr !== null) this.#color_end_attr.needsUpdate = true;
++		if (this.#opacity_attr !== null) this.#opacity_attr.needsUpdate = true;
++
++		// Keep the CPU-sync bookkeeping consistent so an accidental `sync()`
++		// while this mode is active early-returns instead of racing. The mode
++		// exit path unconditionally `force_full_resync()`s, which rewrites
++		// every matrix regardless of this state.
++		manager.clear_dirty();
++		this.#last_synced_version = manager.version;
++		this.#last_synced_count = count;
++	}
++
++	#ensure_gpu_attrs(): void {
++		if (this.#site_attr !== null) return;
++		const cap = this.#mesh.instanceMatrix.count;
++		const geometry = this.#mesh.geometry;
++
++		// f32 holds site indices exactly up to 2^24 — far above any atom count
++		// the viewer handles.
++		const site_buf = new Float32Array(cap * 2);
++		const site_attr = new THREE.InstancedBufferAttribute(site_buf, 2, false);
++		site_attr.setUsage(THREE.DynamicDrawUsage);
++		this.#site_attr = site_attr;
++		geometry.setAttribute('a_site', site_attr);
++
++		// Int8, non-normalized → arrives in the shader as float ±n. jimage
++		// entries are within ±5 in practice (see BondManager doc).
++		const jimage_buf = new Int8Array(cap * 3);
++		const jimage_attr = new THREE.InstancedBufferAttribute(jimage_buf, 3, false);
++		jimage_attr.setUsage(THREE.DynamicDrawUsage);
++		this.#gpu_jimage_attr = jimage_attr;
++		geometry.setAttribute('a_jimage', jimage_attr);
++
++		// Which half of the bond this instance is. Purely a function of the
++		// instance index parity (stride is 2 in GPU mode), so fill once and
++		// never rewrite.
++		const half_buf = new Uint8Array(cap);
++		for (let i = 1; i < cap; i += 2) half_buf[i] = 1;
++		const half_attr = new THREE.InstancedBufferAttribute(half_buf, 1, false);
++		this.#half_attr = half_attr;
++		geometry.setAttribute('a_half', half_attr);
++	}
++
+ 	dispose(): void {
+ 		this.#mesh.geometry.deleteAttribute('bond_kind');
+ 		if (this.#color_start_attr !== null) this.#mesh.geometry.deleteAttribute('instance_color_start');
+ 		if (this.#color_end_attr !== null) this.#mesh.geometry.deleteAttribute('instance_color_end');
+ 		if (this.#opacity_attr !== null) this.#mesh.geometry.deleteAttribute('instance_opacity');
++		if (this.#site_attr !== null) this.#mesh.geometry.deleteAttribute('a_site');
++		if (this.#gpu_jimage_attr !== null) this.#mesh.geometry.deleteAttribute('a_jimage');
++		if (this.#half_attr !== null) this.#mesh.geometry.deleteAttribute('a_half');
+ 	}
+ 
+ 	#ensure_color_attrs(): void {
+diff --git a/src/lib/structure/bonding/image-atom-layout.ts b/src/lib/structure/bonding/image-atom-layout.ts
+index e69ddab01..4a6aa2cbf 100644
+--- a/src/lib/structure/bonding/image-atom-layout.ts
++++ b/src/lib/structure/bonding/image-atom-layout.ts
+@@ -61,6 +61,21 @@ export function build_image_atom_layout(
+ 	sites_to_draw: ReadonlyMap<ImageSiteKey, ImageSiteEntry>,
+ 	bond_manager: BondManager,
+ ): ImageAtomLayout {
++	// Fast path: no non-home image atoms → EMPTY_LAYOUT, skip the O(bonds)
++	// inverted-index build below. This runs on EVERY bond_manager.version
++	// bump (the image_atom_layout $derived tracks it), i.e. once per frame
++	// during trajectory playback — with image atoms off, the old order paid
++	// a 26k-entry Map build per frame just to discover n === 0.
++	let any_image = false
++	for (const entry of sites_to_draw.values()) {
++		const j = entry.jimage_img
++		if (j[0] !== 0 || j[1] !== 0 || j[2] !== 0) {
++			any_image = true
++			break
++		}
++	}
++	if (!any_image) return EMPTY_LAYOUT
++
+ 	const count = bond_manager.count
+ 	const pairs = bond_manager.pairs_buffer
+ 
+diff --git a/tests/vitest/structure/bonding/gpu-topology-sync.test.ts b/tests/vitest/structure/bonding/gpu-topology-sync.test.ts
+new file mode 100644
+index 000000000..929c6437e
+--- /dev/null
++++ b/tests/vitest/structure/bonding/gpu-topology-sync.test.ts
+@@ -0,0 +1,145 @@
++/**
++ * BondInstancedRenderer.sync_gpu_topology — the GPU vertex-transform playback
++ * path. Verifies the static topology attributes (a_site / a_jimage / a_half),
++ * per-half colors/kind/opacity, mesh.count, and that instanceMatrix is left
++ * untouched (the shader's uGpuXform branch ignores it) until the mode-exit
++ * force_full_resync rebuilds it.
++ */
++import { BOND_KIND, BondManager } from '$lib/structure/bonding/bond-manager.svelte'
++import { BondInstancedRenderer } from '$lib/structure/bonding/bond-instanced-renderer'
++import * as THREE from 'three'
++import { beforeEach, describe, expect, test } from 'vitest'
++
++const CAPACITY = 32
++
++function make_mesh(): THREE.InstancedMesh {
++	const geometry = new THREE.CylinderGeometry(0.15, 0.15, 1, 8)
++	const material = new THREE.MeshBasicMaterial()
++	return new THREE.InstancedMesh(geometry, material, CAPACITY)
++}
++
++// 3 atoms on a line, 1 Å apart.
++const positions = new Float32Array([0, 0, 0, 1, 0, 0, 2, 0, 0])
++// Solid per-atom colors: R, G, B.
++const atom_colors = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1])
++const lattice = new Float64Array([10, 0, 0, 0, 10, 0, 0, 0, 10])
++
++let mesh: THREE.InstancedMesh
++let manager: BondManager
++let renderer: BondInstancedRenderer
++
++function attr(name: string): THREE.InstancedBufferAttribute {
++	return mesh.geometry.getAttribute(name) as THREE.InstancedBufferAttribute
++}
++
++beforeEach(() => {
++	mesh = make_mesh()
++	manager = new BondManager(CAPACITY)
++	renderer = new BondInstancedRenderer(
++		mesh,
++		manager,
++		() => positions,
++		() => lattice,
++		() => ({ mode: false, scale: 0.5, hide_incomplete: true }),
++		() => null,
++		() => null,
++		() => atom_colors,
++	)
++})
++
++describe(`sync_gpu_topology`, () => {
++	test(`writes a_site / a_jimage / a_half per half-instance`, () => {
++		manager.add_bond(0, 1, BOND_KIND.AUTO)
++		manager.add_bond(1, 2, BOND_KIND.AUTO, [0, 0, 1])
++		renderer.sync_gpu_topology()
++
++		const site = attr(`a_site`).array as Float32Array
++		const jimage = attr(`a_jimage`).array as Int8Array
++		const half = attr(`a_half`).array as Uint8Array
++
++		// Slot 0 → instances 0 (half A) and 1 (half B), both carrying (0, 1).
++		expect([site[0], site[1], site[2], site[3]]).toEqual([0, 1, 0, 1])
++		// Slot 1 → instances 2, 3 carrying (1, 2).
++		expect([site[4], site[5], site[6], site[7]]).toEqual([1, 2, 1, 2])
++		// jimage mirrored across both halves of each slot.
++		expect(Array.from(jimage.slice(0, 6))).toEqual([0, 0, 0, 0, 0, 0])
++		expect(Array.from(jimage.slice(6, 12))).toEqual([0, 0, 1, 0, 0, 1])
++		// Half parity is a static property of the instance index.
++		expect([half[0], half[1], half[2], half[3]]).toEqual([0, 1, 0, 1])
++		expect(mesh.count).toBe(4)
++	})
++
++	test(`writes per-half solid colors from the per-atom buffer`, () => {
++		manager.add_bond(0, 2, BOND_KIND.AUTO)
++		renderer.sync_gpu_topology()
++
++		const start = attr(`instance_color_start`).array as Float32Array
++		const end = attr(`instance_color_end`).array as Float32Array
++		// Half A (instance 0) = atom 0's color (red), start == end (solid).
++		expect(Array.from(start.slice(0, 3))).toEqual([1, 0, 0])
++		expect(Array.from(end.slice(0, 3))).toEqual([1, 0, 0])
++		// Half B (instance 1) = atom 2's color (blue).
++		expect(Array.from(start.slice(3, 6))).toEqual([0, 0, 1])
++		expect(Array.from(end.slice(3, 6))).toEqual([0, 0, 1])
++	})
++
++	test(`mirrors kind and opacity across both halves`, () => {
++		manager.add_bond(0, 1, BOND_KIND.MANUAL)
++		manager.ensure_opacity()
++		manager.set_opacity(0, 0.25)
++		renderer.sync_gpu_topology()
++
++		const kind = attr(`bond_kind`).array as Uint8Array
++		expect([kind[0], kind[1]]).toEqual([BOND_KIND.MANUAL, BOND_KIND.MANUAL])
++		const op = attr(`instance_opacity`).array as Float32Array
++		expect([op[0], op[1]]).toEqual([0.25, 0.25])
++	})
++
++	test(`leaves instanceMatrix untouched; mode-exit force_full_resync rebuilds it`, () => {
++		manager.add_bond(0, 1, BOND_KIND.AUTO)
++		const before = (mesh.instanceMatrix.array as Float32Array).slice()
++		renderer.sync_gpu_topology()
++
++		// The GPU sync must not write any matrix (the shader's texture branch
++		// ignores instanceMatrix; whatever the mesh was constructed with stays).
++		const mat = mesh.instanceMatrix.array as Float32Array
++		expect(Array.from(mat)).toEqual(Array.from(before))
++
++		// Mode exit: CPU path takes ownership again and composes real matrices
++		// (translation to the half midpoints differs from the initial buffer).
++		renderer.force_full_resync()
++		expect(Array.from(mat.slice(0, 32))).not.toEqual(Array.from(before.slice(0, 32)))
++	})
++
++	test(`tracks manager version so a follow-up sync() is a no-op`, () => {
++		manager.add_bond(0, 1, BOND_KIND.AUTO)
++		const before = (mesh.instanceMatrix.array as Float32Array).slice()
++		renderer.sync_gpu_topology()
++		// sync() early-returns on version match — instanceMatrix stays untouched.
++		renderer.sync()
++		const mat = mesh.instanceMatrix.array as Float32Array
++		expect(Array.from(mat)).toEqual(Array.from(before))
++	})
++
++	test(`replace_auto_bonds between GPU syncs lands in the attrs`, () => {
++		manager.add_bond(0, 1, BOND_KIND.AUTO)
++		renderer.sync_gpu_topology()
++		manager.replace_auto_bonds(new Uint32Array([1, 2]), 1, new Int8Array([1, 0, 0]))
++		renderer.sync_gpu_topology()
++
++		const site = attr(`a_site`).array as Float32Array
++		const jimage = attr(`a_jimage`).array as Int8Array
++		expect([site[0], site[1], site[2], site[3]]).toEqual([1, 2, 1, 2])
++		expect(Array.from(jimage.slice(0, 6))).toEqual([1, 0, 0, 1, 0, 0])
++		expect(mesh.count).toBe(2)
++	})
++
++	test(`dispose removes the GPU topology attributes`, () => {
++		manager.add_bond(0, 1, BOND_KIND.AUTO)
++		renderer.sync_gpu_topology()
++		renderer.dispose()
++		expect(mesh.geometry.getAttribute(`a_site`)).toBeUndefined()
++		expect(mesh.geometry.getAttribute(`a_jimage`)).toBeUndefined()
++		expect(mesh.geometry.getAttribute(`a_half`)).toBeUndefined()
++	})
++})

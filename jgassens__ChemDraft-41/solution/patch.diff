@@ -1,0 +1,1425 @@
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index bee1a3c8d..f4dd0b529 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -1371,7 +1371,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_HISTORY_LIMIT = 100;
+-const CURRENT_BUILD_STAMP = "9.21.07.44-opus";
++const CURRENT_BUILD_STAMP = "9.22.11.52-sol";
+ const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
+ const artBooleanOperationByCommandId: Record<string, NativeArtBooleanOperation> = {
+   [artBooleanOperationCommandIds.union]: "union",
+diff --git a/package.json b/package.json
+index 9678225ba..7c8fbb173 100644
+--- a/package.json
++++ b/package.json
+@@ -10,6 +10,7 @@
+     "dev:web": "pnpm --filter @chemdraft/desktop dev:web",
+     "build": "pnpm lint && pnpm --filter @chemdraft/desktop build",
+     "lint": "tsc -p tsconfig.json --noEmit",
++    "render": "tsx packages/render-cli/src/cli.ts",
+     "plugin:extract": "tsx tools/plugin-extract/extract.ts",
+     "plugin:package": "tsx tools/plugin-package/package.ts",
+     "running-build": "node scripts/running-build.mjs",
+@@ -21,6 +22,7 @@
+     "build:sdk": "node scripts/build-sdk.mjs plugin-api && node scripts/build-sdk.mjs plugin-host"
+   },
+   "devDependencies": {
++    "@resvg/resvg-js": "^2.6.2",
+     "@types/jsdom": "28.0.3",
+     "@types/node": "^26.1.1",
+     "esbuild": "^0.27.7",
+diff --git a/packages/render-cli/README.md b/packages/render-cli/README.md
+new file mode 100644
+index 000000000..58ffd23a4
+--- /dev/null
++++ b/packages/render-cli/README.md
+@@ -0,0 +1,10 @@
++# @chemdraft/render-cli
++
++Headless SMILES-to-SVG/PNG rendering for scripts and document-generation tools. The renderer uses
++the desktop SMILES insertion workflow and the shared SVG export/layout engines, so its chemistry and
++drawing conventions stay aligned with a structure pasted into ChemDraft.
++
++Run it from the workspace root with `pnpm render --help`.
++
++Each successful JSON result reports `stereoCenters` as the number of specified tetrahedral centers
++and `unspecifiedStereoCenters` as the number of constitutional centers with no specified descriptor.
+diff --git a/packages/render-cli/package.json b/packages/render-cli/package.json
+new file mode 100644
+index 000000000..9ba0359bd
+--- /dev/null
++++ b/packages/render-cli/package.json
+@@ -0,0 +1,14 @@
++{
++  "name": "@chemdraft/render-cli",
++  "version": "0.0.0",
++  "private": true,
++  "type": "module",
++  "dependencies": {
++    "@chemdraft/chem-core": "workspace:*",
++    "@chemdraft/export-engine": "workspace:*",
++    "@chemdraft/layout-engine": "workspace:*",
++    "@chemdraft/ocl-adapter": "workspace:*",
++    "@chemdraft/rdkit-adapter": "workspace:*",
++    "@resvg/resvg-js": "^2.6.2"
++  }
++}
+diff --git a/packages/render-cli/src/cli.ts b/packages/render-cli/src/cli.ts
+new file mode 100644
+index 000000000..b74e0e7e3
+--- /dev/null
++++ b/packages/render-cli/src/cli.ts
+@@ -0,0 +1,332 @@
++#!/usr/bin/env node
++import { mkdir, readFile, writeFile } from "node:fs/promises";
++import { basename, dirname, extname, join, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++
++import {
++  finiteNonNegative,
++  finitePositive,
++  renderDefaults,
++  renderSmilesToAssets,
++  type RenderBackground
++} from "./renderer";
++
++type OutputFormat = "png" | "svg" | "both";
++
++interface RenderJob {
++  name: string;
++  smiles: string;
++}
++
++interface ParsedArguments {
++  mode: "single" | "batch";
++  jobsFile?: string;
++  out?: string;
++  outDir?: string;
++  smiles?: string;
++  format: OutputFormat;
++  width: number;
++  background: RenderBackground;
++  bondLength: number;
++  padding: number;
++}
++
++export interface CliIo {
++  stdout: (line: string) => void;
++  stderr: (line: string) => void;
++}
++
++const HELP = `ChemDraft headless structure renderer
++
++Usage:
++  pnpm render --smiles <SMILES> --out <file.png|file.svg>
++  pnpm render --smiles <SMILES> --out <base> --format both
++  pnpm render --batch <jobs.json> --out-dir <dir> [--format png|svg|both]
++
++Batch input is a JSON array of {"name":"aspirin","smiles":"CC(=O)Oc1ccccc1C(=O)O"}.
++Names are trimmed; blank/duplicate names, path separators, and names beginning with a dot are rejected.
++
++Options:
++  --width <px>                    PNG width (default: 600)
++  --background white|transparent SVG/PNG background (default: white)
++  --bond-length <px>              Depicted bond length (default: ${renderDefaults.bondLength}, the desktop paste value)
++  --padding <px>                  Crop padding around the molecule (default: 24)
++  --format png|svg|both           Output format (single mode normally infers the extension)
++  --help                          Print this help
++
++Output:
++  One JSON line per structure is written to stdout. Progress is written to stderr.
++  stereoCenters counts specified centers; unspecifiedStereoCenters counts constitutional centers
++  without a specified descriptor.
++  Exit 0 when every structure succeeds, 1 when any render fails, and 2 for bad arguments.`;
++
++class CliUsageError extends Error {}
++
++function numericOption(value: string | undefined, flag: string, allowZero: boolean): number {
++  if (value === undefined) throw new CliUsageError(`${flag} requires a value.`);
++  const parsed = Number(value);
++  try {
++    return allowZero
++      ? finiteNonNegative(parsed, flag)
++      : finitePositive(parsed, flag);
++  } catch (error) {
++    throw new CliUsageError(error instanceof Error ? error.message : String(error));
++  }
++}
++
++function optionValue(argv: readonly string[], index: number, flag: string): string {
++  const value = argv[index + 1];
++  if (value === undefined || value.startsWith("--")) {
++    throw new CliUsageError(`${flag} requires a value.`);
++  }
++  return value;
++}
++
++function parseArguments(argv: readonly string[]): ParsedArguments | { help: true } {
++  if (argv.includes("--help")) return { help: true };
++
++  let smiles: string | undefined;
++  let jobsFile: string | undefined;
++  let out: string | undefined;
++  let outDir: string | undefined;
++  let format: OutputFormat | undefined;
++  let width = renderDefaults.width;
++  let background: RenderBackground = renderDefaults.background;
++  let bondLength = renderDefaults.bondLength;
++  let padding = renderDefaults.padding;
++
++  for (let index = 0; index < argv.length; index += 1) {
++    const flag = argv[index];
++    if (!flag) continue;
++    const value = () => optionValue(argv, index, flag);
++    switch (flag) {
++      case "--smiles":
++        smiles = value();
++        index += 1;
++        break;
++      case "--batch":
++        jobsFile = value();
++        index += 1;
++        break;
++      case "--out":
++        out = value();
++        index += 1;
++        break;
++      case "--out-dir":
++        outDir = value();
++        index += 1;
++        break;
++      case "--format": {
++        const requested = value();
++        if (requested !== "png" && requested !== "svg" && requested !== "both") {
++          throw new CliUsageError(`--format must be png, svg, or both; received "${requested}".`);
++        }
++        format = requested;
++        index += 1;
++        break;
++      }
++      case "--width":
++        width = numericOption(value(), flag, false);
++        index += 1;
++        break;
++      case "--background": {
++        const requested = value();
++        if (requested !== "white" && requested !== "transparent") {
++          throw new CliUsageError(`--background must be white or transparent; received "${requested}".`);
++        }
++        background = requested;
++        index += 1;
++        break;
++      }
++      case "--bond-length":
++        bondLength = numericOption(value(), flag, false);
++        index += 1;
++        break;
++      case "--padding":
++        padding = numericOption(value(), flag, true);
++        index += 1;
++        break;
++      default:
++        throw new CliUsageError(`Unknown argument "${flag}".`);
++    }
++  }
++
++  if ((smiles ? 1 : 0) + (jobsFile ? 1 : 0) !== 1) {
++    throw new CliUsageError("Provide exactly one of --smiles or --batch.");
++  }
++  if (smiles !== undefined) {
++    if (!out) throw new CliUsageError("Single-structure mode requires --out.");
++    if (outDir) throw new CliUsageError("--out-dir is only valid with --batch.");
++    const extension = extname(out).toLowerCase();
++    const inferred = extension === ".png" ? "png" : extension === ".svg" ? "svg" : undefined;
++    if (!format && !inferred) {
++      throw new CliUsageError("--out must end in .png or .svg unless --format is provided.");
++    }
++    if (format && format !== "both" && inferred && format !== inferred) {
++      throw new CliUsageError(`--format ${format} conflicts with the --out extension ${extension}.`);
++    }
++    return {
++      mode: "single",
++      smiles,
++      out,
++      format: format ?? inferred!,
++      width,
++      background,
++      bondLength,
++      padding
++    };
++  }
++
++  if (!outDir) throw new CliUsageError("Batch mode requires --out-dir.");
++  if (out) throw new CliUsageError("--out is only valid with --smiles.");
++  return {
++    mode: "batch",
++    jobsFile,
++    outDir,
++    format: format ?? "png",
++    width,
++    background,
++    bondLength,
++    padding
++  };
++}
++
++function validateJobName(name: string): void {
++  if (!name || name.startsWith(".") || name.includes("/") || name.includes("\\")) {
++    throw new CliUsageError(
++      `Invalid batch name "${name}": names must be non-empty, must not begin with a dot, and must not contain path separators.`
++    );
++  }
++}
++
++async function readJobs(path: string): Promise<RenderJob[]> {
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    throw new CliUsageError(`Could not read batch file "${path}": ${message}`);
++  }
++  if (!Array.isArray(parsed)) throw new CliUsageError("Batch JSON must be an array of jobs.");
++  const names = new Set<string>();
++  return parsed.map((candidate, index) => {
++    if (
++      !candidate || typeof candidate !== "object" ||
++      typeof (candidate as { name?: unknown }).name !== "string" ||
++      typeof (candidate as { smiles?: unknown }).smiles !== "string"
++    ) {
++      throw new CliUsageError(`Batch job ${index + 1} must contain string "name" and "smiles" fields.`);
++    }
++    const candidateJob = candidate as RenderJob;
++    const job = { ...candidateJob, name: candidateJob.name.trim() };
++    validateJobName(job.name);
++    if (names.has(job.name)) {
++      throw new CliUsageError(`Duplicate batch name "${job.name}".`);
++    }
++    names.add(job.name);
++    if (!job.smiles.trim()) throw new CliUsageError(`Batch job "${job.name}" has an empty SMILES.`);
++    return job;
++  });
++}
++
++function baseWithoutKnownExtension(path: string): string {
++  const extension = extname(path).toLowerCase();
++  return extension === ".png" || extension === ".svg" ? path.slice(0, -extension.length) : path;
++}
++
++function outputPaths(base: string, format: OutputFormat): string[] {
++  if (format === "both") return [`${baseWithoutKnownExtension(base)}.svg`, `${baseWithoutKnownExtension(base)}.png`];
++  const extension = extname(base).toLowerCase();
++  if (extension === `.${format}`) return [base];
++  return [`${base}.${format}`];
++}
++
++async function renderJob(
++  job: RenderJob,
++  base: string,
++  args: ParsedArguments,
++  io: CliIo
++): Promise<boolean> {
++  io.stderr(`Rendering ${job.name}…`);
++  try {
++    const rendered = await renderSmilesToAssets(job.smiles, {
++      name: job.name,
++      width: args.width,
++      background: args.background,
++      bondLength: args.bondLength,
++      padding: args.padding
++    });
++    const files = outputPaths(base, args.format);
++    for (const file of files) {
++      await mkdir(dirname(file), { recursive: true });
++      await writeFile(file, file.endsWith(".svg") ? rendered.svg : rendered.png);
++    }
++    io.stdout(JSON.stringify({
++      name: job.name,
++      smiles: job.smiles,
++      ok: true,
++      files,
++      engine: rendered.engine,
++      stereoCenters: rendered.stereoCenters,
++      unspecifiedStereoCenters: rendered.unspecifiedStereoCenters,
++      warnings: rendered.warnings
++    }));
++    io.stderr(`Wrote ${files.join(", ")}`);
++    return true;
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    const namedMessage = message.includes(job.smiles)
++      ? message
++      : `Unable to render SMILES "${job.smiles}": ${message}`;
++    io.stdout(JSON.stringify({ name: job.name, smiles: job.smiles, ok: false, error: namedMessage }));
++    io.stderr(`Failed ${job.name}: ${namedMessage}`);
++    return false;
++  }
++}
++
++export async function runCli(
++  argv: readonly string[],
++  io: CliIo = {
++    stdout: (line) => process.stdout.write(`${line}\n`),
++    stderr: (line) => process.stderr.write(`${line}\n`)
++  }
++): Promise<number> {
++  try {
++    const parsed = parseArguments(argv);
++    if ("help" in parsed) {
++      io.stdout(HELP);
++      return 0;
++    }
++
++    let jobs: RenderJob[];
++    let bases: string[];
++    if (parsed.mode === "single") {
++      const out = parsed.out!;
++      const name = basename(baseWithoutKnownExtension(out)) || "structure";
++      jobs = [{ name, smiles: parsed.smiles! }];
++      bases = [out];
++    } else {
++      jobs = await readJobs(parsed.jobsFile!);
++      await mkdir(parsed.outDir!, { recursive: true });
++      bases = jobs.map((job) => join(parsed.outDir!, job.name));
++    }
++
++    let allSucceeded = true;
++    for (let index = 0; index < jobs.length; index += 1) {
++      const job = jobs[index]!;
++      const base = bases[index]!;
++      if (!await renderJob(job, base, parsed, io)) allSucceeded = false;
++    }
++    return allSucceeded ? 0 : 1;
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    io.stderr(`Error: ${message}`);
++    io.stderr("Run pnpm render --help for usage.");
++    return error instanceof CliUsageError ? 2 : 1;
++  }
++}
++
++const isMain = process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
++if (isMain) {
++  process.exitCode = await runCli(process.argv.slice(2));
++}
+diff --git a/packages/render-cli/src/render-cli.test.ts b/packages/render-cli/src/render-cli.test.ts
+new file mode 100644
+index 000000000..06341fe9c
+--- /dev/null
++++ b/packages/render-cli/src/render-cli.test.ts
+@@ -0,0 +1,393 @@
++import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { inflateSync } from "node:zlib";
++
++import { afterAll, beforeAll, describe, expect, it } from "vitest";
++
++import { perceiveStereoCentersFromMolfile } from "@chemdraft/ocl-adapter";
++import { atomLabelHaloWidthPx, planMoleculeAtomLabels } from "@chemdraft/layout-engine";
++import {
++  generateSmiles2DMolfile,
++  resetRdkitForTesting,
++  setRdkitModuleLoader
++} from "@chemdraft/rdkit-adapter";
++
++import { stereoPerceptionMolfile } from "../../../apps/desktop/src/documentWorkflow";
++import { runCli } from "./cli";
++import { renderSmilesToAssets, type RenderedSmiles } from "./renderer";
++
++interface DecodedPng {
++  width: number;
++  height: number;
++  pixels: Uint8Array;
++}
++
++let outputDirectory: string;
++
++beforeAll(async () => {
++  outputDirectory = await mkdtemp(join(tmpdir(), "chemdraft-render-cli-"));
++});
++
++afterAll(async () => {
++  resetRdkitForTesting();
++  await rm(outputDirectory, { recursive: true, force: true });
++});
++
++function u32(buffer: Uint8Array, offset: number): number {
++  return ((buffer[offset] ?? 0) << 24) |
++    ((buffer[offset + 1] ?? 0) << 16) |
++    ((buffer[offset + 2] ?? 0) << 8) |
++    (buffer[offset + 3] ?? 0);
++}
++
++function paeth(left: number, above: number, upperLeft: number): number {
++  const estimate = left + above - upperLeft;
++  const leftDistance = Math.abs(estimate - left);
++  const aboveDistance = Math.abs(estimate - above);
++  const upperLeftDistance = Math.abs(estimate - upperLeft);
++  return leftDistance <= aboveDistance && leftDistance <= upperLeftDistance
++    ? left
++    : aboveDistance <= upperLeftDistance ? above : upperLeft;
++}
++
++function decodePng(png: Uint8Array): DecodedPng {
++  expect(Array.from(png.slice(0, 8))).toEqual([137, 80, 78, 71, 13, 10, 26, 10]);
++  const idat: Uint8Array[] = [];
++  let width = 0;
++  let height = 0;
++  let offset = 8;
++  while (offset + 12 <= png.length) {
++    const length = u32(png, offset) >>> 0;
++    const type = Buffer.from(png.slice(offset + 4, offset + 8)).toString("ascii");
++    const data = png.slice(offset + 8, offset + 8 + length);
++    if (type === "IHDR") {
++      width = u32(data, 0) >>> 0;
++      height = u32(data, 4) >>> 0;
++      expect(data[8]).toBe(8);
++      expect(data[9]).toBe(6);
++    } else if (type === "IDAT") {
++      idat.push(data);
++    }
++    offset += length + 12;
++    if (type === "IEND") break;
++  }
++
++  const compressed = Buffer.concat(idat.map((chunk) => Buffer.from(chunk)));
++  const filtered = inflateSync(compressed);
++  const bytesPerPixel = 4;
++  const stride = width * bytesPerPixel;
++  const pixels = new Uint8Array(width * height * bytesPerPixel);
++  let source = 0;
++  for (let y = 0; y < height; y += 1) {
++    const filter = filtered[source++] ?? 0;
++    for (let x = 0; x < stride; x += 1) {
++      const encoded = filtered[source++] ?? 0;
++      const target = y * stride + x;
++      const left = x >= bytesPerPixel ? pixels[target - bytesPerPixel]! : 0;
++      const above = y > 0 ? pixels[target - stride]! : 0;
++      const upperLeft = y > 0 && x >= bytesPerPixel ? pixels[target - stride - bytesPerPixel]! : 0;
++      const predictor = filter === 1
++        ? left
++        : filter === 2
++          ? above
++          : filter === 3
++            ? Math.floor((left + above) / 2)
++            : filter === 4
++              ? paeth(left, above, upperLeft)
++              : 0;
++      pixels[target] = (encoded + predictor) & 0xff;
++    }
++  }
++  return { width, height, pixels };
++}
++
++function pixelAt(png: DecodedPng, x: number, y: number): [number, number, number, number] {
++  const offset = (y * png.width + x) * 4;
++  return [
++    png.pixels[offset]!,
++    png.pixels[offset + 1]!,
++    png.pixels[offset + 2]!,
++    png.pixels[offset + 3]!
++  ];
++}
++
++function expectWhiteEdges(png: DecodedPng): void {
++  for (let x = 0; x < png.width; x += 1) {
++    expect(pixelAt(png, x, 0)).toEqual([255, 255, 255, 255]);
++    expect(pixelAt(png, x, png.height - 1)).toEqual([255, 255, 255, 255]);
++  }
++  for (let y = 0; y < png.height; y += 1) {
++    expect(pixelAt(png, 0, y)).toEqual([255, 255, 255, 255]);
++    expect(pixelAt(png, png.width - 1, y)).toEqual([255, 255, 255, 255]);
++  }
++}
++
++function expectInkNearAtomLabel(rendered: RenderedSmiles, png: DecodedPng, label: string): void {
++  const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++  const tag = rendered.svg.match(new RegExp(`<g(?=[^>]*data-atom-label="${escapedLabel}")[^>]*>`))?.[0];
++  const position = tag?.match(/transform="translate\(([-\d.]+) ([-\d.]+)\)/);
++  expect(position, `expected a positioned SVG atom-label group for ${label}`).not.toBeNull();
++  const pageX = Number(position?.[1]);
++  const pageY = Number(position?.[2]);
++  const centerX = Math.round((pageX - rendered.viewBox.x) / rendered.viewBox.width * png.width);
++  const centerY = Math.round((pageY - rendered.viewBox.y) / rendered.viewBox.height * png.height);
++  const radius = Math.max(8, Math.round(12 / rendered.viewBox.width * png.width));
++  let foundInk = false;
++  for (let y = Math.max(0, centerY - radius); y <= Math.min(png.height - 1, centerY + radius); y += 1) {
++    for (let x = Math.max(0, centerX - radius); x <= Math.min(png.width - 1, centerX + radius); x += 1) {
++      const [red, green, blue, alpha] = pixelAt(png, x, y);
++      if (alpha > 0 && Math.min(red, green, blue) < 128) foundInk = true;
++    }
++  }
++  expect(foundInk, `expected raster ink around the ${label} atom label`).toBe(true);
++}
++
++function expectSvgLabelExtentsInsideViewBox(rendered: RenderedSmiles): void {
++  const maxX = rendered.viewBox.x + rendered.viewBox.width;
++  const maxY = rendered.viewBox.y + rendered.viewBox.height;
++  const labels = planMoleculeAtomLabels(rendered.molecule);
++  expect(labels.length).toBeGreaterThan(0);
++  expect((rendered.svg.match(/<text\b/g) ?? []).length).toBeGreaterThan(0);
++  for (const label of labels) {
++    const halo = label.backgroundVisible ? atomLabelHaloWidthPx(label.drawingStyle) / 2 : 0;
++    const minX = label.anchor.x + label.layout.bounds.x - halo;
++    const minY = label.anchor.y + label.layout.bounds.y - halo;
++    expect(minX, label.label).toBeGreaterThanOrEqual(rendered.viewBox.x - 0.001);
++    expect(minX + label.layout.bounds.width + halo * 2, label.label).toBeLessThanOrEqual(maxX + 0.001);
++    expect(minY, label.label).toBeGreaterThanOrEqual(rendered.viewBox.y - 0.001);
++    expect(minY + label.layout.bounds.height + halo * 2, label.label).toBeLessThanOrEqual(maxY + 0.001);
++  }
++  // These fixtures deliberately contain text-only atom labels. If a future renderer emits paths
++  // for them, the test must gain equivalent path bounds rather than silently stop checking them.
++  expect(rendered.svg).not.toContain("<path");
++}
++
++describe("headless ChemDraft rendering", () => {
++  const cases = [
++    { name: "ethanol", smiles: "CCO", label: "OH" },
++    { name: "benzene", smiles: "c1ccccc1" },
++    { name: "aspirin", smiles: "CC(=O)Oc1ccccc1C(=O)O", label: "O" },
++    { name: "alanine", smiles: "C[C@H](N)C(=O)O", label: "NH2" },
++    { name: "tetramethylammonium", smiles: "C[N+](C)(C)C", label: "N+" }
++  ] as const;
++
++  for (const fixture of cases) {
++    it(`renders ${fixture.name} to cropped SVG and a 600 px PNG`, async () => {
++      const rendered = await renderSmilesToAssets(fixture.smiles, { name: fixture.name });
++      expect(rendered.svg).toMatch(/^<svg /);
++      expect(rendered.svg).toContain(`data-atom-count="${rendered.molecule.atoms.length}"`);
++      if ("label" in fixture) expect(rendered.svg).toContain(`data-atom-label="${fixture.label}`);
++      const png = decodePng(rendered.png);
++      expect(png.width).toBe(600);
++      expect(png.height).toBeGreaterThan(0);
++    });
++  }
++
++  it("preserves tetrahedral stereo as a wedge/hash and reports one stereocenter", async () => {
++    const rendered = await renderSmilesToAssets("C[C@H](N)C(=O)O", { name: "alanine" });
++    expect(rendered.stereoCenters).toBe(1);
++    expect(rendered.unspecifiedStereoCenters).toBe(0);
++    expect(rendered.molecule.bonds.some((bond) =>
++      bond.display?.bondStyle === "wedge" || bond.display?.bondStyle === "hashed"
++    )).toBe(true);
++    expect(rendered.svg).toMatch(/data-bond-style="(?:wedge|hashed)"/);
++  });
++
++  it("reports specified and unspecified constitutional stereocenters separately", async () => {
++    const specified = await renderSmilesToAssets("C[C@H](N)C(=O)O");
++    const unspecified = await renderSmilesToAssets("CC(N)C(=O)O");
++    expect([specified.stereoCenters, specified.unspecifiedStereoCenters]).toEqual([1, 0]);
++    expect([unspecified.stereoCenters, unspecified.unspecifiedStereoCenters]).toEqual([0, 1]);
++  });
++
++  it.each([
++    "C[C@H](N)C(=O)O",
++    "C[C@@H](N)C(=O)O",
++    "C[C@H](O)[C@H](N)C(=O)O"
++  ])("reads rendered chirality back with the same R/S descriptors for %s", async (smiles) => {
++    const rendered = await renderSmilesToAssets(smiles);
++    const sourceMolfile = await generateSmiles2DMolfile(smiles);
++    const expected = perceiveStereoCentersFromMolfile(sourceMolfile)
++      .map((center, atomIndex) => ({ atomIndex, ...center }))
++      .filter((center) => center.isStereoCenter);
++    const actual = perceiveStereoCentersFromMolfile(stereoPerceptionMolfile(rendered.molecule))
++      .map((center, atomIndex) => ({ atomIndex, ...center }))
++      .filter((center) => center.isStereoCenter);
++    expect(actual).toEqual(expected);
++    expect(actual.every((center) => center.descriptor !== "unspecified")).toBe(true);
++  });
++
++  it("does not collapse aromatic benzene to all-single bonds", async () => {
++    const rendered = await renderSmilesToAssets("c1ccccc1", { name: "benzene" });
++    expect(rendered.molecule.bonds.some((bond) =>
++      bond.order === "aromatic" || bond.order === "double"
++    )).toBe(true);
++    expect(rendered.molecule.bonds.every((bond) => bond.order === "single")).toBe(false);
++  });
++
++  it("crops to planned molecule/label bounds and keeps labels away from white PNG edges", async () => {
++    const rendered = await renderSmilesToAssets("CCO", { name: "ethanol", padding: 24 });
++    expect(rendered.viewBox.width).toBeLessThan(200);
++    expect(rendered.viewBox.height).toBeLessThan(150);
++    expect(rendered.svg).not.toContain('viewBox="0 0 816 1056"');
++    const png = decodePng(rendered.png);
++    expectWhiteEdges(png);
++    expectInkNearAtomLabel(rendered, png, "OH");
++  });
++
++  it.each(["NCC(=O)[O-]", "[NH2-]CC=O"])(
++    "keeps every SVG text/path extent inside a zero-padding viewBox for %s",
++    async (smiles) => {
++      const rendered = await renderSmilesToAssets(smiles, { padding: 0 });
++      expectSvgLabelExtentsInsideViewBox(rendered);
++    }
++  );
++
++  it("fails loudly instead of dropping radical or isotope labels", async () => {
++    const jobsPath = join(outputDirectory, "unsupported-labels.json");
++    await writeFile(jobsPath, JSON.stringify([
++      { name: "radical", smiles: "[CH3]" },
++      { name: "carbon-13", smiles: "C[13CH2]O" },
++      { name: "deuterium", smiles: "[2H]C(Cl)(Br)F" },
++      { name: "ethanol", smiles: "CCO" }
++    ]));
++    const stdout: string[] = [];
++    const code = await runCli(
++      ["--batch", jobsPath, "--out-dir", join(outputDirectory, "unsupported-label-output")],
++      { stdout: (line) => stdout.push(line), stderr: () => undefined }
++    );
++    const results = stdout.map((line) => JSON.parse(line) as {
++      smiles: string;
++      ok: boolean;
++      error?: string;
++    });
++    expect(code).toBe(1);
++    expect(results.map(({ smiles, ok }) => ({ smiles, ok }))).toEqual([
++      { smiles: "[CH3]", ok: false },
++      { smiles: "C[13CH2]O", ok: false },
++      { smiles: "[2H]C(Cl)(Br)F", ok: false },
++      { smiles: "CCO", ok: true }
++    ]);
++    for (const result of results.slice(0, 3)) {
++      expect(result.error).toBe(
++        `SMILES contains a radical/isotope label that ChemDraft cannot yet draw: ${result.smiles}`
++      );
++    }
++  });
++
++  it("reports an unparseable SMILES without a stack trace and exits 1", async () => {
++    const stdout: string[] = [];
++    const stderr: string[] = [];
++    const code = await runCli(
++      ["--smiles", "not-a-smiles", "--out", join(outputDirectory, "bad.svg")],
++      { stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) }
++    );
++    expect(code).toBe(1);
++    expect(stdout).toHaveLength(1);
++    expect(JSON.parse(stdout[0]!)).toMatchObject({ smiles: "not-a-smiles", ok: false });
++    expect(JSON.parse(stdout[0]!).error).toContain("not-a-smiles");
++    expect(stdout[0]).not.toContain(" at ");
++    expect(stderr.join("\n")).toContain("Failed");
++  });
++
++  it("writes both formats from a base path and honors --width", async () => {
++    const base = join(outputDirectory, "aspirin-both");
++    const stdout: string[] = [];
++    const code = await runCli(
++      [
++        "--smiles", "CC(=O)Oc1ccccc1C(=O)O",
++        "--out", base,
++        "--format", "both",
++        "--width", "420"
++      ],
++      { stdout: (line) => stdout.push(line), stderr: () => undefined }
++    );
++    expect(code).toBe(0);
++    expect(JSON.parse(stdout[0]!)).toMatchObject({
++      name: "aspirin-both",
++      ok: true,
++      files: [`${base}.svg`, `${base}.png`]
++    });
++    expect(await readFile(`${base}.svg`, "utf8")).toContain("data-atom-label=\"O\"");
++    expect(decodePng(await readFile(`${base}.png`)).width).toBe(420);
++  });
++
++  it("continues a batch after a bad SMILES and exits 1", async () => {
++    const jobsPath = join(outputDirectory, "mixed-jobs.json");
++    const outDir = join(outputDirectory, "mixed-output");
++    await writeFile(jobsPath, JSON.stringify([
++      { name: "ethanol", smiles: "CCO" },
++      { name: "bad", smiles: "not-a-smiles" },
++      { name: "benzene", smiles: "c1ccccc1" }
++    ]));
++    const stdout: string[] = [];
++    const code = await runCli(
++      ["--batch", jobsPath, "--out-dir", outDir, "--format", "svg"],
++      { stdout: (line) => stdout.push(line), stderr: () => undefined }
++    );
++    expect(code).toBe(1);
++    expect(stdout.map((line) => JSON.parse(line).ok)).toEqual([true, false, true]);
++    expect(await readFile(join(outDir, "ethanol.svg"), "utf8")).toContain("<svg");
++    expect(await readFile(join(outDir, "benzene.svg"), "utf8")).toContain("<svg");
++  });
++
++  it.each(["../x", "/tmp/x"])("rejects the path-like batch name %s", async (name) => {
++    const jobsPath = join(outputDirectory, `invalid-${name.includes("tmp") ? "absolute" : "relative"}.json`);
++    await writeFile(jobsPath, JSON.stringify([{ name, smiles: "CCO" }]));
++    const stdout: string[] = [];
++    const stderr: string[] = [];
++    const code = await runCli(
++      ["--batch", jobsPath, "--out-dir", join(outputDirectory, "rejected")],
++      { stdout: (line) => stdout.push(line), stderr: (line) => stderr.push(line) }
++    );
++    expect(code).toBe(2);
++    expect(stdout).toHaveLength(0);
++    expect(stderr.join("\n")).toContain("Invalid batch name");
++  });
++
++  it("trims batch names and rejects a duplicate after trimming", async () => {
++    const jobsPath = join(outputDirectory, "duplicate-jobs.json");
++    await writeFile(jobsPath, JSON.stringify([
++      { name: "ethanol", smiles: "CCO" },
++      { name: "  ethanol  ", smiles: "CCO" }
++    ]));
++    const stderr: string[] = [];
++    const code = await runCli(
++      ["--batch", jobsPath, "--out-dir", join(outputDirectory, "duplicate-output")],
++      { stdout: () => undefined, stderr: (line) => stderr.push(line) }
++    );
++    expect(code).toBe(2);
++    expect(stderr.join("\n")).toContain('Duplicate batch name "ethanol"');
++  });
++
++  it("rejects a whitespace-only batch name", async () => {
++    const jobsPath = join(outputDirectory, "blank-name-jobs.json");
++    await writeFile(jobsPath, JSON.stringify([{ name: "   ", smiles: "CCO" }]));
++    const stderr: string[] = [];
++    const code = await runCli(
++      ["--batch", jobsPath, "--out-dir", join(outputDirectory, "blank-output")],
++      { stdout: () => undefined, stderr: (line) => stderr.push(line) }
++    );
++    expect(code).toBe(2);
++    expect(stderr.join("\n")).toContain("Invalid batch name");
++  });
++
++  it.each([
++    ["an unknown flag", ["--smiles", "CCO", "--out", "ethanol.png", "--wat"]],
++    ["--out without an extension", ["--smiles", "CCO", "--out", "ethanol"]]
++  ] as const)("exits 2 for %s", async (_label, argv) => {
++    expect(await runCli(argv, { stdout: () => undefined, stderr: () => undefined })).toBe(2);
++  });
++
++  it("uses the OCL fallback when the RDKit loader fails", async () => {
++    // Prime the renderer's normal Node loader so this test remains independent when selected with
++    // `-t`; the injected failing loader must be the one used by the subsequent render.
++    await renderSmilesToAssets("C", { name: "loader-prime" });
++    setRdkitModuleLoader(() => Promise.reject(new Error("forced RDKit failure")));
++    const rendered = await renderSmilesToAssets("CCO", { name: "fallback" });
++    expect(rendered.engine).toBe("ocl");
++    expect(decodePng(rendered.png).width).toBe(600);
++    expect(rendered.warnings.join("\n")).toContain("forced RDKit failure");
++  });
++});
+diff --git a/packages/render-cli/src/renderer.ts b/packages/render-cli/src/renderer.ts
+new file mode 100644
+index 000000000..f52ab2805
+--- /dev/null
++++ b/packages/render-cli/src/renderer.ts
+@@ -0,0 +1,420 @@
++import { readFileSync } from "node:fs";
++import { createRequire } from "node:module";
++import { dirname } from "node:path";
++import { fileURLToPath } from "node:url";
++
++import { Resvg } from "@resvg/resvg-js";
++
++import {
++  createEmptyDocument,
++  type ChemDraftDocument,
++  type MoleculeObject
++} from "@chemdraft/chem-core";
++import { exportDocumentToSvg } from "@chemdraft/export-engine";
++import type { Depiction2D } from "@chemdraft/ocl-adapter";
++import {
++  atomLabelHaloWidthPx,
++  planMoleculeAtomLabels,
++  planPageSvgRender,
++  type PageSvgAttributeValue,
++  type PageSvgFragment
++} from "@chemdraft/layout-engine";
++import {
++  generateSmiles2DMolfile,
++  setRdkitModuleLoader,
++  type RdkitMinimalModule
++} from "@chemdraft/rdkit-adapter";
++
++import {
++  applyMoleculeTargetBondLength,
++  insertSmilesMolecule,
++  pastedStructureDepictionFromMolfile,
++  smilesPasteBondLengthPx,
++  type PastedStructureDepiction
++} from "../../../apps/desktop/src/documentWorkflow";
++
++export type RenderBackground = "white" | "transparent";
++export type DepictionEngine = "rdkit" | "ocl";
++
++export interface RenderSmilesOptions {
++  name?: string;
++  width?: number;
++  background?: RenderBackground;
++  bondLength?: number;
++  padding?: number;
++}
++
++export interface RenderedSmiles {
++  name: string;
++  smiles: string;
++  svg: string;
++  png: Uint8Array;
++  engine: DepictionEngine;
++  stereoCenters: number;
++  unspecifiedStereoCenters: number;
++  warnings: string[];
++  document: ChemDraftDocument;
++  molecule: MoleculeObject;
++  viewBox: { x: number; y: number; width: number; height: number };
++}
++
++interface DepictionResult {
++  depiction: PastedStructureDepiction;
++  molfile: string;
++  engine: DepictionEngine;
++  stereoCenters: number;
++  unspecifiedStereoCenters: number;
++  warnings: string[];
++}
++
++interface Bounds {
++  minX: number;
++  minY: number;
++  maxX: number;
++  maxY: number;
++}
++
++const DEFAULT_WIDTH = 600;
++const DEFAULT_PADDING = 24;
++const HIT_TARGET_CLASSES = new Set([
++  "native-bond-hit-target",
++  "native-bond-hover-decorator",
++  "native-atom-hit-target",
++  "native-crossing-hit-target",
++  "native-molecule-ring-hit-target"
++]);
++
++let rdkitLoaderInstalled = false;
++
++/** Register the vendored MinimalLib build using the same Node bootstrap as rdkit-adapter/testing. */
++function installNodeRdkitModuleLoader(): void {
++  if (rdkitLoaderInstalled) return;
++
++  const glueUrl = new URL("../../rdkit-adapter/vendor/RDKit_minimal.js", import.meta.url);
++  const wasmUrl = new URL("../../rdkit-adapter/vendor/RDKit_minimal.wasm", import.meta.url);
++  const glueSource = readFileSync(glueUrl, "utf8");
++  const wasmBinary = new Uint8Array(readFileSync(wasmUrl));
++  const factory = new Function("require", "__dirname", `${glueSource}\n;return initRDKitModule;`)(
++    createRequire(import.meta.url),
++    dirname(fileURLToPath(glueUrl))
++  ) as (options: {
++    locateFile: (file: string) => string;
++    wasmBinary: Uint8Array;
++  }) => Promise<RdkitMinimalModule>;
++
++  setRdkitModuleLoader(() => factory({
++    locateFile: () => fileURLToPath(wasmUrl),
++    wasmBinary
++  }));
++  rdkitLoaderInstalled = true;
++}
++
++function errorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++function structuredOclDepiction(depiction: Depiction2D): PastedStructureDepiction {
++  return {
++    atoms: depiction.atoms.map((atom) => ({
++      element: atom.element,
++      x: atom.x,
++      y: atom.y,
++      charge: atom.charge
++    })),
++    bonds: depiction.bonds.map((bond) => ({
++      from: bond.from,
++      to: bond.to,
++      // Aromatic/unknown orders and wedge direction cross this boundary unchanged.
++      order: bond.order,
++      wedge: bond.wedge
++    }))
++  };
++}
++
++class UnsupportedMolfileLabelError extends Error {}
++
++function rejectUnsupportedMolfileLabels(molfile: string, smiles: string): void {
++  if (/^M  (?:RAD|ISO)\b/m.test(molfile)) {
++    throw new UnsupportedMolfileLabelError(
++      `SMILES contains a radical/isotope label that ChemDraft cannot yet draw: ${smiles}`
++    );
++  }
++}
++
++function stereoCenterCounts(
++  centers: ReadonlyArray<{ isStereoCenter: boolean; descriptor: "R" | "S" | "unspecified" }>
++): { stereoCenters: number; unspecifiedStereoCenters: number } {
++  return {
++    stereoCenters: centers.filter((center) =>
++      center.isStereoCenter && center.descriptor !== "unspecified"
++    ).length,
++    unspecifiedStereoCenters: centers.filter((center) =>
++      center.isStereoCenter && center.descriptor === "unspecified"
++    ).length
++  };
++}
++
++async function depictSmiles(smiles: string): Promise<DepictionResult> {
++  const ocl = await import("@chemdraft/ocl-adapter");
++  let rdkitFailure: unknown;
++
++  try {
++    installNodeRdkitModuleLoader();
++    const molfile = await generateSmiles2DMolfile(smiles);
++    rejectUnsupportedMolfileLabels(molfile, smiles);
++    const depiction = pastedStructureDepictionFromMolfile(molfile);
++    const counts = stereoCenterCounts(ocl.perceiveStereoCentersFromMolfile(molfile));
++    return { depiction, molfile, engine: "rdkit", ...counts, warnings: [] };
++  } catch (error) {
++    if (error instanceof UnsupportedMolfileLabelError) throw error;
++    rdkitFailure = error;
++  }
++
++  try {
++    const fallback = ocl.depictSmiles2D(smiles);
++    rejectUnsupportedMolfileLabels(fallback.molfile, smiles);
++    let depiction: PastedStructureDepiction;
++    try {
++      depiction = pastedStructureDepictionFromMolfile(fallback.molfile);
++    } catch {
++      // V2000 has fixed-width coordinates. Very large OCL layouts can still be carried through
++      // losslessly via its structured result, exactly as desktop SMILES paste does.
++      depiction = structuredOclDepiction(fallback);
++    }
++    const counts = stereoCenterCounts(ocl.perceiveStereoCentersFromMolfile(fallback.molfile));
++    return {
++      depiction,
++      molfile: fallback.molfile,
++      engine: "ocl",
++      ...counts,
++      warnings: [`RDKit depiction failed; used OpenChemLib fallback: ${errorMessage(rdkitFailure)}`]
++    };
++  } catch (oclError) {
++    if (oclError instanceof UnsupportedMolfileLabelError) throw oclError;
++    throw new Error(
++      `Unable to render SMILES "${smiles}": RDKit: ${errorMessage(rdkitFailure)}; OpenChemLib: ${errorMessage(oclError)}`
++    );
++  }
++}
++
++export function finitePositive(value: number, label: string): number {
++  if (!Number.isFinite(value) || value <= 0) {
++    throw new Error(`${label} must be a finite number greater than zero.`);
++  }
++  return value;
++}
++
++export function finiteNonNegative(value: number, label: string): number {
++  if (!Number.isFinite(value) || value < 0) {
++    throw new Error(`${label} must be a finite, non-negative number.`);
++  }
++  return value;
++}
++
++function moleculeFromDocument(document: ChemDraftDocument): MoleculeObject {
++  const molecule = document.pages[0]?.objects.find((object): object is MoleculeObject => object.type === "molecule");
++  if (!molecule) {
++    throw new Error("The SMILES depiction did not produce a molecule object.");
++  }
++  return molecule;
++}
++
++function includePoint(bounds: Bounds, x: number, y: number, expansion = 0): void {
++  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(expansion)) return;
++  bounds.minX = Math.min(bounds.minX, x - expansion);
++  bounds.minY = Math.min(bounds.minY, y - expansion);
++  bounds.maxX = Math.max(bounds.maxX, x + expansion);
++  bounds.maxY = Math.max(bounds.maxY, y + expansion);
++}
++
++function numericAttribute(attrs: Record<string, PageSvgAttributeValue>, name: string): number | undefined {
++  const value = attrs[name];
++  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
++  if (typeof value !== "string" || value.trim().length === 0) return undefined;
++  const parsed = Number(value);
++  return Number.isFinite(parsed) ? parsed : undefined;
++}
++
++function strokeExpansion(attrs: Record<string, PageSvgAttributeValue>): number {
++  return (numericAttribute(attrs, "stroke-width") ?? 0) / 2;
++}
++
++function includePointList(bounds: Bounds, points: string, expansion: number): void {
++  for (const point of points.trim().split(/\s+/)) {
++    const [x, y] = point.split(",").map(Number);
++    if (x !== undefined && y !== undefined) includePoint(bounds, x, y, expansion);
++  }
++}
++
++/**
++ * Read actual line/polygon geometry from the layout engine's page plan. This deliberately consumes
++ * the shared plan instead of reproducing wedge, hash, multiple-bond, or junction rendering math.
++ */
++function includePlannedGeometry(bounds: Bounds, fragment: PageSvgFragment): void {
++  if (fragment.kind === "text") return;
++  const className = typeof fragment.attrs.class === "string" ? fragment.attrs.class : "";
++  if (HIT_TARGET_CLASSES.has(className)) return;
++
++  const expansion = strokeExpansion(fragment.attrs);
++  if (fragment.tag === "line") {
++    const x1 = numericAttribute(fragment.attrs, "x1");
++    const y1 = numericAttribute(fragment.attrs, "y1");
++    const x2 = numericAttribute(fragment.attrs, "x2");
++    const y2 = numericAttribute(fragment.attrs, "y2");
++    if (x1 !== undefined && y1 !== undefined) includePoint(bounds, x1, y1, expansion);
++    if (x2 !== undefined && y2 !== undefined) includePoint(bounds, x2, y2, expansion);
++  } else if (fragment.tag === "polygon" || fragment.tag === "polyline") {
++    const points = fragment.attrs.points;
++    if (typeof points === "string") includePointList(bounds, points, expansion);
++  } else if (fragment.tag === "circle") {
++    const cx = numericAttribute(fragment.attrs, "cx");
++    const cy = numericAttribute(fragment.attrs, "cy");
++    const radius = numericAttribute(fragment.attrs, "r");
++    if (cx !== undefined && cy !== undefined && radius !== undefined) {
++      includePoint(bounds, cx, cy, radius + expansion);
++    }
++  } else if (fragment.tag === "ellipse") {
++    const cx = numericAttribute(fragment.attrs, "cx");
++    const cy = numericAttribute(fragment.attrs, "cy");
++    const rx = numericAttribute(fragment.attrs, "rx");
++    const ry = numericAttribute(fragment.attrs, "ry");
++    if (cx !== undefined && cy !== undefined && rx !== undefined && ry !== undefined) {
++      includePoint(bounds, cx - rx, cy - ry, expansion);
++      includePoint(bounds, cx + rx, cy + ry, expansion);
++    }
++  }
++
++  fragment.children.forEach((child) => includePlannedGeometry(bounds, child));
++}
++
++function moleculeVisualBounds(document: ChemDraftDocument, molecule: MoleculeObject): Bounds {
++  const bounds: Bounds = {
++    minX: Number.POSITIVE_INFINITY,
++    minY: Number.POSITIVE_INFINITY,
++    maxX: Number.NEGATIVE_INFINITY,
++    maxY: Number.NEGATIVE_INFINITY
++  };
++
++  molecule.atoms.forEach((atom) => includePoint(bounds, atom.x, atom.y));
++  planMoleculeAtomLabels(molecule).forEach((plan) => {
++    const halo = plan.backgroundVisible ? atomLabelHaloWidthPx(plan.drawingStyle) / 2 : 0;
++    includePoint(
++      bounds,
++      plan.anchor.x + plan.layout.bounds.x,
++      plan.anchor.y + plan.layout.bounds.y,
++      halo
++    );
++    includePoint(
++      bounds,
++      plan.anchor.x + plan.layout.bounds.x + plan.layout.bounds.width,
++      plan.anchor.y + plan.layout.bounds.y + plan.layout.bounds.height,
++      halo
++    );
++  });
++
++  const page = document.pages[0];
++  if (!page) throw new Error("The render document has no page.");
++  planPageSvgRender(page).fragments.forEach((fragment) => includePlannedGeometry(bounds, fragment));
++
++  if (![bounds.minX, bounds.minY, bounds.maxX, bounds.maxY].every(Number.isFinite)) {
++    throw new Error("The molecule has no finite visual bounds.");
++  }
++  return bounds;
++}
++
++function svgNumber(value: number): string {
++  return Number(value.toFixed(3)).toString();
++}
++
++function cropSvg(
++  svg: string,
++  bounds: Bounds,
++  padding: number,
++  background: RenderBackground
++): { svg: string; viewBox: RenderedSmiles["viewBox"] } {
++  const viewBox = {
++    x: bounds.minX - padding,
++    y: bounds.minY - padding,
++    width: Math.max(1, bounds.maxX - bounds.minX + padding * 2),
++    height: Math.max(1, bounds.maxY - bounds.minY + padding * 2)
++  };
++  const rootPattern = /<svg\s+([^>]*?)width="[^"]+"\s+height="[^"]+"\s+viewBox="[^"]+"([^>]*)>/;
++  let cropped = svg.replace(
++    rootPattern,
++    `<svg $1width="${svgNumber(viewBox.width)}" height="${svgNumber(viewBox.height)}" viewBox="${svgNumber(viewBox.x)} ${svgNumber(viewBox.y)} ${svgNumber(viewBox.width)} ${svgNumber(viewBox.height)}"$2>`
++  );
++  if (cropped === svg) {
++    throw new Error("Could not crop SVG: the exported root dimensions were not found.");
++  }
++
++  if (background === "white") {
++    cropped = cropped.replace(
++      /(<svg[^>]*>\n)\s*<rect\s+width="[^"]+"\s+height="[^"]+"\s+fill="#ffffff"\s*\/>/,
++      `$1  <rect x="${svgNumber(viewBox.x)}" y="${svgNumber(viewBox.y)}" width="${svgNumber(viewBox.width)}" height="${svgNumber(viewBox.height)}" fill="#ffffff" />`
++    );
++  }
++
++  return { svg: cropped, viewBox };
++}
++
++export async function renderSmilesToAssets(
++  smiles: string,
++  options: RenderSmilesOptions = {}
++): Promise<RenderedSmiles> {
++  const trimmedSmiles = smiles.trim();
++  if (!trimmedSmiles) throw new Error("Unable to render SMILES: the input is empty.");
++
++  const name = options.name ?? "structure";
++  const width = finitePositive(options.width ?? DEFAULT_WIDTH, "PNG width");
++  const bondLength = finitePositive(options.bondLength ?? smilesPasteBondLengthPx, "Bond length");
++  const padding = finiteNonNegative(options.padding ?? DEFAULT_PADDING, "Padding");
++  const background = options.background ?? "white";
++  if (background !== "white" && background !== "transparent") {
++    throw new Error(`Background must be "white" or "transparent", received "${String(background)}".`);
++  }
++
++  const depicted = await depictSmiles(trimmedSmiles);
++  let document = createEmptyDocument({ title: name });
++  const page = document.pages[0];
++  if (!page) throw new Error("The render document has no page.");
++  document = insertSmilesMolecule(
++    document,
++    { x: page.width / 2, y: page.height / 2 },
++    depicted.depiction,
++    trimmedSmiles
++  );
++  let molecule = moleculeFromDocument(document);
++  if (Math.abs(bondLength - smilesPasteBondLengthPx) > 0.0001) {
++    document = applyMoleculeTargetBondLength(document, [molecule.id], bondLength);
++    molecule = moleculeFromDocument(document);
++  }
++
++  const exported = exportDocumentToSvg(document, {
++    background: background === "white" ? "#ffffff" : "transparent"
++  });
++  const cropped = cropSvg(exported.contents, moleculeVisualBounds(document, molecule), padding, background);
++  const png = new Resvg(cropped.svg, {
++    fitTo: { mode: "width", value: Math.round(width) }
++  }).render().asPng();
++
++  return {
++    name,
++    smiles: trimmedSmiles,
++    svg: cropped.svg,
++    png,
++    engine: depicted.engine,
++    stereoCenters: depicted.stereoCenters,
++    unspecifiedStereoCenters: depicted.unspecifiedStereoCenters,
++    warnings: [...depicted.warnings, ...exported.warnings.map((warning) => warning.message)],
++    document,
++    molecule,
++    viewBox: cropped.viewBox
++  };
++}
++
++export const renderDefaults = {
++  width: DEFAULT_WIDTH,
++  padding: DEFAULT_PADDING,
++  bondLength: smilesPasteBondLengthPx,
++  background: "white" as const
++};
+diff --git a/packages/render-cli/tsconfig.json b/packages/render-cli/tsconfig.json
+new file mode 100644
+index 000000000..564a59900
+--- /dev/null
++++ b/packages/render-cli/tsconfig.json
+@@ -0,0 +1,4 @@
++{
++  "extends": "../../tsconfig.base.json",
++  "include": ["src"]
++}
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index b70a16988..2af2b3a1a 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -8,6 +8,9 @@ importers:
+ 
+   .:
+     devDependencies:
++      '@resvg/resvg-js':
++        specifier: ^2.6.2
++        version: 2.6.2
+       '@types/jsdom':
+         specifier: 28.0.3
+         version: 28.0.3
+@@ -336,6 +339,27 @@ importers:
+         specifier: workspace:*
+         version: link:../isospec-adapter
+ 
++  packages/render-cli:
++    dependencies:
++      '@chemdraft/chem-core':
++        specifier: workspace:*
++        version: link:../chem-core
++      '@chemdraft/export-engine':
++        specifier: workspace:*
++        version: link:../export-engine
++      '@chemdraft/layout-engine':
++        specifier: workspace:*
++        version: link:../layout-engine
++      '@chemdraft/ocl-adapter':
++        specifier: workspace:*
++        version: link:../ocl-adapter
++      '@chemdraft/rdkit-adapter':
++        specifier: workspace:*
++        version: link:../rdkit-adapter
++      '@resvg/resvg-js':
++        specifier: ^2.6.2
++        version: 2.6.2
++
+   packages/shortcut-engine: {}
+ 
+   packages/style-compat:
+@@ -973,6 +997,82 @@ packages:
+   '@popperjs/core@2.11.8':
+     resolution: {integrity: sha512-P1st0aksCrn9sGZhp8GMYwBnQsbvAWsZAX44oXNNvLHGqAOcoVxmjZiohstwQ7SqKnbR47akdNi+uleWD8+g6A==}
+ 
++  '@resvg/resvg-js-android-arm-eabi@2.6.2':
++    resolution: {integrity: sha512-FrJibrAk6v29eabIPgcTUMPXiEz8ssrAk7TXxsiZzww9UTQ1Z5KAbFJs+Z0Ez+VZTYgnE5IQJqBcoSiMebtPHA==}
++    engines: {node: '>= 10'}
++    cpu: [arm]
++    os: [android]
++
++  '@resvg/resvg-js-android-arm64@2.6.2':
++    resolution: {integrity: sha512-VcOKezEhm2VqzXpcIJoITuvUS/fcjIw5NA/w3tjzWyzmvoCdd+QXIqy3FBGulWdClvp4g+IfUemigrkLThSjAQ==}
++    engines: {node: '>= 10'}
++    cpu: [arm64]
++    os: [android]
++
++  '@resvg/resvg-js-darwin-arm64@2.6.2':
++    resolution: {integrity: sha512-nmok2LnAd6nLUKI16aEB9ydMC6Lidiiq2m1nEBDR1LaaP7FGs4AJ90qDraxX+CWlVuRlvNjyYJTNv8qFjtL9+A==}
++    engines: {node: '>= 10'}
++    cpu: [arm64]
++    os: [darwin]
++
++  '@resvg/resvg-js-darwin-x64@2.6.2':
++    resolution: {integrity: sha512-GInyZLjgWDfsVT6+SHxQVRwNzV0AuA1uqGsOAW+0th56J7Nh6bHHKXHBWzUrihxMetcFDmQMAX1tZ1fZDYSRsw==}
++    engines: {node: '>= 10'}
++    cpu: [x64]
++    os: [darwin]
++
++  '@resvg/resvg-js-linux-arm-gnueabihf@2.6.2':
++    resolution: {integrity: sha512-YIV3u/R9zJbpqTTNwTZM5/ocWetDKGsro0SWp70eGEM9eV2MerWyBRZnQIgzU3YBnSBQ1RcxRZvY/UxwESfZIw==}
++    engines: {node: '>= 10'}
++    cpu: [arm]
++    os: [linux]
++
++  '@resvg/resvg-js-linux-arm64-gnu@2.6.2':
++    resolution: {integrity: sha512-zc2BlJSim7YR4FZDQ8OUoJg5holYzdiYMeobb9pJuGDidGL9KZUv7SbiD4E8oZogtYY42UZEap7dqkkYuA91pg==}
++    engines: {node: '>= 10'}
++    cpu: [arm64]
++    os: [linux]
++
++  '@resvg/resvg-js-linux-arm64-musl@2.6.2':
++    resolution: {integrity: sha512-3h3dLPWNgSsD4lQBJPb4f+kvdOSJHa5PjTYVsWHxLUzH4IFTJUAnmuWpw4KqyQ3NA5QCyhw4TWgxk3jRkQxEKg==}
++    engines: {node: '>= 10'}
++    cpu: [arm64]
++    os: [linux]
++
++  '@resvg/resvg-js-linux-x64-gnu@2.6.2':
++    resolution: {integrity: sha512-IVUe+ckIerA7xMZ50duAZzwf1U7khQe2E0QpUxu5MBJNao5RqC0zwV/Zm965vw6D3gGFUl7j4m+oJjubBVoftw==}
++    engines: {node: '>= 10'}
++    cpu: [x64]
++    os: [linux]
++
++  '@resvg/resvg-js-linux-x64-musl@2.6.2':
++    resolution: {integrity: sha512-UOf83vqTzoYQO9SZ0fPl2ZIFtNIz/Rr/y+7X8XRX1ZnBYsQ/tTb+cj9TE+KHOdmlTFBxhYzVkP2lRByCzqi4jQ==}
++    engines: {node: '>= 10'}
++    cpu: [x64]
++    os: [linux]
++
++  '@resvg/resvg-js-win32-arm64-msvc@2.6.2':
++    resolution: {integrity: sha512-7C/RSgCa+7vqZ7qAbItfiaAWhyRSoD4l4BQAbVDqRRsRgY+S+hgS3in0Rxr7IorKUpGE69X48q6/nOAuTJQxeQ==}
++    engines: {node: '>= 10'}
++    cpu: [arm64]
++    os: [win32]
++
++  '@resvg/resvg-js-win32-ia32-msvc@2.6.2':
++    resolution: {integrity: sha512-har4aPAlvjnLcil40AC77YDIk6loMawuJwFINEM7n0pZviwMkMvjb2W5ZirsNOZY4aDbo5tLx0wNMREp5Brk+w==}
++    engines: {node: '>= 10'}
++    cpu: [ia32]
++    os: [win32]
++
++  '@resvg/resvg-js-win32-x64-msvc@2.6.2':
++    resolution: {integrity: sha512-ZXtYhtUr5SSaBrUDq7DiyjOFJqBVL/dOBN7N/qmi/pO0IgiWW/f/ue3nbvu9joWE5aAKDoIzy/CxsY0suwGosQ==}
++    engines: {node: '>= 10'}
++    cpu: [x64]
++    os: [win32]
++
++  '@resvg/resvg-js@2.6.2':
++    resolution: {integrity: sha512-xBaJish5OeGmniDj9cW5PRa/PtmuVU3ziqrbr5xJj901ZDN4TosrVaNZpEiLZAxdfnhAe7uQ7QFWfjPe9d9K2Q==}
++    engines: {node: '>= 10'}
++
+   '@rolldown/pluginutils@1.0.1':
+     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
+ 
+@@ -3276,6 +3376,57 @@ snapshots:
+ 
+   '@popperjs/core@2.11.8': {}
+ 
++  '@resvg/resvg-js-android-arm-eabi@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-android-arm64@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-darwin-arm64@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-darwin-x64@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-linux-arm-gnueabihf@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-linux-arm64-gnu@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-linux-arm64-musl@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-linux-x64-gnu@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-linux-x64-musl@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-win32-arm64-msvc@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-win32-ia32-msvc@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js-win32-x64-msvc@2.6.2':
++    optional: true
++
++  '@resvg/resvg-js@2.6.2':
++    optionalDependencies:
++      '@resvg/resvg-js-android-arm-eabi': 2.6.2
++      '@resvg/resvg-js-android-arm64': 2.6.2
++      '@resvg/resvg-js-darwin-arm64': 2.6.2
++      '@resvg/resvg-js-darwin-x64': 2.6.2
++      '@resvg/resvg-js-linux-arm-gnueabihf': 2.6.2
++      '@resvg/resvg-js-linux-arm64-gnu': 2.6.2
++      '@resvg/resvg-js-linux-arm64-musl': 2.6.2
++      '@resvg/resvg-js-linux-x64-gnu': 2.6.2
++      '@resvg/resvg-js-linux-x64-musl': 2.6.2
++      '@resvg/resvg-js-win32-arm64-msvc': 2.6.2
++      '@resvg/resvg-js-win32-ia32-msvc': 2.6.2
++      '@resvg/resvg-js-win32-x64-msvc': 2.6.2
++
+   '@rolldown/pluginutils@1.0.1': {}
+ 
+   '@rollup/rollup-android-arm-eabi@4.62.2':

@@ -1,0 +1,436 @@
+diff --git a/src/xyzrender/api.py b/src/xyzrender/api.py
+index fcc05c51..b2b053d7 100644
+--- a/src/xyzrender/api.py
++++ b/src/xyzrender/api.py
+@@ -75,9 +75,9 @@ class EnsembleFrames:
+     opacities:
+         Per-conformer opacity override (``None`` = fully opaque).
+     conformer_graphs:
+-        Optional per-frame graphs for ``rebuild=True`` ensembles (topology
+-        can differ per frame).  ``None`` means all frames share the reference
+-        topology.
++        Optional per-frame graphs for rebuilt topology or independently
++        detected NCI interactions.  ``None`` means all frames share the
++        reference topology.
+     reference_idx:
+         Index into *positions* / *colors* / *opacities* that is the reference.
+     """
+@@ -1959,7 +1959,12 @@ def render_gif(
+ 
+             ens = mol.ensemble
+             rmol.graph = merge_graphs(
+-                rmol.graph, ens.positions, conformer_colors=ens.colors, conformer_opacities=ens.opacities, z_nudge=False
++                rmol.graph,
++                ens.positions,
++                conformer_colors=ens.colors,
++                conformer_opacities=ens.opacities,
++                conformer_graphs=ens.conformer_graphs,
++                z_nudge=False,
+             )
+ 
+         # Overlay & Bond Rules
+@@ -2087,6 +2092,29 @@ def _resolve_ensemble_colors(
+         return sample_palette(DEFAULT_ENSEMBLE_PALETTE, n_conformers)
+ 
+ 
++def _detect_ensemble_ncis(reference_graph: nx.Graph, aligned_positions: list[np.ndarray]) -> list[nx.Graph]:
++    """Detect NCIs per conformer while reusing a fixed covalent topology."""
++    from xyzgraph.nci import NCIAnalyzer, build_nci_graph
++
++    topology_graph = copy.deepcopy(reference_graph)
++    topology_graph.remove_edges_from([(i, j) for i, j, data in topology_graph.edges(data=True) if data.get("NCI")])
++    topology_graph.remove_nodes_from(topology_graph.graph.get("nci_centroid", []))
++    for key in ("ncis", "nci_centroid", "nci_centroid_sites"):
++        topology_graph.graph.pop(key, None)
++
++    analyzer = NCIAnalyzer(topology_graph)
++    atom_nodes = list(topology_graph.nodes())
++    conformer_graphs = []
++    for positions in aligned_positions:
++        for node, position in zip(atom_nodes, positions, strict=True):
++            topology_graph.nodes[node]["position"] = tuple(float(value) for value in position)
++        ncis = analyzer.detect(np.asarray(positions))
++        topology_graph.graph["ncis"] = ncis
++        conformer_graphs.append(build_nci_graph(topology_graph, ncis))
++
++    return conformer_graphs
++
++
+ def _build_ensemble_molecule(
+     trajectory: str | os.PathLike,
+     *,
+@@ -2115,6 +2143,9 @@ def _build_ensemble_molecule(
+     but rendered on one image.  NCI detection is run on each rebuilt frame too
+     when *nci_detect* is also ``True``.
+ 
++    With fixed topology, NCI detection reuses one analyzer but decorates each
++    conformer independently so geometry-dependent interactions remain distinct.
++
+     When *reference_mol* is given, its graph (and positions) are used as the
+     reference frame instead of loading from *trajectory*.  This lets
+     interactive orientation be applied before ensemble alignment.
+@@ -2264,24 +2295,25 @@ def _build_ensemble_molecule(
+         # --no-align: keep each frame's raw coordinates; no Kabsch step.
+         aligned_positions = [np.array(fr["positions"], dtype=float) for fr in frames]
+ 
+-    # NCI detection and per-frame graph building happen *after* alignment so that
+-    # centroid dummy nodes don't interfere with position array sizes.
+-    if nci_detect:
+-        from xyzrender.readers import detect_nci as _detect_nci
+-
+-        if reference_mol is None:
+-            ref_graph = _detect_nci(ref_graph)
+-
+     conformer_graphs: list[nx.Graph] | None = None
+-    if rebuild:
++    if nci_detect and not rebuild:
++        conformer_graphs = _detect_ensemble_ncis(ref_graph, aligned_positions)
++        ref_graph = conformer_graphs[reference_frame]
++
++    elif rebuild:
+         from xyzgraph import build_graph
+ 
++        from xyzrender.readers import detect_nci as _detect_nci
++
++        if nci_detect:
++            ref_graph = _detect_ensemble_ncis(ref_graph, [aligned_positions[reference_frame]])[0]
++
+         conformer_graphs = []
+         for fi, frame in enumerate(frames):
+             if fi == reference_frame:
+                 conformer_graphs.append(ref_graph)
+                 continue
+-            atoms = list(zip(frame["symbols"], [tuple(p) for p in frame["positions"]], strict=True))
++            atoms = list(zip(frame["symbols"], [tuple(p) for p in aligned_positions[fi]], strict=True))
+             fg = build_graph(atoms, charge=charge, multiplicity=multiplicity, kekule=kekule, quick=quick)
+             for _i, _j, d in fg.edges(data=True):
+                 if "bond_order" in d:
+diff --git a/src/xyzrender/ensemble.py b/src/xyzrender/ensemble.py
+index b0655667..dba0c344 100644
+--- a/src/xyzrender/ensemble.py
++++ b/src/xyzrender/ensemble.py
+@@ -92,7 +92,7 @@ def merge_graphs(
+     Parameters
+     ----------
+     reference_graph:
+-        The graph for the reference conformer (frame 0).
++        Graph used for every conformer when *conformer_graphs* is not given.
+     aligned_positions:
+         One (N, 3) position array per frame (including reference).
+     conformer_colors, conformer_opacities:
+@@ -113,12 +113,19 @@ def merge_graphs(
+         msg = "ensemble.merge_graphs: aligned_positions must contain at least one frame"
+         raise ValueError(msg)
+ 
+-    all_nodes = _node_list(reference_graph)
+-    # Separate real atoms from NCI centroid dummy nodes (symbol="*").
+-    real_nodes = [n for n in all_nodes if reference_graph.nodes[n].get("symbol") != "*"]
+-    centroid_nodes = [n for n in all_nodes if reference_graph.nodes[n].get("symbol") == "*"]
+-    n_real = len(real_nodes)
+     n_frames = len(aligned_positions)
++    if conformer_graphs is not None and len(conformer_graphs) != n_frames:
++        msg = (
++            "ensemble.merge_graphs: conformer_graphs length does not match "
++            f"aligned_positions ({len(conformer_graphs)} != {n_frames})"
++        )
++        raise ValueError(msg)
++
++    first_graph = conformer_graphs[0] if conformer_graphs is not None else reference_graph
++    first_nodes = _node_list(first_graph)
++    first_real_nodes = [n for n in first_nodes if first_graph.nodes[n].get("symbol") != "*"]
++    first_centroid_nodes = [n for n in first_nodes if first_graph.nodes[n].get("symbol") == "*"]
++    n_real = len(first_real_nodes)
+ 
+     if aligned_positions[0].shape[0] != n_real:
+         msg = (
+@@ -128,27 +135,68 @@ def merge_graphs(
+         raise ValueError(msg)
+ 
+     merged = nx.Graph()
+-    merged.graph.update(reference_graph.graph)
++    merged.graph.update(first_graph.graph)
++    merged_centroids: list[int] = []
++    merged_centroid_sites: dict[int, tuple[int, ...]] = {}
++
++    def _prepare_centroids(
++        source: nx.Graph,
++        centroid_nodes: list,
++        node_map: dict,
++        real_nodes: list,
++        positions: np.ndarray,
++    ) -> np.ndarray:
++        """Return aligned dummy positions and translate NCI centroid metadata."""
++        real_position_index = {node: idx for idx, node in enumerate(real_nodes)}
++        source_centroids = set(source.graph.get("nci_centroid", []))
++        source_sites = source.graph.get("nci_centroid_sites", {})
++        centroid_positions = []
++        for old_id in centroid_nodes:
++            new_id = node_map[old_id]
++            sites = tuple(source_sites.get(old_id, ()))
++            if sites and all(site in real_position_index for site in sites):
++                site_positions = np.array([positions[real_position_index[site]] for site in sites])
++                centroid_position = site_positions.mean(axis=0)
++            else:
++                centroid_position = np.asarray(source.nodes[old_id]["position"], dtype=float)
++            centroid_positions.append(centroid_position)
++            if old_id in source_centroids:
++                merged_centroids.append(new_id)
++                if sites:
++                    merged_centroid_sites[new_id] = tuple(node_map[site] for site in sites)
++        return np.asarray(centroid_positions, dtype=float).reshape((-1, 3))
+ 
+     # Reference conformer (index 0): keep original node IDs.
+-    ref_map = {nid: nid for nid in real_nodes}
+-    stamp_structure_nodes(merged, reference_graph, ref_map, aligned_positions[0], molecule_index=0)
+-    stamp_structure_edges(merged, reference_graph, ref_map, molecule_index=0)
+-
+-    # NCI centroid dummy nodes (reference frame only) keep their existing positions.
+-    for nid in centroid_nodes:
+-        data = dict(reference_graph.nodes[nid])
+-        data["molecule_index"] = 0
+-        merged.add_node(nid, **data)
++    ref_map = {nid: nid for nid in first_real_nodes}
++    ref_centroid_map = {nid: nid for nid in first_centroid_nodes}
++    ref_all_map = {**ref_map, **ref_centroid_map}
++    ref_positions = np.vstack(
++        (
++            aligned_positions[0],
++            _prepare_centroids(
++                first_graph,
++                first_centroid_nodes,
++                ref_all_map,
++                first_real_nodes,
++                aligned_positions[0],
++            ),
++        )
++    )
++    stamp_structure_nodes(merged, first_graph, ref_all_map, ref_positions, molecule_index=0)
++    stamp_structure_edges(merged, first_graph, ref_all_map, molecule_index=0)
+ 
+     # Additional conformers: copy node/edge attributes, renumbering node IDs.
+-    next_id = max(all_nodes) + 1 if all_nodes else 0
++    next_id = max(first_nodes) + 1 if first_nodes else 0
+     for conf_idx in range(1, n_frames):
+         pos = aligned_positions[conf_idx]
+-        if pos.shape[0] != n_real:
++        frame_graph = conformer_graphs[conf_idx] if conformer_graphs is not None else reference_graph
++        frame_nodes = _node_list(frame_graph)
++        frame_real_nodes = [n for n in frame_nodes if frame_graph.nodes[n].get("symbol") != "*"]
++        frame_centroid_nodes = [n for n in frame_nodes if frame_graph.nodes[n].get("symbol") == "*"]
++        if pos.shape[0] != len(frame_real_nodes):
+             msg = (
+                 "ensemble.merge_graphs: position array length does not match "
+-                f"real atom count in reference graph (got {pos.shape[0]}, expected {n_real})"
++                f"real atom count in conformer {conf_idx} (got {pos.shape[0]}, expected {len(frame_real_nodes)})"
+             )
+             raise ValueError(msg)
+ 
+@@ -160,26 +208,39 @@ def merge_graphs(
+             if conformer_opacities is not None and conf_idx < len(conformer_opacities)
+             else None
+         )
+-        frame_graph = conformer_graphs[conf_idx] if conformer_graphs is not None else reference_graph
+-
+-        id_map = {old: next_id + i for i, old in enumerate(real_nodes)}
++        id_map = {old: next_id + i for i, old in enumerate(frame_real_nodes)}
++        next_id += len(frame_real_nodes)
++        centroid_map = {old: next_id + i for i, old in enumerate(frame_centroid_nodes)}
++        next_id += len(frame_centroid_nodes)
++        all_map = {**id_map, **centroid_map}
+         # Slight z-offset so conformers don't z-fight; scaled by index so later
+         # frames sit further back than earlier ones.
+         z_offset = conf_idx * _Z_NUDGE if z_nudge else 0.0
+ 
++        all_positions = np.vstack(
++            (
++                pos,
++                _prepare_centroids(frame_graph, frame_centroid_nodes, all_map, frame_real_nodes, pos),
++            )
++        )
+         stamp_structure_nodes(
+             merged,
+-            reference_graph,  # source of node attributes (symbols, etc.) — per-frame positions come from `pos`
+-            id_map,
+-            pos,
++            frame_graph,
++            all_map,
++            all_positions,
+             molecule_index=conf_idx,
+             color=color,
+             opacity=opacity,
+             z_offset=z_offset,
+         )
+-        stamp_structure_edges(merged, frame_graph, id_map, molecule_index=conf_idx, color=color)
++        stamp_structure_edges(merged, frame_graph, all_map, molecule_index=conf_idx, color=color)
+         merge_aromatic_rings(merged, frame_graph, id_map)
+ 
+-        next_id += n_real
++    if merged_centroids:
++        merged.graph["nci_centroid"] = merged_centroids
++        merged.graph["nci_centroid_sites"] = merged_centroid_sites
++    else:
++        merged.graph.pop("nci_centroid", None)
++        merged.graph.pop("nci_centroid_sites", None)
+ 
+     return merged
+diff --git a/tests/test_ensemble.py b/tests/test_ensemble.py
+index 2d8fd52e..dcc2d18d 100644
+--- a/tests/test_ensemble.py
++++ b/tests/test_ensemble.py
+@@ -70,6 +70,70 @@ def test_build_ensemble_molecule(tmp_path: Path) -> None:
+     assert all(c is not None and c.startswith("#") for c in ens.colors)
+ 
+ 
++def test_load_ensemble_detects_ncis_for_each_conformer() -> None:
++    mol = load(
++        "examples/structures/bimp.v000.xyz",
++        ensemble=True,
++        max_frames=2,
++        nci_detect=True,
++    )
++    assert mol.ensemble is not None
++    assert mol.ensemble.conformer_graphs is not None
++
++    nci_types = [
++        {data["nci_type"] for *_edge, data in graph.edges(data=True) if data.get("NCI")}
++        for graph in mol.ensemble.conformer_graphs
++    ]
++    assert "hbond" not in nci_types[0]
++    assert "hbond" in nci_types[1]
++
++    merged = merge_graphs(
++        mol.graph,
++        mol.ensemble.positions,
++        conformer_graphs=mol.ensemble.conformer_graphs,
++        z_nudge=False,
++    )
++    assert all(
++        any(data.get("NCI") and data.get("molecule_index") == frame_idx for *_edge, data in merged.edges(data=True))
++        for frame_idx in range(2)
++    )
++
++
++def test_rebuilt_ensemble_nci_centroids_use_aligned_positions() -> None:
++    import numpy as np
++
++    mol = load(
++        "examples/structures/bimp.v000.xyz",
++        ensemble=True,
++        max_frames=2,
++        rebuild=True,
++        nci_detect=True,
++    )
++    assert mol.ensemble is not None
++    assert mol.ensemble.conformer_graphs is not None
++
++    for frame_idx, graph in enumerate(mol.ensemble.conformer_graphs):
++        for centroid, sites in graph.graph.get("nci_centroid_sites", {}).items():
++            expected = mol.ensemble.positions[frame_idx][list(sites)].mean(axis=0)
++            assert np.allclose(graph.nodes[centroid]["position"], expected)
++
++
++def test_rebuilt_ensemble_detects_ncis_on_supplied_reference() -> None:
++    path = "examples/structures/bimp.v000.xyz"
++    mol = load(
++        path,
++        ensemble=True,
++        max_frames=2,
++        rebuild=True,
++        nci_detect=True,
++        reference_mol=load(path),
++    )
++    assert mol.ensemble is not None
++    assert mol.ensemble.conformer_graphs is not None
++    reference_graph = mol.ensemble.conformer_graphs[mol.ensemble.reference_idx]
++    assert any(data.get("NCI") for *_edge, data in reference_graph.edges(data=True))
++
++
+ def test_ensemble_opacity(tmp_path: Path) -> None:
+     xyz_path = _make_traj(tmp_path)
+     mol = _build_ensemble_molecule(xyz_path, ensemble_opacity=0.4)
+@@ -170,6 +234,54 @@ def test_merge_graphs_structure(tmp_path: Path) -> None:
+     assert all(g.nodes[n].get("structure_color", "").startswith("#") for n in non_ref)
+ 
+ 
++def test_merge_graphs_preserves_each_conformers_nci_centroids() -> None:
++    import networkx as nx
++    import numpy as np
++
++    def _frame_graph(nci_type: str, centroid_x: float) -> nx.Graph:
++        graph = nx.Graph()
++        graph.add_node(0, symbol="C", position=(0.0, 0.0, 0.0))
++        graph.add_node(1, symbol="C", position=(2.0, 0.0, 0.0))
++        graph.add_node(2, symbol="*", position=(centroid_x, 0.0, 0.0))
++        graph.add_edge(0, 2, NCI=True, nci_type=nci_type)
++        graph.add_edge(2, 1, NCI=True, nci_type=nci_type)
++        graph.graph["nci_centroid"] = [2]
++        graph.graph["nci_centroid_sites"] = {2: (0, 1)}
++        return graph
++
++    frame_graphs = [_frame_graph("pi_frame_0", 1.0), _frame_graph("pi_frame_1", 2.0)]
++    positions = np.array(
++        [
++            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
++            [[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]],
++        ]
++    )
++
++    merged = merge_graphs(
++        frame_graphs[1],
++        positions,
++        conformer_opacities=[None, 0.25],
++        conformer_graphs=frame_graphs,
++        z_nudge=False,
++    )
++
++    for frame_idx, expected_type in enumerate(("pi_frame_0", "pi_frame_1")):
++        centroids = [
++            node
++            for node, data in merged.nodes(data=True)
++            if data.get("molecule_index") == frame_idx and data.get("symbol") == "*"
++        ]
++        assert len(centroids) == 1
++        expected_opacity = None if frame_idx == 0 else 0.25
++        assert merged.nodes[centroids[0]].get("structure_opacity") == expected_opacity
++        nci_types = {
++            data["nci_type"]
++            for *_edge, data in merged.edges(data=True)
++            if data.get("molecule_index") == frame_idx and data.get("NCI")
++        }
++        assert nci_types == {expected_type}
++
++
+ def test_merge_graphs_cpk_no_structure_color(tmp_path: Path) -> None:
+     """'cpk': merge_graphs sets no structure_color override — renderer falls back to CPK."""
+     xyz_path = _make_traj(tmp_path)
+@@ -227,6 +339,30 @@ def test_ensemble_render_produces_svg(tmp_path: Path) -> None:
+     assert "<svg" in (tmp_path / "out.svg").read_text()
+ 
+ 
++def test_ensemble_rotation_gif_preserves_per_conformer_ncis(tmp_path: Path) -> None:
++    from unittest.mock import patch
++
++    from xyzrender import render_gif
++
++    mol = load(
++        "examples/structures/bimp.v000.xyz",
++        ensemble=True,
++        max_frames=2,
++        nci_detect=True,
++    )
++
++    with patch("xyzrender.gif.render_rotation_gif") as mock_render:
++        render_gif(mol, gif_rot="y", output=tmp_path / "ensemble.gif")
++
++    rendered_graph = mock_render.call_args.kwargs["graph"]
++    frame_one_types = {
++        data["nci_type"]
++        for *_edge, data in rendered_graph.edges(data=True)
++        if data.get("molecule_index") == 1 and data.get("NCI")
++    }
++    assert "hbond" in frame_one_types
++
++
+ def test_ensemble_render_twice_no_mutation(tmp_path: Path) -> None:
+     """render() must not mutate mol — second call must produce an identical graph."""
+     xyz_path = _make_traj(tmp_path)

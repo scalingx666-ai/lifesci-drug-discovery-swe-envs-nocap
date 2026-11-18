@@ -1,0 +1,11 @@
+# Issue
+
+**Title:** Add production API URL and update CSP connect-src directive
+
+## Description
+
+(no description provided in source PR)
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `aec1481d5ca4`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

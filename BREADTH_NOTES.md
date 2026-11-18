@@ -9,9 +9,9 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: drug-discovery.
 | Domain candidates (deduped) | 498 |
 | After active+star+noise filter | 272 |
 | Final target list (cap unlimited) | 272 |
-| Repos with >=1 task | 151 |
-| Repos with 0 tasks | 56 |
-| Total tasks (unlimited (no per-repo cap)) | 7519 |
+| Repos with >=1 task | 163 |
+| Repos with 0 tasks | 44 |
+| Total tasks (unlimited (no per-repo cap)) | 8346 |
 
 ## Generation
 
@@ -23,12 +23,10 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: drug-discovery.
 - Overlap with the 3 published cancer editions is allowed (user decision);
   domains are independent selections, not a partition of one repo set.
 
-## Zero-yield repos (informational, 56)
+## Zero-yield repos (informational, 44)
 
 - china-testing/python-api-tesing
-- volkamerlab/teachopencadd
 - paperclipai/companies
-- aligfellow/xyzrender
 - MinkaiXu/GeoDiff
 - vijaymasand/PyChem-Pro
 - weisscharlesj/SciCompforChemists
@@ -37,7 +35,6 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: drug-discovery.
 - MinkaiXu/GeoLDM
 - Intelligent-Drug-Discovery-Lab/SurfDock
 - MorganCThomas/MolScore
-- merzlab/QUICK
 - AnshMittal1811/MachineLearning-AI
 - zjunlp/MolGen
 - pcko1/Deep-Drug-Coder
@@ -47,10 +44,7 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: drug-discovery.
 - blazerye/DrugAssist
 - mcs07/CIRpy
 - THUNLP-MT/dyMEAN
-- jvalegre/aqme
 - mims-harvard/PDGrapher
-- SMTG-Bham/ShakeNBreak
-- DigiMatChem/LobsterPy
 - ml-jku/clamp
 - jssweller/DrugHIVE
 - benstaf/ChemGAN-challenge
@@ -70,17 +64,11 @@ Repo2RLEnv pr_diff (v0.9.6), Harbor-format output. Domain: drug-discovery.
 - tencent-quantum-lab/TenCirChem
 - Ahey1/Ester-Studio
 - SergeiNikolenko/Burette
-- dptech-corp/Uni-Dock2
-- jgassens/ChemDraft
 - rvianello/chemicalite
-- Membrizard/ml_conformer_generator
 - UnixJunkie/FASMIFRA
-- SteshinSS/lohi_splitter
 - dylanwal/chemistry_drawer
-- JanoschMenke/metis
 - RyanZR/labodock
 - VicFisher/DiffPhore
-- asad/SMSD
 
 ## Caveats
 

@@ -1,0 +1,660 @@
+diff --git a/apps/desktop/src-tauri/src/document_session.rs b/apps/desktop/src-tauri/src/document_session.rs
+new file mode 100644
+index 000000000..df03079d2
+--- /dev/null
++++ b/apps/desktop/src-tauri/src/document_session.rs
+@@ -0,0 +1,321 @@
++//! Renew per-run file access from the app's persisted session, never from an IPC path argument.
++use serde_json::Value;
++use std::{fs, path::Path};
++
++/// Match the readable tab envelope in documentSession.ts. Cosmetic metadata is optional. Do not
++/// treat the outer active-tab mirror, document contents, or arbitrary nested objects as file grants.
++fn readable_tab(tab: &Value) -> bool {
++    tab.is_object()
++        && tab.get("version").and_then(Value::as_u64) == Some(1)
++        && tab.get("tabs").is_none()
++        && tab
++            .get("contents")
++            .and_then(Value::as_str)
++            .is_some_and(|text| !text.is_empty())
++        && ["payloadHash", "displayName", "savedAt"]
++            .iter()
++            .all(|key| tab.get(key).is_some_and(Value::is_string))
++        && ["blank", "dirty"]
++            .iter()
++            .all(|key| tab.get(key).is_some_and(Value::is_boolean))
++        && tab.get("path").is_none_or(Value::is_string)
++        && tab.get("pristine").is_none_or(Value::is_boolean)
++        && tab.get("unrestoredTabs").is_none_or(Value::is_array)
++}
++
++fn check_saved_file(path: &Path) -> Result<(), String> {
++    if !path.is_absolute() {
++        return Err("the saved path is not absolute".into());
++    }
++    if path
++        .as_os_str()
++        .to_string_lossy()
++        .split(['/', '\\'])
++        .any(|part| matches!(part, "." | ".."))
++    {
++        return Err("the saved path contains a dot component".into());
++    }
++    if !path
++        .extension()
++        .and_then(|ext| ext.to_str())
++        .is_some_and(|ext| {
++            ext.eq_ignore_ascii_case("chemdraft") || ext.eq_ignore_ascii_case("cdxml")
++        })
++    {
++        return Err("the saved path is not a ChemDraft or CDXML file".into());
++    }
++    // Inspect every component, so a symlinked parent cannot redirect an otherwise ordinary file.
++    // On Windows also reject junctions and other reparse points. Never canonicalize and grant a
++    // different target instead. These checks are deliberately conservative; Save As can reauthorize.
++    for component in path.ancestors() {
++        let metadata = fs::symlink_metadata(component)
++            .map_err(|error| format!("the saved file is unavailable: {error}"))?;
++        if metadata.is_symlink() {
++            return Err("the saved path uses a symbolic link".into());
++        }
++        #[cfg(windows)]
++        {
++            use std::os::windows::fs::MetadataExt;
++            if metadata.file_attributes() & 0x400 != 0 {
++                return Err("the saved path uses a reparse point".into());
++            }
++        }
++    }
++    let metadata =
++        fs::metadata(path).map_err(|error| format!("the saved file is unavailable: {error}"))?;
++    if !metadata.is_file() {
++        return Err("the saved path is not a regular file".into());
++    }
++    if metadata.permissions().readonly() {
++        return Err("the saved file is read-only".into());
++    }
++    Ok(())
++}
++
++/// Called only with JSON read natively from DOCUMENT_SESSION_FILENAME. The callback grants one
++/// literal file in the fs/asset scopes. A failure annotates this response, preserving all recovery
++/// contents and the original path; the frontend then uses Save As. The annotation is not authority.
++pub(crate) fn restore_file_scopes(
++    session: &mut Value,
++    mut allow_file: impl FnMut(&Path) -> Result<(), String>,
++) {
++    fn restore_tab(tab: &mut Value, allow_file: &mut impl FnMut(&Path) -> Result<(), String>) {
++        if !readable_tab(tab) {
++            return;
++        }
++        // Never trust a stale annotation from disk; recompute it for this run.
++        tab.as_object_mut().unwrap().remove("restoreSavePathError");
++        if let Some(path) = tab.get("path").and_then(Value::as_str) {
++            if let Err(error) =
++                check_saved_file(Path::new(path)).and_then(|()| allow_file(Path::new(path)))
++            {
++                tab["restoreSavePathError"] = Value::String(error);
++            }
++        }
++    }
++
++    if session.get("version").and_then(Value::as_u64) != Some(1) {
++        return;
++    }
++    if let Some(tabs) = session.get("tabs") {
++        let Some(tabs) = tabs.as_array() else { return };
++        if tabs.is_empty()
++            || !session
++                .get("activeTabIndex")
++                .and_then(Value::as_u64)
++                .is_some_and(|index| index < tabs.len() as u64)
++            || !session.get("unrestoredTabs").is_none_or(Value::is_array)
++        {
++            return;
++        }
++        for tab in session["tabs"].as_array_mut().unwrap() {
++            restore_tab(tab, &mut allow_file);
++        }
++    } else {
++        if !readable_tab(session) {
++            return;
++        }
++        restore_tab(session, &mut allow_file);
++    }
++    // Previously unreadable tabs are retried by the frontend too, but only readable envelopes
++    // carrying their own saved path can gain access. No recursion into unsupported recovery data.
++    if let Some(tabs) = session
++        .get_mut("unrestoredTabs")
++        .and_then(Value::as_array_mut)
++    {
++        for tab in tabs {
++            restore_tab(tab, &mut allow_file);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++    use std::{
++        path::PathBuf,
++        sync::atomic::{AtomicU64, Ordering},
++    };
++
++    static NEXT: AtomicU64 = AtomicU64::new(0);
++    struct Files(PathBuf);
++    impl Files {
++        fn new() -> Self {
++            let path = std::env::temp_dir().join(format!(
++                "chemdraft-session-scope-{}-{}",
++                std::process::id(),
++                NEXT.fetch_add(1, Ordering::Relaxed)
++            ));
++            fs::create_dir_all(&path).unwrap();
++            Self(path.canonicalize().unwrap())
++        }
++        fn file(&self, name: &str) -> PathBuf {
++            let path = self.0.join(name);
++            fs::write(&path, "saved drawing").unwrap();
++            path
++        }
++    }
++    impl Drop for Files {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++    fn tab(path: &Path) -> Value {
++        json!({ "version": 1, "contents": "drawing", "payloadHash": "hash", "blank": false,
++            "displayName": "drawing", "dirty": true, "savedAt": "now", "path": path })
++    }
++    fn grants(session: &mut Value) -> Vec<PathBuf> {
++        let mut paths = vec![];
++        restore_file_scopes(session, |path| {
++            paths.push(path.to_path_buf());
++            Ok(())
++        });
++        paths
++    }
++
++    #[test]
++    fn grants_only_recorded_saved_document_files() {
++        let files = Files::new();
++        let a = files.file("a.chemdraft");
++        let b = files.file("b.CDXML");
++        let mirror = files.file("mirror.chemdraft");
++        let unrecorded = files.file("unrecorded.chemdraft");
++        let mut session = json!({ "version": 1, "tabs": [tab(&a), tab(&b)],
++            "activeTabIndex": 1, "path": mirror, "other": { "path": unrecorded } });
++        assert_eq!(grants(&mut session), vec![a.clone(), b]);
++        assert_eq!(grants(&mut tab(&a)), vec![a.clone()]); // legacy single-document session
++        let mut unnamed = tab(&a);
++        unnamed.as_object_mut().unwrap().remove("path");
++        unnamed["contents"] = json!({ "path": a }).to_string().into();
++        assert!(grants(&mut unnamed).is_empty());
++    }
++
++    #[test]
++    fn rejects_relative_missing_directory_and_unsupported_paths_without_losing_contents() {
++        let files = Files::new();
++        let directory = files.0.join("directory.chemdraft");
++        fs::create_dir(&directory).unwrap();
++        for path in [
++            PathBuf::from("relative.chemdraft"),
++            files.file("data.json"),
++            files.file("drawing.cdx"),
++            files.0.join("missing.chemdraft"),
++            directory,
++        ] {
++            let mut session = tab(&path);
++            assert!(grants(&mut session).is_empty());
++            assert!(session["restoreSavePathError"].is_string());
++            assert_eq!(session["path"], json!(path));
++            assert_eq!(session["contents"], "drawing");
++        }
++    }
++
++    #[test]
++    fn rejects_dot_components_in_saved_paths() {
++        let files = Files::new();
++        let target = files.file("drawing.chemdraft");
++        let parent = target.parent().unwrap();
++        let parent_text = parent.to_string_lossy();
++        #[cfg(windows)]
++        let parent_text = parent_text.strip_prefix(r"\\?\").unwrap_or(&parent_text);
++        let separator = std::path::MAIN_SEPARATOR;
++        let paths = [
++            PathBuf::from(format!(
++                "{parent_text}{separator}sub{separator}..{separator}drawing.chemdraft"
++            )),
++            PathBuf::from(format!(
++                "{parent_text}{separator}.{separator}drawing.chemdraft"
++            )),
++        ];
++        for path in paths {
++            let mut session = tab(&path);
++            assert!(grants(&mut session).is_empty());
++            assert!(session["restoreSavePathError"].is_string());
++            assert_eq!(session["contents"], "drawing");
++        }
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn rejects_backslash_dot_components_in_saved_paths() {
++        let files = Files::new();
++        let target = files.file("drawing.chemdraft");
++        let parent = target.parent().unwrap();
++        let parent_text = parent.to_string_lossy();
++        let parent_text = parent_text.strip_prefix(r"\\?\").unwrap_or(&parent_text);
++        let paths = [
++            PathBuf::from(format!(r"{parent_text}\sub\..\drawing.chemdraft")),
++            PathBuf::from(format!(r"{parent_text}\.\drawing.chemdraft")),
++        ];
++        for path in paths {
++            let mut session = tab(&path);
++            assert!(grants(&mut session).is_empty());
++            assert!(session["restoreSavePathError"].is_string());
++        }
++    }
++
++    #[test]
++    fn skips_invalid_envelopes_and_only_retries_readable_kept_tabs() {
++        let files = Files::new();
++        let path = files.file("drawing.chemdraft");
++        let mut invalid = tab(&path);
++        invalid["version"] = json!(99);
++        assert!(grants(&mut invalid).is_empty());
++        let mut session = json!({ "version": 1, "tabs": [invalid.clone()], "activeTabIndex": 0,
++            "unrestoredTabs": [invalid, tab(&path)] });
++        assert_eq!(grants(&mut session), vec![path]);
++        session["activeTabIndex"] = json!(7);
++        assert!(grants(&mut session).is_empty());
++    }
++
++    #[test]
++    fn grant_failure_is_reported_and_stale_failures_are_recomputed() {
++        let files = Files::new();
++        let mut session = tab(&files.file("drawing.chemdraft"));
++        restore_file_scopes(&mut session, |_| {
++            Err("file access could not be restored".into())
++        });
++        assert_eq!(
++            session["restoreSavePathError"],
++            "file access could not be restored"
++        );
++        assert_eq!(grants(&mut session).len(), 1);
++        assert!(session.get("restoreSavePathError").is_none());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn refuses_symlink_files_and_parent_directories() {
++        use std::os::unix::fs::symlink;
++        let files = Files::new();
++        let target = files.file("target.chemdraft");
++        let link = files.0.join("link.chemdraft");
++        symlink(&target, &link).unwrap();
++        let parent_link = files.0.join("linked-parent");
++        symlink(&files.0, &parent_link).unwrap();
++        for path in [link, parent_link.join("target.chemdraft")] {
++            let mut session = tab(&path);
++            assert!(grants(&mut session).is_empty());
++            assert!(session["restoreSavePathError"]
++                .as_str()
++                .unwrap()
++                .contains("symbolic link"));
++        }
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn refuses_symlinks_when_windows_allows_the_test_to_create_one() {
++        use std::os::windows::fs::symlink_file;
++        let files = Files::new();
++        let target = files.file("target.chemdraft");
++        let link = files.0.join("link.chemdraft");
++        if let Err(error) = symlink_file(&target, &link) {
++            // Windows without Developer Mode requires privileges to create symlinks.
++            assert_eq!(error.raw_os_error(), Some(1314));
++            return;
++        }
++        assert!(grants(&mut tab(&link)).is_empty());
++    }
++}
+diff --git a/apps/desktop/src-tauri/src/lib.rs b/apps/desktop/src-tauri/src/lib.rs
+index 280488f17..01a82fb0c 100644
+--- a/apps/desktop/src-tauri/src/lib.rs
++++ b/apps/desktop/src-tauri/src/lib.rs
+@@ -1,4 +1,5 @@
+ mod dialog_windows;
++mod document_session;
+ mod export;
+ mod fonts;
+ mod installed_plugins;
+@@ -2305,22 +2306,49 @@ fn save_toolset_customization_state(
+ }
+ 
+ #[tauri::command]
+-fn load_document_session(app: tauri::AppHandle) -> Result<Option<serde_json::Value>, String> {
++fn load_document_session(
++    app: tauri::AppHandle,
++    window: tauri::WebviewWindow,
++) -> Result<Option<serde_json::Value>, String> {
++    if window.label() != MAIN_WINDOW_LABEL {
++        return Err("Only the main document window can restore the document session".into());
++    }
+     let path = document_session_path(&app)?;
+     let Some(contents) = read_optional_file(&path)? else {
+         return Ok(None);
+     };
+ 
+-    serde_json::from_str(&contents)
+-        .map(Some)
+-        .map_err(|error| format!("Document session is invalid: {error}"))
++    let mut session = serde_json::from_str(&contents)
++        .map_err(|error| format!("Document session is invalid: {error}"))?;
++    document_session::restore_file_scopes(&mut session, |path| {
++        use tauri_plugin_fs::FsExt;
++        let scope = app
++            .try_fs_scope()
++            .ok_or("File access scope is unavailable")?;
++        scope.allow_file(path).map_err(|error| error.to_string())?;
++        if !scope.is_allowed(path) {
++            return Err("File access could not be restored".into());
++        }
++        if let Some(scopes) = app.try_state::<tauri::scope::Scopes>() {
++            scopes.allow_file(path).map_err(|error| error.to_string())?;
++        }
++        Ok(())
++    });
++    Ok(Some(session))
+ }
+ 
+ /// The working document's autosave (serialized contents + file association). JS owns the envelope
+ /// and writes it on every edit so a relaunch resumes the last edited state; Rust just persists the
+ /// opaque JSON, exactly like the toolbar customization state.
+ #[tauri::command]
+-fn save_document_session(app: tauri::AppHandle, state: serde_json::Value) -> Result<(), String> {
++fn save_document_session(
++    app: tauri::AppHandle,
++    window: tauri::WebviewWindow,
++    state: serde_json::Value,
++) -> Result<(), String> {
++    if window.label() != MAIN_WINDOW_LABEL {
++        return Err("Only the main document window can persist the document session".into());
++    }
+     let path = document_session_path(&app)?;
+     let contents = serde_json::to_string_pretty(&state).map_err(|error| error.to_string())?;
+     write_file_atomic(&path, &contents)
+diff --git a/apps/desktop/src/MainWindow.tabs.dom.test.tsx b/apps/desktop/src/MainWindow.tabs.dom.test.tsx
+index 3a2430509..4d5047fa5 100644
+--- a/apps/desktop/src/MainWindow.tabs.dom.test.tsx
++++ b/apps/desktop/src/MainWindow.tabs.dom.test.tsx
+@@ -241,6 +241,66 @@ describe("documents in one window", () => {
+     container.innerHTML = "";
+     await mount();
+   }
++
++  it.each(["/Users/chemist/drawing.chemdraft", "D:\\drawings\\drawing.chemdraft", "D:\\drawings\\drawing.cdxml"])(
++    "saves a restored dirty named tab directly to %s without a picker", async (path) => {
++      const payload = createNativeSavePayload(createPhase4Document("Restored drawing"));
++      native.session = buildDocumentTabsSession([
++        buildDocumentSessionEnvelope(payload, { path, dirty: true }, "drawing.chemdraft", false)
++      ], 0);
++      await remount();
++      native.writeFile.mockClear(); native.savePicker.mockClear();
++      await command("document.save");
++      expect(native.savePicker).not.toHaveBeenCalled();
++      expect(native.writeFile).toHaveBeenCalledExactlyOnceWith(path, expect.any(String));
++      expect(bridge().snapshot().file).toMatchObject({ path, dirty: false });
++    }
++  );
++
++  it.each(["the saved file is unavailable", "File access could not be restored"])(
++    "uses Save As for a restored path when %s, preserving content on cancel", async (reason) => {
++      const path = "D:\\drawings\\missing.chemdraft";
++      const payload = createNativeSavePayload(createPhase4Document("Restored drawing"));
++      native.session = { ...buildDocumentSessionEnvelope(payload, { path, dirty: true }, "missing.chemdraft", false),
++        restoreSavePathError: reason };
++      await remount();
++      const document = bridge().snapshot().document;
++      expect(container.querySelector('[role="status"]')?.textContent).toContain(reason);
++      native.writeFile.mockClear(); native.savePicker.mockClear();
++      native.savePicker.mockResolvedValueOnce(null);
++      await command("document.save");
++      expect(native.writeFile).not.toHaveBeenCalled();
++      expect(native.savePicker).toHaveBeenCalledWith(expect.objectContaining({ title: "Save As — restored file unavailable" }));
++      expect(bridge().snapshot().file).toMatchObject({ path, dirty: true });
++      expect(bridge().snapshot().document).toEqual(document);
++      expect(container.querySelector('[role="status"]')?.textContent).toContain("Choose a location with Save As");
++      const replacement = "D:\\drawings\\rescued.chemdraft";
++      native.savePicker.mockResolvedValueOnce(replacement);
++      await command("document.save");
++      expect(native.writeFile).toHaveBeenCalledExactlyOnceWith(replacement, expect.any(String));
++      expect(bridge().snapshot().file).toMatchObject({ path: replacement, dirty: false });
++      native.savePicker.mockClear();
++      await command("document.save");
++      expect(native.savePicker).not.toHaveBeenCalled();
++    }
++  );
++
++  it("uses the restored-path Save As fallback from the dirty-tab close prompt", async () => {
++    native.session = { ...buildDocumentSessionEnvelope(createNativeSavePayload(createPhase4Document("Kept drawing")),
++      { path: "D:\\missing.chemdraft", dirty: true }, "missing.chemdraft", false),
++      restoreSavePathError: "the saved file is unavailable" };
++    await remount();
++    await closeTab();
++    native.savePicker.mockResolvedValueOnce(null);
++    await modalButton("Save");
++    expect(tabs()).toHaveLength(1);
++    expect(bridge().snapshot().file.dirty).toBe(true);
++    expect(pendingPrompt?.prompt.message).toContain("Choose a location with Save As");
++    native.savePicker.mockResolvedValueOnce("D:\\rescued.chemdraft");
++    await modalButton("Save");
++    expect(native.writeFile).toHaveBeenCalledWith("D:\\rescued.chemdraft", expect.any(String));
++    expect(bridge().snapshot().file).toEqual({ dirty: false });
++  });
+   function bridge(): ChemDraftAgentBridge {
+     return (window as Window & { __CHEMDRAFT_AGENT__: ChemDraftAgentBridge }).__CHEMDRAFT_AGENT__;
+   }
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index b7ee24dca..affd17707 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -136,6 +136,8 @@ import {
+   documentIsBlank,
+   documentSessionRestoreCandidates,
+   parseDocumentSessionEnvelope,
++  restoredDocumentFileState,
++  restoredSavePathNotice,
+   shouldRestoreDocumentSession,
+   strictSessionFlushRefusal,
+   unrestoredTabContents,
+@@ -1287,6 +1289,7 @@ type TextResizeState = {
+ type NativeFileState = {
+   path?: string;
+   dirty: boolean;
++  restoreSavePathError?: string;
+ };
+ type ResolvedOpenDocument = {
+   document: ChemDraftDocument;
+@@ -1590,7 +1593,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "10.19.14.31-codex";
++const CURRENT_BUILD_STAMP = "10.19.23.08-opus";
+ /** Whether this page load already asked the native side for a crash note from the last run. */
+ let pendingCrashNoteChecked = false;
+ const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
+@@ -8543,15 +8546,16 @@ export function MainWindow({
+           }
+           for (const { id, session, resolved, opened, history } of restored) {
+             if (session.pristine !== true || session.path || session.dirty || !session.blank) nonPristineTabsRef.current.add(id);
++            const savePathNotice = restoredSavePathNotice(session);
+             documentTabSnapshotsRef.current.set(id, {
+-              history, file: { path: session.path, dirty: session.dirty },
++              history, file: restoredDocumentFileState(session),
+               viewport: session.view?.viewport ?? createViewportState(),
+               scrollLeft: session.view?.scrollLeft ?? 0, scrollTop: session.view?.scrollTop ?? 0, parts: [],
+               warnings: session.openWarnings ?? {
+                 displayName: session.displayName, sourceLabel: openSourceLabel(resolved.source, resolved.statusSourceLabel),
+                 warnings: opened.warnings
+               },
+-              status: `${shellOpenFailure ? `${shellOpenFailure} — ` : ""}Restored last session — ${session.displayName}${session.dirty ? " (unsaved changes)" : ""}${restoreNotice}`
++              status: `${shellOpenFailure ? `${shellOpenFailure} — ` : ""}Restored last session — ${session.displayName}${session.dirty ? " (unsaved changes)" : ""}${restoreNotice}${savePathNotice ? `. ${savePathNotice}` : ""}`
+             });
+           }
+           documentTabsRef.current = tabs;
+@@ -9030,11 +9034,15 @@ export function MainWindow({
+         finishSave();
+         return true;
+       }
+-      let path = forceSaveAs ? undefined : savingFileState.path;
+-      if (!path) path = await pickNativeSavePath(savingFileState.path ?? payload.filename);
++      const restoreNotice = restoredSavePathNotice(savingFileState);
++      if (restoreNotice) setStatus(restoreNotice);
++      let path = forceSaveAs || restoreNotice ? undefined : savingFileState.path;
++      if (!path) path = await pickNativeSavePath(savingFileState.path ?? payload.filename,
++        restoreNotice ? { title: "Save As — restored file unavailable", extension: "chemdraft" } : undefined);
+       if (!path) {
+-        if (savingTabId === activeDocumentTabIdRef.current) setStatus("Save canceled");
+-        if (closeTabPromptRef.current === savingTabId) setCloseTabSaveMessage("Save canceled. The tab is still open.");
++        const canceled = `${restoreNotice ? `${restoreNotice} ` : ""}Save canceled. The tab is still open.`;
++        if (savingTabId === activeDocumentTabIdRef.current) setStatus(restoreNotice ? canceled : "Save canceled");
++        if (closeTabPromptRef.current === savingTabId) setCloseTabSaveMessage(canceled);
+         return false;
+       }
+       const finalPath = ensureChemDraftFileExtension(path);
+diff --git a/apps/desktop/src/documentSession.test.ts b/apps/desktop/src/documentSession.test.ts
+index 7e97ffc35..3a711e567 100644
+--- a/apps/desktop/src/documentSession.test.ts
++++ b/apps/desktop/src/documentSession.test.ts
+@@ -7,6 +7,8 @@ import {
+   documentIsBlank,
+   documentSessionRestoreCandidates,
+   parseDocumentSessionEnvelope,
++  restoredDocumentFileState,
++  restoredSavePathNotice,
+   unrestoredTabContents,
+   unrestoredTabDisplayName,
+   unrestoredTabsNotice,
+@@ -114,6 +116,27 @@ describe("shouldRestoreDocumentSession", () => {
+   });
+ });
+ 
++describe.each(["/Users/chemist/drawing.chemdraft", "D:\\drawings\\drawing.chemdraft", "/Users/chemist/drawing.cdxml"])("restored file access: %s", (path) => {
++  const session = buildDocumentSessionEnvelope(payload, { path, dirty: true }, "drawing.chemdraft", false);
++
++  it("preserves a named tab's path for Save without requiring Save As", () => {
++    const restored = restoredDocumentFileState(parseDocumentSessionEnvelope(session, true)!);
++    expect(restored).toEqual({ path, dirty: true });
++    expect(restoredSavePathNotice(restored)).toBeUndefined();
++  });
++
++  it("preserves content and file association when native access fails, explaining Save As", () => {
++    const parsed = parseDocumentSessionEnvelope({ ...session, restoreSavePathError: "the saved file is unavailable" }, true)!;
++    expect(parsed.contents).toBe(payload.contents);
++    const restored = restoredDocumentFileState(parsed);
++    expect(restored).toMatchObject({ path, dirty: true, restoreSavePathError: "the saved file is unavailable" });
++    expect(restoredSavePathNotice(restored)).toContain("Choose a location with Save As");
++    expect(restoredSavePathNotice(restored)).toContain(path);
++    // Persist original association, but access must be checked afresh by Rust on the next launch.
++    expect(buildDocumentSessionEnvelope(payload, restored, session.displayName, false)).not.toHaveProperty("restoreSavePathError");
++  });
++});
++
+ describe("multi-document session extension", () => {
+   const blank = buildDocumentSessionEnvelope(payload, { dirty: false }, "Untitled", true);
+   const session = buildDocumentTabsSession([blank, { ...blank, dirty: true }, blank], 1);
+diff --git a/apps/desktop/src/documentSession.ts b/apps/desktop/src/documentSession.ts
+index ee6284384..62c8929c2 100644
+--- a/apps/desktop/src/documentSession.ts
++++ b/apps/desktop/src/documentSession.ts
+@@ -34,6 +34,8 @@ export interface DocumentSessionEnvelope {
+   blank: boolean;
+   /** Absolute path of the associated file, when the document has ever been saved/opened. */
+   path?: string;
++  /** Transient native restore result: access could not be renewed; preserve the path but use Save As. */
++  restoreSavePathError?: string;
+   /** Name shown in the restore status line (file basename, or the document's save filename). */
+   displayName: string;
+   /** True when the session holds edits that were never written to `path`. */
+@@ -229,6 +231,7 @@ export function parseDocumentSessionEnvelope(raw: unknown, nested = false): Pars
+     payloadHash: candidate.payloadHash,
+     blank: candidate.blank,
+     ...(candidate.path !== undefined ? { path: candidate.path } : {}),
++    ...(typeof candidate.restoreSavePathError === "string" ? { restoreSavePathError: candidate.restoreSavePathError } : {}),
+     displayName: candidate.displayName,
+     dirty: candidate.dirty,
+     savedAt: candidate.savedAt,
+@@ -241,6 +244,20 @@ export function parseDocumentSessionEnvelope(raw: unknown, nested = false): Pars
+   return parsed;
+ }
+ 
++/** Keep the file association and drawing even when the native restore could not reauthorize it. */
++export function restoredDocumentFileState(session: DocumentSessionEnvelope): {
++  path?: string; dirty: boolean; restoreSavePathError?: string;
++} {
++  return { path: session.path, dirty: session.dirty,
++    ...(session.path && session.restoreSavePathError ? { restoreSavePathError: session.restoreSavePathError } : {}) };
++}
++
++export function restoredSavePathNotice(file: { path?: string; restoreSavePathError?: string }): string | undefined {
++  return file.path && file.restoreSavePathError
++    ? `Cannot save to the restored file "${file.path}": ${file.restoreSavePathError}. Choose a location with Save As.`
++    : undefined;
++}
++
+ /** An old single-document empty canvas restores nothing — otherwise every fresh launch would announce
+  *  "Restored last session" over the identical blank it starts with anyway. A blank canvas still
+  *  restores when it IS a file (reopen it) or carries unsaved edits (e.g. the user erased
+diff --git a/docs/architecture/save-open-and-file-format.md b/docs/architecture/save-open-and-file-format.md
+index e5e911f6b..7bf58d584 100644
+--- a/docs/architecture/save-open-and-file-format.md
++++ b/docs/architecture/save-open-and-file-format.md
+@@ -78,6 +78,21 @@ File UI state is kept outside the native document:
+ 
+ Dirty state is driven by document history commits. Viewport, palette, ruler, and other UI-only changes must not dirty the document.
+ 
++Session restore renews per-run fs/asset access natively while reading the app's own
++`document-session.json`. Only readable tab envelopes' saved paths are considered (including
++legacy single-document sessions and readable kept tabs retried on launch). The outer active-tab
++mirror and arbitrary objects in document contents never authorize paths. Each grant uses
++`allow_file` for one absolute, existing, regular `.chemdraft` or `.cdxml` file; directories,
++symlink components, Windows reparse points, and read-only files are refused. Both session IPC
++commands accept only the main document window, and no frontend path-grant command is exposed.
++
++A refused or failed grant adds a transient `restoreSavePathError` to the returned tab. Restore
++keeps its contents, dirty state, and original file association; Save (including a close prompt's
++Save) explains the failure and opens Save As. Cancel preserves the drawing and successful Save As
++replaces its association. Autosave does not persist this transient result: access is checked
++again on each launch. The filesystem checks are a restore-time safeguard, not a defense against
++another local process replacing a path after it was checked.
++
+ ## 5. Visible CDXML Subset
+ 
+ The current visible subset is progressive and warning-backed.
+diff --git a/docs/manual-stress-checklist.md b/docs/manual-stress-checklist.md
+index f6daf3a99..a5e2f33b1 100644
+--- a/docs/manual-stress-checklist.md
++++ b/docs/manual-stress-checklist.md
+@@ -197,6 +197,14 @@ in a branch build (long stamp with the worktree label) and in a stable build (sh
+    then relaunch: all tabs, file associations, dirty states and the active tab return without a quit
+    prompt. Repeat using a pre-tabs session file. Invoke a plugin and inspect the agent snapshot after
+    switching tabs; both must use the active document. Keep the worktree label visible throughout.
++   On **macOS and Windows**, open a named `.chemdraft` (also a `.cdxml`) from outside the default
++   filesystem scopes, via a launch path argument / Open With. Edit it, close the window, and relaunch
++   with no arguments. Verify the restored tab is dirty and Cmd+S / Ctrl+S writes those edits to its
++   original path without a picker; reopen the file to confirm the bytes changed. Repeat via the
++   dirty-tab close prompt's Save. Then quit dirty again, move/delete the original file before
++   relaunch, and Save: a clear restored-file message and Save As picker appear, cancel keeps the
++   drawing dirty with its content, and choosing a new location saves it. Check the same fallback
++   for a restored path replaced by a directory or symbolic link; no linked target should be written.
+    Queue a recognition proposal, switch tabs (also during recognition), and check its document name
+    in review; Accept must activate and edit only its source tab with one undo entry. Close that tab:
+    Accept must explain that its document was closed and keep the proposal pending; Reject must work

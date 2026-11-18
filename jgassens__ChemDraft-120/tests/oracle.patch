@@ -1,0 +1,1486 @@
+diff --git a/apps/desktop/src/App.test.ts b/apps/desktop/src/App.test.ts
+index 47a4c9e83..f8a8f57bf 100644
+--- a/apps/desktop/src/App.test.ts
++++ b/apps/desktop/src/App.test.ts
+@@ -483,13 +483,16 @@ describe("ChemDraft desktop shell", () => {
+     expect(enablingLine).toBeGreaterThan(thenLine);
+     expect(enablingLine).toBeLessThan(catchLine);
+ 
+-    // The gate opens only after parser and document restoration finish. The restore helper
+-    // also returns cleanly for first-run and pristine-blank sessions.
++    // Unreadable payloads are kept for recovery; an unreadable outer envelope closes autosave.
+     const restoreLine = lines.findIndex((line) => line.trim() === "await restore();");
+     expect(restoreLine).toBeGreaterThan(thenLine);
+     expect(enablingLine).toBeGreaterThan(restoreLine);
+     expect(mainWindowSource).toContain('if (raw !== undefined && raw !== null) throw new Error("Unreadable session envelope")');
+-    expect(mainWindowSource).toContain('if (!restored.length) throw new Error("No readable document tabs")');
++    expect(mainWindowSource).toContain("unrestoredSessionTabsRef.current = skipped");
++    expect(mainWindowSource).toContain("documentSessionRestoreCandidates(envelope)");
++    expect(mainWindowSource).toContain('setKeptDrawingsPrompt("notice")');
++    expect(mainWindowSource).not.toContain('action.id === "document.saveUnrestoredTabs"');
++    expect(mainWindowSource).not.toContain('action.id === "document.discardUnrestoredTabs"');
+   });
+ 
+   it("keeps toolbar 3D cleanup separate from projected-plane rotate without conformer imports", () => {
+diff --git a/apps/desktop/src/MainWindow.tabs.dom.test.tsx b/apps/desktop/src/MainWindow.tabs.dom.test.tsx
+index 457f61a89..0ca18a9d8 100644
+--- a/apps/desktop/src/MainWindow.tabs.dom.test.tsx
++++ b/apps/desktop/src/MainWindow.tabs.dom.test.tsx
+@@ -9,7 +9,7 @@ import { applyNativeChainTool, createNativeSavePayload, createPhase4Document, op
+ import { openChemDraftPayload } from "@chemdraft/cdx-compat";
+ import { saveKeybindingSettings } from "./keybindingSettings";
+ import { createViewportState } from "@chemdraft/viewport-engine";
+-import { DOM_COMMAND_EVENT, setToolbarsMenu } from "./window-manager";
++import { DOM_COMMAND_EVENT, setToolbarsMenu, type ToolsetWindowState } from "./window-manager";
+ import { buildDocumentSessionEnvelope, buildDocumentTabsSession, parseDocumentSessionEnvelope } from "./documentSession";
+ import { createPluginRuntime, type DesktopPluginRuntime } from "./plugins/createPluginRuntime";
+ import type { DocumentPatch, MoleculeObject } from "@chemdraft/chem-core";
+@@ -21,12 +21,18 @@ import { createDesktopShortcutRegistry } from "./keyboardShortcuts";
+ import { createDocumentTabActions } from "./commands";
+ import type { ChemDraftAgentBridge } from "./agentBridge";
+ import * as atomLabelDraft from "./atomLabelDraft";
++import * as nativePaletteReconciliation from "./toolbars/reconcileNativePalettes";
+ 
+ const native = vi.hoisted(() => ({
+   desktop: true,
+   suspendUtilities: false,
+   suspensionDepth: 0,
+   visibilityChanges: [] as string[],
++  toolsetWindows: new Map<string, boolean>(),
++  suspendedToolsets: [] as string[],
++  loadToolsetLayout: vi.fn<() => Promise<unknown>>(),
++  listToolsets: vi.fn<() => Promise<ToolsetWindowState[]>>(),
++  openToolset: vi.fn<(id: string) => Promise<ToolsetWindowState>>(),
+   session: undefined as unknown,
+   load: vi.fn<() => Promise<unknown>>(),
+   saveSession: vi.fn<(value: unknown) => Promise<void>>(),
+@@ -40,7 +46,7 @@ const native = vi.hoisted(() => ({
+ }));
+ vi.mock("./documentWorkflow", async (original) => {
+   const actual = await original<typeof import("./documentWorkflow")>();
+-  return { ...actual, createNativeSavePayload: vi.fn(actual.createNativeSavePayload) };
++  return { ...actual, createNativeSavePayload: vi.fn(actual.createNativeSavePayload), openNativeDocument: vi.fn(actual.openNativeDocument) };
+ });
+ vi.mock("./rdkitWasmLoader", () => ({ registerRdkitWasmLoader: vi.fn() }));
+ vi.mock("./window-manager", async (original) => ({
+@@ -48,6 +54,13 @@ vi.mock("./window-manager", async (original) => ({
+   isDesktopRuntime: () => native.desktop,
+   loadDocumentSession: native.load,
+   saveDocumentSession: native.saveSession,
++  loadToolsetLayoutState: native.loadToolsetLayout,
++  openToolsetWindow: native.openToolset,
++  listToolsetWindowStates: native.listToolsets,
++  closeToolsetWindow: async (toolsetId: string) => {
++    native.toolsetWindows.set(toolsetId, false);
++    return { toolsetId, open: false, focused: false };
++  },
+   setToolbarsMenu: vi.fn().mockResolvedValue(undefined),
+   listenForQuitFlushRequest: async (handler: () => Promise<void>) => {
+     native.quitFlush = handler;
+@@ -69,8 +82,16 @@ vi.mock("@tauri-apps/api/core", async (original) => ({
+   isTauri: () => native.suspendUtilities,
+   invoke: vi.fn(async (command: string, options?: { suspended?: boolean }) => {
+     if (command === "suspend_toolset_windows") {
+-      if (options?.suspended) { if (native.suspensionDepth++ === 0) native.visibilityChanges.push("hide"); }
+-      else if (--native.suspensionDepth === 0) native.visibilityChanges.push("restore");
++      if (options?.suspended) {
++        if (native.suspensionDepth++ === 0) {
++          native.visibilityChanges.push("hide");
++          native.suspendedToolsets = [...native.toolsetWindows].filter(([, visible]) => visible).map(([id]) => id);
++          for (const id of native.suspendedToolsets) native.toolsetWindows.set(id, false);
++        }
++      } else if (--native.suspensionDepth === 0) {
++        native.visibilityChanges.push("restore");
++        for (const id of native.suspendedToolsets) native.toolsetWindows.set(id, true);
++      }
+     }
+     return null;
+   })
+@@ -111,6 +132,16 @@ describe("documents in one window", () => {
+     native.suspendUtilities = false;
+     native.suspensionDepth = 0;
+     native.visibilityChanges = [];
++    native.toolsetWindows.clear();
++    native.suspendedToolsets = [];
++    native.loadToolsetLayout.mockResolvedValue(undefined);
++    native.listToolsets.mockImplementation(async () => [...native.toolsetWindows]
++      .map(([toolsetId, open]) => ({ toolsetId, open, focused: false })));
++    native.openToolset.mockImplementation(async (toolsetId) => {
++      // Match Rust: suspension refuses even creation of a window that does not yet exist.
++      if (!native.suspensionDepth) native.toolsetWindows.set(toolsetId, true);
++      return { toolsetId, open: native.toolsetWindows.get(toolsetId) ?? false, focused: false };
++    });
+     native.session = undefined;
+     native.events.clear();
+     native.load.mockImplementation(async () => native.session);
+@@ -133,6 +164,7 @@ describe("documents in one window", () => {
+     window.history.replaceState(null, "", "/");
+     vi.restoreAllMocks();
+     vi.unstubAllGlobals();
++    vi.useRealTimers();
+   });
+ 
+   async function mount(initialDocument = createPhase4Document("Untitled")) {
+@@ -146,6 +178,7 @@ describe("documents in one window", () => {
+   }
+   async function remount() {
+     act(() => root!.unmount());
++    pendingPrompt = undefined;
+     container.innerHTML = "";
+     await mount();
+   }
+@@ -1050,6 +1083,583 @@ describe("documents in one window", () => {
+     })), 1);
+   }
+ 
++  function sessionWithUnrestoredTabs(names = ["First.chemdraft", "Second.cdxml", "Third.chemdraft"]) {
++    const session = threeTabSession();
++    session.unrestoredTabs = names.map((displayName, index) => ({
++      ...session.tabs![index % 3]!, displayName, contents: `unreadable raw document ${index}`,
++      extraRecoveryData: { original: index }
++    }));
++    return session;
++  }
++
++  describe.each(["MacIntel", "Win32"])("kept drawings on %s", (platform) => {
++    beforeEach(() => {
++      vi.spyOn(window.navigator, "platform", "get").mockReturnValue(platform);
++      native.suspendUtilities = true;
++    });
++
++    const expectSuspended = () => {
++      expect(native.suspensionDepth).toBeGreaterThan(0);
++      expect(native.visibilityChanges).toEqual(["hide"]);
++      expect(container.querySelector('[role="dialog"]')).toBeNull();
++    };
++    const expectReleased = () => {
++      expect(native.suspensionDepth).toBe(0);
++      expect(native.visibilityChanges).toEqual(["hide", "restore"]);
++      expect(pendingPrompt).toBeUndefined();
++    };
++
++    const startupLayout = {
++      version: 1, toolsetOrder: [], userToolsets: [],
++      toolsetOverrides: ["core.main", "core.art", "core.structure"].map(toolsetId => ({ toolsetId, visible: true }))
++    };
++
++    it("waits for saved toolbar layout and native window creation before suspending for the launch box", async () => {
++      vi.useFakeTimers();
++      native.session = sessionWithUnrestoredTabs(["Kept.chemdraft"]);
++      let finishLayout!: (value: unknown) => void;
++      native.loadToolsetLayout.mockImplementationOnce(() => new Promise(resolve => { finishLayout = resolve; }));
++      let finishArt!: () => void;
++      const openNormally = native.openToolset.getMockImplementation()!;
++      native.openToolset.mockImplementation(async (id) => {
++        if (id === "core.art") await new Promise<void>(resolve => { finishArt = resolve; });
++        return openNormally(id);
++      });
++      native.openToolset.mockClear();
++      await remount();
++      expect(tabs()).toHaveLength(3);
++      expect(native.openToolset).not.toHaveBeenCalled();
++      expect(pendingPrompt).toBeUndefined();
++      expect(native.visibilityChanges).toEqual([]);
++      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
++
++      await act(async () => finishLayout(startupLayout));
++      expect(native.openToolset).toHaveBeenCalledWith("core.main", expect.anything());
++      expect(native.openToolset).toHaveBeenCalledWith("core.art", expect.anything());
++      expect(pendingPrompt).toBeUndefined();
++      expect(native.suspensionDepth).toBe(0);
++      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
++
++      await act(async () => finishArt());
++      expect(native.openToolset).toHaveBeenCalledWith("core.structure", expect.anything());
++      expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
++      expect(pendingPrompt?.prompt.message).toMatch(/^Its drawing is kept,/);
++      expect(pendingPrompt?.prompt.message).not.toContain("1 drawing didn't open");
++      expectSuspended();
++      for (const { toolsetId } of startupLayout.toolsetOverrides) {
++        expect(native.toolsetWindows.has(toolsetId)).toBe(true);
++        expect(native.toolsetWindows.get(toolsetId)).toBe(false);
++      }
++      // Installed plugins can finish loading after the launch box has appeared. The catalog
++      // refresh must not mistake the deliberately hidden windows for creation failures.
++      const currentRuntime = vi.mocked(createPluginRuntime).mock.results.at(-1)!.value as DesktopPluginRuntime;
++      native.openToolset.mockClear();
++      await act(async () => currentRuntime.registerPlugin({
++        id: "org.test.late-startup", name: "Late startup plugin", version: "0.0.1", apiVersion: "^0.1.6",
++        entry: "dist/plugin.js", permissions: [], contributes: { commands: [] }
++      }));
++      // Keeping the box open beyond the old retry window must never activate the web fallback.
++      await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
++      expect(native.openToolset).not.toHaveBeenCalled();
++      expect(container.querySelector(".native-shell")).not.toBeNull();
++      expect(container.querySelector('[role="status"]')?.textContent).not.toContain("unavailable");
++      await modalButton("Cancel");
++      expectReleased();
++      for (const { toolsetId } of startupLayout.toolsetOverrides) {
++        expect(native.toolsetWindows.get(toolsetId)).toBe(true);
++      }
++      expect(container.querySelector(".native-shell")).not.toBeNull();
++    });
++
++    it("still falls back on genuine creation failure before showing the launch box", async () => {
++      vi.useFakeTimers();
++      native.session = sessionWithUnrestoredTabs(["Kept.chemdraft"]);
++      native.loadToolsetLayout.mockResolvedValue(startupLayout);
++      native.openToolset.mockRejectedValue(new Error("native window creation failed"));
++      native.openToolset.mockClear();
++      await remount();
++      expect(pendingPrompt).toBeUndefined();
++      expect(native.suspensionDepth).toBe(0);
++      // Each retry uses the real reconciler, including its delay and failure verdict.
++      for (let attempt = 0; attempt < 3; attempt++) {
++        await act(async () => { await vi.advanceTimersByTimeAsync(220); });
++      }
++      expect(native.openToolset.mock.calls.filter(([id]) => id === "core.main")).toHaveLength(3);
++      expect(container.querySelector(".web-shell")).not.toBeNull();
++      expect(container.querySelector('[role="status"]')?.textContent).toContain("Native toolset windows unavailable; using in-window toolbars");
++      expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
++      expectSuspended();
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it.each(["layout", "list", "open"])("bounds a never-resolving %s load/IPC without blocking commands or queued opens", async (stalled) => {
++      vi.useFakeTimers();
++      native.session = sessionWithUnrestoredTabs(["Kept.chemdraft"]);
++      native.loadToolsetLayout.mockResolvedValue(startupLayout);
++      if (stalled === "layout") native.loadToolsetLayout.mockImplementationOnce(() => new Promise(() => {}));
++      if (stalled === "list") native.listToolsets.mockImplementation(() => new Promise(() => {}));
++      if (stalled === "open") native.openToolset.mockImplementation(() => new Promise(() => {}));
++      await remount();
++      await act(async () => native.events.get("chemdraft://open-document")!({
++        path: "/tmp/incoming.chemdraft", displayName: "incoming.chemdraft", contents: fileContents("Incoming drawing")
++      }));
++      await command("document.new");
++      expect(tabs()).toHaveLength(3);
++      await act(async () => { await vi.advanceTimersByTimeAsync(999); });
++      expect(pendingPrompt).toBeUndefined();
++      expect(native.suspensionDepth).toBe(0);
++      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
++      expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
++      expectSuspended();
++      // Timeout alone cannot establish that native windows are genuinely unavailable.
++      expect(container.querySelector(".native-shell")).not.toBeNull();
++      await modalButton("Cancel");
++      expectReleased();
++      expect(tabs()).toHaveLength(4);
++      expect(bridge().snapshot().document.title).toBe("Incoming drawing");
++      await command("document.new");
++      expect(tabs()).toHaveLength(5);
++    });
++
++    it.each(["layout", "list", "reconciliation"])("opens the box and applies fallback when %s rejects", async (rejected) => {
++      vi.useFakeTimers();
++      native.session = sessionWithUnrestoredTabs(["Kept.chemdraft"]);
++      native.loadToolsetLayout.mockResolvedValue(startupLayout);
++      if (rejected === "layout") native.loadToolsetLayout.mockRejectedValueOnce(new Error("layout read failed"));
++      else if (rejected === "list") native.listToolsets.mockRejectedValue(new Error("list IPC failed"));
++      else vi.spyOn(nativePaletteReconciliation, "reconcileNativePaletteWindows")
++        .mockRejectedValueOnce(new Error("reconciliation failed"));
++      await remount();
++      // IPC rejections take the existing three-attempt path; a layout rejection settles directly.
++      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
++      expect(container.querySelector(".web-shell")).not.toBeNull();
++      expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
++      expectSuspended();
++      await modalButton("Cancel");
++      expectReleased();
++      await command("document.new");
++      expect(tabs()).toHaveLength(4);
++    });
++
++    it.each([
++      ["layout", false], ["open", false], ["layout", true], ["open", true]
++    ] as const)("handles late %s completion without a second box or false fallback (dismissed: %s)", async (late, dismissed) => {
++      vi.useFakeTimers();
++      native.session = sessionWithUnrestoredTabs(["Kept.chemdraft"]);
++      native.loadToolsetLayout.mockResolvedValue(startupLayout);
++      let finish!: () => void;
++      if (late === "layout") {
++        native.loadToolsetLayout.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(startupLayout); }));
++      } else {
++        const openNormally = native.openToolset.getMockImplementation()!;
++        native.openToolset.mockImplementationOnce(async (id) => {
++          await new Promise<void>(resolve => { finish = resolve; });
++          return openNormally(id);
++        });
++      }
++      await remount();
++      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
++      const firstPrompt = pendingPrompt;
++      expect(firstPrompt).toBeDefined();
++      expectSuspended();
++      if (dismissed) await modalButton("Cancel");
++      native.openToolset.mockClear();
++      await act(async () => finish());
++      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
++      if (!dismissed) {
++        // Finishing under suspension must defer the rest of creation until the box is dismissed.
++        expect(pendingPrompt).toBe(firstPrompt);
++        expect(native.openToolset).not.toHaveBeenCalled();
++        await modalButton("Cancel");
++      }
++      expect(container.querySelector(".native-shell")).not.toBeNull();
++      expectReleased();
++      for (const { toolsetId } of startupLayout.toolsetOverrides) {
++        expect(native.toolsetWindows.get(toolsetId)).toBe(true);
++      }
++      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
++      expect(pendingPrompt).toBeUndefined();
++      expect(container.querySelector(".native-shell")).not.toBeNull();
++    });
++
++    function unsupportedChildrenSession() {
++      const session = threeTabSession();
++      return { ...session, tabs: session.tabs!.map((tab, index) => ({
++        ...tab, version: 99, contents: `${tab.contents}\r\n\t `,
++        extraRecoveryData: { original: index, label: "α 🧪" }
++      })) };
++    }
++
++    it("offers every version-99 child, keeps them after Cancel and relaunch, and autosaves new work", async () => {
++      const raw = unsupportedChildrenSession();
++      native.session = raw;
++      await remount();
++      expect(tabs()).toHaveLength(1);
++      expect(bridge().snapshot().page.objectCount).toBe(0);
++      expect(bridge().snapshot().file).toEqual({ dirty: false });
++      expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
++      for (const tab of raw.tabs) expect(pendingPrompt?.prompt.message).toContain(tab.displayName);
++      expectSuspended();
++      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
++      await modalButton("Cancel");
++      expectReleased();
++      native.saveSession.mockClear();
++      await paste("Fresh work after unreadable children");
++      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 900)); });
++      expect(native.saveSession).toHaveBeenCalled();
++      const autosaved = parseDocumentSessionEnvelope(native.session)!;
++      expect(autosaved.unrestoredTabs).toEqual(raw.tabs);
++      expect(autosaved.tabs![0]!.contents).toContain("Fresh work after unreadable children");
++      native.visibilityChanges = [];
++      await remount();
++      expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
++      expect(drawnText()).toContain("Fresh work after unreadable children");
++      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it("saves the original contents of every version-99 child without reserializing them", async () => {
++      const raw = unsupportedChildrenSession();
++      native.session = raw;
++      await remount();
++      expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
++      const paths = raw.tabs.map((_, index) => platform === "Win32"
++        ? `C:\\rescued\\drawing-${index}.chemdraft` : `/tmp/drawing-${index}.chemdraft`);
++      for (const path of paths) native.savePicker.mockResolvedValueOnce(path);
++      native.writeFile.mockClear();
++      await modalButton("Save Drawing…");
++      expect(native.writeFile).toHaveBeenCalledTimes(3);
++      raw.tabs.forEach((tab, index) => {
++        expect(native.writeFile).toHaveBeenNthCalledWith(index + 1, paths[index], tab.contents);
++      });
++      expectReleased();
++      expect((await flush()).unrestoredTabs).toBeUndefined();
++      expect(tabs()).toHaveLength(1);
++      await remount();
++      expect(pendingPrompt).toBeUndefined();
++    });
++
++    it("restores readable siblings while offering unsupported and malformed child envelopes", async () => {
++      const session = threeTabSession();
++      const unreadable = [
++        { ...session.tabs![0]!, version: 99, extraRecoveryData: { original: true } },
++        { ...session.tabs![2]!, dirty: "unknown", extraRecoveryData: { original: false } }
++      ];
++      native.session = { ...session, tabs: [unreadable[0], session.tabs![1], unreadable[1]] };
++      await remount();
++      expect(tabs()).toHaveLength(1);
++      expect(bridge().snapshot().document.title).toBe("Second");
++      expect(pendingPrompt?.prompt.title).toBe("2 drawings didn't open");
++      expect((await flush()).unrestoredTabs).toEqual(unreadable);
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it.each([false, true])("includes existing kept tabs with new unreadable children (readable sibling: %s)", async (readableSibling) => {
++      const raw = unsupportedChildrenSession();
++      const readable = threeTabSession().tabs![1]!;
++      const children = readableSibling ? [raw.tabs[0], readable, raw.tabs[2]] : raw.tabs;
++      const alreadyKept = { version: 99, displayName: "Previously kept", contents: "original\r\nα 🧪" };
++      const recoverable = { ...readable, contents: fileContents("Previously kept, now readable") };
++      native.session = { ...raw, tabs: children, unrestoredTabs: [alreadyKept, recoverable] };
++      await remount();
++      expect(tabs()).toHaveLength(readableSibling ? 2 : 1);
++      expect(pendingPrompt?.prompt.title).toBe(`${readableSibling ? 3 : 4} drawings didn't open`);
++      expect(pendingPrompt?.prompt.message).toContain("Previously kept");
++      const expectedKept = [alreadyKept, ...children.filter(tab => tab.version === 99)];
++      expect((await flush()).unrestoredTabs).toEqual(expectedKept);
++      await modalButton("Cancel");
++      expectReleased();
++      await activate(readableSibling ? 1 : 0);
++      expect(bridge().snapshot().document.title).toBe("Previously kept, now readable");
++    });
++
++    it("offers malformed children even when no child envelope is readable", async () => {
++      const session = threeTabSession();
++      const children = session.tabs!.map(tab => ({ ...tab, dirty: "unknown" }));
++      native.session = { ...session, tabs: children };
++      await remount();
++      expect(tabs()).toHaveLength(1);
++      expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
++      expect((await flush()).unrestoredTabs).toEqual(children);
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it.each(["unknown outer version", "bad JSON"])("leaves the raw file and autosave gate unchanged for %s", async (failure) => {
++      const raw = failure === "bad JSON" ? "{bad JSON" : { ...unsupportedChildrenSession(), version: 99,
++        unrestoredTabs: [{ version: 99, contents: "previously kept" }] };
++      native.session = raw;
++      if (failure === "bad JSON") {
++        // The native load rejects invalid JSON before any envelope reaches MainWindow.
++        native.load.mockImplementationOnce(async () => JSON.parse(raw as string));
++      }
++      await remount();
++      expect(pendingPrompt).toBeUndefined();
++      expect(native.visibilityChanges).toEqual([]);
++      expect(container.querySelector('[role="status"]')?.textContent).toContain("will not be autosaved");
++      native.saveSession.mockClear();
++      await paste("Drawing after unreadable outer session");
++      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 900)); });
++      await flush();
++      expect(native.saveSession).not.toHaveBeenCalled();
++      expect(native.session).toEqual(raw);
++    });
++
++    it.each(["Cancel", "Escape"])("keeps raw drawings and retries next launch after %s", async (ending) => {
++      const session = sessionWithUnrestoredTabs(["Still unreadable.chemdraft"]);
++      native.session = session;
++      for (let launch = 0; launch < 2; launch += 1) {
++        native.visibilityChanges = [];
++        vi.mocked(openNativeDocument).mockClear();
++        await remount();
++        expect(openNativeDocument).toHaveBeenCalledWith("unreadable raw document 0");
++        expect(tabs()).toHaveLength(3);
++        expect(pendingPrompt?.prompt).toMatchObject({
++          title: "1 drawing didn't open", kind: "warning",
++          choices: [{ id: "save", label: "Save Drawing…" }, { id: "delete", label: "Delete", destructive: true },
++            { id: "cancel", label: "Cancel", cancel: true }]
++        });
++        expect(pendingPrompt?.prompt.message).toContain("Still unreadable.chemdraft");
++        expect(pendingPrompt?.prompt.message).toMatch(/^Its drawing is kept,/);
++        expect(pendingPrompt?.prompt.message).not.toContain("1 drawing didn't open");
++        expect(pendingPrompt?.prompt.message).toContain("Cancel keeps the drawings for the next launch.");
++        expectSuspended();
++        // The native layer returns the Cancel choice for Escape; its literal-label mapping is
++        // also tested at the plugin message boundary in nativePrompt.test.ts.
++        if (ending === "Escape") {
++          const resolve = pendingPrompt!.resolve;
++          const cancel = pendingPrompt!.prompt.choices.find(choice => choice.cancel)!;
++          pendingPrompt = undefined;
++          await act(async () => resolve(cancel.id));
++        } else await modalButton("Cancel");
++        expectReleased();
++        await command("view.zoomIn");
++        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
++      }
++    });
++
++    it("retries carried tabs and restores drawings that are now readable", async () => {
++      const session = threeTabSession();
++      const recovered = { ...session.tabs![0]!, displayName: "Recovered.chemdraft", contents: fileContents("Recovered") };
++      session.unrestoredTabs = [recovered];
++      native.session = session;
++      await remount();
++      expect(openNativeDocument).toHaveBeenCalledWith(recovered.contents);
++      expect(tabs()).toHaveLength(4);
++      expect(active()).toBe(1);
++      expect(pendingPrompt).toBeUndefined();
++      await activate(3);
++      expect(bridge().snapshot().document.title).toBe("Recovered");
++      expect((await flush()).unrestoredTabs).toBeUndefined();
++      await remount();
++      expect(tabs()).toHaveLength(4);
++    });
++
++    it("keeps a future schema unchanged and opens it after its schema becomes readable", async () => {
++      const drawing = createPhase4Document("Future drawing");
++      const session = threeTabSession();
++      session.tabs![1] = { ...session.tabs![1]!, displayName: "Future.chemdraft",
++        contents: JSON.stringify({ ...drawing, schema: "chemdraft.document.v999" }) };
++      native.session = session;
++      await remount();
++      expect(tabs()).toHaveLength(2);
++      expect(pendingPrompt?.prompt.message).toContain("Future.chemdraft");
++      expect(pendingPrompt?.prompt.message).toContain("saved by a newer ChemDraft");
++      await modalButton("Cancel");
++      const saved = await flush();
++      expect(saved.unrestoredTabs).toEqual([session.tabs![1]]);
++      saved.unrestoredTabs = [{ ...session.tabs![1]!, contents: JSON.stringify(drawing) }];
++      native.session = saved;
++      await remount();
++      expect(tabs()).toHaveLength(3);
++      expect(pendingPrompt).toBeUndefined();
++      await activate(2);
++      expect(bridge().snapshot().document.title).toBe("Future drawing");
++      expect((await flush()).unrestoredTabs).toBeUndefined();
++    });
++
++    it("saves an unsupported envelope's exact text to the chosen path unchanged", async () => {
++      const session = sessionWithUnrestoredTabs(["Recovered.chemdraft"]);
++      session.unrestoredTabs = [{ version: 99, displayName: "Recovered.chemdraft", contents: "future saved format" }];
++      native.session = session;
++      await remount();
++      native.writeFile.mockClear();
++      native.savePicker.mockResolvedValueOnce(platform === "Win32" ? "C:\\rescued\\chosen-name" : "/tmp/chosen-name");
++      native.writeFile.mockImplementationOnce(async () => { expectSuspended(); });
++      await modalButton("Save Drawing…");
++      expect(native.writeFile).toHaveBeenCalledExactlyOnceWith(
++        platform === "Win32" ? "C:\\rescued\\chosen-name" : "/tmp/chosen-name", "future saved format");
++      expectReleased();
++      expect((await flush()).unrestoredTabs).toBeUndefined();
++      await activate(2);
++      expect(container.querySelector('[role="status"]')?.textContent).not.toContain("kept for later");
++      await remount();
++      expect(pendingPrompt).toBeUndefined();
++    });
++
++    it("saves several raw drawings individually and removes only successful writes", async () => {
++      const session = sessionWithUnrestoredTabs();
++      native.session = session;
++      await remount();
++      expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
++      native.writeFile.mockClear();
++      native.savePicker.mockResolvedValueOnce("C:\\rescued\\First.chemdraft")
++        .mockResolvedValueOnce("C:\\rescued\\Second.cdxml").mockResolvedValueOnce("C:\\rescued\\Third.chemdraft");
++      native.writeFile.mockResolvedValueOnce().mockRejectedValueOnce(new Error("disk full")).mockResolvedValueOnce();
++      await modalButton("Save Drawing…");
++      expect(native.savePicker).toHaveBeenNthCalledWith(1, {
++        title: "Save Drawing — First.chemdraft", defaultPath: "First.chemdraft",
++        filters: [{ name: "Saved document", extensions: ["chemdraft"] }]
++      });
++      expect(native.savePicker).toHaveBeenNthCalledWith(2, expect.objectContaining({
++        defaultPath: "Second.cdxml", filters: [{ name: "Saved document", extensions: ["cdxml"] }]
++      }));
++      expect(native.writeFile).toHaveBeenNthCalledWith(1, "C:\\rescued\\First.chemdraft", "unreadable raw document 0");
++      expect(native.writeFile).toHaveBeenNthCalledWith(2, "C:\\rescued\\Second.cdxml", "unreadable raw document 1");
++      expect((await flush()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
++      expect(pendingPrompt?.prompt.message).toContain("Second.cdxml: disk full");
++      expect(pendingPrompt?.prompt.title).toBe("1 drawing didn't open");
++      expectSuspended();
++      await modalButton("Cancel");
++      expectReleased();
++      await remount();
++      expect((await flush()).unrestoredTabs).toEqual([session.unrestoredTabs![1]]);
++      expect(pendingPrompt).toBeDefined();
++    });
++
++    it.each([0, 1])("keeps pending, canceled and unattempted drawings (saved before cancellation: %s)", async (saved) => {
++      const session = sessionWithUnrestoredTabs();
++      native.session = session;
++      await remount();
++      let finishWrite!: () => void;
++      native.writeFile.mockClear();
++      if (saved) {
++        native.savePicker.mockResolvedValueOnce("/tmp/rescued.chemdraft").mockResolvedValueOnce(null);
++        native.writeFile.mockImplementationOnce(() => new Promise((resolve) => { finishWrite = resolve; }));
++      }
++      await modalButton("Save Drawing…");
++      if (saved) {
++        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
++        expectSuspended();
++        await command("document.new");
++        expect(tabs()).toHaveLength(3);
++        await act(async () => finishWrite());
++      }
++      expect(native.writeFile).toHaveBeenCalledTimes(saved);
++      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs!.slice(saved));
++      expect(pendingPrompt?.prompt.message).toContain(`Saved ${saved} ${saved === 1 ? "drawing" : "drawings"}; ${3 - saved} kept for later (save canceled)`);
++      expectSuspended();
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it.each(["Delete", "Cancel", "Escape"])("requires a second native confirmation before deleting (%s)", async (ending) => {
++      const session = sessionWithUnrestoredTabs(["Alpha.chemdraft", "Beta.chemdraft"]);
++      native.session = session;
++      await remount();
++      await modalButton("Delete");
++      expect(pendingPrompt?.prompt).toMatchObject({
++        title: "Delete the kept drawing?", kind: "warning",
++        choices: [{ id: "delete", label: "Delete", destructive: true }, { id: "cancel", label: "Cancel", cancel: true }]
++      });
++      expect(pendingPrompt?.prompt.message).toContain("This cannot be undone.");
++      expect(pendingPrompt?.prompt.message).toContain("Alpha.chemdraft");
++      expect(pendingPrompt?.prompt.message).toContain("Beta.chemdraft");
++      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
++      expectSuspended();
++      await modalButton(ending === "Escape" ? "Cancel" : ending);
++      const confirmed = ending === "Delete";
++      expect((await flush()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
++      if (!confirmed) {
++        expect(pendingPrompt?.prompt.title).toBe("2 drawings didn't open");
++        expectSuspended();
++        await modalButton("Cancel");
++      }
++      expectReleased();
++      await activate(2);
++      expect(container.querySelector('[role="status"]')?.textContent.includes("kept for later")).toBe(!confirmed);
++      await remount();
++      expect((await flush()).unrestoredTabs).toEqual(confirmed ? undefined : session.unrestoredTabs);
++      expect(pendingPrompt === undefined).toBe(confirmed);
++    });
++
++    it("returns to the native prompt after a save panel fails", async () => {
++      const session = sessionWithUnrestoredTabs(["Kept.chemdraft"]);
++      native.session = session;
++      await remount();
++      native.savePicker.mockRejectedValueOnce(new Error("panel failed"));
++      await modalButton("Save Drawing…");
++      expect(pendingPrompt?.prompt.message).toContain("Kept.chemdraft: panel failed");
++      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
++      expectSuspended();
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it("keeps drawings without an in-app fallback when native prompting fails", async () => {
++      const session = sessionWithUnrestoredTabs();
++      native.session = session;
++      const restoreFailureProvider = setNativePromptProvider(async (prompt, fallback) => fallback(prompt));
++      try {
++        await remount();
++        expectReleased();
++        expect(container.querySelector('[role="dialog"]')).toBeNull();
++        expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
++      } finally { restoreFailureProvider(); }
++    });
++
++    it("retains kept drawings when persisting confirmed deletion fails", async () => {
++      const session = sessionWithUnrestoredTabs();
++      native.session = session;
++      await remount();
++      await modalButton("Delete");
++      native.saveSession.mockRejectedValueOnce(new Error("session write refused"));
++      await modalButton("Delete");
++      expect(pendingPrompt?.prompt.message).toContain("Delete failed; the drawings are kept for later: session write refused");
++      expect((await flush()).unrestoredTabs).toEqual(session.unrestoredTabs);
++      expectSuspended();
++      await modalButton("Cancel");
++      expectReleased();
++    });
++
++    it("carries every raw tab when all document payloads fail", async () => {
++      const raw = { ...threeTabSession(), tabs: threeTabSession().tabs!.map(tab => ({ ...tab, contents: "corrupt" })) };
++      native.session = raw;
++      await remount();
++      expect(tabs()).toHaveLength(1);
++      expect(pendingPrompt?.prompt.title).toBe("3 drawings didn't open");
++      expect((await flush()).unrestoredTabs).toEqual(raw.tabs);
++      await modalButton("Delete");
++      await modalButton("Delete");
++      expect((await flush()).unrestoredTabs).toBeUndefined();
++      expectReleased();
++    });
++
++    it("queues OS open-with until the launch prompt ends", async () => {
++      native.session = sessionWithUnrestoredTabs();
++      await remount();
++      await act(async () => native.events.get("chemdraft://open-document")!({
++        path: "/tmp/incoming.chemdraft", displayName: "incoming.chemdraft", contents: fileContents("Incoming drawing")
++      }));
++      expect(tabs()).toHaveLength(3);
++      await modalButton("Cancel");
++      expect(tabs()).toHaveLength(4);
++      expect(bridge().snapshot().document.title).toBe("Incoming drawing");
++    });
++
++    it("does not register retired menu commands or prompt on a clean launch", async () => {
++      await remount();
++      expect(pendingPrompt).toBeUndefined();
++      for (const id of ["document.saveUnrestoredTabs", "document.discardUnrestoredTabs"]) {
++        expect(runtime().host.commands.has(id)).toBe(false);
++      }
++      expect(native.savePicker).not.toHaveBeenCalled();
++    });
++  });
++
+   it("restores all three tabs despite negative scroll or malformed cosmetic data", async () => {
+     const session = threeTabSession();
+     session.tabs![1]!.view!.scrollTop = -3;
+@@ -1073,7 +1683,7 @@ describe("documents in one window", () => {
+     await act(async () => finishRead(session));
+     expect(tabs()).toHaveLength(2);
+     expect(bridge().snapshot().document.title).toBe("First");
+-    expect(container.querySelector('[role="status"]')?.textContent).toContain("1 tab could not be restored");
++    expect(container.querySelector('[role="status"]')?.textContent).toContain("1 drawing is kept for later");
+     const saved = await flush();
+     expect(saved.unrestoredTabs).toEqual([corrupt]);
+     expect(saved.tabs!.map((tab) => tab.displayName)).toEqual(["First.chemdraft", "Third.chemdraft"]);
+@@ -1083,9 +1693,8 @@ describe("documents in one window", () => {
+     expect((await flush()).unrestoredTabs).toEqual([corrupt]);
+   });
+ 
+-  it.each(["envelope", "contents"])("never overwrites a wholly unreadable session (%s)", async (failure) => {
+-    const raw = failure === "envelope" ? { version: 99, recoverMe: true } :
+-      { ...threeTabSession(), tabs: threeTabSession().tabs!.map((tab) => ({ ...tab, contents: "corrupt" })) };
++  it("never overwrites a wholly unreadable session envelope", async () => {
++    const raw = { version: 99, recoverMe: true };
+     native.session = raw;
+     await remount();
+     native.saveSession.mockClear();
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index 1f868c497..7983d28db 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -132,10 +132,13 @@ import {
+   buildDocumentSessionEnvelope,
+   buildDocumentTabsSession,
+   documentIsBlank,
++  documentSessionRestoreCandidates,
+   parseDocumentSessionEnvelope,
+-  rawDocumentSessionTab,
+   shouldRestoreDocumentSession,
+-  strictSessionFlushRefusal
++  strictSessionFlushRefusal,
++  unrestoredTabContents,
++  unrestoredTabDisplayName,
++  unrestoredTabsNotice
+ } from "./documentSession";
+ import { createPersistentPluginStorage } from "./plugins/pluginStorage";
+ import {
+@@ -1621,7 +1624,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "10.12.17.50-opus";
++const CURRENT_BUILD_STAMP = "10.12.18.05-opus";
+ /** Whether this page load already asked the native side for a crash note from the last run. */
+ let pendingCrashNoteChecked = false;
+ const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
+@@ -2151,6 +2154,10 @@ export function MainWindow({
+   }>());
+   const pendingTabScrollRef = useRef<{ left: number; top: number } | undefined>(undefined);
+   const [closeTabPrompt, setCloseTabPrompt] = useState<string>();
++  const [keptDrawingsPrompt, setKeptDrawingsPrompt] = useState<"notice">();
++  const keptDrawingsPromptRef = useRef(keptDrawingsPrompt);
++  keptDrawingsPromptRef.current = keptDrawingsPrompt;
++  const [keptDrawingsMessage, setKeptDrawingsMessage] = useState<string>();
+   const [closeTabSaving, setCloseTabSaving] = useState(false);
+   const [closeTabSaveMessage, setCloseTabSaveMessage] = useState<string>();
+   const closeTabPromptRef = useRef(closeTabPrompt);
+@@ -2242,6 +2249,11 @@ export function MainWindow({
+   customizeMainToolbarActiveRef.current = customizeMainToolbarActive;
+   const [webPaletteFallback, setWebPaletteFallback] = useState(false);
+   const effectiveNativePalette = nativePalette && !webPaletteFallback;
++  const [nativeToolsetLayoutReady, setNativeToolsetLayoutReady] = useState(false);
++  const [nativeToolsetStartupReady, setNativeToolsetStartupReady] = useState(false);
++  const [keptDrawingsStartupWaitExpired, setKeptDrawingsStartupWaitExpired] = useState(false);
++  const nativeToolsetsSuspendedForLaunchPrompt =
++    (nativeToolsetStartupReady || keptDrawingsStartupWaitExpired) && keptDrawingsPrompt !== undefined;
+   const [webPalettePositions, setWebPalettePositions] = useState<Record<string, PalettePosition>>(() =>
+     createDefaultToolsetPositions(desktopToolsetRegistry)
+   );
+@@ -2386,6 +2398,8 @@ export function MainWindow({
+   const shellOpenFailureRef = useRef<string | undefined>(undefined);
+   const documentSessionSaveEnabledRef = useRef(false);
+   const unrestoredSessionTabsRef = useRef<unknown[]>([]);
++  const [unrestoredSessionTabCount, setUnrestoredSessionTabCount] = useState(0);
++  const unrestoredTabFlowRunningRef = useRef(false);
+   const sessionPayloadCacheRef = useRef(new WeakMap<ChemDraftDocument, ReturnType<typeof createNativeSavePayload>>());
+   const statusRef = useRef(status);
+   const lastExportDirectoryRef = useRef<string | undefined>(undefined);
+@@ -3182,6 +3196,7 @@ export function MainWindow({
+         resolvedToolsetIdsRef.current = new Set(toolbarCatalog.registry().listToolsets().map((toolset) => toolset.id));
+         layoutSaveEnabledRef.current = true;
+         layoutHydratedRef.current = true;
++        setNativeToolsetLayoutReady(true);
+       })
+       .catch((error: unknown) => {
+         if (!active) {
+@@ -8161,8 +8176,8 @@ export function MainWindow({
+     path?: string,
+     options?: OpenDocumentContentsOptions
+   ) => {
+-    if (closeTabPromptRef.current || (isDesktopRuntime() && !documentSessionHydratedRef.current)) {
+-      // Wait for Save/Discard/Cancel and the startup restore before activating an OS open-with.
++    if (closeTabPromptRef.current || keptDrawingsPromptRef.current || (isDesktopRuntime() && !documentSessionHydratedRef.current)) {
++      // Wait for the close/kept-drawing prompt and startup restore before activating an OS open-with.
+       pendingDocumentOpensRef.current.push({ contents, displayName, path, options });
+       return;
+     }
+@@ -8230,7 +8245,7 @@ export function MainWindow({
+   openDocumentContentsRef.current = openDocumentContents;
+ 
+   useEffect(() => {
+-    if (closeTabPrompt || !documentSessionHydratedRef.current) return;
++    if (closeTabPrompt || keptDrawingsPrompt || !documentSessionHydratedRef.current) return;
+     const opens = pendingDocumentOpensRef.current.splice(0);
+     void (async () => {
+       for (const request of opens) {
+@@ -8241,7 +8256,7 @@ export function MainWindow({
+         }
+       }
+     })();
+-  }, [closeTabPrompt]);
++  }, [closeTabPrompt, keptDrawingsPrompt]);
+ 
+   const acceptPageFitRecommendation = useCallback(() => {
+     if (!pageFitPrompt) {
+@@ -8409,7 +8424,7 @@ export function MainWindow({
+ 
+   // Restore every tab before processing startup file opens (see documentSession.ts). If a user
+   // already started editing while the read was pending, keep that work active and append the restored
+-  // tabs. Unreadable tabs stay in the envelope; a wholly unreadable session keeps autosave closed.
++  // tabs. Unreadable tabs stay in the envelope; an unreadable envelope keeps autosave closed.
+   useEffect(() => {
+     if (documentSessionHydratedRef.current) {
+       return undefined;
+@@ -8426,7 +8441,7 @@ export function MainWindow({
+           return;
+         }
+         // Only a completed restore (or an absent/pristine session) is a clean read.
+-        // A parser or document-open failure must leave autosave closed.
++        // An unreadable outer envelope must leave autosave closed; raw tabs remain recoverable.
+         const restore = async () => {
+           const envelope = parseDocumentSessionEnvelope(raw);
+           if (!envelope) {
+@@ -8436,18 +8451,19 @@ export function MainWindow({
+           if (!shouldRestoreDocumentSession(envelope)) return;
+           const shellOpenFailure = shellOpenFailureRef.current;
+           shellOpenFailureRef.current = undefined;
+-          const sessions = envelope.tabs ?? [envelope];
+-          const skipped = [...(envelope.unrestoredTabs ?? [])];
++          const skipped: unknown[] = [];
+           const restored = [];
+-          for (const session of sessions) {
++          for (const [candidateIndex, rawTab] of documentSessionRestoreCandidates(envelope).entries()) {
+             try {
++              const session = parseDocumentSessionEnvelope(rawTab, true);
++              if (!session) throw new Error("Unreadable tab envelope");
+               const opened = openNativeDocument(session.contents);
+               const resolved = await resolveOpenResultDocument(opened);
+               if (!resolved) throw new Error(formatOpenFailure(opened.warnings));
+               const history = createDocumentHistory(normalizeCommittedDocument(admitParsedDocument(resolved.document)));
+-              restored.push({ session, opened, resolved, history, id: crypto.randomUUID() });
++              restored.push({ session, opened, resolved, history, candidateIndex, id: crypto.randomUUID() });
+             } catch {
+-              skipped.push(rawDocumentSessionTab(session));
++              skipped.push(rawTab);
+             }
+           }
+           if (!active) return;
+@@ -8456,10 +8472,13 @@ export function MainWindow({
+             && !fileStateRef.current.path
+             && !fileStateRef.current.dirty
+             && documentIsBlank(documentRef.current);
+-          if (!restored.length) throw new Error("No readable document tabs");
+           unrestoredSessionTabsRef.current = skipped;
+-          const restoreNotice = skipped.length
+-            ? `; ${skipped.length} ${skipped.length === 1 ? "tab could" : "tabs could"} not be restored` : "";
++          setUnrestoredSessionTabCount(skipped.length);
++          const restoreNotice = unrestoredTabsNotice(skipped.length);
++          if (!restored.length) {
++            setStatus(`Could not restore the last session${restoreNotice}`);
++            return;
++          }
+           const restoredTabs = restored.map(({ id, session }) => ({ id, title: session.displayName }));
+           let tabs: Array<{ id: string; title: string }> = restoredTabs;
+           if (!pristine) {
+@@ -8485,7 +8504,7 @@ export function MainWindow({
+           documentTabsRef.current = tabs;
+           setDocumentTabs(tabs);
+           if (pristine) {
+-            const selected = restored.find(({ session }) => session === sessions[envelope.activeTabIndex ?? 0]) ?? restored[0]!;
++            const selected = restored.find(({ candidateIndex }) => candidateIndex === (envelope.activeTabIndex ?? 0)) ?? restored[0]!;
+             installDocumentTab(selected.id);
+           } else if (restoreNotice) setStatus((current) => current + restoreNotice);
+         };
+@@ -8502,6 +8521,11 @@ export function MainWindow({
+       .finally(async () => {
+         if (active) {
+           documentSessionHydratedRef.current = true;
++          if (unrestoredSessionTabsRef.current.length) {
++            keptDrawingsPromptRef.current = "notice";
++            setKeptDrawingsPrompt("notice");
++            return;
++          }
+           const opens = pendingDocumentOpensRef.current.splice(0);
+           for (const request of opens) {
+             try {
+@@ -8732,6 +8756,138 @@ export function MainWindow({
+     });
+   }, []);
+ 
++  const updateUnrestoredTabNotices = useCallback((previousCount: number) => {
++    const previousNotice = unrestoredTabsNotice(previousCount);
++    if (!previousNotice) return;
++    const notice = unrestoredTabsNotice(unrestoredSessionTabsRef.current.length);
++    // Switching back to a restored tab must not resurrect an obsolete recovery notice.
++    for (const [id, snapshot] of documentTabSnapshotsRef.current) {
++      documentTabSnapshotsRef.current.set(id, { ...snapshot, status: snapshot.status.replace(previousNotice, notice) });
++    }
++  }, []);
++
++  const saveUnrestoredTabs = useCallback(async () => {
++    if (unrestoredTabFlowRunningRef.current || !unrestoredSessionTabsRef.current.length) return;
++    unrestoredTabFlowRunningRef.current = true;
++    setKeptDrawingsMessage(undefined);
++    let saved = 0;
++    let canceled = false;
++    const failures: string[] = [];
++    try {
++      const carried = [...unrestoredSessionTabsRef.current];
++      for (const [index, rawTab] of carried.entries()) {
++        const name = unrestoredTabDisplayName(rawTab, index);
++        try {
++          const contents = unrestoredTabContents(rawTab);
++          let filename = nativePathBasename(name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/, "");
++          if (!filename) filename = `Kept drawing ${index + 1}`;
++          if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(filename)) filename = `_${filename}`;
++          const extension = filename.match(/\.([a-z0-9]+)$/i)?.[1] ?? "chemdraft";
++          if (!/\.[a-z0-9]+$/i.test(filename)) filename += `.${extension}`;
++          const path = await pickNativeSavePath(filename, { title: `Save Drawing — ${name}`, extension });
++          if (!path) {
++            canceled = true;
++            break;
++          }
++          // Write exactly the chosen path: changing its extension after the save prompt could
++          // overwrite a different file which the picker never asked the user about.
++          await writeNativeTextFile(path, contents);
++          const previousCount = unrestoredSessionTabsRef.current.length;
++          const position = unrestoredSessionTabsRef.current.indexOf(rawTab);
++          if (position >= 0) unrestoredSessionTabsRef.current.splice(position, 1);
++          setUnrestoredSessionTabCount(unrestoredSessionTabsRef.current.length);
++          saved += 1;
++          await writeDocumentSessionNow({ strict: true });
++          updateUnrestoredTabNotices(previousCount);
++        } catch (error) {
++          failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
++        }
++      }
++      const message = `Saved ${saved} ${saved === 1 ? "drawing" : "drawings"}; ${unrestoredSessionTabsRef.current.length} kept for later${canceled ? " (save canceled)" : ""}${failures.length ? `. Save failed: ${failures.join("; ")}` : ""}`;
++      setStatus(message);
++      setKeptDrawingsMessage(message);
++      return !unrestoredSessionTabsRef.current.length;
++    } finally {
++      unrestoredTabFlowRunningRef.current = false;
++    }
++  }, [updateUnrestoredTabNotices, writeDocumentSessionNow]);
++
++  const discardUnrestoredTabs = useCallback(async () => {
++    if (unrestoredTabFlowRunningRef.current || !unrestoredSessionTabsRef.current.length) return;
++    unrestoredTabFlowRunningRef.current = true;
++    setKeptDrawingsMessage(undefined);
++    const carried = [...unrestoredSessionTabsRef.current];
++    try {
++      unrestoredSessionTabsRef.current = [];
++      setUnrestoredSessionTabCount(0);
++      await writeDocumentSessionNow({ strict: true });
++      updateUnrestoredTabNotices(carried.length);
++      setStatus(`Deleted ${carried.length} kept ${carried.length === 1 ? "drawing" : "drawings"}`);
++      return true;
++    } catch (error) {
++      // A failed session write is not a completed discard. Keep the data available to retry.
++      unrestoredSessionTabsRef.current = carried;
++      setUnrestoredSessionTabCount(carried.length);
++      const message = `Delete failed; the drawings are kept for later: ${error instanceof Error ? error.message : String(error)}`;
++      setStatus(message);
++      setKeptDrawingsMessage(message);
++      return false;
++    } finally {
++      unrestoredTabFlowRunningRef.current = false;
++    }
++  }, [updateUnrestoredTabNotices, writeDocumentSessionNow]);
++
++  // One summary box owns the whole chain: each raw drawing gets its own save panel.
++  // A failed native box safely keeps the drawings; this launch flow has no React dialog fallback.
++  const keptDrawingsTitle = `${unrestoredSessionTabCount} ${unrestoredSessionTabCount === 1 ? "drawing didn't" : "drawings didn't"} open`;
++  const keptDrawingNames = unrestoredSessionTabsRef.current.map(unrestoredTabDisplayName).join("\n");
++  // Suspension makes open_toolset_window skip creation and report closed. Let startup reconcile
++  // finish (or establish a genuine fallback) before the launch box can acquire that suspension.
++  // Bound only the prompt's wait, not native setup: 1 s allows the reconciler's two 200 ms retry
++  // delays plus 600 ms for layout/IPC. A stalled IPC must not indefinitely lock commands and opens.
++  const keptDrawingsPromptReady = !effectiveNativePalette || !isDesktopRuntime()
++    || nativeToolsetStartupReady || keptDrawingsStartupWaitExpired;
++  useEffect(() => {
++    if (!keptDrawingsPrompt || keptDrawingsPromptReady) return;
++    const timer = window.setTimeout(() => setKeptDrawingsStartupWaitExpired(true), 1000);
++    return () => window.clearTimeout(timer);
++  }, [keptDrawingsPrompt, keptDrawingsPromptReady]);
++  useNativePrompt({
++    title: keptDrawingsTitle,
++    message: [
++      `${unrestoredSessionTabCount === 1 ? "Its drawing is" : "Their drawings are"} kept, but this version of ChemDraft can't show ${unrestoredSessionTabCount === 1 ? "it" : "them"}. It may have been saved by a newer ChemDraft, or the data may be damaged.`,
++      keptDrawingNames,
++      "Choose Save Drawing… to save each drawing, or Delete to delete the kept drawings.\nCancel keeps the drawings for the next launch.",
++      keptDrawingsMessage
++    ].filter(Boolean).join("\n\n"),
++    kind: "warning",
++    choices: [
++      { id: "save", label: "Save Drawing…" },
++      { id: "delete", label: "Delete", destructive: true },
++      { id: "cancel", label: "Cancel", cancel: true }
++    ]
++  }, async (choice) => {
++    if (choice === "cancel") { setKeptDrawingsPrompt(undefined); return; }
++    if (choice === "save") {
++      if (await saveUnrestoredTabs()) { setKeptDrawingsPrompt(undefined); return; }
++    } else if (choice === "delete") {
++      const confirmed = await nativePrompt({
++        title: "Delete the kept drawing?",
++        message: `Delete the kept drawing? This cannot be undone.\n\n${unrestoredSessionTabsRef.current.map(unrestoredTabDisplayName).join("\n")}`,
++        kind: "warning",
++        choices: [
++          { id: "delete", label: "Delete", destructive: true },
++          { id: "cancel", label: "Cancel", cancel: true }
++        ]
++      }, async () => "cancel");
++      if (confirmed === "delete" && await discardUnrestoredTabs()) {
++        setKeptDrawingsPrompt(undefined);
++        return;
++      }
++    }
++    return false;
++  }, keptDrawingsPromptReady ? keptDrawingsPrompt : undefined, true, async () => "cancel");
++
+   const saveCurrentDocument = useCallback(async (forceSaveAs: boolean): Promise<boolean> => {
+     const savingTabId = activeDocumentTabIdRef.current;
+     const savingDocument = documentRef.current;
+@@ -10254,6 +10410,7 @@ export function MainWindow({
+   );
+ 
+   const invoke = useCallback(async (commandId: string) => {
++    if (keptDrawingsPromptRef.current) return;
+     if (closeTabPromptRef.current && commandId.startsWith("document.")) return;
+     if (commandId === convertTextToAtomLabelCommandId) {
+       const disabledReason = selectedTextToAtomLabelDisabledReason(documentRef.current);
+@@ -11770,7 +11927,25 @@ export function MainWindow({
+       return;
+     }
+ 
++    // The saved layout may add visible toolsets after the first render. Reconcile that layout
++    // before allowing the kept-drawings launch prompt to suspend native window creation.
++    if (!nativeToolsetLayoutReady) {
++      return;
++    }
++    // A plugin or a timed-out layout/IPC can finish while the box is open. Its hidden windows are
++    // healthy; cancel/defer reconciliation until the launch sequence releases them instead of
++    // counting suspension's refusal to create/reveal windows as genuine failures.
++    if (nativeToolsetsSuspendedForLaunchPrompt) {
++      return;
++    }
++
+     let cancelled = false;
++    const useFallback = () => {
++      if (cancelled) return;
++      setWebPaletteFallback(true);
++      setVisibleToolsetIds(createDefaultVisibleToolsetIds(toolsetRegistry));
++      setStatus("Native toolset windows unavailable; using in-window toolbars");
++    };
+     void reconcileNativePaletteWindows({
+       listToolsetWindowStates,
+       openToolsetWindow: (toolsetId) => openToolsetWindow(toolsetId, toolsetWindowGeometry(toolsetId)),
+@@ -11783,30 +11958,28 @@ export function MainWindow({
+         return;
+       }
+       if (result.outcome === "native") {
++        setNativeToolsetStartupReady(true);
+         // Do NOT narrow visibleToolsetIds to the set that actually opened. If one palette missed its
+         // creating frame (is_visible() briefly false) while others opened, the reconciler returns a
+         // partial openedToolsetIds; overwriting the desired set with it — and then persisting that —
+         // would permanently drop that palette. The desired set stays authoritative.
+         //
+-        // A partial set now means the reconciler retried that palette and it still would not open,
+-        // because it keeps going until the whole desired set is up. This effect cannot be the retry:
+-        // its deps are native mode and the registry, and it reads the desired set from a ref, so
+-        // nothing re-runs it when an open fails.
++        // A partial set means the reconciler retried that palette and it still would not open.
++        // Registry changes and the end of the launch prompt can reconcile again; an individual
++        // open failure does not re-run the effect, so the reconciler itself owns retries.
+         return;
+       }
+       // Retries exhausted — native windows are genuinely unavailable, so show in-window toolbars
+       // rather than leaving the app with no toolbars at all. (A transient startup miss no longer
+       // lands here; reconcileNativePaletteWindows retries first so it can't permanently trap the
+       // palettes in the viewport.)
+-      setWebPaletteFallback(true);
+-      setVisibleToolsetIds(createDefaultVisibleToolsetIds(toolsetRegistry));
+-      setStatus("Native toolset windows unavailable; using in-window toolbars");
+-    });
++      useFallback();
++    }).catch(useFallback);
+ 
+     return () => {
+       cancelled = true;
+     };
+-  }, [effectiveNativePalette, toolsetRegistry, toolsetWindowGeometry]);
++  }, [effectiveNativePalette, nativeToolsetLayoutReady, nativeToolsetsSuspendedForLaunchPrompt, toolsetRegistry, toolsetWindowGeometry]);
+ 
+   // A pointer-down anywhere in the document window dismisses any open palette popover (the colour
+   // picker floats in its own window; "click elsewhere closes it"). Native palettes only — in the
+@@ -30198,12 +30371,15 @@ async function pickNativeOpenPath(): Promise<string | undefined> {
+   return typeof selected === "string" ? selected : undefined;
+ }
+ 
+-async function pickNativeSavePath(defaultPath: string): Promise<string | undefined> {
++async function pickNativeSavePath(
++  defaultPath: string,
++  options?: { title: string; extension: string }
++): Promise<string | undefined> {
+   const { save } = await loadTauriDialogModule();
+   const selected = await save({
+-    title: "Save ChemDraft Document",
++    title: options?.title ?? "Save ChemDraft Document",
+     defaultPath,
+-    filters: [{ name: "ChemDraft", extensions: ["chemdraft"] }]
++    filters: [{ name: options ? "Saved document" : "ChemDraft", extensions: [options?.extension ?? "chemdraft"] }]
+   });
+   return selected ?? undefined;
+ }
+diff --git a/apps/desktop/src/appMenu.test.ts b/apps/desktop/src/appMenu.test.ts
+index b7bbba1b3..bbf07b15c 100644
+--- a/apps/desktop/src/appMenu.test.ts
++++ b/apps/desktop/src/appMenu.test.ts
+@@ -1,7 +1,7 @@
+ import { readFileSync } from "node:fs";
+ import { fileURLToPath } from "node:url";
+ 
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it, vi } from "vitest";
+ 
+ import {
+   buildAppMenuModel,
+@@ -54,6 +54,21 @@ function parseNativeMenuCommandIds(): string[] {
+ }
+ 
+ describe("app menu model", () => {
++  it.each(["MacIntel", "Win32"])("omits kept-drawing actions from the menu on %s", (platform) => {
++    vi.stubGlobal("navigator", { platform });
++    try {
++      const commands = flattenAppMenuCommands(buildAppMenuModel(EMPTY_CONTEXT));
++      for (const id of ["document.saveUnrestoredTabs", "document.discardUnrestoredTabs"]) {
++        expect(commands.some(command => command.commandId === id)).toBe(false);
++        expect(parseNativeMenuCommandIds()).not.toContain(id);
++      }
++      const source = readFileSync("apps/desktop/src-tauri/src/lib.rs", "utf8");
++      expect(source).not.toContain('"Save Unrestored Tabs…"');
++      expect(source).not.toContain('"Discard Unrestored Tabs…"');
++    } finally {
++      vi.unstubAllGlobals();
++    }
++  });
+   it("stays in sync with the native menu's routed command ids (lib.rs MENU_COMMAND_IDS)", () => {
+     const nativeIds = parseNativeMenuCommandIds();
+     const webIds = nativeRoutedCommandIds(buildAppMenuModel(EMPTY_CONTEXT));
+diff --git a/apps/desktop/src/documentSession.test.ts b/apps/desktop/src/documentSession.test.ts
+index 54abd1ce4..7e97ffc35 100644
+--- a/apps/desktop/src/documentSession.test.ts
++++ b/apps/desktop/src/documentSession.test.ts
+@@ -5,7 +5,11 @@ import {
+   buildDocumentSessionEnvelope,
+   buildDocumentTabsSession,
+   documentIsBlank,
++  documentSessionRestoreCandidates,
+   parseDocumentSessionEnvelope,
++  unrestoredTabContents,
++  unrestoredTabDisplayName,
++  unrestoredTabsNotice,
+   shouldRestoreDocumentSession,
+   strictSessionFlushRefusal
+ } from "./documentSession";
+@@ -17,6 +21,12 @@ const payload = {
+ };
+ 
+ describe("documentIsBlank", () => {
++  it("describes kept drawings without referring to retired menu items", () => {
++    expect(unrestoredTabsNotice(0)).toBe("");
++    expect(unrestoredTabsNotice(1)).toBe("; 1 drawing is kept for later");
++    expect(unrestoredTabsNotice(3)).toBe("; 3 drawings are kept for later");
++  });
++
+   it("is true only when every page has zero objects", () => {
+     expect(documentIsBlank({ pages: [{ objects: [] }] })).toBe(true);
+     expect(documentIsBlank({ pages: [{ objects: [] }, { objects: [] }] })).toBe(true);
+@@ -108,6 +118,26 @@ describe("multi-document session extension", () => {
+   const blank = buildDocumentSessionEnvelope(payload, { dirty: false }, "Untitled", true);
+   const session = buildDocumentTabsSession([blank, { ...blank, dirty: true }, blank], 1);
+ 
++  it("offers carried tabs for retry as raw envelopes and retains malformed metadata", () => {
++    const raw = { ...blank, view: { future: true }, futureField: { rescue: true } };
++    const failed = { displayName: "Old tab", contents: "unknown format", version: 99 };
++    const parsed = parseDocumentSessionEnvelope({ ...session, tabs: [raw], activeTabIndex: 0, unrestoredTabs: [failed] })!;
++    expect(documentSessionRestoreCandidates(parsed)).toEqual([raw, failed]);
++    expect(documentSessionRestoreCandidates(parsed)[0]).toBe(raw);
++    expect(documentSessionRestoreCandidates(parseDocumentSessionEnvelope({ ...blank, unrestoredTabs: [failed] })!)).toEqual([
++      { ...blank, unrestoredTabs: [failed] }, failed
++    ]);
++  });
++
++  it("rescues saved text without requiring a readable envelope, and never substitutes missing data", () => {
++    const raw = { displayName: "Old format.cdxml", contents: "exact original text", version: 99 };
++    expect(unrestoredTabContents(raw)).toBe("exact original text");
++    expect(unrestoredTabDisplayName(raw, 0)).toBe("Old format.cdxml");
++    expect(unrestoredTabDisplayName(null, 2)).toBe("Kept drawing 3");
++    expect(unrestoredTabDisplayName({ displayName: " " }, 0)).toBe("Kept drawing 1");
++    expect(() => unrestoredTabContents({ contents: 4 })).toThrow("remains in the session");
++  });
++
+   it("retains blank tabs and the active index while preserving the version-1 active envelope", () => {
+     expect(parseDocumentSessionEnvelope(JSON.parse(JSON.stringify(session)))).toEqual(session);
+     expect(session.contents).toBe(session.tabs![1]!.contents);
+@@ -143,8 +173,51 @@ describe("multi-document session extension", () => {
+     expect(recovered.tabs).toEqual([blank, { ...blank, dirty: true }]);
+     expect(recovered.unrestoredTabs).toEqual([corrupt]);
+     expect(parseDocumentSessionEnvelope(JSON.parse(JSON.stringify(recovered)))!.unrestoredTabs).toEqual([corrupt]);
+-    expect(parseDocumentSessionEnvelope({ ...session, tabs: [corrupt] })).toBeUndefined();
+-    expect(parseDocumentSessionEnvelope({ ...session, activeTabIndex: 0, tabs: [session] })).toBeUndefined();
++    expect(parseDocumentSessionEnvelope({ ...session, activeTabIndex: 0, tabs: [corrupt] })!.unrestoredTabs).toEqual([corrupt]);
++    expect(parseDocumentSessionEnvelope({ ...session, activeTabIndex: 0, tabs: [session] })!.unrestoredTabs).toEqual([session]);
++  });
++
++  describe.each(["macos", "windows"] as const)("unreadable child envelopes on %s", (platform) => {
++    const path = platform === "macos" ? "/tmp/drawing.chemdraft" : "C:\\drawings\\drawing.chemdraft";
++    const originalContents = "{\r\n  \"drawing\": \"α 🧪\"\r\n}\t\n";
++    const unsupported = { ...blank, version: 99, path, contents: originalContents, future: { data: [1, 2] } };
++    const malformed = { ...unsupported, version: 1, dirty: "unknown" };
++    const previouslyKept = { ...unsupported, displayName: "Previously kept" };
++
++    it.each(["unsupported versions", "bad shapes"])("keeps every child with %s when none is readable", (kind) => {
++      const children = kind === "unsupported versions" ? [unsupported, { ...unsupported }] : [malformed, null];
++      const parsed = parseDocumentSessionEnvelope({ ...session, tabs: children, activeTabIndex: 1 })!;
++      expect(parsed).toEqual({ version: 1, tabs: [], activeTabIndex: 0, unrestoredTabs: children });
++      expect(shouldRestoreDocumentSession(parsed)).toBe(true);
++      const candidates = documentSessionRestoreCandidates(parsed);
++      expect(candidates).toEqual(children);
++      expect(candidates[0]).toBe(children[0]);
++      expect(unrestoredTabContents(candidates[0])).toBe(originalContents);
++      const autosaved = { ...buildDocumentTabsSession([blank], 0), unrestoredTabs: candidates };
++      expect(parseDocumentSessionEnvelope(JSON.parse(JSON.stringify(autosaved)))!.unrestoredTabs).toEqual(children);
++    });
++
++    it.each([false, true])("includes previously kept tabs with unreadable children (readable sibling: %s)", (readableSibling) => {
++      const rawTabs = readableSibling ? [unsupported, blank, malformed] : [unsupported, malformed];
++      const parsed = parseDocumentSessionEnvelope({ ...session, tabs: rawTabs, activeTabIndex: 1,
++        unrestoredTabs: [previouslyKept] })!;
++      expect(parsed.tabs).toEqual(readableSibling ? [blank] : []);
++      expect(parsed.unrestoredTabs).toEqual([previouslyKept, unsupported, malformed]);
++      const candidates = documentSessionRestoreCandidates(parsed);
++      expect(candidates).toEqual([...(readableSibling ? [blank] : []), previouslyKept, unsupported, malformed]);
++      expect(candidates.at(-1)).toBe(malformed);
++    });
++
++    it("does not depend on a readable active-document mirror in a structurally valid outer session", () => {
++      const parsed = parseDocumentSessionEnvelope({ version: 1, tabs: [unsupported], activeTabIndex: 0 })!;
++      expect(documentSessionRestoreCandidates(parsed)).toEqual([unsupported]);
++    });
++
++    it("still rejects an unreadable outer session even when it carries recoverable children", () => {
++      expect(parseDocumentSessionEnvelope({ ...session, version: 99, tabs: [unsupported], activeTabIndex: 0,
++        unrestoredTabs: [previouslyKept] })).toBeUndefined();
++      expect(parseDocumentSessionEnvelope("{bad JSON")).toBeUndefined();
++    });
+   });
+ });
+ 
+diff --git a/apps/desktop/src/documentSession.ts b/apps/desktop/src/documentSession.ts
+index 9a1f859c4..ee6284384 100644
+--- a/apps/desktop/src/documentSession.ts
++++ b/apps/desktop/src/documentSession.ts
+@@ -57,6 +57,17 @@ export interface DocumentSessionView {
+   scrollTop: number;
+ }
+ 
++/** A readable outer session can contain no readable document envelopes. It still carries all
++ * recovery data, without inventing an active document from the outer compatibility fields. */
++export interface UnrestoredDocumentTabsSession {
++  version: typeof DOCUMENT_SESSION_VERSION;
++  tabs: [];
++  activeTabIndex: 0;
++  unrestoredTabs: unknown[];
++}
++
++type ParsedDocumentSession = DocumentSessionEnvelope | UnrestoredDocumentTabsSession;
++
+ function record(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null;
+ }
+@@ -140,8 +151,35 @@ export function rawDocumentSessionTab(tab: DocumentSessionEnvelope): unknown {
+   return rawSessionTabs.get(tab) ?? tab;
+ }
+ 
++/** Retry carried envelopes through the current parser without normalizing away recovery data. */
++export function documentSessionRestoreCandidates(envelope: ParsedDocumentSession): unknown[] {
++  const tabs = envelope.tabs ?? ("contents" in envelope ? [envelope] : []);
++  return [...tabs.map(rawDocumentSessionTab), ...(envelope.unrestoredTabs ?? [])];
++}
++
++export function unrestoredTabDisplayName(raw: unknown, index: number): string {
++  return record(raw) && typeof raw.displayName === "string" && raw.displayName.trim()
++    ? raw.displayName : `Kept drawing ${index + 1}`;
++}
++
++export function unrestoredTabsNotice(count: number): string {
++  return count
++    ? `; ${count} ${count === 1 ? "drawing is" : "drawings are"} kept for later`
++    : "";
++}
++
++/** Saved bytes need not be readable by this version in order to rescue them. */
++export function unrestoredTabContents(raw: unknown): string {
++  if (!record(raw) || typeof raw.contents !== "string") {
++    throw new Error("The saved tab has no document text; it remains in the session");
++  }
++  return raw.contents;
++}
++
+ /** Validate each tab independently, retaining unreadable envelopes for the next autosave. */
+-export function parseDocumentSessionEnvelope(raw: unknown, nested = false): DocumentSessionEnvelope | undefined {
++export function parseDocumentSessionEnvelope(raw: unknown, nested: true): DocumentSessionEnvelope | undefined;
++export function parseDocumentSessionEnvelope(raw: unknown, nested?: false): ParsedDocumentSession | undefined;
++export function parseDocumentSessionEnvelope(raw: unknown, nested = false): ParsedDocumentSession | undefined {
+   if (typeof raw !== "object" || raw === null) {
+     return undefined;
+   }
+@@ -162,7 +200,9 @@ export function parseDocumentSessionEnvelope(raw: unknown, nested = false): Docu
+         tabs.push(tab);
+       } else unrestoredTabs.push(rawTab);
+     });
+-    if (!tabs.length) return undefined;
++    if (!tabs.length) return {
++      version: DOCUMENT_SESSION_VERSION, tabs: [], activeTabIndex: 0, unrestoredTabs
++    };
+     return { ...buildDocumentTabsSession(tabs, activeTabIndex),
+       ...(unrestoredTabs.length ? { unrestoredTabs } : {}) };
+   }
+@@ -205,9 +245,9 @@ export function parseDocumentSessionEnvelope(raw: unknown, nested = false): Docu
+  *  "Restored last session" over the identical blank it starts with anyway. A blank canvas still
+  *  restores when it IS a file (reopen it) or carries unsaved edits (e.g. the user erased
+  *  everything and that erasure is the unsaved state). Multiple tabs keep pristine Untitled tabs. */
+-export function shouldRestoreDocumentSession(envelope: DocumentSessionEnvelope): boolean {
++export function shouldRestoreDocumentSession(envelope: ParsedDocumentSession): boolean {
+   return (envelope.tabs?.length ?? 0) > 1 || (envelope.unrestoredTabs?.length ?? 0) > 0 ||
+-    envelope.path !== undefined || envelope.dirty || !envelope.blank || envelope.pristine === false;
++    ("contents" in envelope && (envelope.path !== undefined || envelope.dirty || !envelope.blank || envelope.pristine === false));
+ }
+ 
+ /**
+diff --git a/apps/desktop/src/nativePrompt.test.ts b/apps/desktop/src/nativePrompt.test.ts
+index 52336931c..9dce54993 100644
+--- a/apps/desktop/src/nativePrompt.test.ts
++++ b/apps/desktop/src/nativePrompt.test.ts
+@@ -176,16 +176,30 @@ describe("nativePrompt", () => {
+     ] })).toEqual({ yes: "Keep Engine", no: "Remove Engine", cancel: "Cancel" });
+   });
+ 
+-  it("shows each button once: a lone destructive action is refused, not paired with a duplicated safe button", () => {
+-    expect(() => nativePromptButtons({ ...three, choices: [
++  it("defaults a destructive confirmation to Cancel without duplicating buttons", () => {
++    expect(nativePromptButtons({ ...three, choices: [
+       { id: "remove", label: "Remove", destructive: true }, { id: "cancel", label: "Cancel", cancel: true }
+-    ] })).toThrow(/never the default/);
++    ] })).toEqual({ ok: "Cancel", cancel: "Remove" });
+     for (const prompt of [three, { ...three, choices: [{ id: "a", label: "Use A3 Page" }, { id: "c", label: "Cancel" as const, cancel: true as const }] }]) {
+       const labels = Object.values(nativePromptButtons(prompt));
+       expect(new Set(labels).size).toBe(labels.length);
+     }
+   });
+ 
++  it.each(["MacIntel", "Win32"])("maps confirmation clicks and Escape safely on %s", async (platform) => {
++    vi.spyOn(window.navigator, "platform", "get").mockReturnValue(platform);
++    const prompt: NativePromptOptions = { ...three, choices: [
++      { id: "delete", label: "Delete", destructive: true }, { id: "cancel", label: "Cancel", cancel: true }
++    ] };
++    for (const [result, id] of [["Delete", "delete"], ["Cancel", "cancel"], ["", "cancel"]]) {
++      plugin.message.mockResolvedValue(result);
++      expect(await nativePrompt(prompt)).toBe(id);
++      expect(plugin.message).toHaveBeenLastCalledWith(prompt.message, expect.objectContaining({
++        buttons: { ok: "Cancel", cancel: "Delete" }
++      }));
++    }
++  });
++
+   it("labels the cancel choice Cancel whenever there is a choice, and a notice's button OK (Escape on macOS)", () => {
+     // AppKit reaches only a button titled "Cancel" with Escape; any other cancel label stranded the box open.
+     const loose = (choices: { id: string; label: string; cancel?: boolean }[]) =>
+diff --git a/apps/desktop/src/nativePrompt.ts b/apps/desktop/src/nativePrompt.ts
+index 80f4a124d..d481603b7 100644
+--- a/apps/desktop/src/nativePrompt.ts
++++ b/apps/desktop/src/nativePrompt.ts
+@@ -54,9 +54,12 @@ export function nativePromptButtons(prompt: NativePromptOptions): MessageDialogC
+     throw new Error("A prompt with a choice labels its cancel button Cancel, the only title Escape reaches on macOS.");
+   }
+   // The plugin has no default-button option: the first button (ok/yes) is always the default, so it
+-  // must be a safe action. A lone destructive action needs a safe alternative beside Cancel.
++  // must be a safe action. For a destructive confirmation, Cancel itself occupies the default.
++  // rfd's Windows custom cancel button has a distinct ID from IDCANCEL: Escape returns the
++  // literal "Cancel", while clicking the second button returns its custom label. AppKit finds
++  // Escape's button by the literal title "Cancel". Both therefore cancel this reversed pair.
+   const safe = actions.find((choice) => !choice.destructive);
+-  if (!safe) throw new Error("A destructive action is never the default button; offer a safe action too.");
++  if (!safe) return { ok: cancel.label, cancel: actions[0]!.label };
+   if (actions.length === 1) return { ok: safe.label, cancel: cancel.label };
+   const other = actions.find((choice) => choice !== safe)!;
+   return { yes: safe.label, no: other.label, cancel: cancel.label };
+@@ -94,12 +97,14 @@ export async function nativePrompt(
+ }
+ 
+ /** Existing React dialogs provide the fallback; their buttons resolve the same prompt promise.
+- * `suspendSequence` keeps a close flow hidden through its choice callback and any re-asks. */
++ * `suspendSequence` keeps utilities hidden through the choice callback and any re-asks.
++ * A native-only flow can supply a safe fallback instead of rendering a React dialog. */
+ export function useNativePrompt(
+   prompt: NativePromptOptions,
+   onChoice: (id: string) => void | boolean | Promise<void | boolean>,
+   requestKey: string | number | undefined,
+-  suspendSequence = false
++  suspendSequence = false,
++  promptFallback?: NativePromptFallback
+ ): { visible: boolean; choose: (id: string) => void } {
+   const current = useRef({ prompt, onChoice });
+   current.current = { prompt, onChoice };
+@@ -133,7 +138,7 @@ export function useNativePrompt(
+       resolve.current = done;
+       setVisible(true);
+     });
+-    void nativePrompt(current.current.prompt, fallback, controller.signal).then(async (id) => {
++    void nativePrompt(current.current.prompt, promptFallback ?? fallback, controller.signal).then(async (id) => {
+       if (disposed) return;
+       resolve.current = undefined;
+       // Wait for React to publish Save's status before asking again with its failure detail.
+diff --git a/docs/manual-stress-checklist.md b/docs/manual-stress-checklist.md
+index bcb049364..cd54e546b 100644
+--- a/docs/manual-stress-checklist.md
++++ b/docs/manual-stress-checklist.md
+@@ -203,6 +203,26 @@ in a branch build (long stamp with the worktree label) and in a stable build (sh
+    from any tab.
+ 
+ 
++Kept drawings at launch — run on **macOS and Windows**: with ChemDraft quit, back up the dev
++build's `document-session.json`, then change one saved tab's document schema in its `contents`
++to `chemdraft.document.v999` (leave the session envelope version unchanged). For a CDXML native
++payload, change the Value of the `org.chemdraft/schema-version` objecttag; for legacy JSON,
++change `schema`.
++Relaunch: readable tabs open and one native summary box says “1 drawing didn't open”, explains
++why the drawing is kept, and lists its name. Repeat with several tabs: one summary box lists all
++names and offers exactly Save Drawing…, Delete and Cancel. Its message says “Cancel keeps the
++drawings for the next launch.” Cancel, Escape (including macOS) and closing the box keep all
++drawings; relaunch asks again and retries their contents. Save Drawing… opens a native save panel
++for each drawing, suggesting its name and extension, and writes its exact saved text to the path
++chosen. A successful save removes only that drawing. Canceling a panel returns to the summary
++box, keeping that drawing and all unattempted ones; a failed write shows its reason in the next
++box without losing the drawing. Delete opens a second native confirmation saying “Delete the
++kept drawing? This cannot be undone.” Its default button and Escape are Cancel. Cancel returns
++to the summary; only an explicit Delete there removes the kept drawings. Floating toolbars stay
++hidden through the entire sequence, including save panels, failed saves and both confirmation
++boxes, then return once it ends. Check there is no in-app dialog and no recovery File menu item.
++Restore a kept drawing's supported schema and relaunch: it opens normally without a prompt.
++
+ Native simple prompts — run every item on **macOS and Windows** with the floating Drawing, Rings,
+ and Art toolbars open, including at 125%/150% display scale:
+ 

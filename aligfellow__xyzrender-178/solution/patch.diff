@@ -1,0 +1,342 @@
+diff --git a/docs/source/cli_reference.md b/docs/source/cli_reference.md
+index 7d2a1fb..c470cfc 100644
+--- a/docs/source/cli_reference.md
++++ b/docs/source/cli_reference.md
+@@ -211,6 +211,10 @@ Fine-grained overlay style (`atom_stroke_width`, `atom_stroke_color`, `bond_colo
+ | `--rot-frames` | Rotation frame count (default: 120) |
+ | `--vib-frames` | Vibration frames for `--gif-ts` (default: 20) |
+ 
++With `--gif-trj --no-orient`, input coordinates are preserved unless `-I`,
++`--ref`, or GIF rotation is explicitly requested. An explicit orientation reference
++suppresses PCA and applies one fixed rotation across the trajectory.
++
+ Available rotation axes: `x`, `y`, `z`, `xy`, `xz`, `yz`, `yx`, `zx`, `zy`. Prefix `-` to reverse (e.g. `-xy`). For crystal inputs, a 3-digit Miller index string is also accepted (e.g. `111`, `001`).
+ 
+ ## Crystal / unit cell
+diff --git a/docs/source/python_api.md b/docs/source/python_api.md
+index 6709212..0007e80 100644
+--- a/docs/source/python_api.md
++++ b/docs/source/python_api.md
+@@ -4,6 +4,11 @@ xyzrender has a full Python API. Every CLI flag has a keyword-argument equivalen
+ 
+ See also the [auto-generated API reference](api/core.rst) for docstrings and type signatures, and the runnable [`examples/examples.ipynb`](https://github.com/aligfellow/xyzrender/blob/main/examples/examples.ipynb) notebook.
+ 
++GIF rendering uses processes when the entrypoint supports them. On spawn-based
++platforms, calls supplied through stdin render serially. In saved Python scripts,
++put GIF calls inside `if __name__ == "__main__":` to prevent spawned workers from
++running the script's rendering calls again.
++
+ ## Loading molecules
+ 
+ `load()` parses a file and returns a `Molecule` object. Pass it to `render()` to avoid re-reading the file on every call. You can also pass a path string directly to `render()` as a shorthand.
+diff --git a/src/xyzrender/api.py b/src/xyzrender/api.py
+index 5ffd504..6248174 100644
+--- a/src/xyzrender/api.py
++++ b/src/xyzrender/api.py
+@@ -1559,6 +1559,7 @@ def render_gif(
+     opacity: float | None = None,
+     # --- Orientation reference (gif_ts / gif_trj: graph after orient()) ---
+     reference_graph: "nx.Graph | None" = None,
++    annotation_graph: "nx.Graph | None" = None,
+     # --- Per-frame bond detection (gif_trj only) ---
+     trj_bonds: bool = False,
+     # --- NCI detection (gif_ts / gif_trj / gif_rot) ---
+@@ -1647,6 +1648,11 @@ def render_gif(
+         Number of frames for a full rotation.
+     ts_frame:
+         Reference frame index for TS detection (0-indexed).
++    reference_graph:
++        Explicit orientation reference for trajectory/vibration GIFs. Trajectory
++        references match the first XYZ frame or the last QM geometry and suppress PCA.
++    annotation_graph:
++        Trajectory TS/NCI edge attributes to copy without changing orientation.
+     config:
+         Preset name, JSON path, or pre-built :class:`~xyzrender.types.RenderConfig`.
+ 
+@@ -1774,6 +1780,8 @@ def render_gif(
+         cfg.vectors = list(cfg.vectors)
+         cfg.annotations = list(cfg.annotations)
+         cfg.overlay = copy.copy(cfg.overlay)
++        if orient is not None:
++            cfg.auto_orient = orient
+     else:
+         cfg = build_config(
+             config,
+@@ -1938,9 +1946,22 @@ def render_gif(
+ 
+     rmol = mol.copy()
+ 
++    if ref is not None and not gif_diffuse:
++        ref_source = reference_graph if gif_trj and reference_graph is not None else rmol.graph
++        _ref_mol = Molecule(graph=copy.deepcopy(ref_source), cell_data=copy.deepcopy(mol.cell_data))
++        _ref_path = Path(ref)
++        if _ref_path.is_file():
++            _apply_ref_orientation(_ref_mol, _ref_path, cfg)
++        else:
++            _apply_and_save_ref(_ref_mol, cfg, _ref_path)
++        rmol = _ref_mol
++        if gif_trj:
++            reference_graph = rmol.graph
++
+     if gif_trj:
+         from xyzrender.readers import load_trajectory_frames
+ 
++        assert mol_path is not None
+         frames = load_trajectory_frames(str(mol_path))
+         if len(frames) < 2:
+             raise ValueError("render_gif(gif_trj=True) requires a multi-frame XYZ file")
+@@ -1952,7 +1973,9 @@ def render_gif(
+             config=cfg,
+             output=str(gif_path),
+             fps=gif_fps,
+-            reference_graph=trj_ref,
++            reference_graph=reference_graph,
++            reference_frame=0 if mol_path.suffix.lower() == ".xyz" else len(frames) - 1,
++            annotation_graph=annotation_graph,
+             axis=gif_rot,
+             trj_bonds=trj_bonds,
+             detect_nci=detect_nci,
+@@ -1988,13 +2011,6 @@ def render_gif(
+ 
+     else:
+         # Orientation & Ensemble
+-        if ref is not None:
+-            ref_path = Path(ref)
+-            if ref_path.is_file():
+-                _apply_ref_orientation(rmol, ref_path, cfg)
+-            else:
+-                _apply_and_save_ref(rmol, cfg, ref_path)
+-
+         if mol.ensemble is not None:
+             from xyzrender.ensemble import merge_graphs
+ 
+diff --git a/src/xyzrender/cli.py b/src/xyzrender/cli.py
+index 8474662..9f113c8 100644
+--- a/src/xyzrender/cli.py
++++ b/src/xyzrender/cli.py
+@@ -1517,9 +1517,8 @@ def main() -> None:
+             mol_or_path = mol
+         else:
+             mol_or_path: str | Molecule = args.input if (args.gif_ts or args.gif_trj) else mol
+-        # For gif_ts/gif_trj the trajectory is read from disk (mol_or_path is a path),
+-        # but pass mol.graph as reference_graph so -I orientation and TS/NCI bonds are respected.
+-        _ref_graph = mol.graph if (args.gif_ts or args.gif_trj) else None
++        # Trajectories are read from disk; annotations must not request rotation.
++        _ref_graph = mol.graph if (args.gif_ts or (args.gif_trj and mol.oriented)) else None
+         try:
+             render_gif(
+                 mol_or_path,
+@@ -1548,6 +1547,7 @@ def main() -> None:
+                 auto_align=args.align,  # None = preset default; True/False = explicit override
+                 opacity=args.opacity,
+                 reference_graph=_ref_graph,
++                annotation_graph=mol.graph if args.gif_trj else None,
+                 trj_bonds=args.trj_bonds,
+                 detect_nci=args.nci_detect,
+                 mo=args.mo,
+diff --git a/src/xyzrender/gif.py b/src/xyzrender/gif.py
+index 8b1b456..f460450 100644
+--- a/src/xyzrender/gif.py
++++ b/src/xyzrender/gif.py
+@@ -523,6 +523,8 @@ def render_trajectory_gif(
+     multiplicity: int | None = None,
+     fps: int = 10,
+     reference_graph: nx.Graph | None = None,
++    reference_frame: int = 0,
++    annotation_graph: nx.Graph | None = None,
+     detect_nci: bool | str | list[str] = False,
+     axis: str | None = None,
+     kekule: bool = False,
+@@ -534,7 +536,9 @@ def render_trajectory_gif(
+     to get correct bond orders, then updates positions per frame.
+     If ``trj_bonds`` is True, builds a fresh graph for every frame so
+     that changing connectivity (e.g. NEB-TS MEPs) is shown correctly.
+-    If ``reference_graph`` is provided, all frames are rotated to match.
++    If ``reference_graph`` is provided, all frames are rotated using the
++    matching ``reference_frame`` as the un-oriented source. ``annotation_graph``
++    copies TS/NCI edge attributes without requesting orientation.
+     If ``detect_nci`` is enabled, NCI interactions are re-detected per frame
+     using xyzgraph's NCIAnalyzer (topology built once, geometry per frame).
+     A string or list limits detection to the selected NCI types or groups.
+@@ -548,13 +552,18 @@ def render_trajectory_gif(
+ 
+     from xyzgraph import build_graph
+ 
++    if not 0 <= reference_frame < len(frames):
++        msg = f"Trajectory reference frame {reference_frame} is out of range for {len(frames)} frames"
++        raise ValueError(msg)
++    annotations = annotation_graph if annotation_graph is not None else reference_graph
++
+     if trj_bonds:
+         # Build one graph per frame so changing connectivity is shown correctly.
+         for i, frame in enumerate(frames):
+             atoms = list(zip(frame["symbols"], [tuple(p) for p in frame["positions"]], strict=True))
+             g = build_graph(atoms, charge=charge, multiplicity=multiplicity, kekule=kekule)
+-            if reference_graph is not None:
+-                _copy_ts_nci_attrs(g, reference_graph)
++            if annotations is not None:
++                _copy_ts_nci_attrs(g, annotations)
+             frame["graph"] = g
+             logger.debug("Per-frame graph %d/%d: %d bonds", i + 1, len(frames), g.number_of_edges())
+         bond_counts = [f["graph"].number_of_edges() for f in frames]
+@@ -565,7 +574,7 @@ def render_trajectory_gif(
+             max(bond_counts),
+             bond_counts[-1],
+         )
+-        # Use last frame's graph as the topology anchor for Kabsch alignment.
++        # Bond perception uses the last frame, independently of orientation.
+         graph = frames[-1]["graph"]
+     else:
+         # Build graph from last frame (optimized geometry → correct bond orders)
+@@ -573,8 +582,8 @@ def render_trajectory_gif(
+         last_atoms = list(zip(last["symbols"], [tuple(p) for p in last["positions"]], strict=True))
+         graph = build_graph(last_atoms, charge=charge, multiplicity=multiplicity, kekule=kekule)
+ 
+-        if reference_graph is not None:
+-            _copy_ts_nci_attrs(graph, reference_graph)
++        if annotations is not None:
++            _copy_ts_nci_attrs(graph, annotations)
+ 
+     # NCI: build analyzer once from the fixed topology, or rebuild per frame
+     # when bonds change (trj_bonds) since π-systems / sites / pair list depend
+@@ -588,13 +597,19 @@ def render_trajectory_gif(
+     # Apply viewer rotation if reference orientation was given
+     if reference_graph is not None:
+         logger.debug("Applying Kabsch rotation from viewer orientation")
+-        rot = _compute_rotation(graph, reference_graph)
++        source = frames[reference_frame]
++        real_nodes = [d for _, d in reference_graph.nodes(data=True) if d["symbol"] != "*"]
++        if [d["symbol"] for d in real_nodes] != source["symbols"]:
++            msg = "Trajectory reference graph and source frame must have the same atom count and element order"
++            raise ValueError(msg)
++        target_positions = np.array([d["position"] for d in real_nodes])
++        rot = kabsch_rotation(np.array(source["positions"]), target_positions)
+         frames = _rotate_frames(frames, rot)
++        config = copy.copy(config)
++        config.auto_orient = False
+ 
+     # PCA: compute once from first frame, apply consistently to all
+     if config.auto_orient:
+-        import copy
+-
+         vt = pca_matrix(np.array(frames[0]["positions"]))
+         frames = _orient_frames(frames, vt)
+         config = copy.copy(config)
+@@ -882,16 +897,29 @@ def _parallel_render(worker, items, total: int) -> list[bytes]:
+     Callers are responsible for including the ordering index in each item.
+     """
+     import multiprocessing
++    from concurrent.futures import ProcessPoolExecutor, as_completed
++    from pathlib import Path
+ 
+     pngs = [b""] * total
+-    pool = multiprocessing.Pool()
++    main_path = getattr(sys.modules["__main__"], "__file__", None)
++    if multiprocessing.get_start_method() in ("spawn", "forkserver") and main_path and not Path(main_path).is_file():
++        # Spawn cannot import <stdin>; copy inputs to retain process isolation.
++        for i, item in enumerate(items, 1):
++            frame_worker, frame_item = copy.deepcopy((worker, item))
++            idx, png_data = frame_worker(frame_item)
++            pngs[idx] = png_data
++            _progress(i, total)
++        return pngs
++
++    pool = ProcessPoolExecutor(max_workers=min(total, multiprocessing.cpu_count()) or 1)
+     try:
+-        for i, (idx, png_data) in enumerate(pool.imap_unordered(worker, items)):
++        futures = [pool.submit(worker, item) for item in items]
++        for i, future in enumerate(as_completed(futures), 1):
++            idx, png_data = future.result()
+             pngs[idx] = png_data
+-            _progress(i + 1, total)
++            _progress(i, total)
+     finally:
+-        pool.close()
+-        pool.join()
++        pool.shutdown(wait=True, cancel_futures=True)
+     return pngs
+ 
+ 
+diff --git a/tests/test_gif.py b/tests/test_gif.py
+index 1e447b2..91f3d19 100644
+--- a/tests/test_gif.py
++++ b/tests/test_gif.py
+@@ -1,5 +1,7 @@
+ """Tests for gif.py — rotation axis parsing and GIF rendering."""
+ 
++import subprocess
++import sys
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -8,6 +10,70 @@
+ STRUCTURES = Path(__file__).parent.parent / "examples" / "structures"
+ 
+ 
++def test_trajectory_gif_from_stdin(tmp_path):
++    from PIL import Image
++
++    output = tmp_path / "stdin.gif"
++    source = (
++        "import multiprocessing\n"
++        "multiprocessing.set_start_method('spawn')\n"
++        "from xyzrender import render_gif\n"
++        f"render_gif({str(STRUCTURES / 'sn2.v000.xyz')!r}, gif_trj=True, orient=False, "
++        f"canvas_size=100, output={str(output)!r})\n"
++    )
++    subprocess.run([sys.executable, "-"], input=source, text=True, check=True, capture_output=True, timeout=30)
++    with Image.open(output) as image:
++        image.seek(1)
++
++
++def test_gif_worker_exit_propagates():
++    source = (
++        "import multiprocessing, os\n"
++        "multiprocessing.set_start_method('spawn')\n"
++        "from xyzrender.gif import _parallel_render\n"
++        "_parallel_render(os._exit, [1], 1)\n"
++    )
++    result = subprocess.run([sys.executable, "-c", source], text=True, capture_output=True, timeout=30, check=False)
++    assert result.returncode != 0
++    assert "BrokenProcessPool" in result.stderr
++
++
++def test_trajectory_orientation_uses_matching_frame(tmp_path, monkeypatch):
++    from xyzrender import load, render_gif
++    from xyzrender.readers import load_trajectory_frames
++    from xyzrender.types import RenderConfig
++
++    path = STRUCTURES / "sn2.v000.xyz"
++    original = load_trajectory_frames(path)
++    captured = {}
++
++    def capture(graph, frames, config, **_):
++        captured["frames"] = frames
++        captured["graph"] = graph
++        return []
++
++    monkeypatch.setattr("xyzrender.gif._render_frames", capture)
++    monkeypatch.setattr("xyzrender.gif._stitch_gif", lambda *args: None)
++    cfg = RenderConfig(auto_orient=True)
++    render_gif(path, gif_trj=True, orient=False, config=cfg, output=tmp_path / "raw.gif")
++    for before, after in zip(original, captured["frames"], strict=True):
++        np.testing.assert_array_equal(after["positions"], before["positions"])
++    assert cfg.auto_orient is True
++
++    reference = load(path).graph
++    rotation = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
++    for node in reference.nodes.values():
++        node["position"] = tuple(np.array(node["position"]) @ rotation.T)
++    edge = next(iter(reference.edges))
++    reference.edges[edge]["TS"] = True
++    render_gif(path, gif_trj=True, reference_graph=reference, output=tmp_path / "rotated.gif")
++    for before, after in zip(original, captured["frames"], strict=True):
++        positions = np.array(before["positions"])
++        center = positions.mean(axis=0)
++        np.testing.assert_allclose(after["positions"], (positions - center) @ rotation.T + center, atol=1e-10)
++    assert captured["graph"].edges[edge]["TS"] is True
++
++
+ # ---------------------------------------------------------------------------
+ # _rotation_axis — unit tests (no I/O)
+ # ---------------------------------------------------------------------------

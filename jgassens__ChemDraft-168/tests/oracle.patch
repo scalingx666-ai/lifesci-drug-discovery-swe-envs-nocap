@@ -1,0 +1,840 @@
+diff --git a/.github/workflows/windows-release.yml b/.github/workflows/windows-release.yml
+new file mode 100644
+index 000000000..c07258e45
+--- /dev/null
++++ b/.github/workflows/windows-release.yml
+@@ -0,0 +1,294 @@
++name: Windows release
++
++on:
++  workflow_dispatch:
++    inputs:
++      ref:
++        description: Public repository tag or full commit SHA to build (must match the workflow ref)
++        required: true
++        type: string
++      upload_to_release:
++        description: Optional existing DRAFT release tag (v<app version>)
++        required: false
++        type: string
++      allow_unsigned_upload:
++        description: Allow uploading artifacts without both verified signatures (dry runs only)
++        required: false
++        type: boolean
++        default: false
++      notes_file:
++        description: Optional repository path to Windows release notes
++        required: false
++        type: string
++
++permissions:
++  contents: read
++
++# Do not race two uploads to the same draft, or cancel an outstanding signing approval.
++concurrency:
++  group: windows-release-${{ inputs.upload_to_release || inputs.ref }}
++  cancel-in-progress: false
++
++jobs:
++  build:
++    # No fork runs, PR events, fork checkouts, or credentials persisted in the checkout.
++    if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork
++    runs-on: windows-latest
++    timeout-minutes: 120
++    permissions:
++      contents: read
++      actions: read # SignPath reads the CI artifact and build provenance.
++    defaults:
++      run:
++        shell: pwsh
++    outputs:
++      version: ${{ steps.bundle.outputs.version }}
++      authenticode_signed: ${{ steps.authenticode.outputs.signed || 'false' }}
++      updater_signed: ${{ steps.updater.outputs.signed || 'false' }}
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          ref: ${{ inputs.ref }}
++          fetch-depth: 0
++          persist-credentials: false
++
++      - name: Validate public release source and notes
++        env:
++          BUILD_REF: ${{ inputs.ref }}
++          WORKFLOW_SHA: ${{ github.sha }}
++          RELEASE_TAG: ${{ inputs.upload_to_release }}
++          NOTES_FILE: ${{ inputs.notes_file }}
++        run: |
++          $sha = (git rev-parse HEAD).Trim()
++          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve build commit.' }
++          if ($env:BUILD_REF -notmatch '^[0-9a-fA-F]{40}$') {
++            $tag = $env:BUILD_REF -replace '^refs/tags/', ''
++            git check-ref-format "refs/tags/$tag"
++            if ($LASTEXITCODE -ne 0) { throw 'ref must be a tag or full commit SHA.' }
++            $tagSha = git rev-parse --verify "refs/tags/${tag}^{commit}"
++            if ($LASTEXITCODE -ne 0 -or $tagSha -ne $sha) { throw 'ref must resolve to a repository tag.' }
++          }
++          if ($sha -ne $env:WORKFLOW_SHA) {
++            throw 'Build ref must match the workflow commit for SignPath provenance. Dispatch with --ref <release-tag>.'
++          }
++          $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
++          if ($env:RELEASE_TAG -and $env:RELEASE_TAG -cne "v$($config.version)") {
++            throw 'upload_to_release must be v<app version>, matching latest.json download URLs.'
++          }
++          if ($env:NOTES_FILE) {
++            $root = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) + [IO.Path]::DirectorySeparatorChar
++            $notes = [IO.Path]::GetFullPath((Join-Path $root $env:NOTES_FILE))
++            if (-not $notes.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw 'Notes must be inside the repository.' }
++            $relativeNotes = [IO.Path]::GetRelativePath($root, $notes).Replace('\', '/')
++            git ls-files --error-unmatch -- $relativeNotes
++            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw 'Notes must be a tracked repository file.' }
++          }
++          Write-Host "Release source: $sha"
++
++      - uses: pnpm/action-setup@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 24
++          cache: pnpm
++      - run: pnpm install --frozen-lockfile
++      # rust-toolchain.toml is the same single source of truth as the CI Windows job.
++      - run: rustup show
++      - uses: Swatinem/rust-cache@v2
++        with:
++          workspaces: apps/desktop/src-tauri
++          shared-key: windows-release
++      - uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: '21' # jlink --compress=zip-9 requires JDK 21+.
++      - name: Build host-native OPSIN runtime and smoke test benzene
++        run: node scripts/build-opsin-runtime.mjs
++
++      - name: Build stable NSIS installer without updater signing
++        env:
++          CHEMDRAFT_STABLE_BUILD: '1'
++          CHEMDRAFT_SKIP_UPDATER_SIGNING: '1'
++        run: pnpm --filter @chemdraft/desktop build --bundles nsis
++
++      - name: Verify stable bundle identity and stage unsigned installer
++        id: bundle
++        run: |
++          $config = Get-Content apps/desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
++          $windows = Get-Content apps/desktop/src-tauri/tauri.windows.conf.json -Raw | ConvertFrom-Json
++          $identifier = if ($windows.identifier) { $windows.identifier } else { $config.identifier }
++          $product = if ($windows.productName) { $windows.productName } else { $config.productName }
++          if ($identifier -cne 'org.chemdraft.desktop' -or $product -cne 'ChemDraft') { throw 'Bundle has a development identity.' }
++          # build.rs re-emits the label into the compiled native title. Inspect the latest build output.
++          $output = Get-ChildItem apps/desktop/src-tauri/target/release/build/chemdraft-*/output |
++            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
++          if (-not $output) { throw 'No native build output to verify.' }
++          $labels = @(Get-Content $output.FullName | Where-Object { $_ -like 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=*' })
++          if ($labels.Count -ne 1 -or $labels[0] -cne 'cargo:rustc-env=CHEMDRAFT_WORKTREE_LABEL=') { throw 'Native build has a worktree label.' }
++          $shortSha = (git rev-parse --short HEAD).Trim()
++          $assets = (Get-ChildItem apps/desktop/dist/assets/*.js | Get-Content -Raw) -join "`n"
++          if ($assets -notmatch "\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} $shortSha" -or
++              $assets -match '\[[^\]\r\n]+\] (?:·|\\x[bB]7|\\u00[bB]7) \d{4}-\d{2}-\d{2}') { throw 'Frontend build stamp missing or labelled.' }
++          $bundleDir = 'apps/desktop/src-tauri/target/release/bundle/nsis'
++          $installers = @(Get-ChildItem "$bundleDir/*.exe")
++          $expected = "ChemDraft_$($config.version)_x64-setup.exe"
++          if ($installers.Count -ne 1 -or $installers[0].Name -cne $expected) { throw 'Expected exactly one stable x64 installer.' }
++          if (Get-ChildItem "$bundleDir/*.sig") { throw 'Updater signing ran before Authenticode.' }
++          New-Item -ItemType Directory -Path release-assets | Out-Null
++          Copy-Item -LiteralPath $installers[0].FullName -Destination release-assets
++          "version=$($config.version)" >> $env:GITHUB_OUTPUT
++          "installer=$expected" >> $env:GITHUB_OUTPUT
++          Write-Host "Verified identifier=$identifier; product=$product; worktree label=<empty>; frontend commit=$shortSha"
++
++      # Signing secrets are step-scoped: no setup/cache/artifact action receives them.
++      - name: Check signing availability
++        id: signing
++        env:
++          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
++          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
++          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
++          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
++          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
++        run: |
++          if ($env:SIGNPATH_API_TOKEN) {
++            if (-not $env:SIGNPATH_ORGANIZATION_ID -or -not $env:SIGNPATH_PROJECT_SLUG -or -not $env:SIGNPATH_SIGNING_POLICY_SLUG) {
++              throw 'SignPath token is set but required SignPath repository variables are missing.'
++            }
++            'authenticode=true' >> $env:GITHUB_OUTPUT
++          } else {
++            Write-Host '::warning::SIGNPATH_API_TOKEN is missing. Skipping Authenticode; this is an unsigned dry run.'
++          }
++          if ($env:TAURI_SIGNING_PRIVATE_KEY) {
++            'updater=true' >> $env:GITHUB_OUTPUT
++          } else {
++            Write-Host '::warning::TAURI_SIGNING_PRIVATE_KEY is missing. Skipping updater .sig and latest.json; installer cannot be published as an update.'
++          }
++
++      - name: Upload unsigned installer for SignPath provenance
++        id: unsigned
++        uses: actions/upload-artifact@v4
++        with:
++          name: windows-nsis-unsigned
++          path: release-assets/*.exe
++          if-no-files-found: error
++
++      - name: Authenticode-sign and download final installer
++        if: steps.signing.outputs.authenticode == 'true'
++        # https://github.com/SignPath/github-action-submit-signing-request/releases/tag/v2
++        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2
++        with:
++          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
++          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
++          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
++          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
++          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
++          wait-for-completion: true
++          wait-for-completion-timeout-in-seconds: 3600
++          output-artifact-directory: signpath-signed
++
++      - name: Verify Authenticode and replace unsigned installer
++        id: authenticode
++        if: steps.signing.outputs.authenticode == 'true'
++        env:
++          EXPECTED_AUTHENTICODE_SUBJECT: ${{ vars.EXPECTED_AUTHENTICODE_SUBJECT }}
++          INSTALLER: ${{ steps.bundle.outputs.installer }}
++        run: |
++          $signed = @(Get-ChildItem signpath-signed -Recurse -File)
++          if ($signed.Count -ne 1 -or $signed[0].Name -cne $env:INSTALLER) { throw 'SignPath must return exactly the expected installer.' }
++          $signature = Get-AuthenticodeSignature -LiteralPath $signed[0].FullName
++          if ($signature.Status -ne 'Valid') { throw "Authenticode verification failed: $($signature.Status)" }
++          Write-Host "Authenticode: Valid; publisher=$($signature.SignerCertificate.Subject)"
++          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_AUTHENTICODE_SUBJECT)) {
++            throw 'EXPECTED_AUTHENTICODE_SUBJECT repository variable is required when Authenticode signing runs. Set it to the expected signer certificate subject substring.'
++          }
++          if (-not $signature.SignerCertificate.Subject.Contains($env:EXPECTED_AUTHENTICODE_SUBJECT)) {
++            throw "Authenticode signer subject does not contain EXPECTED_AUTHENTICODE_SUBJECT: $($signature.SignerCertificate.Subject)"
++          }
++          Copy-Item -LiteralPath $signed[0].FullName -Destination (Join-Path release-assets $env:INSTALLER) -Force
++          'signed=true' >> $env:GITHUB_OUTPUT
++
++      # No operation may change the .exe after this point. Minisign covers the FINAL installer.
++      - name: Sign final installer for the Tauri updater
++        if: steps.signing.outputs.updater == 'true'
++        env:
++          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
++          INSTALLER: ${{ steps.bundle.outputs.installer }}
++        run: |
++          $env:TAURI_SIGNING_PRIVATE_KEY = $env:TAURI_SIGNING_PRIVATE_KEY.Trim()
++          $installer = Join-Path release-assets $env:INSTALLER
++          # Call Node directly so cmd.exe/pnpm.cmd cannot discard the empty password argument.
++          node apps/desktop/node_modules/@tauri-apps/cli/tauri.js signer sign --password '' $installer
++          if ($LASTEXITCODE -ne 0) { throw 'Tauri updater signing failed.' }
++
++      - name: Verify updater signature and generate latest.json
++        id: updater
++        if: steps.signing.outputs.updater == 'true'
++        env:
++          INSTALLER: ${{ steps.bundle.outputs.installer }}
++          VERSION: ${{ steps.bundle.outputs.version }}
++          NOTES_FILE: ${{ inputs.notes_file }}
++        run: |
++          $installer = Join-Path release-assets $env:INSTALLER
++          pnpm exec tsx tools/release/verify-windows-updater.ts $installer
++          if ($LASTEXITCODE -ne 0) { throw 'Updater signature verification failed.' }
++          $manifestArgs = @('--version', $env:VERSION, '--installer', $installer, '--out', 'release-assets/latest.json')
++          if ($env:NOTES_FILE) { $manifestArgs += @('--notes', $env:NOTES_FILE) }
++          pnpm -s release:windows-manifest @manifestArgs
++          if ($LASTEXITCODE -ne 0) { throw 'Windows update manifest generation failed.' }
++          'signed=true' >> $env:GITHUB_OUTPUT
++
++      - name: Print SHA-256 and sizes and write checksums
++        run: |
++          $checksums = @(Get-ChildItem release-assets -File | Sort-Object Name | ForEach-Object {
++            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
++            Write-Host "$hash  $($_.Length) bytes  $($_.Name)"
++            "$hash  $($_.Name)"
++          })
++          $checksums | Set-Content -Encoding utf8NoBOM release-assets/SHA256SUMS.txt
++      - name: Upload final release artifacts
++        uses: actions/upload-artifact@v4
++        with:
++          name: windows-release
++          path: release-assets/*
++          if-no-files-found: error
++
++  upload:
++    needs: build
++    if: github.repository == 'jgassens/ChemDraft' && !github.event.repository.fork && inputs.upload_to_release != ''
++    runs-on: windows-latest
++    permissions:
++      contents: write # Only this job can upload release assets; no source code executes here.
++      actions: read
++    steps:
++      - name: Require verified signatures before release upload
++        shell: pwsh
++        env:
++          AUTHENTICODE_SIGNED: ${{ needs.build.outputs.authenticode_signed }}
++          UPDATER_SIGNED: ${{ needs.build.outputs.updater_signed }}
++          ALLOW_UNSIGNED_UPLOAD: ${{ inputs.allow_unsigned_upload }}
++        run: |
++          if ($env:AUTHENTICODE_SIGNED -ne 'true' -or $env:UPDATER_SIGNED -ne 'true') {
++            if ($env:ALLOW_UNSIGNED_UPLOAD -ne 'true') {
++              throw 'Refusing release upload: both Authenticode and updater signatures must be verified. Use allow_unsigned_upload only for an explicit unsigned dry run.'
++            }
++            Write-Host '::warning::UNSIGNED RELEASE UPLOAD OVERRIDE: one or both signatures are missing. These artifacts must not be published as a signed production update.'
++          }
++      - uses: actions/download-artifact@v4
++        with:
++          name: windows-release
++          path: release-assets
++      - name: Upload only to an existing draft release
++        shell: pwsh
++        env:
++          GH_TOKEN: ${{ github.token }}
++          GH_REPO: ${{ github.repository }}
++          RELEASE_TAG: ${{ inputs.upload_to_release }}
++          VERSION: ${{ needs.build.outputs.version }}
++        run: |
++          if ($env:RELEASE_TAG -cne "v$env:VERSION") { throw 'Release tag must match the installer version.' }
++          $releaseJson = gh release view $env:RELEASE_TAG --json isDraft,tagName
++          if ($LASTEXITCODE -ne 0) { throw 'Target release must already exist.' }
++          $release = $releaseJson | ConvertFrom-Json
++          if ($release.isDraft -ne $true -or $release.tagName -cne $env:RELEASE_TAG) { throw 'Refusing to upload to a published release.' }
++          $assets = @(Get-ChildItem release-assets -File | ForEach-Object { $_.FullName })
++          gh release upload $env:RELEASE_TAG @assets --clobber
++          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed.' }
+diff --git a/docs/releasing/windows-signing.md b/docs/releasing/windows-signing.md
+new file mode 100644
+index 000000000..4b2ee9252
+--- /dev/null
++++ b/docs/releasing/windows-signing.md
+@@ -0,0 +1,141 @@
++# Windows installer signing in CI
++
++`.github/workflows/windows-release.yml` builds ChemDraft's x64 NSIS installer on a GitHub-hosted
++Windows runner. SignPath Foundation can Authenticode-sign that CI artifact after the owner completes
++the account setup below. The existing [Windows VM release path](windows-updates.md#existing-windows-vm-path)
++remains available.
++
++There are two independent signatures, in this order:
++
++1. Build the stable installer with `CHEMDRAFT_STABLE_BUILD=1` and
++   `CHEMDRAFT_SKIP_UPDATER_SIGNING=1`.
++2. Upload the unsigned installer as `windows-nsis-unsigned`, submit its artifact ID to SignPath,
++   wait for approval/completion, and download the signed installer. Require
++   `Get-AuthenticodeSignature` to report `Valid` and the signer certificate subject to contain
++   `EXPECTED_AUTHENTICODE_SUBJECT` before replacing the unsigned copy.
++3. Use `tauri signer sign` to create the updater `.exe.sig` over that **final** installer.
++4. Verify the updater signature against `plugins.updater.pubkey` in
++   `apps/desktop/src-tauri/tauri.windows.conf.json`, then generate `latest.json` with
++   `pnpm -s release:windows-manifest` and the optional Windows notes.
++
++Authenticode changes the installer's bytes. Never Authenticode-sign, rebuild, or otherwise modify the
++installer after creating its updater `.sig`; recreate and verify the `.sig` and manifest if it changes.
++The opt-out is explicit: without it, VM builds retain their existing automatic updater signing.
++
++## Owner setup for SignPath Foundation
++
++The **repository owner must personally** complete these account and trust steps. No account, token,
++certificate, or approval is supplied by the workflow.
++
++1. Read the [Foundation conditions](https://signpath.org/terms) and
++   [apply for free open-source signing](https://signpath.org/apply). ChemDraft's core uses the
++   OSI-approved Apache-2.0 licence. Supply the public `jgassens/ChemDraft` repository, project and
++   download pages, release history, and the CI build workflow. All bundled components must meet
++   the Foundation's licensing conditions; core licensing alone does not establish eligibility.
++   Approval is the Foundation's decision.
++2. After acceptance, create the ChemDraft project in the supplied SignPath organization. Publish the
++   required code signing policy, attribution, named committers/reviewers/approvers and accurate
++   privacy policy on the project/download pages. Enable MFA and nominate the people who will approve
++   release signing requests.
++3. Add GitHub.com as a trusted build system, install/authorize the SignPath GitHub integration for
++   this repository, and link that trusted build system to the SignPath project. Follow the
++   [official GitHub integration guide](https://docs.signpath.io/trusted-build-systems/github).
++   Foundation signing verifies the artifact's CI origin in the public repository: uploading a
++   manually built VM executable to CI does not substitute for building it there.
++4. Create the project's default artifact configuration for the ZIP produced by
++   `actions/upload-artifact@v4`: a ZIP containing exactly `ChemDraft_*_x64-setup.exe` at its root,
++   with that installer selected for Authenticode signing. Set the required ChemDraft product/version
++   metadata restrictions. The requested scope is the installer; do not configure signing of bundled
++   third-party binaries. Use the Foundation-approved certificate and create a signing policy linked
++   to the trusted GitHub build system, the repository and reviewed release refs. Require the
++   Foundation's manual release approval. The workflow waits up to one hour for completion; failures
++   fail the run rather than falling back to an unsigned installer.
++5. Create a restricted submitter API token for that project/policy. Under GitHub **Settings → Secrets
++   and variables → Actions**, add:
++
++   | Kind | Name | Value |
++   | --- | --- | --- |
++   | Secret | `SIGNPATH_API_TOKEN` | SignPath submitter API token |
++   | Variable | `SIGNPATH_ORGANIZATION_ID` | SignPath organization ID |
++   | Variable | `SIGNPATH_PROJECT_SLUG` | ChemDraft project slug |
++   | Variable | `SIGNPATH_SIGNING_POLICY_SLUG` | Approved signing policy slug |
++   | Variable | `EXPECTED_AUTHENTICODE_SUBJECT` | Required, case-sensitive substring of the expected signer certificate subject |
++
++   SignPath Foundation certificates name the foundation as publisher. After the first signed run,
++   inspect the logged certificate subject, confirm it matches the Foundation-approved certificate,
++   and set `EXPECTED_AUTHENTICODE_SUBJECT` to the exact expected subject (or an identifying substring).
++   That first run fails verification if the variable is unset; rerun after setting it. An unset or
++   whitespace-only variable, invalid signature, or mismatched subject always fails the job.
++
++6. Add the **existing updater key** as repository secret `TAURI_SIGNING_PRIVATE_KEY`. The owner
++   copies the contents of `%USERPROFILE%\.tauri\chemdraft-updater.key` (or its protected backup)
++   directly into the secret field. Never print it, paste it into a workflow, commit it, upload it
++   as an artifact, or place its value on a command line. Keep the same public key: replacing the
++   pair would strand installed apps. The current key has an empty password; the workflow passes
++   that explicitly to the signer and trims surrounding whitespace from the secret.
++
++The official SignPath action is pinned to the full commit SHA of its `v2` release.
++Review action updates and trust policy changes as release infrastructure changes.
++
++## Run a release
++
++Use a reviewed commit that has landed on the public repository's `main` branch, with the workflow
++and signing tools present. Both platform artifacts must use the same commit and version. The release
++body must include `## macOS` and `## Windows`; this workflow supplies the Windows artifacts only.
++
++1. Set the app version before tagging, and prepare tracked Windows release notes if needed. Create
++   the release tag and an **existing draft** GitHub release, for example `vX.Y.Z`.
++2. In **Actions → Windows release → Run workflow**, select that tag as the workflow ref, enter the
++   same tag in the required `ref` input, optionally enter `vX.Y.Z` in `upload_to_release`, and
++   optionally enter a tracked repository notes path in `notes_file`. The CLI equivalent is:
++
++   ```text
++   gh workflow run windows-release.yml --ref vX.Y.Z -f ref=vX.Y.Z -f upload_to_release=vX.Y.Z -f notes_file=release-notes/windows-X.Y.Z.md
++   ```
++
++   Omit optional inputs when unused. A full commit SHA is also accepted for `ref`, provided the
++   selected workflow branch/tag resolves to that same commit. Matching the dispatched workflow
++   commit and checked-out source keeps SignPath's GitHub provenance accurate. Fork runs and mismatched
++   source commits are refused before signing secrets are used. For a pre-merge dry run, select the
++   reviewed workflow branch and pass its full SHA as `ref`, leaving `upload_to_release` empty.
++3. Approve the signing request in SignPath when prompted. The runner installs Node 24, the repository
++   pnpm version, the Rust version from `rust-toolchain.toml`, and Temurin JDK 21. It builds and
++   smoke-tests OPSIN's host-native `jlink` runtime; the 3D sidecar is already committed.
++4. Review the logs: stable identifier `org.chemdraft.desktop`, product `ChemDraft`, empty native
++   worktree label, frontend commit stamp, `Authenticode: Valid`, updater verification, and final
++   SHA-256 hashes and byte sizes. Build-time label checks inspect the native build output and built
++   frontend assets. Install and launch the artifact on Windows to confirm its actual title and app
++   identity and complete the update/session-preservation checks in [windows-updates.md](windows-updates.md#verification).
++5. Download **`windows-release`**, which contains the final installer, its `.exe.sig`, `latest.json`,
++   and `SHA256SUMS.txt`. **`windows-nsis-unsigned` is input to SignPath, not the release installer.**
++   For a local updater signature check, from the repository root run:
++
++   ```text
++   pnpm exec tsx tools/release/verify-windows-updater.ts path/to/ChemDraft_X.Y.Z_x64-setup.exe
++   ```
++
++6. If `upload_to_release` was supplied, a separate job downloads only the final artifact and uses
++   `gh release upload --clobber`. It refuses a missing or already published release, and requires
++   `v<app version>` because the generated feed points to that URL. It also requires both
++   `authenticode_signed` and `updater_signed` build outputs to be true; these are set only after
++   successful verification. The boolean input `allow_unsigned_upload` defaults to false. Setting it
++   to true explicitly permits an upload with missing signatures and prints a loud workflow warning;
++   use it only for draft dry runs. Only this job has
++   `contents: write`; the build/signing job has read access. Leave the release draft while testing.
++   If uploading manually, upload the same final artifacts, without rebuilding or re-signing.
++7. After both platform artifacts pass review, publish the joint release. Only **after** the installer
++   URL is publicly downloadable, commit the generated `latest.json` to `main` through the normal PR
++   path. This workflow neither publishes the release nor updates the feed on `main`.
++
++## Dry runs before credentials exist
++
++- Missing `SIGNPATH_API_TOKEN`: a loud workflow warning, Authenticode skipped, installer retained.
++  If the updater key is available it still signs those final unsigned bytes and generates the feed.
++- Missing `TAURI_SIGNING_PRIVATE_KEY`: a loud warning, no `.sig` or `latest.json`; the installer and
++  checksums are still uploaded. Authenticode can run independently.
++- A SignPath token with missing organization/project/policy variables is an error. A configured
++  signing operation or verification that fails is an error, never a silent dry run.
++
++Use dry runs with `upload_to_release` empty. Do not publish their output as a signed production
++update. Repository secrets are scoped to signing steps, not the build; the workflow never runs on
++pull requests and its jobs are disabled in forks.
+diff --git a/docs/releasing/windows-updates.md b/docs/releasing/windows-updates.md
+index f80374fdd..3d3224159 100644
+--- a/docs/releasing/windows-updates.md
++++ b/docs/releasing/windows-updates.md
+@@ -35,7 +35,7 @@ by the installer. They are there on the next launch, as on macOS.
+ - **Crate:** `tauri-plugin-updater` 2.12.0, `cfg(windows)` only (Apache-2.0 OR MIT).
+ - **Frontend package:** `@tauri-apps/plugin-updater` 2.12.0 (Apache-2.0 OR MIT).
+ - **Feed:** `https://raw.githubusercontent.com/jgassens/ChemDraft/main/latest.json`. It sits next to
+-  the macOS `appcast.xml`, so each platform publishes on its own schedule.
++  the macOS `appcast.xml`; joint releases use the same commit and version for both platforms.
+ - **Public key:** `plugins.updater.pubkey` in `apps/desktop/src-tauri/tauri.windows.conf.json`.
+ - **Private key:** `%USERPROFILE%\.tauri\chemdraft-updater.key`.
+   - It is outside the repository. Never commit it, and never print it.
+@@ -43,6 +43,8 @@ by the installer. They are there on the next launch, as on macOS.
+     Sparkle key.
+   - Override its location with `CHEMDRAFT_UPDATER_KEY_PATH`. `TAURI_SIGNING_PRIVATE_KEY`, if set,
+     wins over both.
++  - CI uses the repository secret `TAURI_SIGNING_PRIVATE_KEY`, populated by the owner from this
++    same key. See [Windows installer signing](windows-signing.md) for SignPath setup and secret handling.
+ - **Permission:** the document window alone gets `updater:default`, from
+   `capabilities/app-updates.json`. That capability is marked `"platforms": ["windows"]`: the
+   updater plugin exists only in Windows builds, and Tauri skips a capability for another platform
+@@ -58,6 +60,28 @@ The updater compares the installed app's version with the feed's `version`. Ever
+ must therefore raise `version` in `apps/desktop/src-tauri/tauri.conf.json`, and must never reuse a
+ published version.
+ 
++### GitHub Actions path
++
++The manual-dispatch [Windows release workflow](../../.github/workflows/windows-release.yml) builds
++the installer on `windows-latest`, optionally Authenticode-signs the CI artifact through SignPath
++Foundation, then signs the **final installer bytes** for the Tauri updater and generates `latest.json`.
++The [signing guide](windows-signing.md) covers the owner's SignPath application, trusted build setup,
++repository secrets/variables, workflow inputs and release checks.
++
++Dispatch on the release tag with the same tag in `ref`; optionally provide a tracked Windows notes
++file and an existing draft release tag in `upload_to_release`. The final `windows-release` artifact
++contains the installer, `.exe.sig`, `latest.json`, and checksums. Missing signing secrets produce
++explicit warnings and dry-run output. Optional uploads refuse published releases; the workflow never
++publishes a release or commits the feed. Review both platform artifacts from the same commit/version,
++publish the joint release, then commit the generated feed to `main` only after its installer URL works.
++
++### Existing Windows VM path
++
++This path stays valid. Its updater signature does not provide Authenticode signing. If Authenticode
++is applied separately, do it **before** the final `tauri signer sign` and manifest generation: an
++existing `.sig` is invalid once any installer bytes change. SignPath Foundation requires verifiable
++CI builds; submitting a VM-built installer through the workflow is not supported.
++
+ 1. On `main` (or with `CHEMDRAFT_STABLE_BUILD=1`), with the key on this machine, build the installer:
+ 
+    ```bash
+diff --git a/scripts/desktop-tauri.mjs b/scripts/desktop-tauri.mjs
+index 975473430..252cedf64 100644
+--- a/scripts/desktop-tauri.mjs
++++ b/scripts/desktop-tauri.mjs
+@@ -68,9 +68,14 @@ if (isBranchBuild) {
+ // input to `pnpm release:windows-manifest`). Only when the updater key is on this machine: without it
+ // the build still succeeds, just without update signatures, so a developer on main is never blocked.
+ // Branch builds never sign — they must not be publishable as an update to the released app.
++// CI defers updater signing until AFTER Authenticode, which changes the installer bytes. The
++// explicit opt-out also overrides createUpdaterArtifacts in a checked-in config; VM defaults stay.
+ if (args[0] === "build" && !isBranchBuild && process.platform === "win32") {
+   const keyPath = env.CHEMDRAFT_UPDATER_KEY_PATH ?? join(homedir(), ".tauri", "chemdraft-updater.key");
+-  if (env.TAURI_SIGNING_PRIVATE_KEY || existsSync(keyPath)) {
++  if (env.CHEMDRAFT_SKIP_UPDATER_SIGNING === "1") {
++    args.splice(1, 0, "--config", JSON.stringify({ bundle: { createUpdaterArtifacts: false } }));
++    console.log("Stable build: updater signing explicitly deferred (CHEMDRAFT_SKIP_UPDATER_SIGNING=1).");
++  } else if (env.TAURI_SIGNING_PRIVATE_KEY || existsSync(keyPath)) {
+     // Trimmed (which also strips a BOM, whitespace to trim()): a key restored from a password manager
+     // through an editor or PowerShell gains a trailing newline, and the CLI then fails to decode it.
+     env.TAURI_SIGNING_PRIVATE_KEY ??= readFileSync(keyPath, "utf8").trim();
+diff --git a/scripts/desktop-tauri.test.ts b/scripts/desktop-tauri.test.ts
+new file mode 100644
+index 000000000..4e9f112bc
+--- /dev/null
++++ b/scripts/desktop-tauri.test.ts
+@@ -0,0 +1,75 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { spawnSync } from "node:child_process";
++import { existsSync, readFileSync } from "node:fs";
++
++vi.mock("node:child_process", () => ({ spawnSync: vi.fn(() => ({ status: 0 })) }));
++vi.mock("node:fs", () => ({ existsSync: vi.fn(() => false), readFileSync: vi.fn(() => "  test-only-key\n") }));
++vi.mock("./worktree-identity.mjs", async (importOriginal) => ({
++  ...await importOriginal<typeof import("./worktree-identity.mjs")>(),
++  worktreeIdentity: () => ({ branch: "release/test", label: "checkout [release/test]", devBundleId: "test.dev" })
++}));
++
++afterEach(() => {
++  vi.restoreAllMocks();
++  vi.unstubAllEnvs();
++  vi.clearAllMocks();
++  vi.resetModules();
++});
++
++async function build(platform = "win32") {
++  vi.spyOn(process, "platform", "get").mockReturnValue(platform as NodeJS.Platform);
++  vi.spyOn(process, "argv", "get").mockReturnValue(["node", "desktop-tauri.mjs", "--package-build", "--bundles", "nsis"]);
++  vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("test exit"); });
++  vi.spyOn(console, "log").mockImplementation(() => {});
++  vi.stubEnv("CHEMDRAFT_STABLE_BUILD", "1");
++  await expect(import("./desktop-tauri.mjs")).rejects.toThrow("test exit");
++  const call = vi.mocked(spawnSync).mock.calls.at(-1)!;
++  return { args: call[1] as string[], env: call[2]!.env! };
++}
++
++describe("desktop updater signing", () => {
++  it("explicitly disables build-time signatures even with an env key or a key on disk", async () => {
++    vi.stubEnv("CHEMDRAFT_SKIP_UPDATER_SIGNING", "1");
++    vi.stubEnv("TAURI_SIGNING_PRIVATE_KEY", "test-only-env-key");
++    vi.mocked(existsSync).mockReturnValue(true);
++    const { args, env } = await build();
++    expect(args).toContain(JSON.stringify({ bundle: { createUpdaterArtifacts: false } }));
++    expect(readFileSync).not.toHaveBeenCalled();
++    expect(env.CHEMDRAFT_WORKTREE_LABEL).toBe("");
++  });
++
++  it("keeps the VM default: reads and trims the local key and enables updater artifacts", async () => {
++    vi.stubEnv("CHEMDRAFT_SKIP_UPDATER_SIGNING", undefined);
++    vi.stubEnv("TAURI_SIGNING_PRIVATE_KEY", undefined);
++    vi.stubEnv("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", undefined);
++    vi.mocked(existsSync).mockReturnValue(true);
++    const { args, env } = await build();
++    expect(args).toContain(JSON.stringify({ bundle: { createUpdaterArtifacts: true } }));
++    expect(env.TAURI_SIGNING_PRIVATE_KEY).toBe("test-only-key");
++    expect(env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD).toBe("");
++  });
++
++  it("keeps env keys preferred and treats only 1 as the opt-out", async () => {
++    vi.stubEnv("CHEMDRAFT_SKIP_UPDATER_SIGNING", "0");
++    vi.stubEnv("TAURI_SIGNING_PRIVATE_KEY", "test-only-env-key");
++    const { args, env } = await build();
++    expect(args).toContain(JSON.stringify({ bundle: { createUpdaterArtifacts: true } }));
++    expect(env.TAURI_SIGNING_PRIVATE_KEY).toBe("test-only-env-key");
++    expect(readFileSync).not.toHaveBeenCalled();
++  });
++
++  it("keeps a stable Windows build without a key buildable", async () => {
++    vi.stubEnv("CHEMDRAFT_SKIP_UPDATER_SIGNING", undefined);
++    vi.stubEnv("TAURI_SIGNING_PRIVATE_KEY", undefined);
++    vi.mocked(existsSync).mockReturnValue(false);
++    const { args } = await build();
++    expect(args).not.toContain("--config");
++  });
++
++  it("does not change the macOS package build path", async () => {
++    vi.stubEnv("CHEMDRAFT_SKIP_UPDATER_SIGNING", "1");
++    const { args } = await build("darwin");
++    expect(args).toContain("pnpm prepare:sparkle && pnpm sign:opsin-runtime && PATH=\"$HOME/.cargo/bin:$PATH\" tauri \"$@\"");
++    expect(args).not.toContain("--config");
++  });
++});
+diff --git a/tools/release/verify-windows-updater.test.ts b/tools/release/verify-windows-updater.test.ts
+new file mode 100644
+index 000000000..f3d2af6d7
+--- /dev/null
++++ b/tools/release/verify-windows-updater.test.ts
+@@ -0,0 +1,82 @@
++import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
++import { spawnSync } from "node:child_process";
++import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { createRequire } from "node:module";
++import { describe, expect, it } from "vitest";
++import { verifyUpdaterSignature } from "./verify-windows-updater";
++
++// Ephemeral test keys only. No project private key is read, stored, or needed.
++function signed(algorithm = "ED") {
++  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
++  const id = randomBytes(8);
++  const installer = Buffer.from("final Authenticode-signed installer bytes");
++  const message = algorithm === "ED" ? createHash("blake2b512").update(installer).digest() : installer;
++  const signature = sign(null, message, privateKey);
++  const comment = "timestamp:1792540800\tfile:ChemDraft_1.0.0_x64-setup.exe";
++  const global = sign(null, Buffer.concat([signature, Buffer.from(comment)]), privateKey).toString("base64");
++  const packet = Buffer.concat([Buffer.from(algorithm), id, signature]).toString("base64");
++  const key = Buffer.concat([Buffer.from("Ed"), id, publicKey.export({ format: "der", type: "spki" }).subarray(-32)]);
++  const pubkey = Buffer.from(`untrusted comment: test key\n${key.toString("base64")}\n`).toString("base64");
++  const encode = (text: string) => Buffer.from(text).toString("base64");
++  const raw = `untrusted comment: test signature\n${packet}\ntrusted comment: ${comment}\n${global}\n`;
++  return { installer, pubkey, sig: encode(raw), raw, encode };
++}
++
++describe("Windows updater verification", () => {
++  it("accepts an actual Tauri CLI signature with an ephemeral test key", (context) => {
++    const desktopRequire = createRequire(new URL("../../apps/desktop/package.json", import.meta.url));
++    let cli: string;
++    try {
++      cli = desktopRequire.resolve("@tauri-apps/cli/tauri.js");
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code !== "MODULE_NOT_FOUND") throw error;
++      context.skip("Tauri CLI is not installed/resolvable from the desktop package; skipping real CLI signature test.");
++      return;
++    }
++    const root = mkdtempSync(join(tmpdir(), "chemdraft-updater-verify-"));
++    const key = join(root, "test.key");
++    const installer = join(root, "test.exe");
++    try {
++      // Capture all CLI output: even generated test keys must not appear in test logs.
++      const generated = spawnSync(process.execPath, [cli, "signer", "generate", "--ci", "--password", "", "--write-keys", key]);
++      expect(generated.status).toBe(0);
++      writeFileSync(installer, "final installer test bytes");
++      const signed = spawnSync(process.execPath, [cli, "signer", "sign", "--password", "", installer], {
++        env: { ...process.env, TAURI_SIGNING_PRIVATE_KEY: readFileSync(key, "utf8").trim() }
++      });
++      expect(signed.status).toBe(0);
++      expect(() => verifyUpdaterSignature(readFileSync(installer), readFileSync(`${installer}.sig`, "utf8"),
++        readFileSync(`${key}.pub`, "utf8"))).not.toThrow();
++    } finally {
++      rmSync(root, { recursive: true, force: true });
++    }
++  });
++
++  it.each(["ED", "Ed"])("verifies %s Minisign packets in Tauri's base64 envelope", (algorithm) => {
++    const { installer, pubkey, sig } = signed(algorithm);
++    expect(() => verifyUpdaterSignature(installer, sig, pubkey)).not.toThrow();
++  });
++
++  it("rejects signing before Authenticode changes the bytes", () => {
++    const { installer, pubkey, sig } = signed();
++    expect(() => verifyUpdaterSignature(Buffer.concat([installer, Buffer.from("certificate")]), sig, pubkey))
++      .toThrow(/verification failed/);
++  });
++
++  it("rejects a different key, tampered comments, truncated packets and unsupported algorithms", () => {
++    const { installer, pubkey, sig, raw, encode } = signed();
++    expect(() => verifyUpdaterSignature(installer, sig, signed().pubkey)).toThrow(/key ID mismatch/);
++    expect(() => verifyUpdaterSignature(installer, encode(raw.replace("timestamp:1792540800", "timestamp:1")), pubkey))
++      .toThrow(/verification failed/);
++    expect(() => verifyUpdaterSignature(installer, encode(raw.split("\n").slice(0, 3).join("\n")), pubkey))
++      .toThrow(/structure/);
++    const lines = raw.trim().split("\n");
++    lines[1] = Buffer.from("Ed").toString("base64");
++    expect(() => verifyUpdaterSignature(installer, encode(lines.join("\n")), pubkey)).toThrow(/packet/);
++    const unknown = signed("XX");
++    expect(() => verifyUpdaterSignature(unknown.installer, unknown.sig, unknown.pubkey)).toThrow(/algorithm/);
++    expect(() => verifyUpdaterSignature(installer, "bad-base64!", pubkey)).toThrow(/base64/);
++  });
++});
+diff --git a/tools/release/verify-windows-updater.ts b/tools/release/verify-windows-updater.ts
+new file mode 100644
+index 000000000..461809173
+--- /dev/null
++++ b/tools/release/verify-windows-updater.ts
+@@ -0,0 +1,66 @@
++/** Verify Tauri's base64-wrapped Minisign .sig against the checked-in updater public key.
++ * Tauri CLI has no `signer verify` command. Use Node's Ed25519 and BLAKE2b-512 primitives;
++ * verify both the file signature and Minisign's authenticated comment, including the key ID.
++ */
++import { createHash, createPublicKey, verify } from "node:crypto";
++import { readFileSync } from "node:fs";
++import { resolve } from "node:path";
++import { pathToFileURL } from "node:url";
++
++function decode(value: string): Buffer {
++  const trimmed = value.trim();
++  const bytes = Buffer.from(trimmed, "base64");
++  if (!bytes.length || bytes.toString("base64") !== trimmed) throw new Error("Invalid Minisign base64 encoding.");
++  return bytes;
++}
++
++export function verifyUpdaterSignature(installer: Buffer, encodedSignature: string, encodedPublicKey: string): void {
++  const publicLines = decode(encodedPublicKey).toString("utf8").trim().split(/\r?\n/);
++  const signatureLines = decode(encodedSignature).toString("utf8").trim().split(/\r?\n/);
++  if (publicLines.length !== 2 || signatureLines.length !== 4 ||
++      !publicLines[0].startsWith("untrusted comment: ") ||
++      !signatureLines[0].startsWith("untrusted comment: ") ||
++      !signatureLines[2].startsWith("trusted comment: ")) {
++    throw new Error("Invalid Minisign key or signature structure.");
++  }
++  const key = decode(publicLines[1]);
++  const signature = decode(signatureLines[1]);
++  const globalSignature = decode(signatureLines[3]);
++  if (key.length !== 42 || key.subarray(0, 2).toString() !== "Ed" ||
++      signature.length !== 74 || globalSignature.length !== 64) {
++    throw new Error("Invalid Minisign key or signature packet.");
++  }
++  if (!key.subarray(2, 10).equals(signature.subarray(2, 10))) throw new Error("Updater signature key ID mismatch.");
++  const algorithm = signature.subarray(0, 2).toString();
++  if (algorithm !== "Ed" && algorithm !== "ED") throw new Error("Unsupported Minisign signature algorithm.");
++  // DER SubjectPublicKeyInfo prefix for a raw Ed25519 public key (RFC 8410).
++  const publicKey = createPublicKey({
++    key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), key.subarray(10)]),
++    format: "der",
++    type: "spki"
++  });
++  const message = algorithm === "ED" ? createHash("blake2b512").update(installer).digest() : installer;
++  const fileSignature = signature.subarray(10);
++  const comment = Buffer.from(signatureLines[2].slice("trusted comment: ".length));
++  if (!verify(null, message, publicKey, fileSignature) ||
++      !verify(null, Buffer.concat([fileSignature, comment]), publicKey, globalSignature)) {
++    throw new Error("Updater signature verification failed: installer or authenticated comment changed.");
++  }
++}
++
++export function main(args: readonly string[]): void {
++  if (args.length !== 1) throw new Error("Usage: verify-windows-updater.ts <installer.exe>");
++  const installer = resolve(args[0]);
++  const config = JSON.parse(readFileSync(resolve("apps/desktop/src-tauri/tauri.windows.conf.json"), "utf8"));
++  verifyUpdaterSignature(readFileSync(installer), readFileSync(`${installer}.sig`, "utf8"), config.plugins.updater.pubkey);
++  console.log("Updater signature verified against tauri.windows.conf.json.");
++}
++
++if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
++  try {
++    main(process.argv.slice(2));
++  } catch (error) {
++    console.error(`verify-windows-updater: ${error instanceof Error ? error.message : String(error)}`);
++    process.exit(1);
++  }
++}
+diff --git a/tools/release/windows-release.test.ts b/tools/release/windows-release.test.ts
+new file mode 100644
+index 000000000..752f40523
+--- /dev/null
++++ b/tools/release/windows-release.test.ts
+@@ -0,0 +1,75 @@
++import { spawnSync } from "node:child_process";
++import { mkdtempSync, readFileSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++
++const workflow = readFileSync(new URL("../../.github/workflows/windows-release.yml", import.meta.url), "utf8");
++const hasPowerShell = spawnSync("pwsh", ["-NoProfile", "-Command", "exit 0"]).status === 0;
++
++// Execute the workflow's actual scripts, with only the Windows certificate/file APIs mocked.
++function stepScript(name: string) {
++  const step = workflow.split(`      - name: ${name}\n`)[1]?.split(/\n      - /)[0];
++  const script = step?.split("        run: |\n")[1];
++  if (!script) throw new Error(`Missing workflow script: ${name}`);
++  return script.split("\n").map((line) => line.replace(/^          /, "")).join("\n");
++}
++
++function run(script: string, env: Record<string, string>) {
++  return spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", `$ErrorActionPreference = 'Stop'\n${script}`], {
++    encoding: "utf8",
++    env: { ...process.env, ...env }
++  });
++}
++
++describe.skipIf(!hasPowerShell)("Windows release signing gates (requires installed pwsh)", () => {
++  it.each([
++    ["Valid", "CN=SignPath Foundation", "SignPath Foundation", true],
++    ["Valid", "CN=Unexpected Publisher", "SignPath Foundation", false],
++    ["Valid", "CN=SignPath Foundation", "", false],
++    ["Valid", "CN=SignPath Foundation", "   ", false],
++    ["NotSigned", "CN=SignPath Foundation", "SignPath Foundation", false]
++  ] as const)("checks status %s and subject %s against '%s'", (status, subject, expected, accepted) => {
++    const root = mkdtempSync(join(tmpdir(), "chemdraft-signing-gate-"));
++    const output = join(root, "output");
++    try {
++      const result = run(`
++function Get-ChildItem { [PSCustomObject]@{ Name = 'test.exe'; FullName = 'test.exe' } }
++function Get-AuthenticodeSignature {
++  [PSCustomObject]@{ Status = $env:TEST_STATUS; SignerCertificate = [PSCustomObject]@{ Subject = $env:TEST_SUBJECT } }
++}
++function Copy-Item { }
++${stepScript("Verify Authenticode and replace unsigned installer")}`, {
++        TEST_STATUS: status,
++        TEST_SUBJECT: subject,
++        EXPECTED_AUTHENTICODE_SUBJECT: expected,
++        INSTALLER: "test.exe",
++        GITHUB_OUTPUT: output
++      });
++      expect(result.status === 0, result.stderr).toBe(accepted);
++      if (accepted) expect(readFileSync(output, "utf8")).toContain("signed=true");
++      if (!expected.trim()) expect(result.stderr).toContain("EXPECTED_AUTHENTICODE_SUBJECT repository variable is required");
++    } finally {
++      rmSync(root, { recursive: true, force: true });
++    }
++  });
++
++  it.each([
++    ["true", "true", "false", true, false],
++    ["false", "true", "false", false, false],
++    ["true", "false", "false", false, false],
++    ["false", "false", "false", false, false],
++    ["", "", "false", false, false],
++    ["false", "true", "true", true, true],
++    ["true", "false", "true", true, true],
++    ["false", "false", "true", true, true]
++  ] as const)("gates upload with Authenticode=%s updater=%s override=%s", (authenticode, updater, override, accepted, warned) => {
++    const result = run(stepScript("Require verified signatures before release upload"), {
++      AUTHENTICODE_SIGNED: authenticode,
++      UPDATER_SIGNED: updater,
++      ALLOW_UNSIGNED_UPLOAD: override
++    });
++    expect(result.status === 0, result.stderr).toBe(accepted);
++    expect(result.stdout.includes("::warning::UNSIGNED RELEASE UPLOAD OVERRIDE")).toBe(warned);
++  });
++});

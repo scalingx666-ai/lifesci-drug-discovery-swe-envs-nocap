@@ -1,0 +1,205 @@
+diff --git a/src/xyzrender/api.py b/src/xyzrender/api.py
+index eff4fe1..d4ab2e4 100644
+--- a/src/xyzrender/api.py
++++ b/src/xyzrender/api.py
+@@ -352,7 +352,9 @@ def load(
+         Skip bond-order optimisation (``build_graph(quick=True)``).  Use
+         when you know bond orders will be suppressed at render time (e.g.
+         ``render(mol, bo=False)``).  CIF and PDB-with-cell always use
+-        ``quick=True`` automatically regardless of this flag.
++        ``quick=True`` automatically regardless of this flag.  Ignored when
++        *nci_detect* is set: NCI detection needs the formal charges this step
++        assigns.
+     ensemble:
+         Load as a multi-frame trajectory (or RDKit Mol conformer) ensemble.
+         All frames are RMSD-aligned onto *reference_frame* and merged into a
+@@ -396,6 +398,11 @@ def load(
+     }
+     if mol_frame != 0 and not supports_mol_frame:
+         logger.warning("mol_frame has no effect unless loading an SDF or CJSON file")
++    if quick and nci_detect:
++        # Bond-order optimisation is where formal charges come from; without them
++        # charge-based NCIs (cation-pi, ionic) vanish.  bo=False still hides orders.
++        logger.info("quick ignored: nci_detect needs full bond-order/charge perception")
++        quick = False
+ 
+     # --- Ensemble: load multi-frame trajectory as merged molecule ---
+     if ensemble:
+diff --git a/src/xyzrender/parsers.py b/src/xyzrender/parsers.py
+index 3d403b0..7d7efd8 100644
+--- a/src/xyzrender/parsers.py
++++ b/src/xyzrender/parsers.py
+@@ -77,6 +77,8 @@ class MolData:
+         ``None`` when the format carries no explicit colouring.
+     camera:
+         Saved viewer camera, or ``None`` when the file carries none.
++    formal_charges:
++        Per-atom formal charges, or ``None`` when the format carries none.
+     """
+ 
+     atoms: list[tuple[str, tuple[float, float, float]]]
+@@ -86,6 +88,7 @@ class MolData:
+     pbc_cell: np.ndarray | None = field(default=None, repr=False)
+     colors: list[str] | None = field(default=None, repr=False)
+     camera: CameraData | None = field(default=None, repr=False)
++    formal_charges: list[int] | None = field(default=None, repr=False)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -214,8 +217,8 @@ def _parse_mol_v2000(lines: list[str], name: str) -> MolData:
+             except (IndexError, ValueError):
+                 pass
+ 
+-    total_charge = sum(atom_charges.values())
+-    return MolData(atoms=atoms, bonds=bonds, name=name, charge=total_charge)
++    formal_charges = [atom_charges.get(i, 0) for i in range(n_atoms)]
++    return MolData(atoms=atoms, bonds=bonds, name=name, charge=sum(formal_charges), formal_charges=formal_charges)
+ 
+ 
+ def _parse_mol_v3000(lines: list[str], name: str) -> MolData:
+@@ -224,7 +227,7 @@ def _parse_mol_v3000(lines: list[str], name: str) -> MolData:
+     in_bond = False
+     atoms: list[tuple[str, tuple[float, float, float]]] = []
+     bonds: list[tuple[int, int, float]] = []
+-    total_charge = 0
++    formal_charges: list[int] = []
+ 
+     for ln in lines:
+         s = ln.strip()
+@@ -266,7 +269,7 @@ def _parse_mol_v3000(lines: list[str], name: str) -> MolData:
+                         chg = int(p.split("=", 1)[1])
+                     except ValueError:
+                         pass
+-            total_charge += chg
++            formal_charges.append(chg)
+             atoms.append((sym, (x, y, z)))
+ 
+         elif in_bond:
+@@ -282,7 +285,7 @@ def _parse_mol_v3000(lines: list[str], name: str) -> MolData:
+                 continue
+             bonds.append((a1, a2, _V2000_BOND_ORDER.get(btype, 1.0)))
+ 
+-    return MolData(atoms=atoms, bonds=bonds, name=name, charge=total_charge)
++    return MolData(atoms=atoms, bonds=bonds, name=name, charge=sum(formal_charges), formal_charges=formal_charges)
+ 
+ 
+ def parse_mol(path: str | Path) -> MolData:
+@@ -924,7 +927,8 @@ def parse_smiles(smiles: str, kekule: bool = False) -> MolData:
+         (b.GetBeginAtomIdx(), b.GetEndAtomIdx(), b.GetBondTypeAsDouble()) for b in mol.GetBonds()
+     ]
+ 
+-    return MolData(atoms=atoms, bonds=bonds, name=smiles)
++    formal_charges = [a.GetFormalCharge() for a in mol.GetAtoms()]
++    return MolData(atoms=atoms, bonds=bonds, name=smiles, charge=sum(formal_charges), formal_charges=formal_charges)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -974,14 +978,15 @@ def parse_molobject(mol, *, conf_id: int = -1, kekule: bool = False, name: str |
+         )
+         for bond in mol.GetBonds()
+     ]
+-    charge = int(sum(atom.GetFormalCharge() for atom in mol.GetAtoms()))
++    formal_charges = [atom.GetFormalCharge() for atom in mol.GetAtoms()]
+     if not name:
+         name = mol.GetProp("_Name") if mol.HasProp("_Name") else ""
+     return MolData(
+         atoms=atoms,
+         bonds=bonds,
+         name=name,
+-        charge=charge,
++        charge=sum(formal_charges),
++        formal_charges=formal_charges,
+     )
+ 
+ 
+diff --git a/src/xyzrender/readers.py b/src/xyzrender/readers.py
+index 9e696db..1be5db2 100644
+--- a/src/xyzrender/readers.py
++++ b/src/xyzrender/readers.py
+@@ -411,8 +411,18 @@ def graph_from_moldata(
+         graph: nx.Graph = nx.Graph()
+         for i, (sym, pos) in enumerate(data.atoms):
+             graph.add_node(i, symbol=sym, position=pos)
++            if data.formal_charges is not None:
++                graph.nodes[i]["formal_charge"] = data.formal_charges[i]
+         for i, j, order in data.bonds:
+             graph.add_edge(i, j, bond_order=order)
++        # NCI site rules read per-atom formal_charge and valence; valence is the
++        # non-metal bond-order sum, matching what xyzgraph's builder stamps.
++        from xyzgraph import DATA
++
++        for i in graph.nodes:
++            graph.nodes[i]["valence"] = sum(
++                e["bond_order"] for j, e in graph[i].items() if graph.nodes[j]["symbol"] not in DATA.metals
++            )
+         isolated = sum(1 for n in graph.nodes if graph.degree(n) == 0)
+         if isolated > 0:
+             logger.warning(
+diff --git a/tests/test_molobject.py b/tests/test_molobject.py
+index 022a189..1019a9b 100644
+--- a/tests/test_molobject.py
++++ b/tests/test_molobject.py
+@@ -7,6 +7,8 @@
+ 
+ from __future__ import annotations
+ 
++import math
++
+ import pytest
+ 
+ pytest.importorskip("rdkit", reason="rdkit required for MolObject tests")
+@@ -64,3 +66,29 @@ def test_load_ensemble_payload_shape():
+ def test_nci_detect_adds_nci_edge():
+     m = load(_water_dimer(), nci_detect=True)
+     assert any(d.get("NCI") for *_, d in m.graph.edges(data=True))
++
++
++def _ion_pair() -> Chem.Mol:
++    """NH4+ with one N-H pointing at Cl- (N...Cl 3.1 A)."""
++    upper = [(0.971 * math.cos(t), 0.971 * math.sin(t), 3.443) for t in (0, 2 * math.pi / 3, 4 * math.pi / 3)]
++    coords = [(0.0, 0.0, 3.1), (0.0, 0.0, 2.07), *upper, (0.0, 0.0, 0.0)]
++    mol = Chem.RWMol(Chem.CombineMols(Chem.AddHs(Chem.MolFromSmiles("[NH4+]")), Chem.MolFromSmiles("[Cl-]")))
++    conf = Chem.Conformer(mol.GetNumAtoms())
++    for i, xyz in enumerate(coords):
++        conf.SetAtomPosition(i, Point3D(*xyz))
++    mol.AddConformer(conf)
++    return mol.GetMol()
++
++
++@pytest.mark.parametrize("route", ["mol", "xyz_quick"])
++def test_nci_detect_finds_ion_pair(tmp_path, route):
++    # Ionic contacts need per-atom formal charges: copied from the Mol, and not
++    # skipped by quick=True.
++    mol = _ion_pair()
++    if route == "mol":
++        m = load(mol, nci_detect=True)
++    else:
++        path = tmp_path / "pose.xyz"
++        Chem.MolToXYZFile(mol, str(path))
++        m = load(path, quick=True, nci_detect=True)
++    assert "ionic" in {d.get("nci_type") for *_, d in m.graph.edges(data=True)}
+diff --git a/uv.lock b/uv.lock
+index c49332a..4618cd1 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -2192,7 +2192,7 @@ wheels = [
+ 
+ [[package]]
+ name = "xyzgraph"
+-version = "1.6.13"
++version = "1.7.0"
+ source = { registry = "https://pypi.org/simple" }
+ dependencies = [
+     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+@@ -2201,9 +2201,9 @@ dependencies = [
+     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+     { name = "rdkit" },
+ ]
+-sdist = { url = "https://files.pythonhosted.org/packages/d0/52/0a724654181fbe2492081acc05ece6ec96041a6b613cc282c49150d497ff/xyzgraph-1.6.13.tar.gz", hash = "sha256:54bdc8dfd2eaf8dd56a8663e1e5280238328cb46eb181f6796a864c8de0d728f", size = 180418, upload-time = "2026-07-11T16:03:11.024Z" }
++sdist = { url = "https://files.pythonhosted.org/packages/9c/d3/cdff0f08919b2cc12394af0345e36a043f37777222c2ab195c337482da51/xyzgraph-1.7.0.tar.gz", hash = "sha256:e2fefd0b26bc1974dc56ee16874e15fe1338127a810f8b623836cec2be2c314b", size = 204386, upload-time = "2026-11-05T13:49:42.763Z" }
+ wheels = [
+-    { url = "https://files.pythonhosted.org/packages/f8/80/9a966abdb505c5042e14136d4fc6a0ce0a3896d77ca02ab87b288e5417db/xyzgraph-1.6.13-py3-none-any.whl", hash = "sha256:8442d6d71bfc2f85944e1e5dc015e82f4abe988062b8db8e99ec9ef534b71df9", size = 130242, upload-time = "2026-07-11T16:03:09.042Z" },
++    { url = "https://files.pythonhosted.org/packages/cf/1c/ec11c00ebf7f0807d85a25f2addc641a057a0c9853aebfb3b6f08b186726/xyzgraph-1.7.0-py3-none-any.whl", hash = "sha256:69850932ddce4b35db95281df05c4a12d9b9874898407711b627256c5f97168d", size = 141507, upload-time = "2026-11-05T13:49:41.26Z" },
+ ]
+ 
+ [[package]]

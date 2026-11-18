@@ -1,0 +1,21 @@
+# Issue
+
+**Title:** Revision t035
+
+## Description
+
+## Description
+Revision for T035
+
+## Todos
+- [X] GIN / GCN explanation and figures improved
+- [X] New figure for permutation invariance
+- [X] GPU support code
+- [X] Small bug fix in code and rerun
+
+## Status
+- [ ] Ready to go
+
+## Task
+
+Modify the repository so that the issue described above is resolved. The repository is checked out at base commit `ef08f349ace9`. Edit files in place; the verifier captures your changes via `git diff` and scores them against an oracle patch using SWE-RL-style diff-similarity reward.

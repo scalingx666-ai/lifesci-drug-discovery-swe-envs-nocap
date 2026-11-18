@@ -1,0 +1,2930 @@
+diff --git a/apps/desktop/src-tauri/src/export.rs b/apps/desktop/src-tauri/src/export.rs
+index 2d991cb9b..2f9c2edc6 100644
+--- a/apps/desktop/src-tauri/src/export.rs
++++ b/apps/desktop/src-tauri/src/export.rs
+@@ -5,6 +5,8 @@ use resvg::{tiny_skia, usvg};
+ 
+ use crate::fonts::shared_fontdb;
+ 
++mod pictures;
++
+ const DEFAULT_RASTER_SCALE: f64 = 1.0;
+ const DEFAULT_MAX_DIMENSION_PX: u32 = 8192;
+ const DEFAULT_JPEG_QUALITY: u8 = 90;
+@@ -64,6 +66,10 @@ pub(crate) struct RasterExportRequest {
+     /// (see `target_size`), so a request that gets clamped for `max_dimension_px` still gets a
+     /// truthful density instead of one describing the unclamped size that was asked for.
+     css_px_per_inch: Option<f64>,
++    /// PNG pictures decoded by the webview, keyed by the id of their stand-in `<image>`
++    /// (`rasterPictureDecode.ts`, `export/pictures.rs`). Absent when the drawing has none.
++    #[serde(default)]
++    pictures: Vec<pictures::RasterPictureInput>,
+ }
+ 
+ #[derive(Debug, serde::Serialize)]
+@@ -98,7 +104,7 @@ pub(crate) async fn rasterize_svg(
+         })?
+ }
+ 
+-fn rasterize_svg_impl(request: RasterExportRequest) -> Result<RasterExportResponse, String> {
++fn rasterize_svg_impl(mut request: RasterExportRequest) -> Result<RasterExportResponse, String> {
+     // Check UTF-8 bytes before font discovery or usvg parsing; usvg's tree limits do not
+     // bound the input string (including embedded data: images).
+     if request.svg.len() > MAX_SVG_BYTES {
+@@ -110,6 +116,12 @@ fn rasterize_svg_impl(request: RasterExportRequest) -> Result<RasterExportRespon
+         ));
+     }
+ 
++    // serde has already deserialized the request by now; sizes, lengths and the decoded-pixel
++    // budget are checked before any pixels are unpacked.
++    let supplied_pictures = pictures::SuppliedPictures::from_request(
++        std::mem::take(&mut request.pictures),
++        request.format.label(),
++    )?;
+     let options = export_svg_options();
+ 
+     // Inspect the source XML: usvg can discard unsupported or malformed pictures.
+@@ -123,8 +135,17 @@ fn rasterize_svg_impl(request: RasterExportRequest) -> Result<RasterExportRespon
+         },
+     )
+     .map_err(|error| format!("Could not parse SVG for raster export: {error}"))?;
++    let stand_ins = supplied_pictures.find_stand_ins(&document);
++    let over_count_pictures = document
++        .descendants()
++        .filter(pictures::is_over_count_stand_in)
++        .count();
+     let mut inspection_budget = MAX_SVG_BYTES;
+-    let contains_bitmap_pictures = contains_bitmap_pictures(&document, 0, &mut inspection_budget);
++    let contains_bitmap_pictures = document.descendants().any(|node| {
++        let id = node.attribute("id").unwrap_or_default();
++        // Supplied pictures are reported below, each with its own reason when not drawn.
++        !stand_ins.contains_key(id) && image_is_omitted_bitmap(&node, 0, &mut inspection_budget)
++    });
+     let tree = usvg::Tree::from_xmltree(&document, &options)
+         .map_err(|error| format!("Could not parse SVG for raster export: {error}"))?;
+     let base_size = tree.size().to_int_size();
+@@ -147,7 +168,18 @@ fn rasterize_svg_impl(request: RasterExportRequest) -> Result<RasterExportRespon
+     }
+ 
+     let transform = tiny_skia::Transform::from_scale(scale_x, scale_y);
+-    resvg::render(&tree, transform, &mut pixmap.as_mut());
++    let drawn_pictures = if supplied_pictures.is_empty() {
++        resvg::render(&tree, transform, &mut pixmap.as_mut());
++        Default::default()
++    } else {
++        supplied_pictures.render(&tree, &stand_ins, transform, &mut pixmap.as_mut())
++    };
++    warnings.extend(supplied_pictures.omission_warnings(
++        &stand_ins,
++        &drawn_pictures,
++        over_count_pictures,
++        request.format.label(),
++    ));
+ 
+     // scale_x/scale_y are the ACTUAL raster-px-per-source-px ratio after any max-dimension
+     // clamping above, so densities derived from it always match the bitmap really produced —
+@@ -185,40 +217,58 @@ fn contains_bitmap_pictures(
+     depth: usize,
+     remaining_bytes: &mut usize,
+ ) -> bool {
+-    document.descendants().any(|node| {
+-        if !node.is_element() || node.tag_name().name() != "image" {
+-            return false;
+-        }
+-        let mut hrefs = node
+-            .attributes()
+-            .filter(|attr| attr.name() == "href")
+-            .peekable();
+-        if hrefs.peek().is_none() {
++    document
++        .descendants()
++        .any(|node| image_is_omitted_bitmap(&node, depth, remaining_bytes))
++}
++
++/// Whether `node` is an `<image>` that resvg would leave out of the raster: anything but an SVG
++/// picture whose own pictures (to a bounded depth) are all SVG.
++fn image_is_omitted_bitmap(
++    node: &usvg::roxmltree::Node<'_, '_>,
++    depth: usize,
++    remaining_bytes: &mut usize,
++) -> bool {
++    if !node.is_element() || node.tag_name().name() != "image" {
++        return false;
++    }
++    // A picture stand-in whose pixels were not supplied with this request.
++    if pictures::is_unsupplied_stand_in(node) {
++        return true;
++    }
++    // Left out by the webview for the picture count, and reported with that reason.
++    if pictures::is_over_count_stand_in(node) {
++        return false;
++    }
++    let mut hrefs = node
++        .attributes()
++        .filter(|attr| attr.name() == "href")
++        .peekable();
++    if hrefs.peek().is_none() {
++        return true;
++    }
++    hrefs.any(|attr| {
++        // usvg 0.47 has no explicit image nesting bound. Cap inspection and
++        // warn on exhaustion so a deeper bitmap can never be missed.
++        if depth >= 32 {
+             return true;
+         }
+-        hrefs.any(|attr| {
+-            // usvg 0.47 has no explicit image nesting bound. Cap inspection and
+-            // warn on exhaustion so a deeper bitmap can never be missed.
+-            if depth >= 32 {
+-                return true;
+-            }
+-            let Some(data) = decode_svg_picture(attr.value(), remaining_bytes) else {
+-                return true;
+-            };
+-            let Ok(text) = std::str::from_utf8(&data) else {
+-                return true;
+-            };
+-            let Ok(nested) = usvg::roxmltree::Document::parse_with_options(
+-                text,
+-                usvg::roxmltree::ParsingOptions {
+-                    allow_dtd: true,
+-                    ..Default::default()
+-                },
+-            ) else {
+-                return true;
+-            };
+-            contains_bitmap_pictures(&nested, depth + 1, remaining_bytes)
+-        })
++        let Some(data) = decode_svg_picture(attr.value(), remaining_bytes) else {
++            return true;
++        };
++        let Ok(text) = std::str::from_utf8(&data) else {
++            return true;
++        };
++        let Ok(nested) = usvg::roxmltree::Document::parse_with_options(
++            text,
++            usvg::roxmltree::ParsingOptions {
++                allow_dtd: true,
++                ..Default::default()
++            },
++        ) else {
++            return true;
++        };
++        contains_bitmap_pictures(&nested, depth + 1, remaining_bytes)
+     })
+ }
+ 
+@@ -652,6 +702,7 @@ mod tests {
+             jpeg_quality: None,
+             max_dimension_px: None,
+             css_px_per_inch: None,
++            pictures: Vec::new(),
+         }
+     }
+ 
+@@ -1200,4 +1251,615 @@ mod tests {
+         // error rather than panic on a non-char-boundary slice.
+         assert!(parse_background(Some("#\u{2603}")).is_err());
+     }
++
++    const PICTURE_ID: &str = "chemdraft-raster-picture-0";
++    /// Straight-alpha colours of the 8 × 8 test picture's quadrants: top left, top right,
++    /// bottom left, bottom right.
++    const QUADRANTS: [[u8; 4]; 4] = [
++        [255, 0, 0, 255],
++        [0, 255, 0, 255],
++        [0, 0, 255, 255],
++        [255, 255, 0, 255],
++    ];
++    const WHITE: [u8; 4] = [255; 4];
++
++    fn supplied_picture(
++        id: &str,
++        width: u32,
++        height: u32,
++        rgba: &[u8],
++    ) -> pictures::RasterPictureInput {
++        pictures::RasterPictureInput {
++            id: id.to_string(),
++            width: Some(width),
++            height: Some(height),
++            rgba_base64: Some(base64::engine::general_purpose::STANDARD.encode(rgba)),
++            refused: None,
++        }
++    }
++
++    fn quadrant_picture(id: &str) -> pictures::RasterPictureInput {
++        let mut rgba = Vec::with_capacity(8 * 8 * 4);
++        for y in 0..8 {
++            for x in 0..8 {
++                rgba.extend_from_slice(&QUADRANTS[usize::from(y >= 4) * 2 + usize::from(x >= 4)]);
++            }
++        }
++        supplied_picture(id, 8, 8, &rgba)
++    }
++
++    fn refused_picture(
++        id: &str,
++        refusal: pictures::PictureRefusal,
++    ) -> pictures::RasterPictureInput {
++        pictures::RasterPictureInput {
++            id: id.to_string(),
++            refused: Some(refusal),
++            ..Default::default()
++        }
++    }
++
++    /// The stand-in `<image>` the webview writes for a picture of `width` × `height` pixels.
++    fn stand_in(id: &str, width: u32, height: u32, frame: &str) -> String {
++        format!(
++            r#"<image id="{id}" {frame} preserveAspectRatio="none" href="{}"/>"#,
++            pictures::placeholder_href(width, height, id)
++        )
++    }
++
++    fn picture_page(size: &str, body: &str) -> String {
++        format!(r#"<svg xmlns="http://www.w3.org/2000/svg" {size}>{body}</svg>"#)
++    }
++
++    fn render_pictures(
++        svg: &str,
++        scale: u32,
++        supplied: Vec<pictures::RasterPictureInput>,
++    ) -> (image::RgbaImage, Vec<RasterExportWarning>) {
++        let response = rasterize_svg_impl(RasterExportRequest {
++            svg: svg.to_string(),
++            scale: Some(f64::from(scale)),
++            pictures: supplied,
++            ..request(RasterExportFormat::Png)
++        })
++        .expect("render the picture page");
++        let pixels = image::load_from_memory(&response.bytes)
++            .expect("decode the exported page")
++            .to_rgba8();
++        (pixels, response.warnings)
++    }
++
++    #[track_caller]
++    fn assert_rgba_near(pixels: &image::RgbaImage, (x, y): (u32, u32), expected: [u8; 4]) {
++        let actual = pixels.get_pixel(x, y).0;
++        assert!(
++            actual
++                .iter()
++                .zip(expected)
++                .all(|(actual, expected)| actual.abs_diff(expected) <= 2),
++            "pixel ({x}, {y}) is {actual:?}, expected {expected:?}"
++        );
++    }
++
++    #[test]
++    fn supplied_pictures_land_on_their_frame_at_every_scale_and_rotation() {
++        let picture = stand_in(PICTURE_ID, 8, 8, r#"x="20" y="20" width="40" height="40""#);
++        let plain = picture_page(
++            r#"width="100" height="100" viewBox="0 0 100 100""#,
++            &format!("<g>{picture}</g>"),
++        );
++        // As documentStyleSvg writes it: a pt-sized root and a scale group (net scale 1 here).
++        let document_style = picture_page(
++            r#"width="75pt" height="75pt" viewBox="0 0 50 50""#,
++            &format!(r#"<g transform="scale(0.5)">{picture}</g>"#),
++        );
++        // As a rotated picture is written: rotated 90° clockwise about the frame centre.
++        let rotated = picture_page(
++            r#"width="100" height="100""#,
++            &format!(r#"<g transform="rotate(90 40 40)">{picture}</g>"#),
++        );
++        // Quadrant centres, with the quadrant expected there upright and rotated.
++        let probes = [
++            ((30, 30), 0, 2),
++            ((50, 30), 1, 0),
++            ((30, 50), 2, 3),
++            ((50, 50), 3, 1),
++        ];
++        for scale in [1, 3] {
++            for (svg, is_rotated) in [(&plain, false), (&document_style, false), (&rotated, true)] {
++                let (pixels, warnings) =
++                    render_pictures(svg, scale, vec![quadrant_picture(PICTURE_ID)]);
++                assert!(warnings.is_empty(), "{warnings:?}");
++                assert_eq!(pixels.dimensions(), (100 * scale, 100 * scale));
++                for ((x, y), upright, turned) in probes {
++                    let quadrant = if is_rotated { turned } else { upright };
++                    assert_rgba_near(&pixels, (x * scale, y * scale), QUADRANTS[quadrant]);
++                }
++                // White just outside each edge of the 20..60 frame, picture just inside.
++                assert_rgba_near(&pixels, (20 * scale - 2, 30 * scale), WHITE);
++                assert_rgba_near(&pixels, (60 * scale + 1, 30 * scale), WHITE);
++                assert_rgba_near(&pixels, (30 * scale, 20 * scale - 2), WHITE);
++                assert_rgba_near(&pixels, (30 * scale, 60 * scale + 1), WHITE);
++                let edge = QUADRANTS[if is_rotated { 2 } else { 0 }];
++                assert_rgba_near(&pixels, (20 * scale + 1, 30 * scale), edge);
++            }
++        }
++    }
++
++    #[test]
++    fn supplied_pictures_keep_their_z_order_and_the_rest_of_the_page_matches_resvg() {
++        let body = format!(
++            r##"<rect x="10" y="10" width="80" height="80" fill="#000000"/><g>{}</g><rect x="40" y="0" width="60" height="100" fill="#ff00ff"/><line x1="0" y1="95" x2="100" y2="95" stroke="#00ff00" stroke-width="2"/><text x="5" y="8" font-size="6">CH3</text>"##,
++            stand_in(PICTURE_ID, 8, 8, r#"x="20" y="20" width="40" height="40""#)
++        );
++        let svg = picture_page(r#"width="100" height="100""#, &body);
++        for scale in [1, 3] {
++            let (pixels, warnings) =
++                render_pictures(&svg, scale, vec![quadrant_picture(PICTURE_ID)]);
++            assert!(warnings.is_empty(), "{warnings:?}");
++            // Over the black rect drawn before it, under the magenta rect drawn after it.
++            assert_rgba_near(&pixels, (30 * scale, 30 * scale), QUADRANTS[0]);
++            assert_rgba_near(&pixels, (30 * scale, 50 * scale), QUADRANTS[2]);
++            assert_rgba_near(&pixels, (50 * scale, 30 * scale), [255, 0, 255, 255]);
++            assert_rgba_near(&pixels, (15 * scale, 15 * scale), [0, 0, 0, 255]);
++            // A bare horizontal line has no fill box, and must still be stroked.
++            assert_rgba_near(
++                &pixels,
++                (20 * scale, 94 * scale + scale / 2),
++                [0, 255, 0, 255],
++            );
++
++            // Off the picture, the page is what resvg draws for the same SVG on its own.
++            let (reference, _) = render_pictures(&svg, scale, Vec::new());
++            let frame = (20 * scale - 1)..(60 * scale + 1);
++            for (x, y, pixel) in pixels.enumerate_pixels() {
++                if frame.contains(&x) && frame.contains(&y) {
++                    continue;
++                }
++                let expected = reference.get_pixel(x, y).0;
++                assert!(
++                    pixel
++                        .0
++                        .iter()
++                        .zip(expected)
++                        .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
++                    "pixel ({x}, {y}) is {:?}; resvg alone draws {expected:?}",
++                    pixel.0
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn supplied_pictures_honour_group_opacity_alpha_and_slice_clipping() {
++        let body = format!(
++            r#"<g opacity="0.5">{}</g>{}<image id="chemdraft-raster-picture-2" x="50" y="0" width="40" height="20" preserveAspectRatio="xMidYMid slice" href="{}"/>"#,
++            stand_in(PICTURE_ID, 8, 8, r#"x="0" y="0" width="40" height="40""#),
++            stand_in(
++                "chemdraft-raster-picture-1",
++                1,
++                1,
++                r#"x="0" y="60" width="20" height="20""#
++            ),
++            pictures::placeholder_href(8, 8, "chemdraft-raster-picture-2")
++        );
++        let svg = picture_page(r#"width="100" height="100""#, &body);
++        let (pixels, warnings) = render_pictures(
++            &svg,
++            1,
++            vec![
++                quadrant_picture(PICTURE_ID),
++                supplied_picture("chemdraft-raster-picture-1", 1, 1, &[0, 0, 255, 128]),
++                quadrant_picture("chemdraft-raster-picture-2"),
++            ],
++        );
++        assert!(warnings.is_empty(), "{warnings:?}");
++        // Half-opaque red, and a half-transparent (straight alpha) blue pixel, over white.
++        assert_rgba_near(&pixels, (10, 10), [255, 128, 128, 255]);
++        assert_rgba_near(&pixels, (10, 70), [127, 127, 255, 255]);
++        // The slice covers its 40 × 20 frame with the picture's middle rows, clipped to the frame.
++        assert_rgba_near(&pixels, (55, 5), QUADRANTS[0]);
++        assert_rgba_near(&pixels, (85, 15), QUADRANTS[3]);
++        assert_rgba_near(&pixels, (55, 25), WHITE);
++    }
++
++    #[test]
++    fn omitted_picture_warnings_name_each_reason_and_skip_drawn_pictures() {
++        let id = |index: usize| format!("chemdraft-raster-picture-{index}");
++        let frame = |x: u32| format!(r#"x="{x}" y="0" width="10" height="10""#);
++        let body = format!(
++            r##"<defs><mask id="m"><rect width="100" height="100" fill="#ffffff"/></mask><pattern id="p" width="10" height="10" patternUnits="userSpaceOnUse">{}</pattern></defs>{}{}{}{}{}<g mask="url(#m)">{}</g><rect x="50" y="50" width="10" height="10" fill="url(#p)"/><image x="80" y="80" width="10" height="10" href="data:image/jpeg;base64,/9j/4AAQ"/>"##,
++            stand_in(&id(6), 8, 8, &frame(0)),
++            stand_in(&id(0), 8, 8, &frame(0)),
++            stand_in(&id(1), 1, 1, &frame(10)),
++            stand_in(&id(2), 1, 1, &frame(20)),
++            stand_in(&id(3), 1, 1, &frame(30)),
++            stand_in(&id(4), 1, 1, &frame(40)),
++            stand_in(&id(5), 8, 8, &frame(50)),
++        );
++        let svg = picture_page(r#"width="100" height="100""#, &body);
++        let (pixels, warnings) = render_pictures(
++            &svg,
++            1,
++            vec![
++                quadrant_picture(&id(0)),
++                refused_picture(&id(1), pictures::PictureRefusal::TooLarge),
++                refused_picture(&id(2), pictures::PictureRefusal::TooLarge),
++                refused_picture(&id(3), pictures::PictureRefusal::OverBudget),
++                refused_picture(&id(4), pictures::PictureRefusal::DecodeFailed),
++                quadrant_picture(&id(5)),
++                quadrant_picture(&id(6)),
++            ],
++        );
++        let messages: Vec<&str> = warnings
++            .iter()
++            .map(|warning| warning.message.as_str())
++            .collect();
++        assert_eq!(
++            messages,
++            [
++                "PNG export: PNG and other bitmap pictures are not included in image exports yet; export SVG or PDF to include them.",
++                "PNG export: 2 pictures larger than 16384 px on a side were not included; export SVG or PDF to include them.",
++                "PNG export: 1 picture was not included because the pictures in this export exceed 256 MiB once decoded; export SVG or PDF to include it.",
++                "PNG export: 1 picture could not be decoded and was not included; export SVG or PDF to include it.",
++                "PNG export: 2 pictures inside a mask, filter, blend mode, pattern or marker were not included; export SVG or PDF to include them.",
++            ]
++        );
++        assert!(warnings.iter().all(|warning| {
++            warning.code == "raster_pictures_omitted" && warning.severity == "warning"
++        }));
++        // The drawn picture is there; the masked one is not drawn at all.
++        assert_rgba_near(&pixels, (2, 2), QUADRANTS[0]);
++        assert_rgba_near(&pixels, (52, 2), WHITE);
++
++        // Stand-ins whose pixels were not sent fall back to the general warning, once.
++        let (_, unsupplied) = render_pictures(&svg, 1, Vec::new());
++        assert_eq!(unsupplied.len(), 1);
++        assert_eq!(unsupplied[0].message, messages[0]);
++    }
++
++    #[test]
++    fn supplied_picture_sizes_lengths_and_budget_are_validated_before_unpacking() {
++        let picture = |id: &str, width: Option<u32>, height: Option<u32>, rgba_base64: &str| {
++            pictures::RasterPictureInput {
++                id: id.to_string(),
++                width,
++                height,
++                rgba_base64: Some(rgba_base64.to_string()),
++                refused: None,
++            }
++        };
++        let refused = |id: &str| refused_picture(id, pictures::PictureRefusal::DecodeFailed);
++        let second = "chemdraft-raster-picture-1";
++        let full_budget = Some(8192);
++        let cases = [
++            (
++                vec![picture(PICTURE_ID, Some(2), Some(2), "AAAA")],
++                format!("picture {PICTURE_ID} does not carry 2 × 2 RGBA pixels"),
++            ),
++            (
++                vec![picture(PICTURE_ID, Some(1), Some(1), "AAAAAAA=")],
++                format!("picture {PICTURE_ID} does not carry 1 × 1 RGBA pixels"),
++            ),
++            (
++                vec![picture(PICTURE_ID, Some(1), Some(1), "!!!!!!!!")],
++                format!("picture {PICTURE_ID} is not valid base64"),
++            ),
++            (
++                vec![picture(PICTURE_ID, Some(16385), Some(1), "")],
++                format!("picture {PICTURE_ID} is 16385 × 1 px; each side must be 1 to 16384 px"),
++            ),
++            (
++                vec![picture(PICTURE_ID, None, Some(4), "")],
++                format!("picture {PICTURE_ID} is 0 × 4 px"),
++            ),
++            // Exactly the budget passes the size checks (and then fails on its empty payload).
++            (
++                vec![picture(PICTURE_ID, full_budget, full_budget, "")],
++                format!("picture {PICTURE_ID} does not carry 8192 × 8192 RGBA pixels"),
++            ),
++            (
++                vec![
++                    picture(PICTURE_ID, full_budget, full_budget, ""),
++                    picture(second, Some(1), Some(1), ""),
++                ],
++                "the pictures exceed 256 MiB of decoded pixels".to_string(),
++            ),
++            (
++                vec![refused(PICTURE_ID), refused(PICTURE_ID)],
++                format!("picture id {PICTURE_ID:?} is malformed or repeated"),
++            ),
++            (
++                vec![refused("picture-0")],
++                "picture id \"picture-0\" is malformed or repeated".to_string(),
++            ),
++            (
++                vec![pictures::RasterPictureInput {
++                    refused: Some(pictures::PictureRefusal::TooLarge),
++                    ..picture(PICTURE_ID, Some(1), Some(1), "AAAA/w==")
++                }],
++                format!("picture {PICTURE_ID} must carry either pixels or a refusal"),
++            ),
++            (
++                vec![pictures::RasterPictureInput {
++                    id: PICTURE_ID.to_string(),
++                    ..Default::default()
++                }],
++                format!("picture {PICTURE_ID} must carry either pixels or a refusal"),
++            ),
++            (
++                (0..=pictures::MAX_PICTURES)
++                    .map(|index| refused(&format!("chemdraft-raster-picture-{index}")))
++                    .collect(),
++                "1025 pictures; the limit is 1024".to_string(),
++            ),
++        ];
++        for (supplied, detail) in cases {
++            let error = rasterize_svg_impl(RasterExportRequest {
++                pictures: supplied,
++                ..request(RasterExportFormat::Png)
++            })
++            .expect_err("invalid picture data must fail the export");
++            assert!(
++                error.starts_with(
++                    "Could not export PNG: the picture data sent for raster export is invalid ("
++                ) && error.contains(&detail),
++                "{error}"
++            );
++        }
++
++        // The shape the webview sends; pictures without a stand-in in the SVG are not reported.
++        let request: RasterExportRequest = serde_json::from_value(serde_json::json!({
++            "svg": SIMPLE_SVG,
++            "format": "png",
++            "pictures": [
++                { "id": PICTURE_ID, "width": 1, "height": 1, "rgbaBase64": "AAAA/w==" },
++                { "id": "chemdraft-raster-picture-1", "refused": "tooLarge" },
++                { "id": "chemdraft-raster-picture-2", "refused": "overBudget" },
++                { "id": "chemdraft-raster-picture-3", "refused": "decodeFailed" }
++            ]
++        }))
++        .expect("the webview's picture shape deserializes");
++        assert_eq!(
++            request
++                .pictures
++                .iter()
++                .map(|picture| picture.refused)
++                .collect::<Vec<_>>(),
++            [
++                None,
++                Some(pictures::PictureRefusal::TooLarge),
++                Some(pictures::PictureRefusal::OverBudget),
++                Some(pictures::PictureRefusal::DecodeFailed)
++            ]
++        );
++        let response = rasterize_svg_impl(request).expect("valid pictures export");
++        assert!(response.warnings.is_empty());
++    }
++
++    fn warning_messages(warnings: &[RasterExportWarning]) -> Vec<&str> {
++        warnings
++            .iter()
++            .map(|warning| warning.message.as_str())
++            .collect()
++    }
++
++    #[test]
++    fn supplied_pictures_are_drawn_beside_bare_lines_with_gradient_and_pattern_strokes() {
++        // Horizontal and vertical lines have no fill box, so resvg::render_node cannot draw them
++        // on their own; every stroke paint must still be drawn, and the picture with them.
++        let defs = r##"<defs><linearGradient id="g" x1="0" y1="0" x2="100" y2="0" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient><radialGradient id="r" cx="50" cy="90" r="50" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#00ffff"/><stop offset="1" stop-color="#000000"/></radialGradient><pattern id="p" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="2" height="4" fill="#00aa00"/><line x1="0" y1="3" x2="4" y2="3" stroke="url(#g)"/></pattern></defs>"##;
++        let lines = r#"<line x1="0" y1="80" x2="100" y2="80" stroke="url(#g)" stroke-width="4"/><line x1="0" y1="90" x2="100" y2="90" stroke="url(#r)" stroke-width="4"/><line x1="80" y1="0" x2="80" y2="100" stroke="url(#p)" stroke-width="4"/>"#;
++        let picture = stand_in(PICTURE_ID, 8, 8, r#"x="20" y="20" width="40" height="40""#);
++        for group in ["<g>", r#"<g opacity="0.5">"#] {
++            let svg = picture_page(
++                r#"width="100" height="100""#,
++                &format!("{defs}{group}{picture}{lines}</g>"),
++            );
++            for scale in [1, 3] {
++                let (pixels, warnings) =
++                    render_pictures(&svg, scale, vec![quadrant_picture(PICTURE_ID)]);
++                assert!(warnings.is_empty(), "{warnings:?}");
++                assert_ne!(pixels.get_pixel(30 * scale, 30 * scale).0, WHITE);
++                assert_ne!(pixels.get_pixel(50 * scale, 50 * scale).0, WHITE);
++
++                // Off the picture, the page is what resvg draws for the same SVG on its own.
++                let (reference, _) = render_pictures(&svg, scale, Vec::new());
++                for (x, y) in [(50, 80), (50, 90), (80, 10)] {
++                    assert_ne!(
++                        reference.get_pixel(x * scale, y * scale).0,
++                        WHITE,
++                        "resvg draws the line at ({x}, {y})"
++                    );
++                }
++                let frame = (20 * scale - 1)..(60 * scale + 1);
++                for (x, y, pixel) in pixels.enumerate_pixels() {
++                    if frame.contains(&x) && frame.contains(&y) {
++                        continue;
++                    }
++                    let expected = reference.get_pixel(x, y).0;
++                    assert!(
++                        pixel
++                            .0
++                            .iter()
++                            .zip(expected)
++                            .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
++                        "{group} at {scale}x: pixel ({x}, {y}) is {:?}; resvg alone draws {expected:?}",
++                        pixel.0
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn svg_pictures_whose_ids_look_generated_are_drawn_without_a_warning() {
++        let red = svg_data_uri(
++            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##,
++        );
++        let red_picture = format!(
++            r#"<image id="chemdraft-raster-picture-7" x="0" y="0" width="10" height="10" href="{red}"/>"#
++        );
++        let with_supplied = picture_page(
++            r#"width="40" height="20""#,
++            &format!(
++                "{red_picture}{}",
++                stand_in(PICTURE_ID, 8, 8, r#"x="20" y="0" width="20" height="20""#)
++            ),
++        );
++        let (pixels, warnings) =
++            render_pictures(&with_supplied, 1, vec![quadrant_picture(PICTURE_ID)]);
++        assert!(warnings.is_empty(), "{warnings:?}");
++        assert_rgba_near(&pixels, (5, 5), [255, 0, 0, 255]);
++        assert_rgba_near(&pixels, (22, 2), QUADRANTS[0]);
++
++        let alone = picture_page(r#"width="40" height="20""#, &red_picture);
++        let (pixels, warnings) = render_pictures(&alone, 1, Vec::new());
++        assert!(warnings.is_empty(), "{warnings:?}");
++        assert_rgba_near(&pixels, (5, 5), [255, 0, 0, 255]);
++    }
++
++    #[test]
++    fn pictures_left_out_for_the_picture_count_are_reported_with_that_reason() {
++        let over = |x: u32| {
++            format!(
++                r#"<image x="{x}" y="0" width="10" height="10" href="{}"/>"#,
++                pictures::OVER_COUNT_HREF
++            )
++        };
++        let body = format!(
++            "{}{}{}",
++            stand_in(PICTURE_ID, 8, 8, r#"x="0" y="0" width="10" height="10""#),
++            over(10),
++            over(20)
++        );
++        let svg = picture_page(r#"width="30" height="10""#, &body);
++        let (pixels, warnings) = render_pictures(&svg, 1, vec![quadrant_picture(PICTURE_ID)]);
++        assert_eq!(
++            warning_messages(&warnings),
++            ["PNG export: 2 pictures were not included because this export has more than 1024 pictures; export SVG or PDF to include them."]
++        );
++        assert_rgba_near(&pixels, (2, 2), QUADRANTS[0]);
++        assert_rgba_near(&pixels, (15, 5), WHITE);
++
++        let (_, warnings) = render_pictures(
++            &picture_page(r#"width="30" height="10""#, &over(0)),
++            1,
++            Vec::new(),
++        );
++        assert_eq!(
++            warning_messages(&warnings),
++            ["PNG export: 1 picture was not included because this export has more than 1024 pictures; export SVG or PDF to include it."]
++        );
++    }
++
++    #[test]
++    fn a_picture_used_again_inside_a_mask_is_drawn_and_warns_only_for_the_masked_copy() {
++        let body = format!(
++            r##"<defs><mask id="m"><rect width="100" height="100" fill="#ffffff"/></mask></defs>{}<g mask="url(#m)"><use href="#{PICTURE_ID}" x="50" y="50"/></g>"##,
++            stand_in(PICTURE_ID, 8, 8, r#"x="0" y="0" width="40" height="40""#)
++        );
++        let svg = picture_page(r#"width="100" height="100""#, &body);
++        let (pixels, warnings) = render_pictures(&svg, 1, vec![quadrant_picture(PICTURE_ID)]);
++        assert_eq!(
++            warning_messages(&warnings),
++            ["PNG export: 1 picture was included, but not its copies inside a mask, filter, blend mode or pattern; export SVG or PDF to include every copy."]
++        );
++        assert_rgba_near(&pixels, (10, 10), QUADRANTS[0]);
++        assert_rgba_near(&pixels, (60, 60), WHITE);
++    }
++
++    #[test]
++    fn copies_of_a_picture_made_by_reference_are_counted_as_left_out() {
++        // usvg drops the ids of copies made through `<use>` or `<feImage>`, so they are not drawn.
++        let picture = stand_in(PICTURE_ID, 8, 8, r#"x="0" y="0" width="40" height="40""#);
++        for copy in [
++            format!(r##"<use href="#{PICTURE_ID}" x="50" y="50"/>"##),
++            format!(
++                r##"<defs><filter id="f"><feImage href="#{PICTURE_ID}"/></filter></defs><rect x="50" y="50" width="40" height="40" fill="#000000" filter="url(#f)"/>"##
++            ),
++        ] {
++            let svg = picture_page(r#"width="100" height="100""#, &format!("{picture}{copy}"));
++            let (pixels, warnings) = render_pictures(&svg, 1, vec![quadrant_picture(PICTURE_ID)]);
++            assert_eq!(
++                warning_messages(&warnings),
++                ["PNG export: 1 picture was included, but not its copies inside a mask, filter, blend mode or pattern; export SVG or PDF to include every copy."],
++                "{copy}"
++            );
++            assert_rgba_near(&pixels, (10, 10), QUADRANTS[0]);
++            assert_rgba_near(&pixels, (60, 60), WHITE);
++        }
++    }
++
++    #[test]
++    fn links_and_unrelated_blank_images_are_not_counted_as_copies() {
++        // A link clones nothing, and a blank SVG image of a picture's size is no copy of it, nor
++        // is one that only hides a path with the picture's id.
++        let picture = stand_in(PICTURE_ID, 8, 8, r#"x="0" y="0" width="40" height="40""#);
++        let blank =
++            |href: &str| format!(r#"<image x="50" y="50" width="40" height="40" href="{href}"/>"#);
++        let unmarked = blank(
++            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='8'%20height='8'/%3E",
++        );
++        let other_picture = blank(&pictures::placeholder_href(
++            8,
++            8,
++            "chemdraft-raster-picture-9",
++        ));
++        let forged = |size: &str, d: &str| {
++            blank(&format!(
++                "data:image/svg+xml;base64,{}",
++                base64::engine::general_purpose::STANDARD.encode(format!(
++                    "<svg xmlns='http://www.w3.org/2000/svg' {size}><path id='{PICTURE_ID}' d='{d}' fill='none'/></svg>"
++                ))
++            ))
++        };
++        let forgeries = [
++            forged("width='3' height='5'", "M0 0H2V2H0Z"),
++            forged("width='8' height='8'", "M0 0H2V2H0Z"),
++            forged("width='5' height='8'", "M0 0H1V1H0Z"),
++        ]
++        .concat();
++        let link = |id: &str| {
++            format!(
++                r##"<a href="#{id}"><rect x="50" y="0" width="10" height="10" fill="#000000"/></a>"##
++            )
++        };
++        for body in [
++            format!(r##"<a href="#{PICTURE_ID}">{picture}</a>{unmarked}"##),
++            format!("{picture}{}{unmarked}{other_picture}", link(PICTURE_ID)),
++            format!(r#"<g id="group">{picture}</g>{}{unmarked}"#, link("group")),
++            format!("{picture}{forgeries}"),
++        ] {
++            let svg = picture_page(r#"width="100" height="100""#, &body);
++            let (pixels, warnings) = render_pictures(&svg, 1, vec![quadrant_picture(PICTURE_ID)]);
++            assert!(warnings.is_empty(), "{body}: {warnings:?}");
++            assert_rgba_near(&pixels, (10, 10), QUADRANTS[0]);
++            assert_rgba_near(&pixels, (60, 60), WHITE);
++        }
++    }
++
++    #[test]
++    fn each_copy_is_blamed_only_on_the_picture_it_copies() {
++        // Two pictures of the same size; only the second is copied, inside a mask.
++        let second = "chemdraft-raster-picture-1";
++        let body = format!(
++            r##"<defs><mask id="m"><rect width="100" height="100" fill="#ffffff"/></mask></defs>{}{}<g mask="url(#m)"><use href="#{second}" x="50" y="50"/></g>"##,
++            stand_in(PICTURE_ID, 8, 8, r#"x="0" y="0" width="40" height="40""#),
++            stand_in(second, 8, 8, r#"x="50" y="0" width="40" height="40""#),
++        );
++        let svg = picture_page(r#"width="100" height="100""#, &body);
++        let (pixels, warnings) = render_pictures(
++            &svg,
++            1,
++            vec![quadrant_picture(PICTURE_ID), quadrant_picture(second)],
++        );
++        assert_eq!(
++            warning_messages(&warnings),
++            ["PNG export: 1 picture was included, but not its copies inside a mask, filter, blend mode or pattern; export SVG or PDF to include every copy."]
++        );
++        assert_rgba_near(&pixels, (10, 10), QUADRANTS[0]);
++        assert_rgba_near(&pixels, (60, 10), QUADRANTS[0]);
++        assert_rgba_near(&pixels, (60, 60), WHITE);
++    }
+ }
+diff --git a/apps/desktop/src-tauri/src/export/pictures.rs b/apps/desktop/src-tauri/src/export/pictures.rs
+new file mode 100644
+index 000000000..c8217fb71
+--- /dev/null
++++ b/apps/desktop/src-tauri/src/export/pictures.rs
+@@ -0,0 +1,1455 @@
++//! Bitmap pictures in raster export, drawn without a native image decoder.
++//!
++//! resvg is built without `raster-images`, so it never decodes a bitmap. The webview decodes each
++//! PNG picture instead (`rasterPictureDecode.ts`) and sends straight-alpha RGBA8 pixels that are
++//! checked here by size and length alone. In the SVG, the picture's `<image>` keeps its frame and
++//! z-order but carries an id and a blank stand-in SVG of the picture's pixel size, so usvg still
++//! resolves its placement (`preserveAspectRatio`, transforms, clipping) exactly as for any image.
++//! The stand-in holds one invisible path whose id is the picture's, so every copy of it names its
++//! picture, even where usvg has dropped the `<image>`'s own id.
++//! The tree is then rendered node by node: everything through resvg, and each stand-in from the
++//! supplied pixels with the same transform and sampling resvg would give a decoded bitmap.
++//!
++//! A picture copy that cannot be drawn exactly (inside a mask, filter, blend mode, pattern or
++//! marker) is not drawn and gets a warning, counted per rendered copy, as do pictures the webview
++//! refused to decode or left out because the export has more than `MAX_PICTURES` of them. usvg
++//! drops the ids of copies made by reference (`<use>`, `<feImage>`), so those copies are never
++//! drawn either; they are found by their stand-in, which must be exactly the picture's, and
++//! counted as left out.
++
++use std::collections::{HashMap, HashSet};
++
++use resvg::{tiny_skia, usvg};
++
++use super::{warning, RasterExportWarning};
++
++pub(super) const MAX_PICTURE_SIDE_PX: u32 = 16384;
++/// Decoded pixels (width × height × 4) across all pictures of one export.
++pub(super) const MAX_DECODED_PICTURE_BYTES: u64 = 256 * 1024 * 1024;
++pub(super) const MAX_PICTURES: usize = 1024;
++pub(super) const PICTURE_ID_PREFIX: &str = "chemdraft-raster-picture-";
++const MAX_PICTURE_ID_LEN: usize = 64;
++const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
++const PLACEHOLDER_HREF_START: &str =
++    "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='";
++const PLACEHOLDER_HREF_MIDDLE: &str = "'%20height='";
++const PLACEHOLDER_HREF_ID: &str = "'%3E%3Cpath%20id='";
++const PLACEHOLDER_HREF_END: &str = "'%20d='M0%200H1V1H0Z'%20fill='none'/%3E%3C/svg%3E";
++/// The stand-in for a PNG picture the webview neither decoded nor sent, because the export already
++/// had `MAX_PICTURES` pictures; `RasterPictureOverCountHref` is the same string.
++pub(super) const OVER_COUNT_HREF: &str = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'%20data-chemdraft-omitted='count'/%3E";
++
++/// One picture of a raster export request: decoded pixels, or why the webview refused it.
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub(crate) struct RasterPictureInput {
++    pub(super) id: String,
++    pub(super) width: Option<u32>,
++    pub(super) height: Option<u32>,
++    /// Straight-alpha RGBA8, row-major, standard padded base64.
++    pub(super) rgba_base64: Option<String>,
++    pub(super) refused: Option<PictureRefusal>,
++}
++
++#[derive(Clone, Copy, Debug, serde::Deserialize, PartialEq, Eq, Hash)]
++#[serde(rename_all = "camelCase")]
++pub(super) enum PictureRefusal {
++    TooLarge,
++    OverBudget,
++    DecodeFailed,
++}
++
++/// Why a picture, or some copies of it, are missing from the raster output.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++enum Omission {
++    Refused(PictureRefusal),
++    OverCount,
++    Unplaceable,
++    SomeCopies,
++}
++
++/// How many rendered copies of one picture were drawn and how many were left out. A picture
++/// shown again through `<use>` has one copy per place it is rendered.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(super) struct Copies {
++    drawn: usize,
++    omitted: usize,
++}
++
++/// Where a supplied picture's stand-in sits in the SVG.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(super) struct StandIn {
++    /// Inside a `<marker>`: usvg strips ids there, so the picture can never be placed.
++    in_marker: bool,
++}
++
++/// The blank SVG standing in for picture `id`, of the picture's pixel size: one invisible path
++/// carrying the id. `rasterPicturePlaceholderHref` builds the same string.
++pub(super) fn placeholder_href(width: u32, height: u32, id: &str) -> String {
++    format!(
++        "{PLACEHOLDER_HREF_START}{width}{PLACEHOLDER_HREF_MIDDLE}{height}{PLACEHOLDER_HREF_ID}{id}{PLACEHOLDER_HREF_END}"
++    )
++}
++
++/// Whether `href` is exactly the stand-in `placeholder_href` writes for picture `id`, of any size
++/// a picture can have: each side in plain decimal, with no sign or leading zero.
++fn is_placeholder_href(href: &str, id: &str) -> bool {
++    let is_side = |digits: &str| {
++        digits.parse::<u32>().is_ok_and(|side| {
++            (1..=MAX_PICTURE_SIDE_PX).contains(&side) && side.to_string() == digits
++        })
++    };
++    href.strip_prefix(PLACEHOLDER_HREF_START)
++        .and_then(|rest| rest.strip_suffix(PLACEHOLDER_HREF_END))
++        .and_then(|rest| rest.strip_suffix(id))
++        .and_then(|rest| rest.strip_suffix(PLACEHOLDER_HREF_ID))
++        .and_then(|rest| rest.split_once(PLACEHOLDER_HREF_MIDDLE))
++        .is_some_and(|(width, height)| is_side(width) && is_side(height))
++}
++
++/// The picture in `pixmaps` whose stand-in `image` is: an SVG image whose own tree is exactly what
++/// usvg makes of the stand-in `placeholder_href` writes for that picture, at its pixel size, and
++/// nothing else. usvg parses every `<image>`'s href afresh into that image's own tree
++/// (`Tree::from_data_nested`), so the marker path's id survives on every copy, whatever usvg did
++/// to the ids of the copied elements themselves. Any other SVG image is no copy of a picture, even
++/// one that hides a path with the picture's id.
++fn stand_in_picture<'p>(
++    image: &usvg::Image,
++    pixmaps: &HashMap<&'p str, &tiny_skia::Pixmap>,
++) -> Option<&'p str> {
++    let usvg::ImageKind::SVG(tree) = image.kind() else {
++        return None;
++    };
++    // The stand-in has no viewBox, so usvg puts its path straight into the root, ungrouped.
++    let [usvg::Node::Path(path)] = tree.root().children() else {
++        return None;
++    };
++    let (&id, pixmap) = pixmaps.get_key_value(path.id())?;
++    let size = tree.size();
++    let is_stand_in = size.width() == pixmap.width() as f32
++        && size.height() == pixmap.height() as f32
++        && !tree.has_defs_nodes()
++        && is_marker_path(path);
++    is_stand_in.then_some(id)
++}
++
++/// The stand-in's `<path d='M0 0H1V1H0Z' fill='none'/>` as usvg converts it: unpainted, hence
++/// invisible, and untransformed.
++fn is_marker_path(path: &usvg::Path) -> bool {
++    let point = tiny_skia::Point::from_xy;
++    !path.is_visible()
++        && path.fill().is_none()
++        && path.stroke().is_none()
++        && path.abs_transform().is_identity()
++        && path.data().segments().eq([
++            tiny_skia::PathSegment::MoveTo(point(0.0, 0.0)),
++            tiny_skia::PathSegment::LineTo(point(1.0, 0.0)),
++            tiny_skia::PathSegment::LineTo(point(1.0, 1.0)),
++            tiny_skia::PathSegment::LineTo(point(0.0, 1.0)),
++            tiny_skia::PathSegment::Close,
++        ])
++}
++
++/// The href of an SVG `<image>` that has exactly one (in any namespace usvg reads).
++fn single_image_href<'a>(node: &usvg::roxmltree::Node<'a, '_>) -> Option<&'a str> {
++    if !node.is_element()
++        || node.tag_name().name() != "image"
++        || node.tag_name().namespace() != Some(SVG_NAMESPACE)
++    {
++        return None;
++    }
++    let mut hrefs = node.attributes().filter(|attr| attr.name() == "href");
++    let href = hrefs.next()?;
++    hrefs.next().is_none().then_some(href.value())
++}
++
++/// A picture stand-in whose pixels were not supplied: an id of the generated form and the stand-in
++/// href for that id. An image whose id merely starts like a generated one, or whose href is only
++/// close to a stand-in's, is judged by its href like any other.
++pub(super) fn is_unsupplied_stand_in(node: &usvg::roxmltree::Node<'_, '_>) -> bool {
++    node.attribute("id").is_some_and(|id| {
++        valid_picture_id(id)
++            && single_image_href(node).is_some_and(|href| is_placeholder_href(href, id))
++    })
++}
++
++/// A PNG picture the webview left out because the export had more than `MAX_PICTURES`.
++pub(super) fn is_over_count_stand_in(node: &usvg::roxmltree::Node<'_, '_>) -> bool {
++    single_image_href(node) == Some(OVER_COUNT_HREF)
++}
++
++enum Supplied {
++    Decoded(tiny_skia::Pixmap),
++    Refused(PictureRefusal),
++}
++
++/// The pictures of one request, validated and unpacked into premultiplied pixmaps.
++pub(super) struct SuppliedPictures {
++    pictures: HashMap<String, Supplied>,
++}
++
++impl SuppliedPictures {
++    pub(super) fn from_request(
++        inputs: Vec<RasterPictureInput>,
++        label: &str,
++    ) -> Result<Self, String> {
++        let invalid = |detail: String| {
++            format!("Could not export {label}: the picture data sent for raster export is invalid ({detail}).")
++        };
++        if inputs.len() > MAX_PICTURES {
++            return Err(invalid(format!(
++                "{} pictures; the limit is {MAX_PICTURES}",
++                inputs.len()
++            )));
++        }
++
++        // serde has already deserialized the IPC request (its base64 strings included) by the time
++        // this runs; the webview is the app's own caller. These checks bound only what follows:
++        // every id, size and the per-export total first, then the payload lengths, and only then
++        // the unpacking, so an oversized request allocates no pixel buffers.
++        let mut ids = HashSet::new();
++        let mut total_bytes = 0u64;
++        for input in &inputs {
++            let id = &input.id;
++            if !valid_picture_id(id) || !ids.insert(id.as_str()) {
++                return Err(invalid(format!(
++                    "picture id {id:?} is malformed or repeated"
++                )));
++            }
++            match (&input.rgba_base64, input.refused) {
++                (Some(_), None) => {
++                    let (width, height) = (input.width.unwrap_or(0), input.height.unwrap_or(0));
++                    if !(1..=MAX_PICTURE_SIDE_PX).contains(&width)
++                        || !(1..=MAX_PICTURE_SIDE_PX).contains(&height)
++                    {
++                        return Err(invalid(format!(
++                            "picture {id} is {width} × {height} px; each side must be 1 to {MAX_PICTURE_SIDE_PX} px"
++                        )));
++                    }
++                    total_bytes += u64::from(width) * u64::from(height) * 4;
++                    if total_bytes > MAX_DECODED_PICTURE_BYTES {
++                        return Err(invalid(format!(
++                            "the pictures exceed {} MiB of decoded pixels",
++                            MAX_DECODED_PICTURE_BYTES / (1024 * 1024)
++                        )));
++                    }
++                }
++                (None, Some(_)) => {}
++                _ => {
++                    return Err(invalid(format!(
++                        "picture {id} must carry either pixels or a refusal"
++                    )))
++                }
++            }
++        }
++        for input in &inputs {
++            if let (Some(rgba_base64), Some(width), Some(height)) =
++                (&input.rgba_base64, input.width, input.height)
++            {
++                let bytes = u64::from(width) * u64::from(height) * 4;
++                if rgba_base64.len() as u64 != bytes.div_ceil(3) * 4 {
++                    return Err(invalid(format!(
++                        "picture {} does not carry {width} × {height} RGBA pixels",
++                        input.id
++                    )));
++                }
++            }
++        }
++
++        let mut pictures = HashMap::with_capacity(inputs.len());
++        for input in inputs {
++            let supplied = match (input.rgba_base64, input.refused) {
++                (Some(rgba_base64), _) => {
++                    let (width, height) = (input.width.unwrap_or(0), input.height.unwrap_or(0));
++                    // `decode` takes the string by value, so each picture's base64 is freed as
++                    // soon as it is unpacked, and the decoded buffer becomes the pixmap in place.
++                    let mut rgba = base64::Engine::decode(
++                        &base64::engine::general_purpose::STANDARD,
++                        rgba_base64,
++                    )
++                    .map_err(|error| {
++                        invalid(format!("picture {} is not valid base64: {error}", input.id))
++                    })?;
++                    premultiply(&mut rgba);
++                    let pixmap = tiny_skia::IntSize::from_wh(width, height)
++                        .and_then(|size| tiny_skia::Pixmap::from_vec(rgba, size))
++                        .ok_or_else(|| {
++                            invalid(format!(
++                                "picture {} does not carry {width} × {height} RGBA pixels",
++                                input.id
++                            ))
++                        })?;
++                    Supplied::Decoded(pixmap)
++                }
++                (None, Some(refusal)) => Supplied::Refused(refusal),
++                (None, None) => unreachable!("validated above"),
++            };
++            pictures.insert(input.id, supplied);
++        }
++        Ok(Self { pictures })
++    }
++
++    pub(super) fn is_empty(&self) -> bool {
++        self.pictures.is_empty()
++    }
++
++    fn expected_href(&self, id: &str) -> Option<String> {
++        Some(match self.pictures.get(id)? {
++            Supplied::Decoded(pixmap) => placeholder_href(pixmap.width(), pixmap.height(), id),
++            Supplied::Refused(_) => placeholder_href(1, 1, id),
++        })
++    }
++
++    /// The supplied pictures whose stand-in is in the SVG: exactly one SVG `<image>` with the id
++    /// and a single href equal to the expected stand-in, each with where it sits.
++    pub(super) fn find_stand_ins(
++        &self,
++        document: &usvg::roxmltree::Document<'_>,
++    ) -> HashMap<String, StandIn> {
++        let mut elements: HashMap<&str, Vec<usvg::roxmltree::Node<'_, '_>>> = HashMap::new();
++        for node in document.descendants().filter(|node| node.is_element()) {
++            if let Some(id) = node.attribute("id") {
++                if self.pictures.contains_key(id) {
++                    elements.entry(id).or_default().push(node);
++                }
++            }
++        }
++        elements
++            .into_iter()
++            .filter_map(|(id, nodes)| {
++                let [node] = nodes.as_slice() else {
++                    return None;
++                };
++                let href = single_image_href(node)?;
++                (href == self.expected_href(id)?).then(|| {
++                    let in_marker = node.ancestors().any(|ancestor| {
++                        ancestor.tag_name().name() == "marker"
++                            && ancestor.tag_name().namespace() == Some(SVG_NAMESPACE)
++                    });
++                    (id.to_string(), StandIn { in_marker })
++                })
++            })
++            .collect()
++    }
++
++    /// Renders `tree` as `resvg::render` would, plus every placeable decoded picture.
++    /// Returns, per picture id, how many rendered copies were drawn and how many left out.
++    pub(super) fn render(
++        &self,
++        tree: &usvg::Tree,
++        stand_ins: &HashMap<String, StandIn>,
++        transform: tiny_skia::Transform,
++        canvas: &mut tiny_skia::PixmapMut<'_>,
++    ) -> HashMap<String, Copies> {
++        let pixmaps: HashMap<&str, &tiny_skia::Pixmap> = self
++            .pictures
++            .iter()
++            .filter_map(|(id, supplied)| match supplied {
++                Supplied::Decoded(pixmap)
++                    if stand_ins
++                        .get(id)
++                        .is_some_and(|stand_in| !stand_in.in_marker) =>
++                {
++                    Some((id.as_str(), pixmap))
++                }
++                _ => None,
++            })
++            .collect();
++        if pixmaps.is_empty() {
++            resvg::render(tree, transform, canvas);
++            return HashMap::new();
++        }
++
++        let mut renderer = PictureRenderer {
++            pixmaps: &pixmaps,
++            copies: Vec::new(),
++        };
++        let root = tree.root();
++        renderer.render_children(root, None, transform, canvas);
++        // Pictures used by patterns, masks, clip paths or filter images are drawn there by resvg,
++        // which has no pixels for them; report them rather than show them only in some places.
++        renderer.mark_subroot_pictures(root, &mut SharedSubroots::default());
++        // Copies made by reference have lost their ids, so none of the above saw them.
++        renderer.copies.extend(
++            find_copies_by_reference(root, &pixmaps)
++                .into_iter()
++                .map(|id| (id.to_string(), false)),
++        );
++        let mut copies: HashMap<String, Copies> = HashMap::new();
++        for (id, drawn) in renderer.copies {
++            let entry = copies.entry(id).or_default();
++            if drawn {
++                entry.drawn += 1;
++            } else {
++                entry.omitted += 1;
++            }
++        }
++        copies
++    }
++
++    /// One warning per reason, counting the pictures in the SVG that were not drawn, or drawn
++    /// only in some of the places they are used. `over_count` is the number of stand-ins the
++    /// webview left out for exceeding `MAX_PICTURES`, which have no entry in the request.
++    pub(super) fn omission_warnings(
++        &self,
++        stand_ins: &HashMap<String, StandIn>,
++        copies: &HashMap<String, Copies>,
++        over_count: usize,
++        label: &str,
++    ) -> Vec<RasterExportWarning> {
++        let mut counts: HashMap<Omission, usize> = HashMap::new();
++        if over_count > 0 {
++            counts.insert(Omission::OverCount, over_count);
++        }
++        for (id, supplied) in &self.pictures {
++            let Some(&StandIn { in_marker, .. }) = stand_ins.get(id) else {
++                continue;
++            };
++            let omission = match supplied {
++                Supplied::Refused(refusal) => Omission::Refused(*refusal),
++                Supplied::Decoded(_) => {
++                    let Copies { drawn, omitted } = copies.get(id).copied().unwrap_or_default();
++                    if in_marker || drawn == 0 {
++                        Omission::Unplaceable
++                    } else if omitted > 0 {
++                        Omission::SomeCopies
++                    } else {
++                        continue;
++                    }
++                }
++            };
++            *counts.entry(omission).or_default() += 1;
++        }
++        [
++            Omission::Refused(PictureRefusal::TooLarge),
++            Omission::Refused(PictureRefusal::OverBudget),
++            Omission::Refused(PictureRefusal::DecodeFailed),
++            Omission::OverCount,
++            Omission::Unplaceable,
++            Omission::SomeCopies,
++        ]
++        .into_iter()
++        .filter_map(|omission| {
++            let count = *counts.get(&omission)?;
++            Some(omission_warning(label, count, omission))
++        })
++        .collect()
++    }
++}
++
++fn omission_warning(label: &str, count: usize, omission: Omission) -> RasterExportWarning {
++    let (pictures, were, them, its) = if count == 1 {
++        ("1 picture".to_string(), "was", "it", "its")
++    } else {
++        (format!("{count} pictures"), "were", "them", "their")
++    };
++    let budget_mib = MAX_DECODED_PICTURE_BYTES / (1024 * 1024);
++    let message = match omission {
++        Omission::Refused(PictureRefusal::TooLarge) => format!(
++            "{label} export: {pictures} larger than {MAX_PICTURE_SIDE_PX} px on a side {were} not included; export SVG or PDF to include {them}."
++        ),
++        Omission::Refused(PictureRefusal::OverBudget) => format!(
++            "{label} export: {pictures} {were} not included because the pictures in this export exceed {budget_mib} MiB once decoded; export SVG or PDF to include {them}."
++        ),
++        Omission::Refused(PictureRefusal::DecodeFailed) => format!(
++            "{label} export: {pictures} could not be decoded and {were} not included; export SVG or PDF to include {them}."
++        ),
++        Omission::OverCount => format!(
++            "{label} export: {pictures} {were} not included because this export has more than {MAX_PICTURES} pictures; export SVG or PDF to include {them}."
++        ),
++        Omission::Unplaceable => format!(
++            "{label} export: {pictures} inside a mask, filter, blend mode, pattern or marker {were} not included; export SVG or PDF to include {them}."
++        ),
++        Omission::SomeCopies => format!(
++            "{label} export: {pictures} {were} included, but not {its} copies inside a mask, filter, blend mode or pattern; export SVG or PDF to include every copy."
++        ),
++    };
++    warning("raster_pictures_omitted", message)
++}
++
++fn valid_picture_id(id: &str) -> bool {
++    id.len() <= MAX_PICTURE_ID_LEN
++        && id.strip_prefix(PICTURE_ID_PREFIX).is_some_and(|rest| {
++            !rest.is_empty()
++                && rest
++                    .bytes()
++                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
++        })
++}
++
++/// Straight to premultiplied alpha, in place; tiny-skia pixmaps are premultiplied.
++fn premultiply(rgba: &mut [u8]) {
++    for pixel in rgba.chunks_exact_mut(4) {
++        let alpha = u16::from(pixel[3]);
++        if alpha == 255 {
++            continue;
++        }
++        for channel in &mut pixel[..3] {
++            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
++        }
++    }
++}
++
++/// The pictures in `pixmaps` with at least one copy made by reference: through `<use>` or
++/// `<feImage>`, directly or inside cloned content. Such copies are never drawn. usvg 0.47 clones
++/// a `<use>` target with every `id` ignored (svgtree `parse_svg_use_element`), and moves an
++/// `<feImage>` target's own, empty, image id onto its wrapper (filter `convert_image_inner`), so
++/// a copy has no picture wrapper; its stand-in still names the picture (`stand_in_picture`).
++/// A link that clones nothing (`<a href>`) leaves no such image, and an image that is not exactly
++/// a supplied picture's stand-in is never counted.
++///
++/// One visit per node: a clip path, mask, filter or pattern shared by several elements is entered
++/// once (`SharedSubroots`; its copies are the same whichever element uses it), and the trees of
++/// SVG images are not entered, as no reference reaches inside an image. The result holds at most
++/// one entry per picture.
++fn find_copies_by_reference<'p>(
++    root: &usvg::Group,
++    pixmaps: &HashMap<&'p str, &tiny_skia::Pixmap>,
++) -> HashSet<&'p str> {
++    let mut search = CopySearch {
++        pixmaps,
++        shared: SharedSubroots::default(),
++        omitted: HashSet::new(),
++    };
++    search.run(root);
++    search.omitted
++}
++
++struct CopySearch<'p, 'm> {
++    pixmaps: &'m HashMap<&'p str, &'m tiny_skia::Pixmap>,
++    shared: SharedSubroots,
++    omitted: HashSet<&'p str>,
++}
++
++impl CopySearch<'_, '_> {
++    fn run(&mut self, root: &usvg::Group) {
++        // An explicit stack, so no depth of groups or chain of subroots can overflow the call
++        // stack. Each entry: a group to search, and whether it is inside a picture wrapper, whose
++        // image is the picture itself, not a copy.
++        let mut stack = vec![(root, false)];
++        while let Some((parent, in_picture)) = stack.pop() {
++            for node in parent.children() {
++                match node {
++                    usvg::Node::Group(group) => {
++                        let in_picture = in_picture || self.pixmaps.contains_key(group.id());
++                        stack.push((group, in_picture));
++                    }
++                    usvg::Node::Image(image) => {
++                        if !in_picture {
++                            if let Some(id) = stand_in_picture(image, self.pixmaps) {
++                                self.omitted.insert(id);
++                            }
++                        }
++                        // Its own tree is a stand-in or an SVG picture, and no reference reaches in.
++                        continue;
++                    }
++                    usvg::Node::Path(_) | usvg::Node::Text(_) => {}
++                }
++                self.shared
++                    .subroots(node, |subroot| stack.push((subroot, false)));
++            }
++        }
++    }
++}
++
++/// The subroots of a tree's nodes, as `Node::subroots` gives them, with the contents of each shared
++/// clip path, mask, filter and pattern given once. `Node::subroots` (usvg 0.47, tree/mod.rs)
++/// enumerates a shared resource again for every node that uses it, every primitive of every filter
++/// included, before its callback could skip anything; so N groups sharing a filter of M primitives
++/// would cost N × M. This reads the same fields itself and checks each resource's identity, its
++/// `Arc` address, before reading its contents. Clip-path and mask chains are followed to their end
++/// (`Node::subroots` stops after one link), each link entered once.
++#[derive(Default)]
++struct SharedSubroots {
++    /// Addresses of the shared resources already entered; the tree outlives the walk.
++    entered: HashSet<*const ()>,
++    /// Filter primitives read, to prove each shared filter is read once.
++    #[cfg(test)]
++    primitives_read: usize,
++}
++
++impl SharedSubroots {
++    /// Whether `resource` is entered for the first time.
++    fn enter<T>(&mut self, resource: &T) -> bool {
++        self.entered.insert(std::ptr::from_ref(resource).cast())
++    }
++
++    /// Calls `f` with each subroot of `node`, leaving out shared resources already entered.
++    fn subroots<'t>(&mut self, node: &'t usvg::Node, mut f: impl FnMut(&'t usvg::Group)) {
++        match node {
++            usvg::Node::Group(group) => {
++                let mut clip = group.clip_path();
++                while let Some(clip_path) = clip.filter(|&clip_path| self.enter(clip_path)) {
++                    f(clip_path.root());
++                    clip = clip_path.clip_path();
++                }
++                let mut mask = group.mask();
++                while let Some(group_mask) = mask.filter(|&group_mask| self.enter(group_mask)) {
++                    f(group_mask.root());
++                    mask = group_mask.mask();
++                }
++                for filter in group.filters() {
++                    if !self.enter(&**filter) {
++                        continue;
++                    }
++                    for primitive in filter.primitives() {
++                        #[cfg(test)]
++                        {
++                            self.primitives_read += 1;
++                        }
++                        if let usvg::filter::Kind::Image(image) = primitive.kind() {
++                            f(image.root());
++                        }
++                    }
++                }
++            }
++            usvg::Node::Path(path) => {
++                let fill = path.fill().map(usvg::Fill::paint);
++                let stroke = path.stroke().map(usvg::Stroke::paint);
++                for paint in [fill, stroke].into_iter().flatten() {
++                    if let usvg::Paint::Pattern(pattern) = paint {
++                        if self.enter(&**pattern) {
++                            f(pattern.root());
++                        }
++                    }
++                }
++            }
++            // Owned by the node, so given once per place the node is in the tree.
++            usvg::Node::Image(image) => {
++                if let usvg::ImageKind::SVG(tree) = image.kind() {
++                    f(tree.root());
++                }
++            }
++            usvg::Node::Text(text) => f(text.flattened()),
++        }
++    }
++}
++
++struct PictureRenderer<'p> {
++    pixmaps: &'p HashMap<&'p str, &'p tiny_skia::Pixmap>,
++    /// One entry per rendered copy of a picture, in drawing order: its id and whether it was drawn.
++    copies: Vec<(String, bool)>,
++}
++
++impl PictureRenderer<'_> {
++    fn picture_id<'t>(&self, group: &'t usvg::Group) -> Option<&'t str> {
++        let id = group.id();
++        self.pixmaps.contains_key(id).then_some(id)
++    }
++
++    fn contains_pictures(&self, group: &usvg::Group) -> bool {
++        group.children().iter().any(|node| match node {
++            usvg::Node::Group(child) => {
++                self.pixmaps.contains_key(child.id()) || self.contains_pictures(child)
++            }
++            _ => false,
++        })
++    }
++
++    fn render_children<'t>(
++        &mut self,
++        parent: &'t usvg::Group,
++        picture: Option<&'t str>,
++        transform: tiny_skia::Transform,
++        canvas: &mut tiny_skia::PixmapMut<'_>,
++    ) {
++        for node in parent.children() {
++            self.render_node(node, picture, transform, canvas);
++        }
++    }
++
++    /// `picture` is the id of the enclosing picture wrapper, which usvg puts around the image.
++    fn render_node<'t>(
++        &mut self,
++        node: &'t usvg::Node,
++        picture: Option<&'t str>,
++        transform: tiny_skia::Transform,
++        canvas: &mut tiny_skia::PixmapMut<'_>,
++    ) {
++        match node {
++            usvg::Node::Group(group) => {
++                let picture = self.picture_id(group).or(picture);
++                if picture.is_none() && !self.contains_pictures(group) {
++                    render_with_resvg(node, transform, canvas);
++                } else {
++                    self.render_group(node, group, picture, transform, canvas);
++                }
++            }
++            usvg::Node::Image(image) if matches!(image.kind(), usvg::ImageKind::SVG(_)) => {
++                let pixmaps = self.pixmaps;
++                match picture.and_then(|id| pixmaps.get(id).map(|pixmap| (id, *pixmap))) {
++                    Some((id, pixmap)) => {
++                        self.copies.push((id.to_string(), true));
++                        draw_picture(image, pixmap, transform, canvas);
++                    }
++                    None => render_with_resvg(node, transform, canvas),
++                }
++            }
++            _ => render_plain_node(node, transform, canvas),
++        }
++    }
++
++    fn render_group<'t>(
++        &mut self,
++        node: &'t usvg::Node,
++        group: &'t usvg::Group,
++        picture: Option<&'t str>,
++        parent_transform: tiny_skia::Transform,
++        canvas: &mut tiny_skia::PixmapMut<'_>,
++    ) {
++        // Mask, filter and blend effects are left to resvg, without the pictures they contain.
++        let unsupported_effect = group.mask().is_some()
++            || !group.filters().is_empty()
++            || group.blend_mode() != usvg::BlendMode::Normal;
++        if unsupported_effect {
++            self.mark(group, picture, false);
++            render_with_resvg(node, parent_transform, canvas);
++            return;
++        }
++
++        let transform = parent_transform.pre_concat(group.transform());
++        if !group.should_isolate() {
++            self.render_children(group, picture, transform, canvas);
++            return;
++        }
++
++        // Opacity and clip-path need a layer, as in resvg's render_group. It is cropped to the
++        // canvas: neither effect reads outside its own pixel, so nothing on the canvas changes.
++        let Some(bbox) = group.layer_bounding_box().transform(transform) else {
++            // A degenerate transform: nothing of the group is visible.
++            self.mark(group, picture, true);
++            return;
++        };
++        let left = (bbox.left().floor() - 2.0).max(0.0);
++        let top = (bbox.top().floor() - 2.0).max(0.0);
++        let right = (bbox.right().ceil() + 2.0).min(canvas.width() as f32);
++        let bottom = (bbox.bottom().ceil() + 2.0).min(canvas.height() as f32);
++        let on_canvas = left < right && top < bottom;
++        if !on_canvas {
++            self.mark(group, picture, true);
++            return;
++        }
++        let (x, y) = (left as i32, top as i32);
++        let Some(mut layer) =
++            tiny_skia::Pixmap::new((right as i32 - x) as u32, (bottom as i32 - y) as u32)
++        else {
++            self.mark(group, picture, false);
++            render_with_resvg(node, parent_transform, canvas);
++            return;
++        };
++        let layer_transform =
++            tiny_skia::Transform::from_translate(-(x as f32), -(y as f32)).pre_concat(transform);
++        let first_copy = self.copies.len();
++        self.render_children(group, picture, layer_transform, &mut layer.as_mut());
++        if let Some(clip) = group.clip_path() {
++            if apply_clip(clip, layer_transform, &mut layer).is_none() {
++                // The layer is discarded, so the copies drawn into it are not on the canvas.
++                self.copies.truncate(first_copy);
++                self.mark(group, picture, false);
++                render_with_resvg(node, parent_transform, canvas);
++                return;
++            }
++        }
++        canvas.draw_pixmap(
++            x,
++            y,
++            layer.as_ref(),
++            &tiny_skia::PixmapPaint {
++                opacity: group.opacity().get(),
++                blend_mode: tiny_skia::BlendMode::SourceOver,
++                quality: tiny_skia::FilterQuality::Nearest,
++            },
++            tiny_skia::Transform::identity(),
++            None,
++        );
++    }
++
++    /// Records every picture copy in `group` (and the enclosing `picture`) as drawn — used when
++    /// nothing of the group can be visible — or as impossible to place exactly.
++    fn mark(&mut self, group: &usvg::Group, picture: Option<&str>, drawn: bool) {
++        let mut ids: Vec<String> = picture.map(str::to_string).into_iter().collect();
++        self.collect_picture_ids(group, &mut ids);
++        self.copies.extend(ids.into_iter().map(|id| (id, drawn)));
++    }
++
++    fn collect_picture_ids(&self, group: &usvg::Group, ids: &mut Vec<String>) {
++        for node in group.children() {
++            if let usvg::Node::Group(child) = node {
++                if self.pixmaps.contains_key(child.id()) {
++                    ids.push(child.id().to_string());
++                }
++                self.collect_picture_ids(child, ids);
++            }
++        }
++    }
++
++    /// Records each picture wrapper inside a subroot under `root` (pattern, mask, clip path,
++    /// filter image, text or SVG image) as a copy left out. A shared resource is entered once, so
++    /// its pictures count once however many elements use it; only whether a picture has any copy
++    /// left out matters to the warnings.
++    fn mark_subroot_pictures(&mut self, root: &usvg::Group, shared: &mut SharedSubroots) {
++        // An explicit stack, as in `CopySearch::run`: a group to search, and whether it is inside
++        // a subroot.
++        let mut stack = vec![(root, false)];
++        while let Some((parent, in_subroot)) = stack.pop() {
++            for node in parent.children() {
++                if let usvg::Node::Group(group) = node {
++                    if in_subroot && self.pixmaps.contains_key(group.id()) {
++                        self.copies.push((group.id().to_string(), false));
++                    }
++                    stack.push((group, in_subroot));
++                }
++                shared.subroots(node, |subroot| stack.push((subroot, true)));
++            }
++        }
++    }
++}
++
++/// Draws a node that holds no supplied picture exactly as `resvg::render` would.
++fn render_plain_node(
++    node: &usvg::Node,
++    transform: tiny_skia::Transform,
++    canvas: &mut tiny_skia::PixmapMut<'_>,
++) {
++    match node {
++        // `resvg::render_node` skips a node without a layer box, which would lose a bare
++        // horizontal or vertical stroked line; it is stroked here instead.
++        usvg::Node::Path(path) if node.abs_layer_bounding_box().is_none() => {
++            stroke_degenerate_path(path, transform, canvas);
++        }
++        _ => render_with_resvg(node, transform, canvas),
++    }
++}
++
++/// Draws one node exactly where `resvg::render` would. `resvg::render_node` offsets the node by
++/// its own layer box (it is meant for rendering a node on its own); that offset is undone here.
++fn render_with_resvg(
++    node: &usvg::Node,
++    transform: tiny_skia::Transform,
++    canvas: &mut tiny_skia::PixmapMut<'_>,
++) {
++    if let Some(bbox) = node.abs_layer_bounding_box() {
++        resvg::render_node(node, transform.pre_translate(bbox.x(), bbox.y()), canvas);
++    } else if let usvg::Node::Text(text) = node {
++        // A text box of zero size; render its outlines as resvg does.
++        let flattened = usvg::Node::Group(Box::new(text.flattened().clone()));
++        render_with_resvg(&flattened, transform, canvas);
++    }
++}
++
++/// Draws a picture as resvg draws a decoded bitmap: its pixel rectangle under the image transform.
++fn draw_picture(
++    image: &usvg::Image,
++    pixmap: &tiny_skia::Pixmap,
++    transform: tiny_skia::Transform,
++    canvas: &mut tiny_skia::PixmapMut<'_>,
++) {
++    if !image.is_visible() {
++        return;
++    }
++    let size = image.size();
++    let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, size.width(), size.height()) else {
++        return;
++    };
++    let quality = match image.rendering_mode() {
++        usvg::ImageRendering::OptimizeQuality | usvg::ImageRendering::HighQuality => {
++            tiny_skia::FilterQuality::Bicubic
++        }
++        usvg::ImageRendering::Smooth => tiny_skia::FilterQuality::Bilinear,
++        usvg::ImageRendering::OptimizeSpeed
++        | usvg::ImageRendering::CrispEdges
++        | usvg::ImageRendering::Pixelated => tiny_skia::FilterQuality::Nearest,
++    };
++    let paint = tiny_skia::Paint {
++        shader: tiny_skia::Pattern::new(
++            pixmap.as_ref(),
++            tiny_skia::SpreadMode::Pad,
++            quality,
++            1.0,
++            tiny_skia::Transform::from_scale(
++                size.width() / pixmap.width() as f32,
++                size.height() / pixmap.height() as f32,
++            ),
++        ),
++        ..Default::default()
++    };
++    canvas.fill_rect(rect, &paint, transform, None);
++}
++
++/// A path whose fill box has no area. resvg never fills such a path, so only its stroke shows;
++/// this is resvg's `stroke_path` (resvg 0.47, src/path.rs) for every paint: plain colour,
++/// gradients, and patterns, whose tile is drawn with `render_plain_node` as resvg draws it.
++fn stroke_degenerate_path(
++    path: &usvg::Path,
++    transform: tiny_skia::Transform,
++    canvas: &mut tiny_skia::PixmapMut<'_>,
++) {
++    let Some(stroke) = path.stroke().filter(|_| path.is_visible()) else {
++        return;
++    };
++    let pattern_pixmap;
++    let mut paint = tiny_skia::Paint::default();
++    match stroke.paint() {
++        usvg::Paint::Color(color) => {
++            paint.set_color_rgba8(color.red, color.green, color.blue, stroke.opacity().to_u8());
++        }
++        usvg::Paint::LinearGradient(gradient) => {
++            let Some(shader) = linear_gradient_shader(gradient, stroke.opacity()) else {
++                return;
++            };
++            paint.shader = shader;
++        }
++        usvg::Paint::RadialGradient(gradient) => {
++            let Some(shader) = radial_gradient_shader(gradient, stroke.opacity()) else {
++                return;
++            };
++            paint.shader = shader;
++        }
++        usvg::Paint::Pattern(pattern) => {
++            let Some((tile, tile_transform)) = render_pattern_tile(pattern, transform) else {
++                return;
++            };
++            pattern_pixmap = tile;
++            paint.shader = tiny_skia::Pattern::new(
++                pattern_pixmap.as_ref(),
++                tiny_skia::SpreadMode::Repeat,
++                tiny_skia::FilterQuality::Bicubic,
++                stroke.opacity().get(),
++                tile_transform,
++            );
++        }
++    }
++    paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
++    canvas.stroke_path(path.data(), &paint, &stroke.to_tiny_skia(), transform, None);
++}
++
++// resvg's paint-server conversion (resvg 0.47, src/path.rs), which is private to resvg.
++
++fn linear_gradient_shader(
++    gradient: &usvg::LinearGradient,
++    opacity: usvg::Opacity,
++) -> Option<tiny_skia::Shader<'static>> {
++    let (mode, stops) = gradient_stops(gradient, opacity);
++    tiny_skia::LinearGradient::new(
++        (gradient.x1(), gradient.y1()).into(),
++        (gradient.x2(), gradient.y2()).into(),
++        stops,
++        mode,
++        gradient.transform(),
++    )
++}
++
++fn radial_gradient_shader(
++    gradient: &usvg::RadialGradient,
++    opacity: usvg::Opacity,
++) -> Option<tiny_skia::Shader<'static>> {
++    let (mode, stops) = gradient_stops(gradient, opacity);
++    tiny_skia::RadialGradient::new(
++        (gradient.fx(), gradient.fy()).into(),
++        gradient.fr().get(),
++        (gradient.cx(), gradient.cy()).into(),
++        gradient.r().get(),
++        stops,
++        mode,
++        gradient.transform(),
++    )
++}
++
++fn gradient_stops(
++    gradient: &usvg::BaseGradient,
++    opacity: usvg::Opacity,
++) -> (tiny_skia::SpreadMode, Vec<tiny_skia::GradientStop>) {
++    let mode = match gradient.spread_method() {
++        usvg::SpreadMethod::Pad => tiny_skia::SpreadMode::Pad,
++        usvg::SpreadMethod::Reflect => tiny_skia::SpreadMode::Reflect,
++        usvg::SpreadMethod::Repeat => tiny_skia::SpreadMode::Repeat,
++    };
++    let stops = gradient
++        .stops()
++        .iter()
++        .map(|stop| {
++            let color = tiny_skia::Color::from_rgba8(
++                stop.color().red,
++                stop.color().green,
++                stop.color().blue,
++                (stop.opacity() * opacity).to_u8(),
++            );
++            tiny_skia::GradientStop::new(stop.offset().get(), color)
++        })
++        .collect();
++    (mode, stops)
++}
++
++fn render_pattern_tile(
++    pattern: &usvg::Pattern,
++    transform: tiny_skia::Transform,
++) -> Option<(tiny_skia::Pixmap, tiny_skia::Transform)> {
++    let (sx, sy) = transform.pre_concat(pattern.transform()).get_scale();
++    let rect = pattern.rect();
++    let size = tiny_skia::IntSize::from_wh(
++        (rect.width() * sx).round() as u32,
++        (rect.height() * sy).round() as u32,
++    )?;
++    let mut tile = tiny_skia::Pixmap::new(size.width(), size.height())?;
++    let tile_scale = tiny_skia::Transform::from_scale(sx, sy);
++    for node in pattern.root().children() {
++        render_plain_node(node, tile_scale, &mut tile.as_mut());
++    }
++    let tile_transform = pattern
++        .transform()
++        .pre_translate(rect.x(), rect.y())
++        .pre_scale(1.0 / sx, 1.0 / sy);
++    Some((tile, tile_transform))
++}
++
++// resvg's clip-path application (resvg 0.47, src/clip.rs), which is private to resvg.
++
++fn apply_clip(
++    clip: &usvg::ClipPath,
++    transform: tiny_skia::Transform,
++    pixmap: &mut tiny_skia::Pixmap,
++) -> Option<()> {
++    let mut clip_pixmap = tiny_skia::Pixmap::new(pixmap.width(), pixmap.height())?;
++    clip_pixmap.fill(tiny_skia::Color::BLACK);
++    draw_clip_children(
++        clip.root(),
++        tiny_skia::BlendMode::Clear,
++        transform.pre_concat(clip.transform()),
++        &mut clip_pixmap.as_mut(),
++    )?;
++    if let Some(clip) = clip.clip_path() {
++        apply_clip(clip, transform, pixmap)?;
++    }
++    let mut mask = tiny_skia::Mask::from_pixmap(clip_pixmap.as_ref(), tiny_skia::MaskType::Alpha);
++    mask.invert();
++    pixmap.apply_mask(&mask);
++    Some(())
++}
++
++fn draw_clip_children(
++    parent: &usvg::Group,
++    mode: tiny_skia::BlendMode,
++    transform: tiny_skia::Transform,
++    pixmap: &mut tiny_skia::PixmapMut<'_>,
++) -> Option<()> {
++    for child in parent.children() {
++        match child {
++            usvg::Node::Path(path) => {
++                if path.is_visible() {
++                    fill_clip_path(path, mode, transform, pixmap);
++                }
++            }
++            usvg::Node::Text(text) => {
++                draw_clip_children(text.flattened(), mode, transform, pixmap)?
++            }
++            usvg::Node::Group(group) => {
++                let transform = transform.pre_concat(group.transform());
++                match group.clip_path() {
++                    Some(clip) => clip_group(group, clip, transform, pixmap)?,
++                    None => draw_clip_children(group, mode, transform, pixmap)?,
++                }
++            }
++            usvg::Node::Image(_) => {}
++        }
++    }
++    Some(())
++}
++
++fn clip_group(
++    children: &usvg::Group,
++    clip: &usvg::ClipPath,
++    transform: tiny_skia::Transform,
++    pixmap: &mut tiny_skia::PixmapMut<'_>,
++) -> Option<()> {
++    let mut clip_pixmap = tiny_skia::Pixmap::new(pixmap.width(), pixmap.height())?;
++    draw_clip_children(
++        children,
++        tiny_skia::BlendMode::SourceOver,
++        transform,
++        &mut clip_pixmap.as_mut(),
++    )?;
++    apply_clip(clip, transform, &mut clip_pixmap)?;
++    let paint = tiny_skia::PixmapPaint {
++        blend_mode: tiny_skia::BlendMode::Xor,
++        ..Default::default()
++    };
++    pixmap.draw_pixmap(
++        0,
++        0,
++        clip_pixmap.as_ref(),
++        &paint,
++        tiny_skia::Transform::identity(),
++        None,
++    );
++    Some(())
++}
++
++/// resvg's `fill_path` for clip-path children, which usvg always gives a plain black fill.
++fn fill_clip_path(
++    path: &usvg::Path,
++    mode: tiny_skia::BlendMode,
++    transform: tiny_skia::Transform,
++    pixmap: &mut tiny_skia::PixmapMut<'_>,
++) {
++    let Some(fill) = path.fill() else {
++        return;
++    };
++    let bounds = path.data().bounds();
++    if bounds.width() == 0.0 || bounds.height() == 0.0 {
++        return;
++    }
++    let rule = match fill.rule() {
++        usvg::FillRule::NonZero => tiny_skia::FillRule::Winding,
++        usvg::FillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
++    };
++    let mut paint = tiny_skia::Paint::default();
++    match fill.paint() {
++        usvg::Paint::Color(color) => {
++            paint.set_color_rgba8(color.red, color.green, color.blue, fill.opacity().to_u8())
++        }
++        _ => paint.set_color_rgba8(0, 0, 0, fill.opacity().to_u8()),
++    }
++    paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
++    paint.blend_mode = mode;
++    pixmap.fill_path(path.data(), &paint, rule, transform, None);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const ID: &str = "chemdraft-raster-picture-0";
++
++    fn parse(body: &str) -> usvg::Tree {
++        let svg = format!(
++            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{body}</svg>"#
++        );
++        usvg::Tree::from_str(&svg, &usvg::Options::default()).expect("parse the test SVG")
++    }
++
++    #[test]
++    fn a_stand_in_names_its_picture_in_its_own_tree() {
++        let href = placeholder_href(144, 72, ID);
++        // `rasterPicturePlaceholderHref(144, 72, "chemdraft-raster-picture-0")` writes the same.
++        assert_eq!(
++            href,
++            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='144'%20height='72'%3E%3Cpath%20id='chemdraft-raster-picture-0'%20d='M0%200H1V1H0Z'%20fill='none'/%3E%3C/svg%3E"
++        );
++        assert!(is_placeholder_href(&href, ID));
++        for other_id in ["chemdraft-raster-picture-1", "picture-0", ""] {
++            assert!(!is_placeholder_href(&href, other_id), "{other_id}");
++        }
++        // Sides are written in plain decimal, within a picture's limits.
++        for side in ["0144", "+144", "-144", "0", "16385", "1e2", "144.0", " 144"] {
++            let other_size = href.replace("width='144'", &format!("width='{side}'"));
++            assert!(!is_placeholder_href(&other_size, ID), "{side}");
++        }
++        let unmarked =
++            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='144'%20height='72'/%3E";
++        assert!(!is_placeholder_href(unmarked, ID));
++
++        // usvg keeps the path's id inside the image's own tree, and sizes the image by the SVG.
++        let tree = parse(&format!(
++            r#"<image width="10" height="5" href="{href}"/><image width="10" height="5" href="{unmarked}"/>"#
++        ));
++        let images: Vec<&usvg::Image> = tree
++            .root()
++            .children()
++            .iter()
++            .filter_map(|node| match node {
++                usvg::Node::Group(group) => match group.children() {
++                    [usvg::Node::Image(image)] => Some(image.as_ref()),
++                    _ => None,
++                },
++                _ => None,
++            })
++            .collect();
++        assert_eq!(images.len(), 2);
++        let pixmap = tiny_skia::Pixmap::new(144, 72).expect("a 144 × 72 pixmap");
++        let pixmaps = HashMap::from([(ID, &pixmap)]);
++        assert_eq!(stand_in_picture(images[0], &pixmaps), Some(ID));
++        assert_eq!(
++            (images[0].size().width(), images[0].size().height()),
++            (144.0, 72.0)
++        );
++        assert_eq!(stand_in_picture(images[1], &pixmaps), None);
++        // The stand-in of a picture of another size is no copy of this one.
++        let transposed = tiny_skia::Pixmap::new(72, 144).expect("a 72 × 144 pixmap");
++        assert_eq!(
++            stand_in_picture(images[0], &HashMap::from([(ID, &transposed)])),
++            None
++        );
++    }
++
++    /// The SVG images under `group`, at any depth.
++    fn svg_images(group: &usvg::Group) -> Vec<&usvg::Image> {
++        let mut images = Vec::new();
++        for node in group.children() {
++            match node {
++                usvg::Node::Group(child) => images.extend(svg_images(child)),
++                usvg::Node::Image(image) if matches!(image.kind(), usvg::ImageKind::SVG(_)) => {
++                    images.push(image.as_ref());
++                }
++                _ => {}
++            }
++        }
++        images
++    }
++
++    #[test]
++    fn only_a_pictures_exact_stand_in_is_a_copy_of_it() {
++        let marker = format!("<path id='{ID}' d='M0 0H1V1H0Z' fill='none'/>");
++        let svg = |size: &str, content: &str| {
++            let svg = format!("<svg xmlns='{SVG_NAMESPACE}' {size}>{content}</svg>");
++            format!(
++                "data:image/svg+xml;base64,{}",
++                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, svg)
++            )
++        };
++        let exact = "width='144' height='72'";
++        let forged = [
++            // A hidden path with the picture's id, of other geometry and size.
++            svg(
++                "width='10' height='10'",
++                &format!("<path id='{ID}' d='M0 0H5V5H0Z' fill='none'/>"),
++            ),
++            // The picture's size, but other geometry.
++            svg(
++                exact,
++                &format!("<path id='{ID}' d='M0 0H2V1H0Z' fill='none'/>"),
++            ),
++            // The marker, at another size.
++            svg("width='72' height='144'", &marker),
++            // The marker and something else.
++            svg(
++                exact,
++                &format!("{marker}<rect width='1' height='1' fill='none'/>"),
++            ),
++            // The marker, scaled by a viewBox.
++            svg(&format!("{exact} viewBox='0 0 72 36'"), &marker),
++            // The marker, painted or transformed.
++            svg(
++                exact,
++                &format!("<path id='{ID}' d='M0 0H1V1H0Z' fill='red' visibility='hidden'/>"),
++            ),
++            svg(
++                exact,
++                &format!("<path id='{ID}' d='M0 0H1V1H0Z' fill='none' transform='scale(2)'/>"),
++            ),
++        ];
++        let pixmap = tiny_skia::Pixmap::new(144, 72).expect("a 144 × 72 pixmap");
++        let pixmaps = HashMap::from([(ID, &pixmap)]);
++        let image = |href: &str| format!(r#"<image width="10" height="5" href="{href}"/>"#);
++
++        // The same stand-in, written another way, is a copy.
++        let tree = parse(&image(&svg(exact, &marker)));
++        let images = svg_images(tree.root());
++        assert_eq!(images.len(), 1);
++        assert_eq!(stand_in_picture(images[0], &pixmaps), Some(ID));
++
++        let forgeries: String = forged.iter().map(|href| image(href.as_str())).collect();
++        let tree = parse(&forgeries);
++        let images = svg_images(tree.root());
++        assert_eq!(images.len(), forged.len());
++        for (image, href) in images.into_iter().zip(&forged) {
++            assert_eq!(stand_in_picture(image, &pixmaps), None, "{href}");
++        }
++        // Beside the picture itself, they are not counted as its copies.
++        let page = format!(
++            r#"<image id="{ID}" width="1" height="1" href="{}"/>{forgeries}"#,
++            placeholder_href(144, 72, ID)
++        );
++        let tree = parse(&page);
++        assert!(find_copies_by_reference(tree.root(), &pixmaps).is_empty());
++    }
++
++    #[test]
++    fn an_unsupplied_stand_in_has_a_generated_id_and_its_exact_href() {
++        let image = |id: &str, href: &str| {
++            format!(r#"<svg xmlns="{SVG_NAMESPACE}"><image id="{id}" href="{href}"/></svg>"#)
++        };
++        let is_unsupplied = |svg: &str| {
++            let document = usvg::roxmltree::Document::parse(svg).expect("parse the test SVG");
++            let node = document
++                .descendants()
++                .find(|node| node.tag_name().name() == "image")
++                .expect("an image");
++            is_unsupplied_stand_in(&node)
++        };
++        assert!(is_unsupplied(&image(ID, &placeholder_href(144, 72, ID))));
++        // Only the prefix of a generated id, or more than an id may hold.
++        for id in [
++            PICTURE_ID_PREFIX,
++            "chemdraft-raster-picture-0_1",
++            "chemdraft-raster-picture-0.1",
++        ] {
++            assert!(
++                !is_unsupplied(&image(id, &placeholder_href(144, 72, id))),
++                "{id}"
++            );
++        }
++        // Sides with a sign or a leading zero.
++        for side in ["+144", "0144"] {
++            let href =
++                placeholder_href(144, 72, ID).replace("width='144'", &format!("width='{side}'"));
++            assert!(!is_unsupplied(&image(ID, &href)), "{side}");
++        }
++    }
++
++    #[test]
++    fn copies_by_reference_are_found_in_one_pass_with_one_entry_per_picture() {
++        let ids: Vec<String> = (0..MAX_PICTURES)
++            .map(|index| format!("{PICTURE_ID_PREFIX}{index}"))
++            .collect();
++        // A mask that copies every picture, shared (one `Arc`) by every masked group below.
++        let mut body = String::from(
++            r#"<defs><mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="10" height="10">"#,
++        );
++        for id in &ids {
++            body.push_str(&format!(r##"<use href="#{id}"/>"##));
++        }
++        body.push_str("</mask></defs>");
++        for id in &ids {
++            body.push_str(&format!(
++                r#"<image id="{id}" width="1" height="1" href="{}"/>"#,
++                placeholder_href(1, 1, id)
++            ));
++        }
++        // Blank SVG images of every picture's size, which are no copies of anything.
++        let blank =
++            "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'/%3E";
++        for _ in 0..1000 {
++            body.push_str(&format!(
++                r#"<image width="1" height="1" href="{blank}"/><g mask="url(#m)"><rect width="1" height="1"/></g>"#
++            ));
++        }
++        let tree = parse(&body);
++        let pixmap = tiny_skia::Pixmap::new(1, 1).expect("a 1 × 1 pixmap");
++        let pixmaps: HashMap<&str, &tiny_skia::Pixmap> =
++            ids.iter().map(|id| (id.as_str(), &pixmap)).collect();
++
++        let mut search = CopySearch {
++            pixmaps: &pixmaps,
++            shared: SharedSubroots::default(),
++            omitted: HashSet::new(),
++        };
++        search.run(tree.root());
++        // Every picture once, though 1000 groups draw its copy, and the shared mask entered once:
++        // the only allocations are these two sets, bounded by the pictures and distinct subroots.
++        assert_eq!(search.omitted.len(), MAX_PICTURES);
++        assert!(ids.iter().all(|id| search.omitted.contains(id.as_str())));
++        assert_eq!(search.shared.entered.len(), 1);
++
++        // Without the mask's copies, nothing is a copy: the pictures' own images are in their
++        // wrappers, and the blank images name no picture.
++        let unused = body.replace(r#" mask="url(#m)""#, "");
++        let tree = parse(&unused);
++        assert!(find_copies_by_reference(tree.root(), &pixmaps).is_empty());
++    }
++
++    #[test]
++    fn a_filter_shared_by_many_groups_is_read_once_by_both_searches() {
++        const GROUPS: usize = 2000;
++        const PRIMITIVES: usize = 200;
++        // One user-space filter, which usvg shares (one `Arc`) among every group that uses it,
++        // copying the picture in every one of its primitives.
++        let mut body = String::from(
++            r#"<defs><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="10" height="10">"#,
++        );
++        for _ in 0..PRIMITIVES {
++            body.push_str(&format!(r##"<feImage href="#{ID}"/>"##));
++        }
++        body.push_str("</filter></defs>");
++        body.push_str(&format!(
++            r#"<image id="{ID}" width="1" height="1" href="{}"/>"#,
++            placeholder_href(1, 1, ID)
++        ));
++        for _ in 0..GROUPS {
++            body.push_str(r#"<g filter="url(#f)"><rect width="1" height="1"/></g>"#);
++        }
++        let tree = parse(&body);
++        assert_eq!(tree.filters().len(), 1);
++        assert_eq!(tree.filters()[0].primitives().len(), PRIMITIVES);
++        let pixmap = tiny_skia::Pixmap::new(1, 1).expect("a 1 × 1 pixmap");
++        let pixmaps: HashMap<&str, &tiny_skia::Pixmap> = HashMap::from([(ID, &pixmap)]);
++
++        let mut search = CopySearch {
++            pixmaps: &pixmaps,
++            shared: SharedSubroots::default(),
++            omitted: HashSet::new(),
++        };
++        search.run(tree.root());
++        assert_eq!(search.omitted, HashSet::from([ID]));
++        assert_eq!(search.shared.primitives_read, PRIMITIVES);
++        assert_eq!(search.shared.entered.len(), 1);
++
++        let mut renderer = PictureRenderer {
++            pixmaps: &pixmaps,
++            copies: Vec::new(),
++        };
++        let mut shared = SharedSubroots::default();
++        renderer.mark_subroot_pictures(tree.root(), &mut shared);
++        assert_eq!(shared.primitives_read, PRIMITIVES);
++        assert_eq!(shared.entered.len(), 1);
++    }
++
++    #[test]
++    fn deep_chains_of_subroots_do_not_overflow_the_stack() {
++        // Each mask holds a group masked by the next, so every subroot leads to another.
++        const DEPTH: usize = 500;
++        let mut body = String::from("<defs>");
++        for level in 0..DEPTH {
++            body.push_str(&format!(
++                r#"<mask id="m{level}" maskUnits="userSpaceOnUse" x="0" y="0" width="10" height="10">"#
++            ));
++            if level + 1 < DEPTH {
++                body.push_str(&format!(
++                    r#"<g mask="url(#m{})"><rect width="1" height="1"/></g>"#,
++                    level + 1
++                ));
++            } else {
++                body.push_str(&format!(r##"<use href="#{ID}"/>"##));
++            }
++            body.push_str("</mask>");
++        }
++        body.push_str("</defs>");
++        body.push_str(&format!(
++            r#"<image id="{ID}" width="1" height="1" href="{}"/>"#,
++            placeholder_href(1, 1, ID)
++        ));
++        body.push_str(r#"<g mask="url(#m0)"><rect width="1" height="1"/></g>"#);
++
++        // usvg parses and drops the chain recursively, so that happens on a large stack; the
++        // searches run on a small one, as they keep their own stack on the heap.
++        std::thread::Builder::new()
++            .stack_size(256 * 1024 * 1024)
++            .spawn(move || {
++                let tree = parse(&body);
++                let pixmap = tiny_skia::Pixmap::new(1, 1).expect("a 1 × 1 pixmap");
++                let pixmaps: HashMap<&str, &tiny_skia::Pixmap> = HashMap::from([(ID, &pixmap)]);
++                std::thread::scope(|scope| {
++                    std::thread::Builder::new()
++                        .stack_size(64 * 1024)
++                        .spawn_scoped(scope, || {
++                            assert_eq!(
++                                find_copies_by_reference(tree.root(), &pixmaps),
++                                HashSet::from([ID])
++                            );
++                            let mut renderer = PictureRenderer {
++                                pixmaps: &pixmaps,
++                                copies: Vec::new(),
++                            };
++                            let mut shared = SharedSubroots::default();
++                            renderer.mark_subroot_pictures(tree.root(), &mut shared);
++                            assert_eq!(shared.entered.len(), DEPTH);
++                        })
++                        .expect("spawn the search thread")
++                        .join()
++                        .expect("the searches finish");
++                });
++            })
++            .expect("spawn the parsing thread")
++            .join()
++            .expect("the chain is parsed and searched");
++    }
++}
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index 6095f334a..49ce86ed5 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -1689,7 +1689,7 @@ function tableClipboardDecisionBeforePicture(payload: ClipboardReadPayload) {
+   return tableClipboardPasteDecision(payload, html => new DOMParser().parseFromString(html, "text/html"));
+ }
+ 
+-const CURRENT_BUILD_STAMP = "11.01.18.26-opus";
++const CURRENT_BUILD_STAMP = "11.01.18.52-sonnet";
+ const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
+ /** Starts in the background for the document webview under the existing probe gate. */
+ export function startMainWindowPerfProbe(): void {
+diff --git a/apps/desktop/src/nativeRasterExport.ts b/apps/desktop/src/nativeRasterExport.ts
+index 31210c6b1..6fa79ad46 100644
+--- a/apps/desktop/src/nativeRasterExport.ts
++++ b/apps/desktop/src/nativeRasterExport.ts
+@@ -1,3 +1,5 @@
++import { prepareRasterPictures } from "./rasterPictureDecode";
++
+ export type NativeRasterExportFormat = "png" | "jpeg" | "bmp" | "gif" | "tiff";
+ 
+ export interface NativeRasterExportOptions {
+@@ -40,9 +42,14 @@ export async function rasterizeSvgNative(
+   options: NativeRasterExportOptions = {}
+ ): Promise<NativeRasterExportResult> {
+   const { invoke } = await import("@tauri-apps/api/core");
++  // PNG pictures are decoded here, in the webview, and reach Rust as checked RGBA pixels: native
++  // code never decodes a bitmap (see rasterPictureDecode.ts). Base64 fields keep the request JSON;
++  // the command's argument shape is unchanged when a drawing has no PNG pictures.
++  const prepared = await prepareRasterPictures(svg);
+   const response = await invoke<NativeRasterExportResponse>("rasterize_svg", {
+     request: {
+-      svg,
++      svg: prepared.svg,
++      ...(prepared.pictures.length > 0 ? { pictures: prepared.pictures } : {}),
+       format,
+       scale: options.scale,
+       background: options.background,
+diff --git a/apps/desktop/src/rasterPictureDecode.test.ts b/apps/desktop/src/rasterPictureDecode.test.ts
+new file mode 100644
+index 000000000..2833fdd94
+--- /dev/null
++++ b/apps/desktop/src/rasterPictureDecode.test.ts
+@@ -0,0 +1,255 @@
++// @vitest-environment jsdom
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  bytesToBase64,
++  decodePngPixels,
++  prepareRasterPictures,
++  RasterPictureDecodedBudgetBytes,
++  RasterPictureMaxCount,
++  RasterPictureMaxSidePx,
++  RasterPictureOverCountHref,
++  rasterPicturePlaceholderHref,
++  readPngSize
++} from "./rasterPictureDecode";
++import { picturePngBase64 } from "./testSupport/imageFixture";
++
++afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
++
++const bytesOf = (base64: string) => Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
++
++/** A PNG signature and IHDR declaring `width` × `height`: enough for the size check, nothing more. */
++function pngHeader(width: number, height: number): string {
++  const header = new Uint8Array(33);
++  header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
++  new DataView(header.buffer).setUint32(16, width);
++  new DataView(header.buffer).setUint32(20, height);
++  return bytesToBase64(header);
++}
++
++const pngImage = (base64: string, attributes = "") =>
++  `<image x="1" y="2" width="30" height="40" preserveAspectRatio="none" ${attributes} href="data:image/png;base64,${base64}"/>`;
++const page = (...images: string[]) =>
++  `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100">${images.join("")}</svg>`;
++
++/** Stands in for the webview decoder: one colour at the size the PNG declares. */
++const solidDecoder = (rgba = [10, 20, 30, 255]) => vi.fn(async (png: Uint8Array<ArrayBuffer>) => {
++  const { width, height } = readPngSize(png)!;
++  return { width, height, rgba: new Uint8ClampedArray(width * height * 4).map((_, index) => rgba[index % 4]) };
++});
++
++function images(svg: string) {
++  return Array.from(new DOMParser().parseFromString(svg, "image/svg+xml").getElementsByTagName("image"));
++}
++
++describe("raster picture decoding", () => {
++  it("reads PNG sizes from the IHDR and rejects anything else", () => {
++    expect(readPngSize(bytesOf(picturePngBase64))).toEqual({ width: 144, height: 72 });
++    expect(readPngSize(bytesOf(pngHeader(16385, 3)))).toEqual({ width: 16385, height: 3 });
++    expect(readPngSize(bytesOf(pngHeader(0, 3)))).toBeUndefined();
++    expect(readPngSize(bytesOf(picturePngBase64).subarray(0, 23))).toBeUndefined();
++    expect(readPngSize(bytesOf(btoa("GIF89a......................")))).toBeUndefined();
++  });
++
++  it("decodes each top-level PNG picture into RGBA pixels and leaves an empty stand-in in its place", async () => {
++    const decode = solidDecoder();
++    const svg = page(
++      pngImage(picturePngBase64, 'data-chemdraft-picture-frame="1 2 30 40 0"'),
++      '<image width="5" height="5" href="data:image/svg+xml;base64,PHN2Zy8+"/>',
++      '<image width="5" height="5" href="data:image/jpeg;base64,/9j/4AAQ"/>',
++      `<image width="5" height="5" xlink:href="data:image/png;base64,${pngHeader(2, 1)}"/>`
++    );
++    const prepared = await prepareRasterPictures(svg, { decode });
++    expect(decode).toHaveBeenCalledTimes(2);
++    expect([...decode.mock.calls[0][0]]).toEqual([...bytesOf(picturePngBase64)]);
++    expect(prepared.pictures.map(({ id }) => id)).toEqual(["chemdraft-raster-picture-0", "chemdraft-raster-picture-1"]);
++    expect(prepared.pictures[0]).toMatchObject({ width: 144, height: 72 });
++    const pixels = bytesOf((prepared.pictures[0] as { rgbaBase64: string }).rgbaBase64);
++    expect(pixels).toHaveLength(144 * 72 * 4);
++    expect([...pixels.subarray(-4)]).toEqual([10, 20, 30, 255]);
++    expect(prepared.svg).not.toContain(picturePngBase64);
++
++    const [picture, svgPicture, jpegPicture, xlinkPicture] = images(prepared.svg);
++    expect(picture.getAttribute("id")).toBe("chemdraft-raster-picture-0");
++    expect(picture.getAttribute("href")).toBe(rasterPicturePlaceholderHref(144, 72, "chemdraft-raster-picture-0"));
++    for (const name of ["x", "y", "width", "height", "preserveAspectRatio", "data-chemdraft-picture-frame"]) {
++      expect(picture.getAttribute(name)).toBe(images(svg)[0].getAttribute(name));
++    }
++    // SVG pictures already draw natively; other bitmaps keep Rust's omitted-picture warning.
++    expect(svgPicture.outerHTML).toBe(images(svg)[1].outerHTML);
++    expect(jpegPicture.outerHTML).toBe(images(svg)[2].outerHTML);
++    expect(xlinkPicture.getAttributeNS("http://www.w3.org/1999/xlink", "href"))
++      .toBe(rasterPicturePlaceholderHref(2, 1, "chemdraft-raster-picture-1"));
++  });
++
++  it("refuses a picture over 16384 px a side before decoding it", async () => {
++    expect(RasterPictureMaxSidePx).toBe(16384);
++    const decode = solidDecoder();
++    const prepared = await prepareRasterPictures(page(pngImage(pngHeader(16385, 1)), pngImage(pngHeader(1, 16384))), { decode });
++    expect(prepared.pictures).toEqual([
++      { id: "chemdraft-raster-picture-0", refused: "tooLarge" },
++      expect.objectContaining({ id: "chemdraft-raster-picture-1", width: 1, height: 16384 })
++    ]);
++    expect(decode).toHaveBeenCalledTimes(1);
++    expect(images(prepared.svg)[0].getAttribute("href")).toBe(rasterPicturePlaceholderHref(1, 1, "chemdraft-raster-picture-0"));
++  });
++
++  it("keeps a running budget of decoded bytes across one export, 256 MiB by default", async () => {
++    expect(RasterPictureDecodedBudgetBytes).toBe(256 * 1024 * 1024);
++    const decode = solidDecoder();
++    // 8192 × 8193 × 4 bytes is just over 256 MiB, so it is refused without being decoded.
++    const overDefault = await prepareRasterPictures(page(pngImage(pngHeader(8192, 8193))), { decode });
++    expect(overDefault.pictures).toEqual([{ id: "chemdraft-raster-picture-0", refused: "overBudget" }]);
++    expect(decode).not.toHaveBeenCalled();
++
++    // 64 + 64 bytes fit a 150-byte budget, a third 64 does not, and a later 16 still does.
++    const svg = page(pngImage(pngHeader(4, 4)), pngImage(pngHeader(4, 4)), pngImage(pngHeader(4, 4)), pngImage(pngHeader(2, 2)));
++    for (let call = 0; call < 2; call += 1) {
++      const prepared = await prepareRasterPictures(svg, { decode, budgetBytes: 150 });
++      expect(prepared.pictures.map((picture) => "refused" in picture ? picture.refused : picture.width))
++        .toEqual([4, 4, "overBudget", 2]);
++    }
++  });
++
++  it("reports pictures that fail to decode, and does not charge them to the budget", async () => {
++    const failing = vi.fn(async (png: Uint8Array<ArrayBuffer>) => {
++      const { width, height } = readPngSize(png)!;
++      if (width === 3) throw new Error("corrupt image data");
++      // A decoder that disagrees with the IHDR is not trusted.
++      if (width === 5) return { width: 5, height: 6, rgba: new Uint8ClampedArray(5 * 6 * 4) };
++      return { width, height, rgba: new Uint8ClampedArray(width * height * 4) };
++    });
++    // 36 and 100 bytes both fit a 100-byte budget only if failed decodes are not charged.
++    const prepared = await prepareRasterPictures(page(
++      pngImage(pngHeader(3, 3)), pngImage(pngHeader(5, 5)), pngImage("AAAA"), pngImage(`${pngHeader(4, 4)}A`), pngImage(pngHeader(4, 4))
++    ), { decode: failing, budgetBytes: 100 });
++    expect(prepared.pictures.map((picture) => "refused" in picture ? picture.refused : picture.width))
++      .toEqual(["decodeFailed", "decodeFailed", "decodeFailed", "decodeFailed", 4]);
++    expect(failing).toHaveBeenCalledTimes(3);
++    expect(images(prepared.svg).slice(0, 4).map((image) => image.getAttribute("href")))
++      .toEqual([0, 1, 2, 3].map((index) => rasterPicturePlaceholderHref(1, 1, `chemdraft-raster-picture-${index}`)));
++  });
++
++  it("sends at most 1024 pictures and leaves the rest undecoded behind a marked stand-in", async () => {
++    expect(RasterPictureMaxCount).toBe(1024);
++    const decode = solidDecoder();
++    // The first is refused, which still counts toward the limit.
++    const svg = page(pngImage(pngHeader(16385, 1)), ...Array.from({ length: RasterPictureMaxCount + 1 }, () => pngImage(pngHeader(1, 1))));
++    const prepared = await prepareRasterPictures(svg, { decode });
++    expect(prepared.pictures).toHaveLength(RasterPictureMaxCount);
++    expect(prepared.pictures[0]).toEqual({ id: "chemdraft-raster-picture-0", refused: "tooLarge" });
++    expect(decode).toHaveBeenCalledTimes(RasterPictureMaxCount - 1);
++    const written = images(prepared.svg);
++    expect(written.slice(0, RasterPictureMaxCount).every((image) => image.hasAttribute("id"))).toBe(true);
++    for (const image of written.slice(RasterPictureMaxCount)) {
++      expect(image.hasAttribute("id")).toBe(false);
++      expect(image.getAttribute("href")).toBe(RasterPictureOverCountHref);
++    }
++    expect(written.slice(RasterPictureMaxCount)).toHaveLength(2);
++    expect(RasterPictureOverCountHref).not.toBe(rasterPicturePlaceholderHref(1, 1, "chemdraft-raster-picture-0"));
++  });
++
++  it("leaves SVGs it cannot rewrite unambiguously untouched", async () => {
++    const decode = solidDecoder();
++    for (const svg of [
++      page(pngImage(pngHeader(2, 2), 'id="logo"')),
++      page(pngImage(pngHeader(2, 2), `xlink:href="data:image/png;base64,${pngHeader(2, 2)}"`)),
++      page('<image href="data:image/gif;base64,R0lGODlh"/>'),
++      `<svg xmlns="http://www.w3.org/2000/svg">${pngImage(pngHeader(2, 2))}`,
++      page()
++    ]) {
++      expect(await prepareRasterPictures(svg, { decode })).toEqual({ svg, pictures: [] });
++    }
++    expect(decode).not.toHaveBeenCalled();
++  });
++
++  it("picks an id prefix the SVG does not already use", async () => {
++    const svg = page('<g id="chemdraft-raster-picture-0"/>', pngImage(pngHeader(2, 2)));
++    const prepared = await prepareRasterPictures(svg, { decode: solidDecoder() });
++    expect(prepared.pictures.map(({ id }) => id)).toEqual(["chemdraft-raster-picture-1-0"]);
++    expect(images(prepared.svg)[0].getAttribute("id")).toBe("chemdraft-raster-picture-1-0");
++    expect(images(prepared.svg)[0].getAttribute("href")).toBe(rasterPicturePlaceholderHref(2, 2, "chemdraft-raster-picture-1-0"));
++  });
++
++  it("gives each stand-in a blank SVG of its picture's size whose one invisible path carries the picture's id", async () => {
++    // Rust's `placeholder_href(144, 72, "chemdraft-raster-picture-0")` is pinned to the same string.
++    expect(rasterPicturePlaceholderHref(144, 72, "chemdraft-raster-picture-0")).toBe(
++      "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='144'%20height='72'%3E%3Cpath%20id='chemdraft-raster-picture-0'%20d='M0%200H1V1H0Z'%20fill='none'/%3E%3C/svg%3E"
++    );
++    // Two pictures of the same size still get different stand-ins, one per picture.
++    const prepared = await prepareRasterPictures(page(pngImage(pngHeader(3, 2)), pngImage(pngHeader(3, 2))), { decode: solidDecoder() });
++    const hrefs = images(prepared.svg).map((image) => image.getAttribute("href")!);
++    expect(new Set(hrefs).size).toBe(2);
++    hrefs.forEach((href, index) => {
++      const id = `chemdraft-raster-picture-${index}`;
++      expect(images(prepared.svg)[index].getAttribute("id")).toBe(id);
++      const standIn = new DOMParser().parseFromString(decodeURIComponent(href.slice(href.indexOf(",") + 1)), "image/svg+xml");
++      const root = standIn.documentElement;
++      expect([root.namespaceURI, root.getAttribute("width"), root.getAttribute("height")]).toEqual([
++        "http://www.w3.org/2000/svg", "3", "2"
++      ]);
++      expect(Array.from(root.children).map((child) => [child.localName, child.getAttribute("id"), child.getAttribute("fill")]))
++        .toEqual([["path", id, "none"]]);
++      expect(root.children[0].hasAttribute("stroke")).toBe(false);
++    });
++  });
++
++  it("decodes with the webview's createImageBitmap and reads straight RGBA back from a canvas", async () => {
++    const bitmap = { width: 2, height: 1, close: vi.fn() };
++    const createImageBitmap = vi.fn(async (_blob: Blob) => bitmap);
++    const context = {
++      drawImage: vi.fn(),
++      getImageData: vi.fn((_x: number, _y: number, width: number, height: number) =>
++        ({ data: new Uint8ClampedArray(width * height * 4).fill(7) }))
++    };
++    const canvases: { width: number; height: number }[] = [];
++    vi.stubGlobal("createImageBitmap", createImageBitmap);
++    vi.stubGlobal("OffscreenCanvas", class {
++      constructor(public width: number, public height: number) { canvases.push(this); }
++      getContext(kind: string) { return kind === "2d" ? context : null; }
++    });
++    const png = bytesOf(pngHeader(2, 1));
++    const pixels = await decodePngPixels(png);
++    expect(pixels).toEqual({ width: 2, height: 1, rgba: new Uint8ClampedArray(8).fill(7) });
++    const blob = createImageBitmap.mock.calls[0][0];
++    expect(blob.type).toBe("image/png");
++    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(png);
++    expect(context.drawImage).toHaveBeenCalledWith(bitmap, 0, 0);
++    expect(context.getImageData).toHaveBeenCalledWith(0, 0, 2, 1);
++    expect(bitmap.close).toHaveBeenCalled();
++    expect(canvases).toEqual([expect.objectContaining({ width: 0, height: 0 })]);
++
++    // A canvas that cannot be created still releases the decoded bitmap.
++    bitmap.close.mockClear();
++    vi.stubGlobal("OffscreenCanvas", class {
++      constructor() { throw new RangeError("canvas too large"); }
++    });
++    await expect(decodePngPixels(png)).rejects.toThrow("canvas too large");
++    expect(bitmap.close).toHaveBeenCalledTimes(1);
++
++    // Without OffscreenCanvas the document's canvas is used.
++    vi.stubGlobal("OffscreenCanvas", undefined);
++    const getContext = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(context as never);
++    await expect(decodePngPixels(png)).resolves.toMatchObject({ width: 2, height: 1 });
++    expect(getContext).toHaveBeenCalledWith("2d", { willReadFrequently: true });
++  });
++
++  it("encodes RGBA as standard base64 across chunk boundaries, with or without Uint8Array.toBase64", () => {
++    const bytes = Uint8Array.from({ length: 3 * 8192 * 2 + 5 }, (_, index) => (index * 31) % 256);
++    const expected = Buffer.from(bytes).toString("base64");
++    expect(bytesToBase64(bytes)).toBe(expected);
++    expect(bytesToBase64(new Uint8ClampedArray(bytes.buffer))).toBe(expected);
++    const prototype = Uint8Array.prototype as { toBase64?: unknown };
++    const native = Object.getOwnPropertyDescriptor(prototype, "toBase64");
++    Object.defineProperty(prototype, "toBase64", { value: undefined, configurable: true, writable: true });
++    try {
++      expect(bytesToBase64(bytes)).toBe(expected);
++      expect(bytesToBase64(new Uint8ClampedArray(bytes.buffer))).toBe(expected);
++      for (let length = 0; length <= 7; length += 1) {
++        expect(bytesToBase64(bytes.subarray(0, length))).toBe(Buffer.from(bytes.subarray(0, length)).toString("base64"));
++      }
++    } finally {
++      if (native) Object.defineProperty(prototype, "toBase64", native);
++      else delete prototype.toBase64;
++    }
++  });
++});
+diff --git a/apps/desktop/src/rasterPictureDecode.ts b/apps/desktop/src/rasterPictureDecode.ts
+new file mode 100644
+index 000000000..82ac5b618
+--- /dev/null
++++ b/apps/desktop/src/rasterPictureDecode.ts
+@@ -0,0 +1,254 @@
++/**
++ * PNG pictures for native raster export (PNG, JPEG, BMP, GIF, TIFF, Copy as PNG, plugin renders).
++ *
++ * The native renderer has no bitmap decoder, by design: pictures are decoded HERE, by the webview's
++ * own image decoder (WKWebView on macOS, WebView2 on Windows), and Rust receives straight-alpha
++ * RGBA8 pixels it checks by length alone (`export.rs`). Each decoded picture's `<image>` keeps its
++ * frame, transform and z-order in the SVG; only its href becomes a blank SVG of the picture's pixel
++ * size, tagged with an id, so usvg still places it and native code draws the supplied pixels there.
++ * The blank SVG holds one invisible path carrying the same id: usvg drops the `<image>`'s id on a
++ * copy made through `<use>` or `<feImage>`, but parses each copy's href afresh, so the copy still
++ * names its picture and Rust can report exactly which pictures have copies it could not draw.
++ *
++ * Limits, enforced before decoding and re-checked in Rust: 16384 px a side, 256 MiB of decoded
++ * pixels (width × height × 4) across one export call, and 1024 pictures per call. A picture over a
++ * limit, or one that fails to decode, is not drawn; Rust reports it with a warning naming the reason.
++ * Pictures past the 1024th are neither decoded nor sent: their href becomes a marked empty SVG that
++ * Rust counts for its warning.
++ *
++ * Memory: pictures are processed one at a time; each ImageBitmap and canvas is released as soon as
++ * its pixels are read back, and each picture's RGBA is dropped once it is base64-encoded.
++ */
++
++export const RasterPictureMaxSidePx = 16384;
++export const RasterPictureDecodedBudgetBytes = 256 * 1024 * 1024;
++/** Pictures sent per export call; `MAX_PICTURES` in `export/pictures.rs` is the same. */
++export const RasterPictureMaxCount = 1024;
++/** The stand-in for a picture past the count limit; `OVER_COUNT_HREF` in Rust is the same string. */
++export const RasterPictureOverCountHref =
++  "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'%20data-chemdraft-omitted='count'/%3E";
++const RasterPictureIdPrefix = "chemdraft-raster-picture-";
++
++const SvgNamespace = "http://www.w3.org/2000/svg";
++const XlinkNamespace = "http://www.w3.org/1999/xlink";
++const PngDataUri = /^data:image\/png;base64,([A-Za-z0-9+/]*={0,2})$/i;
++const PngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
++// Signature (8) + IHDR length and type (8) + width and height (8): 24 bytes, 32 base64 characters.
++const PngSizeHeaderBase64Length = 32;
++
++export type RasterPictureRefusal = "tooLarge" | "overBudget" | "decodeFailed";
++
++/** One picture as `rasterize_svg` receives it: decoded pixels, or why the webview refused it. */
++export type NativeRasterPicture =
++  | { id: string; width: number; height: number; rgbaBase64: string }
++  | { id: string; refused: RasterPictureRefusal };
++
++/** Straight (not premultiplied) RGBA8, row-major, as `getImageData` returns it. */
++export interface DecodedPicturePixels {
++  width: number;
++  height: number;
++  rgba: Uint8Array | Uint8ClampedArray;
++}
++
++export type PicturePixelDecoder = (png: Uint8Array<ArrayBuffer>) => Promise<DecodedPicturePixels>;
++
++export interface PrepareRasterPicturesOptions {
++  /** Defaults to the webview's own decoder, `decodePngPixels`. */
++  decode?: PicturePixelDecoder;
++  /** Decoded bytes allowed across this call; defaults to `RasterPictureDecodedBudgetBytes`. */
++  budgetBytes?: number;
++}
++
++export interface PreparedRasterPictures {
++  svg: string;
++  pictures: NativeRasterPicture[];
++}
++
++/**
++ * The blank SVG that stands in for picture `id`'s PNG: the picture's pixel size and one invisible
++ * path with the picture's id. `placeholder_href` in `export/pictures.rs` builds the same string.
++ */
++export function rasterPicturePlaceholderHref(width: number, height: number, id: string): string {
++  return `data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='${width}'%20height='${height}'%3E%3Cpath%20id='${id}'%20d='M0%200H1V1H0Z'%20fill='none'/%3E%3C/svg%3E`;
++}
++
++/** Width and height from a PNG's IHDR chunk, or undefined when the bytes do not start like a PNG. */
++export function readPngSize(bytes: Uint8Array): { width: number; height: number } | undefined {
++  if (bytes.length < 24 || PngSignature.some((byte, index) => bytes[index] !== byte)) return undefined;
++  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++  const ihdr = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
++  if (view.getUint32(8) !== 13 || ihdr !== "IHDR") return undefined;
++  const width = view.getUint32(16);
++  const height = view.getUint32(20);
++  return width > 0 && height > 0 ? { width, height } : undefined;
++}
++
++/**
++ * Decodes the SVG's top-level PNG pictures for one native raster export. Pictures nested inside SVG
++ * pictures, other bitmap types, and `<image>` elements that already carry an id or more than one
++ * href are left untouched, so Rust keeps its general omitted-picture warning for them.
++ */
++export async function prepareRasterPictures(
++  svg: string,
++  { decode = decodePngPixels, budgetBytes = RasterPictureDecodedBudgetBytes }: PrepareRasterPicturesOptions = {}
++): Promise<PreparedRasterPictures> {
++  if (!/data:image\/png;base64,/i.test(svg)) return { svg, pictures: [] };
++  const parsed = new DOMParser().parseFromString(svg, "image/svg+xml");
++  if (parsed.getElementsByTagName("parsererror").length > 0) return { svg, pictures: [] };
++
++  const prefix = unusedIdPrefix(svg);
++  const pictures: NativeRasterPicture[] = [];
++  let remainingBytes = budgetBytes;
++  for (const image of Array.from(parsed.getElementsByTagNameNS(SvgNamespace, "image"))) {
++    const href = pngHref(image);
++    if (!href) continue;
++    if (pictures.length >= RasterPictureMaxCount) {
++      // Counted before decoding: past the limit nothing is decoded or sent.
++      href.attribute.value = RasterPictureOverCountHref;
++      continue;
++    }
++    const id = `${prefix}${pictures.length}`;
++    // One picture at a time: its RGBA exists only inside encodeWithinLimits.
++    const outcome = await encodeWithinLimits(href.base64, remainingBytes, decode);
++    if ("refused" in outcome) {
++      pictures.push({ id, refused: outcome.refused });
++      href.attribute.value = rasterPicturePlaceholderHref(1, 1, id);
++    } else {
++      remainingBytes -= outcome.width * outcome.height * 4;
++      pictures.push({ id, ...outcome });
++      href.attribute.value = rasterPicturePlaceholderHref(outcome.width, outcome.height, id);
++    }
++    image.setAttribute("id", id);
++  }
++  if (pictures.length === 0) return { svg, pictures };
++  return { svg: new XMLSerializer().serializeToString(parsed), pictures };
++}
++
++/** Decodes one picture within the limits and returns its pixels as base64, or why it was refused. */
++async function encodeWithinLimits(
++  base64: string,
++  remainingBytes: number,
++  decode: PicturePixelDecoder
++): Promise<{ width: number; height: number; rgbaBase64: string } | { refused: RasterPictureRefusal }> {
++  try {
++    // Read the size from the first base64 characters, before decoding anything else.
++    const size = base64.length % 4 === 0 ? readPngSize(base64ToBytes(base64.slice(0, PngSizeHeaderBase64Length))) : undefined;
++    if (!size) return { refused: "decodeFailed" };
++    if (size.width > RasterPictureMaxSidePx || size.height > RasterPictureMaxSidePx) return { refused: "tooLarge" };
++    if (size.width * size.height * 4 > remainingBytes) return { refused: "overBudget" };
++    const { width, height, rgba } = await decode(base64ToBytes(base64));
++    // A decoder that disagrees with the IHDR (or returns the wrong amount of data) is not trusted.
++    if (width !== size.width || height !== size.height || rgba.length !== width * height * 4) return { refused: "decodeFailed" };
++    // Nothing keeps the RGBA once this returns, so it can be collected before the next picture.
++    return { width, height, rgbaBase64: bytesToBase64(rgba) };
++  } catch {
++    return { refused: "decodeFailed" };
++  }
++}
++
++/** The PNG data URI of an `<image>` with exactly one href (in any namespace usvg reads) and no id. */
++function pngHref(image: Element): { attribute: Attr; base64: string } | undefined {
++  if (image.hasAttribute("id")) return undefined;
++  const hrefs = Array.from(image.attributes).filter((attribute) => attribute.localName === "href");
++  const [attribute] = hrefs;
++  if (hrefs.length !== 1 || ![null, SvgNamespace, XlinkNamespace].includes(attribute.namespaceURI)) return undefined;
++  const match = PngDataUri.exec(attribute.value);
++  return match ? { attribute, base64: match[1] } : undefined;
++}
++
++/** An id prefix no existing text in the SVG contains, so generated ids cannot collide. */
++function unusedIdPrefix(svg: string): string {
++  if (!svg.includes(RasterPictureIdPrefix)) return RasterPictureIdPrefix;
++  let index = 1;
++  while (svg.includes(`${RasterPictureIdPrefix}${index}-`)) index += 1;
++  return `${RasterPictureIdPrefix}${index}-`;
++}
++
++/** Decodes one PNG with the webview's image decoder and reads it back as straight-alpha RGBA8. */
++export async function decodePngPixels(png: Uint8Array<ArrayBuffer>): Promise<DecodedPicturePixels> {
++  const source = await loadPicture(new Blob([png], { type: "image/png" }));
++  let canvas: OffscreenCanvas | HTMLCanvasElement | undefined;
++  try {
++    let context: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null;
++    if (typeof OffscreenCanvas === "function") {
++      canvas = new OffscreenCanvas(source.width, source.height);
++      context = canvas.getContext("2d", { willReadFrequently: true });
++    } else {
++      canvas = Object.assign(document.createElement("canvas"), { width: source.width, height: source.height });
++      context = canvas.getContext("2d", { willReadFrequently: true });
++    }
++    if (!context) throw new Error("No 2D canvas is available to decode the picture.");
++    context.drawImage(source.image, 0, 0);
++    const { data } = context.getImageData(0, 0, source.width, source.height);
++    return { width: source.width, height: source.height, rgba: data };
++  } finally {
++    // Runs as soon as the pixels are read back (or anything above throws): the bitmap and the
++    // canvas backing store are released now rather than at garbage collection.
++    source.release();
++    if (canvas) {
++      canvas.width = 0;
++      canvas.height = 0;
++    }
++  }
++}
++
++async function loadPicture(blob: Blob): Promise<{
++  image: CanvasImageSource; width: number; height: number; release: () => void;
++}> {
++  if (typeof createImageBitmap === "function") {
++    const bitmap = await createImageBitmap(blob);
++    return { image: bitmap, width: bitmap.width, height: bitmap.height, release: () => bitmap.close() };
++  }
++  const url = URL.createObjectURL(blob);
++  try {
++    const image = new Image();
++    image.src = url;
++    await image.decode();
++    return { image, width: image.naturalWidth, height: image.naturalHeight, release: () => undefined };
++  } finally {
++    URL.revokeObjectURL(url);
++  }
++}
++
++function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
++  const fromBase64 = (Uint8Array as { fromBase64?: (value: string) => Uint8Array<ArrayBuffer> }).fromBase64;
++  if (typeof fromBase64 === "function") return fromBase64(base64);
++  const binary = atob(base64);
++  const bytes = new Uint8Array(binary.length);
++  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
++  return bytes;
++}
++
++const Base64Alphabet = Uint8Array.from(
++  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", (char) => char.charCodeAt(0)
++);
++const Base64Pad = 0x3d;
++
++/**
++ * Standard padded base64. Uses the engine's `Uint8Array.prototype.toBase64` when present; otherwise
++ * encodes in one pass into a single ASCII buffer that becomes the string, with no chunk strings.
++ */
++export function bytesToBase64(bytes: Uint8Array | Uint8ClampedArray): string {
++  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++  const toBase64 = (view as { toBase64?: () => string }).toBase64;
++  if (typeof toBase64 === "function") return toBase64.call(view);
++  const ascii = new Uint8Array(Math.ceil(view.length / 3) * 4);
++  let out = 0;
++  let index = 0;
++  for (; index + 2 < view.length; index += 3) {
++    const triple = (view[index] << 16) | (view[index + 1] << 8) | view[index + 2];
++    ascii[out++] = Base64Alphabet[triple >>> 18];
++    ascii[out++] = Base64Alphabet[(triple >>> 12) & 63];
++    ascii[out++] = Base64Alphabet[(triple >>> 6) & 63];
++    ascii[out++] = Base64Alphabet[triple & 63];
++  }
++  if (index < view.length) {
++    const hasSecond = index + 1 < view.length;
++    const triple = (view[index] << 16) | (hasSecond ? view[index + 1] << 8 : 0);
++    ascii[out++] = Base64Alphabet[triple >>> 18];
++    ascii[out++] = Base64Alphabet[(triple >>> 12) & 63];
++    ascii[out++] = hasSecond ? Base64Alphabet[(triple >>> 6) & 63] : Base64Pad;
++    ascii[out++] = Base64Pad;
++  }
++  return new TextDecoder().decode(ascii);
++}
+diff --git a/apps/desktop/src/rasterPictureExport.test.ts b/apps/desktop/src/rasterPictureExport.test.ts
+index 8e21be9b7..40f7b0275 100644
+--- a/apps/desktop/src/rasterPictureExport.test.ts
++++ b/apps/desktop/src/rasterPictureExport.test.ts
+@@ -3,6 +3,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { inspectClipboardPayload } from "@chemdraft/clipboard-adapter";
+ import { createDefaultExportDialogState, createDialogExportResult } from "./MainWindow";
+ import { applyClipboardPastePayload, createPhase4Document, insertNativeTemplateMolecule } from "./documentWorkflow";
++import { rasterizeSvgNative } from "./nativeRasterExport";
++import { rasterPicturePlaceholderHref } from "./rasterPictureDecode";
+ import { picturePngBase64, pictureSvg } from "./testSupport/imageFixture";
+ 
+ const native = vi.hoisted(() => ({ invoke: vi.fn() }));
+@@ -10,7 +12,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
+ vi.mock("./window-manager", async original => ({
+   ...await original<typeof import("./window-manager")>(), isDesktopRuntime: () => true
+ }));
+-afterEach(() => { vi.clearAllMocks(); });
++afterEach(() => { vi.clearAllMocks(); vi.unstubAllGlobals(); });
+ 
+ function pageWithPicture(mimeType: "image/png" | "image/svg+xml") {
+   const document = insertNativeTemplateMolecule(createPhase4Document("Raster pictures"), { x: 500, y: 300 }, "benzene");
+@@ -20,11 +22,28 @@ function pageWithPicture(mimeType: "image/png" | "image/svg+xml") {
+   }), { x: 200, y: 200 }).document;
+ }
+ 
++/** The webview decoder as WKWebView and WebView2 provide it: an ImageBitmap read back from a canvas. */
++function stubWebviewDecoder(width: number, height: number, rgba: number[]) {
++  const close = vi.fn();
++  vi.stubGlobal("createImageBitmap", vi.fn(async (blob: Blob) => ({ width, height, close, type: blob.type })));
++  vi.stubGlobal("OffscreenCanvas", class {
++    constructor(public width: number, public height: number) {}
++    getContext() {
++      return {
++        drawImage: vi.fn(),
++        getImageData: (_x: number, _y: number, w: number, h: number) =>
++          ({ data: new Uint8ClampedArray(w * h * 4).map((_, index) => rgba[index % 4]) })
++      };
++    }
++  });
++  return close;
++}
++
+ describe("picture page raster requests", () => {
+-  it.each(["image/png", "image/svg+xml"] as const)("sends a %s page at 1x and 3x with source density and preserves the native warning", async mimeType => {
++  it.each(["image/png", "image/svg+xml"] as const)("sends a %s page at 1x and 3x with source density and preserves native warnings", async mimeType => {
+     const document = pageWithPicture(mimeType);
+-    const warning = { code: "raster_pictures_omitted", severity: "warning",
+-      message: "PNG export: PNG and other bitmap pictures are not included in image exports yet; export SVG or PDF to include them." };
++    const close = stubWebviewDecoder(144, 72, [0, 0, 255, 255]);
++    const warning = { code: "raster_dimension_clamped", severity: "warning", message: "Raster export was clamped to 8192px on its longest side." };
+     native.invoke.mockResolvedValue({ bytes: [1, 2, 3], width: 1, height: 1, warnings: [warning] });
+     let previousSvg: string | undefined;
+     for (const scale of [1, 3]) {
+@@ -37,12 +56,53 @@ describe("picture page raster requests", () => {
+       const svg = new DOMParser().parseFromString(request.svg, "image/svg+xml");
+       expect(svg.querySelector("parsererror")).toBeNull();
+       expect(svg.documentElement.getAttribute("viewBox")).toBe(`0 0 ${document.pages[0].width} ${document.pages[0].height}`);
+-      expect(svg.querySelector("image")?.getAttribute("href")).toMatch(new RegExp(`^data:${mimeType.replace("+", "\\+")};base64,`));
++      const image = svg.querySelector("image")!;
++      expect(image.getAttribute("data-chemdraft-picture-frame")).toMatch(/^[-\d.]+ [-\d.]+ [-\d.]+ [-\d.]+ [-\d.]+$/);
++      expect(image.getAttribute("preserveAspectRatio")).toBe("none");
++      if (mimeType === "image/png") {
++        // Decoded in the webview: native code gets RGBA pixels and an empty stand-in, never the PNG.
++        expect(request.svg).not.toContain(picturePngBase64);
++        expect(image.getAttribute("href")).toBe(rasterPicturePlaceholderHref(144, 72, image.getAttribute("id") ?? ""));
++        expect(request.pictures).toHaveLength(1);
++        const [picture] = request.pictures;
++        expect(picture).toMatchObject({ id: image.getAttribute("id"), width: 144, height: 72 });
++        const pixels = Uint8Array.from(atob(picture.rgbaBase64), char => char.charCodeAt(0));
++        expect(pixels).toHaveLength(144 * 72 * 4);
++        expect([...pixels.subarray(0, 8)]).toEqual([0, 0, 255, 255, 0, 0, 255, 255]);
++      } else {
++        expect(image.getAttribute("href")).toMatch(/^data:image\/svg\+xml;base64,/);
++        expect(image.hasAttribute("id")).toBe(false);
++        expect(request).not.toHaveProperty("pictures");
++      }
+       if (previousSvg) expect(request.svg).toBe(previousSvg);
+       previousSvg = request.svg;
+ 
+       expect(svg.querySelectorAll("path, line").length).toBeGreaterThan(0);
+     }
++    expect(close).toHaveBeenCalledTimes(mimeType === "image/png" ? 2 : 0);
++  });
++
++  it("reports a PNG picture the webview cannot decode instead of sending its bytes", async () => {
++    // jsdom has neither createImageBitmap nor a working image decoder.
++    const document = pageWithPicture("image/png");
++    native.invoke.mockResolvedValue({ bytes: [1], width: 1, height: 1, warnings: [] });
++    const state = createDefaultExportDialogState(document);
++    await createDialogExportResult(document, { ...state, format: "jpeg", presentation: undefined });
++    const { request } = native.invoke.mock.calls.at(-1)![1];
++    const image = new DOMParser().parseFromString(request.svg, "image/svg+xml").querySelector("image")!;
++    expect(request.pictures).toEqual([{ id: image.getAttribute("id"), refused: "decodeFailed" }]);
++    expect(image.getAttribute("href")).toBe(rasterPicturePlaceholderHref(1, 1, image.getAttribute("id") ?? ""));
++    expect(request.svg).not.toContain(picturePngBase64);
++  });
++
++  it("decodes pictures for every caller of the native rasterizer, including Copy as PNG and plugin renders", async () => {
++    stubWebviewDecoder(144, 72, [255, 0, 0, 128]);
++    native.invoke.mockResolvedValue({ bytes: [1], width: 1, height: 1, warnings: [] });
++    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><image width="10" height="10" href="data:image/png;base64,${picturePngBase64}"/></svg>`;
++    await rasterizeSvgNative(svg, "png", { scale: 4, background: "#ffffff", maxDimensionPx: 8192, cssPxPerInch: 96 });
++    const { request } = native.invoke.mock.calls.at(-1)![1];
++    expect(request).toMatchObject({ format: "png", scale: 4, maxDimensionPx: 8192, cssPxPerInch: 96 });
++    expect(request.pictures).toEqual([expect.objectContaining({ id: "chemdraft-raster-picture-0", width: 144, height: 72 })]);
+   });
+ 
+   it("keeps the chosen DPI for explicit pixel sizing instead of multiplying it again", async () => {

@@ -1,0 +1,1405 @@
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index f69475431..1c8144964 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -512,6 +512,7 @@ import {
+   nativeMoleculeUnmodeledMetalElements,
+   applyNativeMoleculeEngineRelayout,
+   prepareNativeMoleculeEngineRelayout,
++  cleanUpStructureStatus,
+   type NativeMoleculeRelayoutEngine,
+   cleanUpNativeMolecules2d,
+   moleculeHasFusedRingSystem,
+@@ -1648,7 +1649,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "11.01.08.55-codex";
++const CURRENT_BUILD_STAMP = "11.01.10.00-codex";
+ const StructureTemplatePicker = lazy(() => import("./dialogs/StructureTemplatePicker").then(module => ({ default: module.StructureTemplatePicker })));
+ /** Starts in the background for the document webview under the existing probe gate. */
+ export function startMainWindowPerfProbe(): void {
+@@ -4609,8 +4610,8 @@ export function MainWindow({
+       setObjectContextMenu(undefined);
+     };
+     const targetLabel = targetObjectIds.length === 1 ? "structure" : "structures";
+-    const cleanedStatus = (changed: boolean) =>
+-      changed ? `Cleaned up selected ${targetLabel}` : `Selected ${targetLabel} already clean`;
++    const cleanedStatus = (changed: boolean, warnings: readonly string[] = []) =>
++      cleanUpStructureStatus(documentRef.current, targetObjectIds, changed, warnings);
+ 
+     // The polygon+tree pass idealises single-ring components in place. Anything with more than
+     // one ring per component (fused, bridged, spiro, several rings joined through chains or a
+@@ -4668,7 +4669,7 @@ export function MainWindow({
+           return;
+         }
+         const changed = commitDocumentChange(() => prepared);
+-        setStatus(cleanedStatus(changed) + (warnings.length ? ` — ${[...new Set(warnings)].join(" ")}` : ""));
++        setStatus(cleanedStatus(changed, warnings));
+       } catch (error) {
+         setStatus(`Clean up failed: ${error instanceof Error ? error.message : String(error)}`);
+       }
+diff --git a/apps/desktop/src/cagePasteQuality.test.ts b/apps/desktop/src/cagePasteQuality.test.ts
+new file mode 100644
+index 000000000..268dac22a
+--- /dev/null
++++ b/apps/desktop/src/cagePasteQuality.test.ts
+@@ -0,0 +1,188 @@
++/** P8b: the real paste kernel and identity-checked Clean Up must prefer legible cages. */
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++import { createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
++import { ensureOclResources, relayoutMolfile2D, perceiveStereoCentersFromMolfile } from "@chemdraft/ocl-adapter";
++import { evaluateLayoutQuality, moleculeLayoutLabelBoxes, type LayoutQuality } from "@chemdraft/layout-engine";
++import * as layoutEngine from "@chemdraft/layout-engine";
++import * as workflow from "./documentWorkflow";
++import * as rdkitDepiction from "@chemdraft/rdkit-adapter/depiction";
++import { smilesListCandidates } from "@chemdraft/clipboard-adapter";
++import { pastedStructureDepictionFromMolfile, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
++import { ensureRdkit, generateSmiles2DMolfile, resetRdkitForTesting } from "../../../packages/rdkit-adapter/src/conformer";
++import { createRdkit2DRelayouts } from "../../../packages/rdkit-adapter/src/relayout2d";
++import { installRealRdkitModuleLoader } from "../../../packages/rdkit-adapter/src/testing";
++import { depictInWorker } from "./depiction2d/depict";
++import { inspectStructureInWorker } from "./depiction2d/identityInspect";
++import { applyNativeMoleculeEngineRelayout, insertSmilesMolecule, SMILES_PASTE_OPTIONS } from "./documentWorkflow";
++import { depictSmilesForPaste, depictSmilesListForPaste } from "./smilesListPaste";
++import { gatePasteDepiction } from "./depiction2d/qualityGate";
++
++// Use the exact worker kernel with real engines, without a second worker's independent module cache.
++vi.mock("./depiction2d/client", () => ({ depictSmilesOffThread: (smiles: string) =>
++  depictInWorker(smiles, generateSmiles2DMolfile, () => {}) }));
++
++const cage = "C1CC2CC3CC1CC(C2)C3";
++function quality(m: MoleculeObject) {
++  const ids = new Map(m.atoms.map((a, i) => [a.id, i]));
++  return evaluateLayoutQuality(m.atoms, m.bonds.map(b => ({ from: ids.get(b.fromAtomId)!, to: ids.get(b.toAtomId)! })),
++    undefined, undefined, undefined, moleculeLayoutLabelBoxes(m));
++}
++const atomDefects = (q: LayoutQuality) => q.overlappingAtoms.length + q.atomBondOverlaps.length + q.collinearBondOverlaps.length;
++const metrics = (q: LayoutQuality) => ({ atoms: q.overlappingAtoms, onBonds: q.atomBondOverlaps,
++  collinear: q.collinearBondOverlaps, labelBonds: q.labelBondOverlaps, labelLabels: q.labelLabelOverlaps,
++  crossings: q.crossings, nearest: q.nearestAtomPairDistance });
++const insert = (depiction: Parameters<typeof insertSmilesMolecule>[2], smiles = cage) =>
++  insertSmilesMolecule(createEmptyDocument(), { x: 400, y: 400 }, depiction, smiles, SMILES_PASTE_OPTIONS);
++beforeAll(async () => { installRealRdkitModuleLoader(); await ensureOclResources(); });
++afterAll(() => resetRdkitForTesting());
++afterEach(() => vi.restoreAllMocks());
++
++describe("bridged cage paste quality (real engines)", () => {
++  it("commits five crossings over one atom overlap, rather than comparing their total counts", () => {
++    const points = Array.from({ length: 5 }, (_, i) => ({ element: "C", charge: 0,
++      x: Math.cos(i * Math.PI * 2 / 5), y: Math.sin(i * Math.PI * 2 / 5) }));
++    const bonds = points.map((_, from) => ({ from, to: (from + 2) % 5, order: "single" as const, wedge: null }));
++    const drawn = points.map((_, i) => ({ ...points[(i * 3) % 5] }));
++    drawn[0] = { ...drawn[0], x: drawn[0].x * 0.3 + drawn[2].x * 0.7, y: drawn[0].y * 0.3 + drawn[2].y * 0.7 };
++    const document = insert({ atoms: drawn, bonds }, "C1CCCC1");
++    const before = document.pages[0].objects[0] as MoleculeObject;
++    expect(quality(before).overlappingAtoms).toHaveLength(1);
++    expect(quality(before).crossings).toHaveLength(0);
++    const cleaned = applyNativeMoleculeEngineRelayout(document, before.id, () => ({ atoms: points, bonds }),
++      { targetBondLengthPx: 22, perceiveStereo: perceiveStereoCentersFromMolfile });
++    expect(cleaned).not.toBe(document);
++    const after = quality(cleaned.pages[0].objects[0] as MoleculeObject);
++    expect(layoutEngine.layoutAtomAndLabelDefects(after)).toBe(0);
++    expect(after.crossings).toHaveLength(5);
++    expect(after.hardDefects).toBeGreaterThan(quality(before).hardDefects);
++  });
++
++  it("reproduces the raw overlap and commits a crossing-only Clean Up candidate", async () => {
++    const raw = pastedStructureDepictionFromMolfile(await generateSmiles2DMolfile(cage, { openUnspecifiedDoubleBonds: true }));
++    const document = insert(raw);
++    const before = document.pages[0].objects[0] as MoleculeObject;
++    expect(atomDefects(quality(before))).toBeGreaterThan(0);
++    const engines = [relayoutMolfile2D, ...await createRdkit2DRelayouts()];
++    const candidates = engines.map(engine => {
++      const depiction = engine(stereoPerceptionMolfile(before));
++      return metrics(quality(insert(depiction).pages[0].objects[0] as MoleculeObject));
++    });
++    const warnings: string[] = [];
++    const contactRepairs = vi.spyOn(layoutEngine, "repairBridgedLayoutContacts");
++    const cleaned = applyNativeMoleculeEngineRelayout(document, before.id, engines[0], {
++      targetBondLengthPx: 22, alternateRelayouts: engines.slice(1), warnings, perceiveStereo: perceiveStereoCentersFromMolfile
++    });
++    console.log("P8B_CAGE " + JSON.stringify({ pasted: metrics(quality(before)),
++      candidates: Object.fromEntries(candidates.map((q, i) => [["OCL", "RDKit CoordGen", "RDKit default"][i], q])),
++      contactRepairs: contactRepairs.mock.calls.map((args, i) => ({ engine: ["OCL", "RDKit CoordGen", "RDKit default"][i],
++        defects: contactRepairs.mock.results[i].value
++          ? metrics(evaluateLayoutQuality(contactRepairs.mock.results[i].value, args[1])) : "no qualifying repair" })),
++      committed: metrics(quality(cleaned.pages[0].objects[0] as MoleculeObject)), warnings }));
++    expect(cleaned).not.toBe(document);
++    const after = cleaned.pages[0].objects[0] as MoleculeObject;
++    expect(after.atoms.map(({ x: _x, y: _y, ...atom }) => atom))
++      .toEqual(before.atoms.map(({ x: _x, y: _y, ...atom }) => atom));
++    expect(after.bonds.map(b => [b.id, b.fromAtomId, b.toAtomId, b.order]))
++      .toEqual(before.bonds.map(b => [b.id, b.fromAtomId, b.toAtomId, b.order]));
++    expect(atomDefects(quality(after))).toBe(0);
++    expect(quality(after).crossings.length).toBeGreaterThan(0);
++    const module = await ensureRdkit();
++    expect(inspectStructureInWorker(module, stereoPerceptionMolfile(after)))
++      .toEqual(inspectStructureInWorker(module, stereoPerceptionMolfile(before)));
++  }, 60_000);
++
++  it("pastes the cage without atom-level defects", async () => {
++    const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout");
++    const standardResults: Parameters<typeof gatePasteDepiction>[0][] = [];
++    const parsed = await depictInWorker(cage, generateSmiles2DMolfile, result => standardResults.push(result));
++    expect(select).toHaveBeenCalledOnce();
++    const pasted = insert(parsed.depiction);
++    const molecule = pasted.pages[0].objects[0] as MoleculeObject;
++    expect(atomDefects(quality(molecule))).toBe(0);
++    expect(quality(molecule).labelBondOverlaps).toEqual([]);
++    expect(quality(molecule).labelLabelOverlaps).toEqual([]);
++    for (const standard of standardResults) {
++      // Deadline fallbacks always retain the original geometry, warning about hard contacts.
++      expect(atomDefects(quality(insert(standard.depiction).pages[0].objects[0] as MoleculeObject))).toBeGreaterThan(0);
++      expect(standard.warnings).toContainEqual(expect.stringContaining("overlapping atoms"));
++    }
++    const module = await ensureRdkit();
++    const drawnIdentity = inspectStructureInWorker(module, stereoPerceptionMolfile(molecule));
++    const inputIdentity = inspectStructureInWorker(module, cage);
++    if (!drawnIdentity.valid || !inputIdentity.valid) throw new Error("Cage identity inspection failed");
++    expect(drawnIdentity.canonicalSmiles).toBe(inputIdentity.canonicalSmiles);
++    const empty = createEmptyDocument();
++    const history = { past: [empty], present: pasted, future: [] };
++    // Preparation never commits: the insertion is the sole history entry, with exact redo.
++    const { undo, redo } = await import("@chemdraft/chem-core");
++    expect(undo(history).present).toBe(empty);
++    expect(redo(undo(history)).present).toBe(pasted);
++    expect(select).toHaveBeenCalledOnce();
++  }, 60_000);
++
++  it("gates the cage inside a SMILES list before the single grid insertion", async () => {
++    const text = `${cage}\nc1ccccc1`;
++    const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout");
++    const list = await depictSmilesListForPaste(text, smilesListCandidates(text));
++    expect(list?.entries).toHaveLength(2);
++    expect(list?.warnings).toBeUndefined();
++    expect(select).toHaveBeenCalledOnce();
++    const placed = workflow.insertSmilesMoleculeGrid(createEmptyDocument(), { x: 400, y: 400 }, list!.entries);
++    expect(placed.objectIds).toHaveLength(2);
++    for (const molecule of placed.document.pages[0].objects as MoleculeObject[]) {
++      expect(layoutEngine.layoutAtomAndLabelDefects(quality(molecule))).toBe(0);
++    }
++  }, 60_000);
++
++  it("repairs the cage through the real worker transport within its layout deadline", async () => {
++    const { depictSmilesOffThread } = await vi.importActual<typeof import("./depiction2d/client")>("./depiction2d/client");
++    const pasted = await depictSmilesOffThread(cage);
++    expect(layoutEngine.layoutAtomAndLabelDefects(quality(insert(pasted.depiction).pages[0].objects[0] as MoleculeObject))).toBe(0);
++    expect(pasted.warnings ?? []).toEqual([]);
++  }, 60_000);
++
++  it("keeps an unfixable drawing and never calls its unchanged status already clean", async () => {
++    const raw = pastedStructureDepictionFromMolfile(await generateSmiles2DMolfile(cage));
++    const document = insert(raw);
++    const molecule = document.pages[0].objects[0] as MoleculeObject;
++    // Simulate exhausted local repairs while retaining real engine parsing/mapping/read-back.
++    vi.spyOn(layoutEngine, "repairBridgedLayoutContacts").mockReturnValue(undefined);
++    const warnings: string[] = [];
++    const kept = applyNativeMoleculeEngineRelayout(document, molecule.id, () => raw,
++      { targetBondLengthPx: 22, warnings, perceiveStereo: perceiveStereoCentersFromMolfile });
++    expect(kept).toBe(document);
++    const status = workflow.cleanUpStructureStatus(kept, [molecule.id], false, warnings);
++    expect(status).toContain("Clean Up couldn't fix");
++    expect(status).toContain("overlapping atoms");
++    expect(status).not.toContain("already clean");
++    const pasted = await gatePasteDepiction({ depiction: raw, stereoCount: 0 }, cage);
++    expect(pasted.depiction).toBe(raw);
++    expect(pasted.warnings).toContain("Pasted structure still has overlapping atoms; no generated layout cleared the overlaps.");
++    const text = `${cage}\nc1ccccc1`;
++    const list = await depictSmilesListForPaste(text, smilesListCandidates(text));
++    expect(list?.entries).toHaveLength(2);
++    expect(list?.warnings).toContain(`${cage}: Pasted structure still has overlapping atoms; no generated layout cleared the overlaps.`);
++  }, 60_000);
++
++  const normal = [
++    "c1ccccc1",
++    "CN(C)C1=CC2=C(C=C1)C(=C3C=CC(=[N+](C)C)C=C3O2)C4=C(C=C(C=C4)C(=O)[O-])C(=O)O",
++    "O=C1OC2(c3ccccc31)c1ccc(O)cc1Oc1cc(O)ccc12",
++    "Oc1ccc2c(c1)oc1cc(=O)ccc-1c2-c1ccccc1C(=O)O",
++    "c1ccc2nc3ccccc3cc2c1",
++    "CC(C)CCC[C@@H](C)[C@H]1CC[C@H]2[C@@H]3CC=C4C[C@@H](O)CC[C@]4(C)[C@H]3CC[C@]12C",
++    "c1ccc2c(c1)Cc1ccccc1O2",
++    "CN(C)c1ccc2cc3ccc(=[N+](C)C)cc3oc2c1"
++  ];
++  it.each(normal.map(smiles => ({ smiles })))(
++    "only runs alternates when the original depiction fails the gate: $smiles", async ({ smiles }) => {
++    const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout");
++    const alternates = vi.spyOn(rdkitDepiction, "createRdkit2DRelayouts");
++    const raw = pastedStructureDepictionFromMolfile(await generateSmiles2DMolfile(smiles, { openUnspecifiedDoubleBonds: true }));
++    const pasted = await depictSmilesForPaste(smiles);
++    // Paste ignores label-only defects (including TMR), retaining main's coordinates.
++    expect(pasted?.depiction).toEqual(raw);
++    expect(select).not.toHaveBeenCalled();
++    expect(alternates).not.toHaveBeenCalled();
++  }, 60_000);
++});
+diff --git a/apps/desktop/src/depiction2d/depict.ts b/apps/desktop/src/depiction2d/depict.ts
+index 7ddfb58be..69edd8586 100644
+--- a/apps/desktop/src/depiction2d/depict.ts
++++ b/apps/desktop/src/depiction2d/depict.ts
+@@ -1,6 +1,7 @@
+ import { pastedStructureDepictionFromMolfile, type PastedStructureDepiction } from "@chemdraft/document-workflow-core";
+ import type { Smiles2DOptions } from "@chemdraft/rdkit-adapter";
+ import type { DepictionEngineAvailability } from "@chemdraft/rdkit-adapter/depiction";
++import { gatePasteDepiction, standardPasteDepiction } from "./qualityGate";
+ 
+ export interface PasteDepiction {
+   depiction: PastedStructureDepiction;
+@@ -41,11 +42,13 @@ export async function depictInWorker(
+         input = normalized;
+       } finally { molecule?.delete(); }
+     }
+-    return fromMolfile(await generateMolfile(input, {
++    return gatePasteDepiction(fromMolfile(await generateMolfile(input, {
+       ...options,
+       openUnspecifiedDoubleBonds: true,
+-      onStandardMolfile: (molfile) => onStandard(fromMolfile(molfile))
+-    }));
++      onStandardMolfile: (molfile) => {
++        onStandard(standardPasteDepiction(fromMolfile(molfile)));
++      }
++    })), smiles, options);
+   } catch (error) {
+     if (!ocl) throw error;
+     if (options.rdkitLoadFailure !== undefined) warnings.push(`RDKit failed to load: ${options.rdkitLoadFailure}; used OpenChemLib fallback.`);
+@@ -60,7 +63,7 @@ export async function depictInWorker(
+       throw error;
+     }
+     try {
+-      return fromMolfile(fallback.molfile);
++      return gatePasteDepiction(fromMolfile(fallback.molfile), smiles, options);
+     } catch {
+       // Large OCL coordinates can overflow V2000. Keep the existing structured fallback.
+       const depiction: PastedStructureDepiction = {
+@@ -74,7 +77,7 @@ export async function depictInWorker(
+       } catch {
+         stereoCount = fallback.bonds.filter((bond) => bond.wedge !== null).length;
+       }
+-      return { depiction, stereoCount, ...(warnings.length ? { warnings: [...warnings] } : {}) };
++      return gatePasteDepiction({ depiction, stereoCount, ...(warnings.length ? { warnings: [...warnings] } : {}) }, smiles, options);
+     }
+   }
+ }
+diff --git a/apps/desktop/src/depiction2d/labelQuality.test.ts b/apps/desktop/src/depiction2d/labelQuality.test.ts
+new file mode 100644
+index 000000000..74a3b406c
+--- /dev/null
++++ b/apps/desktop/src/depiction2d/labelQuality.test.ts
+@@ -0,0 +1,197 @@
++import { Resvg } from "@resvg/resvg-js";
++import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
++import { createEmptyDocument, type MoleculeObject } from "@chemdraft/chem-core";
++import { pastedStructureDepictionFromMolfile, stereoPerceptionMolfile } from "@chemdraft/document-workflow-core";
++import { atomLabelRunFontSize, moleculeLayoutLabelBoxes, planMoleculeAtomLabels } from "@chemdraft/layout-engine";
++import * as layoutEngine from "@chemdraft/layout-engine";
++import { ensureOclResources, perceiveStereoCentersFromMolfile, relayoutMolfile2D } from "@chemdraft/ocl-adapter";
++import * as rdkitDepiction from "@chemdraft/rdkit-adapter/depiction";
++import { createDepictionWorkerClient, type DepictionWorkerPort } from "@chemdraft/rdkit-adapter/depiction";
++import { ensureRdkit, generateSmiles2DMolfile, resetRdkitForTesting } from "../../../../packages/rdkit-adapter/src/conformer";
++import { installRealRdkitModuleLoader } from "../../../../packages/rdkit-adapter/src/testing";
++import * as workflow from "../documentWorkflow";
++import { depictInWorker, type PasteDepiction } from "./depict";
++import { inspectStructureInWorker } from "./identityInspect";
++import { nativeMoleculeLayoutQuality } from "./layoutQuality";
++import { gatePasteDepiction } from "./qualityGate";
++
++// Atom indices follow the input SMILES/standard depiction, and cover every originally flagged pair.
++const fixtures = [
++  { smiles: "Nc1cc(N)cc([N+](=O)[O-])c1", pairs: [[7, 9]] },
++  { smiles: "CCC(=O)c1ccc([N+](=O)[O-])cc1", pairs: [[8, 9], [8, 10]] },
++  { smiles: "CC(=O)c1ccc(C)c([N+](=O)[O-])c1", pairs: [[9, 10], [9, 11]] },
++  { smiles: "O=[N+]([O-])c1c(O)cccc1O", pairs: [[0, 1], [1, 2]] },
++  { smiles: "NNC(=O)C(=O)NN", pairs: [[0, 1], [6, 7]] },
++  { smiles: "Cc1ccccc1NNc1ccccc1C", pairs: [[7, 8]] },
++  { smiles: "O=c1[nH][nH]c2c(Cl)cccc12", pairs: [[2, 3]] },
++  { smiles: "O=S(=O)(O)c1ccc2ccc(O)cc2c1", pairs: [[0, 1], [1, 2]] },
++  { smiles: "c1ccn2nnnc2c1", pairs: [[4, 5], [5, 6]] },
++  { smiles: "O=C(O)C1(C(=O)O)CCOCC1", pairs: [[2, 5]] }
++];
++const insert = (depiction: PasteDepiction["depiction"], smiles: string) => workflow.insertSmilesMolecule(
++  createEmptyDocument(), { x: 400, y: 400 }, depiction, smiles, workflow.SMILES_PASTE_OPTIONS);
++const moleculeOf = (document: ReturnType<typeof insert>) => document.pages[0].objects[0] as MoleculeObject;
++const rawDepiction = async (smiles: string) => pastedStructureDepictionFromMolfile(
++  await generateSmiles2DMolfile(smiles, { openUnspecifiedDoubleBonds: true }));
++type Box = { x: number; y: number; width: number; height: number };
++const boxDistance = (a: Box, b: Box) => Math.hypot(
++  Math.max(0, a.x - b.x - b.width, b.x - a.x - a.width),
++  Math.max(0, a.y - b.y - b.height, b.y - a.y - a.height));
++
++beforeAll(async () => { installRealRdkitModuleLoader(); await ensureOclResources(); });
++afterAll(() => resetRdkitForTesting());
++afterEach(() => vi.restoreAllMocks());
++
++describe("renderer label collision regressions", () => {
++  it("exempts bonded labels only, retaining non-bonded label pairs and nonincident bonds", () => {
++    const atoms = [{ x: 0, y: 0 }, { x: 22, y: 0 }, { x: 11, y: 0 }];
++    const boxes = atoms.map((_, atom) => ({ atom, x: 0, y: -5, width: 22, height: 10 }));
++    const q = layoutEngine.evaluateLayoutQuality(atoms, [{ from: 0, to: 1 }], 22,
++      undefined, undefined, boxes);
++    expect(q.labelLabelOverlaps).toEqual([[0, 2], [1, 2]]);
++    expect(q.labelBondOverlaps).toEqual([[2, 0]]);
++  });
++
++  it.each(fixtures)("keeps the paste coordinates without alternates: $smiles", async ({ smiles, pairs }) => {
++    const raw = await rawDepiction(smiles);
++    const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout");
++    const alternates = vi.spyOn(rdkitDepiction, "createRdkit2DRelayouts");
++    const result = { depiction: raw, stereoCount: 0 };
++    expect(await gatePasteDepiction(result, smiles)).toBe(result);
++    const pasted = await depictInWorker(smiles, generateSmiles2DMolfile, () => {});
++    expect(pasted.depiction).toEqual(raw);
++    expect(pasted.warnings).toBeUndefined();
++    expect(select).not.toHaveBeenCalled();
++    expect(alternates).not.toHaveBeenCalled();
++    const molecule = moleculeOf(insert(raw, smiles));
++    const quality = nativeMoleculeLayoutQuality(molecule);
++    expect(quality.labelLabelOverlaps).toEqual([]);
++    expect(quality.labelBondOverlaps).toEqual([]);
++    const contacts = layoutEngine.evaluateLayoutContacts(raw.atoms, raw.bonds);
++    expect(contacts.overlappingAtoms).toEqual(quality.overlappingAtoms);
++    expect(contacts.atomBondOverlaps).toEqual(quality.atomBondOverlaps);
++    expect(contacts.collinearBondOverlaps).toEqual(quality.collinearBondOverlaps);
++
++    const plans = planMoleculeAtomLabels(molecule), boxes = moleculeLayoutLabelBoxes(molecule);
++    // Render the canvas's exact text runs: same anchor, H side, scripts, font and dy.
++    // Resvg measures ink rather than the padded rectangle used to clip bonds.
++    const glyphs = plans.map(plan => {
++      const runs = plan.layout.runs.map(run => `<text x="${run.x}" y="${run.y}" dy="0.35em" text-anchor="${run.textAnchor}" font-size="${atomLabelRunFontSize(run.script, plan.drawingStyle) ?? plan.fontSizePx}">${run.text}</text>`).join("");
++      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="800"><g transform="translate(${plan.anchor.x} ${plan.anchor.y})" font-family="${plan.fontFamily}" font-weight="${plan.fontWeight}" font-style="${plan.fontStyle}">${runs}</g></svg>`;
++      const glyph = new Resvg(svg).getBBox()!;
++      const box = boxes.find(box => molecule.atoms[box.atom].id === plan.atom.id)!;
++      expect(glyph.x).toBeGreaterThanOrEqual(box.x - 0.5);
++      expect(glyph.y).toBeGreaterThanOrEqual(box.y - 0.5);
++      expect(glyph.x + glyph.width).toBeLessThanOrEqual(box.x + box.width + 0.5);
++      expect(glyph.y + glyph.height).toBeLessThanOrEqual(box.y + box.height + 0.5);
++      // Tight extents, not a centred em square plus clipping padding.
++      expect(box.height - glyph.height).toBeLessThan(3);
++      return glyph;
++    });
++    const measurements = pairs.map(([a, b]) => {
++      const i = plans.findIndex(plan => plan.atom === molecule.atoms[a]);
++      const j = plans.findIndex(plan => plan.atom === molecule.atoms[b]);
++      return { atoms: [a, b], labels: [plans[i].label, plans[j].label],
++        distancePx: boxDistance(glyphs[i], glyphs[j]), distanceL: boxDistance(glyphs[i], glyphs[j]) / 22 };
++    });
++    console.log("LABEL_GLYPH_DISTANCES " + JSON.stringify({ smiles, measurements }));
++    if (smiles === fixtures[9].smiles) {
++      expect(measurements[0].distancePx).toBeGreaterThan(3);
++      // Non-bonded labels still count if their actual glyph envelopes overlap.
++      const ids = new Map(molecule.atoms.map((atom, i) => [atom.id, i]));
++      const touching = boxes.map(box => box.atom === 2 ? { ...box, ...boxes.find(b => b.atom === 5)!, atom: 2 } : box);
++      expect(layoutEngine.evaluateLayoutQuality(molecule.atoms, molecule.bonds.map(b => ({
++        from: ids.get(b.fromAtomId)!, to: ids.get(b.toAtomId)!
++      })), undefined, undefined, undefined, touching).labelLabelOverlaps).toContainEqual([2, 5]);
++    }
++  });
++
++  it.each([fixtures[5].smiles, fixtures[6].smiles, fixtures[8].smiles])(
++    "Clean Up keeps OpenChemLib without loading RDKit alternates: %s", async smiles => {
++      const document = insert(await rawDepiction(smiles), smiles), molecule = moleculeOf(document);
++      const primary = vi.fn(relayoutMolfile2D), loadRdkit = vi.fn(async () => []);
++      const options = { targetBondLengthPx: 22, perceiveStereo: perceiveStereoCentersFromMolfile };
++      const expected = workflow.applyNativeMoleculeEngineRelayout(document, molecule.id, relayoutMolfile2D, options);
++      const cleaned = await workflow.prepareNativeMoleculeEngineRelayout(document, molecule.id, primary, loadRdkit, options);
++      expect(primary).toHaveBeenCalledOnce();
++      expect(loadRdkit).not.toHaveBeenCalled();
++      expect(cleaned).toEqual(expected);
++      expect(nativeMoleculeLayoutQuality(moleculeOf(cleaned)).passes).toBe(true);
++    });
++});
++
++describe("paste repair deadline and chemistry", () => {
++  const cage = "C1CC2CC3CC1CC(C2)C3";
++  it("returns the original warned standard depiction through transport when alternate selection stalls", async () => {
++    const molfile = await generateSmiles2DMolfile(cage, { openUnspecifiedDoubleBonds: true });
++    const raw = pastedStructureDepictionFromMolfile(molfile);
++    const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout")
++      .mockImplementation(() => new Promise(() => {}));
++    const worker: DepictionWorkerPort<PasteDepiction> = { onmessage: null, onerror: null,
++      terminate: vi.fn(), postMessage: ({ id, smiles, standardOnly }) => {
++        void depictInWorker(smiles, async (_input, options) => {
++          options.onStandardMolfile?.(molfile);
++          return molfile;
++        }, result => worker.onmessage?.({ data: { id, stage: "standard", result } }), { standardOnly })
++          .then(result => worker.onmessage?.({ data: { id, stage: "result", result } }));
++      } };
++    const factory = vi.fn(() => worker);
++    const pasted = await createDepictionWorkerClient(factory, 50)(cage);
++    expect(select).toHaveBeenCalledOnce();
++    expect(pasted.depiction).toEqual(raw);
++    expect(pasted.warnings).toContainEqual(expect.stringContaining("overlapping atoms"));
++    expect(pasted.warnings).toContainEqual(expect.stringContaining("layout deadline"));
++    expect(factory).toHaveBeenCalledOnce();
++    expect(worker.terminate).toHaveBeenCalledOnce();
++  });
++
++  it("standardOnly publishes the defective standard and never selects alternates or repairs", async () => {
++    const molfile = await generateSmiles2DMolfile(cage);
++    const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout");
++    const repair = vi.spyOn(layoutEngine, "repairBridgedLayoutContacts");
++    const onStandard = vi.fn();
++    const pasted = await depictInWorker(cage, async (_input, options) => {
++      options.onStandardMolfile?.(molfile);
++      return molfile;
++    }, onStandard, { standardOnly: true });
++    expect(onStandard).toHaveBeenCalledOnce();
++    expect(pasted.depiction).toEqual(pastedStructureDepictionFromMolfile(molfile));
++    expect(pasted.warnings).toContainEqual(expect.stringContaining("overlapping atoms"));
++    expect(select).not.toHaveBeenCalled();
++    expect(repair).not.toHaveBeenCalled();
++  });
++
++  it.each(["[13CH3][C@H](O)[C@H]([NH3+])C(=O)[O-]", "CC=CC"])(
++    "serializes alternate-path chemistry without losing isotope, charge or directed stereo: %s", async smiles => {
++      const raw = await rawDepiction(smiles);
++      const expectedDocument = insert(raw, smiles), expected = moleculeOf(expectedDocument);
++      // Inject a hard contact, then supply a selected, valid layout. This isolates the
++      // serializer after candidate selection, including its directed wedge/hash endpoints.
++      const defective = { ...raw, atoms: raw.atoms.map((atom, i) => i === raw.atoms.length - 1
++        ? { ...atom, x: raw.atoms[0].x, y: raw.atoms[0].y } : atom) };
++      const select = vi.spyOn(workflow, "prepareNativeMoleculeEngineRelayout").mockResolvedValue(expectedDocument);
++      const pasted = await gatePasteDepiction({ depiction: defective, stereoCount: 2 }, smiles);
++      expect(select).toHaveBeenCalledOnce();
++      expect(pasted.depiction).not.toBe(defective);
++      const actual = moleculeOf(insert(pasted.depiction, smiles));
++      const facts = (m: MoleculeObject) => ({
++        atoms: m.atoms.map(atom => [atom.element, atom.isotope, atom.formalCharge]),
++        bonds: m.bonds.map(bond => [m.atoms.findIndex(a => a.id === bond.fromAtomId),
++          m.atoms.findIndex(a => a.id === bond.toAtomId), bond.order, bond.stereo, bond.display?.bondStyle])
++      });
++      expect(facts(actual)).toEqual(facts(expected));
++      const module = await ensureRdkit();
++      expect(inspectStructureInWorker(module, stereoPerceptionMolfile(actual)))
++        .toEqual(inspectStructureInWorker(module, stereoPerceptionMolfile(expected)));
++      const input = inspectStructureInWorker(module, smiles), output = inspectStructureInWorker(module, stereoPerceptionMolfile(actual));
++      expect(output.valid && input.valid && output.canonicalSmiles === input.canonicalSmiles).toBe(true);
++      if (smiles === "CC=CC") expect(actual.bonds.some(bond => bond.stereo === "either")).toBe(true);
++      else {
++        expect(raw.bonds.some(bond => bond.wedge === "wedge")).toBe(true);
++        expect(raw.bonds.some(bond => bond.wedge === "hashed")).toBe(true);
++        expect(actual.atoms.some(atom => atom.isotope === 13)).toBe(true);
++        expect(actual.atoms.map(atom => atom.formalCharge)).toContain(1);
++        expect(actual.atoms.map(atom => atom.formalCharge)).toContain(-1);
++      }
++    });
++});
+diff --git a/apps/desktop/src/depiction2d/layoutQuality.ts b/apps/desktop/src/depiction2d/layoutQuality.ts
+new file mode 100644
+index 000000000..04b8d539b
+--- /dev/null
++++ b/apps/desktop/src/depiction2d/layoutQuality.ts
+@@ -0,0 +1,10 @@
++import type { MoleculeObject } from "@chemdraft/chem-core";
++import { evaluateLayoutQuality, moleculeLayoutLabelBoxes, type LayoutQuality } from "@chemdraft/layout-engine";
++
++/** Shared geometry check; paste requests skeleton contacts without planning text boxes. */
++export function nativeMoleculeLayoutQuality(molecule: MoleculeObject, includeLabels = true): LayoutQuality {
++  const indices = new Map(molecule.atoms.map((atom, i) => [atom.id, i]));
++  return evaluateLayoutQuality(molecule.atoms, molecule.bonds.map(bond => ({
++    from: indices.get(bond.fromAtomId)!, to: indices.get(bond.toAtomId)!
++  })), undefined, undefined, undefined, includeLabels ? moleculeLayoutLabelBoxes(molecule) : []);
++}
+diff --git a/apps/desktop/src/depiction2d/qualityGate.ts b/apps/desktop/src/depiction2d/qualityGate.ts
+new file mode 100644
+index 000000000..7c468d557
+--- /dev/null
++++ b/apps/desktop/src/depiction2d/qualityGate.ts
+@@ -0,0 +1,71 @@
++import { createEmptyDocument, nativeDrawingStyleFromObjectStyle, type MoleculeObject } from "@chemdraft/chem-core";
++import { createSmilesMolecule, type PastedStructureDepiction } from "@chemdraft/document-workflow-core";
++import { evaluateLayoutContacts, type LayoutContacts } from "@chemdraft/layout-engine";
++import type { DepictionEngineAvailability } from "@chemdraft/rdkit-adapter/depiction";
++import type { PasteDepiction } from "./depict";
++import { nativeMoleculeLayoutQuality } from "./layoutQuality";
++
++function drawingForPaste(depiction: PastedStructureDepiction, smiles: string) {
++  const document = createEmptyDocument();
++  const molecule = createSmilesMolecule(document, { x: 400, y: 400 }, depiction, smiles,
++    undefined, { openUnspecifiedDoubleBonds: true, constrainToPage: false });
++  return { document: { ...document, pages: [{ ...document.pages[0], objects: [molecule] }] }, molecule };
++}
++
++/** Paste repairs skeleton contacts only; labels and crossings retain the engine's layout. */
++function hardPasteDefects(quality: LayoutContacts): number {
++  return quality.overlappingAtoms.length + quality.atomBondOverlaps.length + quality.collinearBondOverlaps.length;
++}
++
++function overlapDescription(quality: LayoutContacts): string {
++  return quality.overlappingAtoms.length ? "overlapping atoms"
++    : quality.atomBondOverlaps.length ? "atoms overlapping bonds" : "overlapping collinear bonds";
++}
++
++/** Always publish the standard layout, warning if a deadline returns it before repair. */
++export function standardPasteDepiction(result: PasteDepiction): PasteDepiction {
++  if (!result.depiction.atoms.length) return result;
++  const quality = evaluateLayoutContacts(result.depiction.atoms, result.depiction.bonds);
++  return hardPasteDefects(quality) === 0 ? result : { ...result, warnings: [...(result.warnings ?? []),
++    `Pasted structure still has ${overlapDescription(quality)}; used the standard layout without repair.`] };
++}
++
++/** Runs inside the existing depiction worker. Clean pastes perform no re-layout or engine load. */
++export async function gatePasteDepiction(
++  result: PasteDepiction, smiles: string, availability: DepictionEngineAvailability & { standardOnly?: boolean } = {}
++): Promise<PasteDepiction> {
++  if (availability.standardOnly) return standardPasteDepiction(result);
++  if (!result.depiction.atoms.length) return result;
++  const original = evaluateLayoutContacts(result.depiction.atoms, result.depiction.bonds);
++  if (hardPasteDefects(original) === 0) return result;
++  const { document, molecule } = drawingForPaste(result.depiction, smiles);
++  const warnings = [...(result.warnings ?? [])];
++  try {
++    // Only failed depictions reach the host's shared selection. No second ranking, mapping,
++    // repair or stereo implementation is maintained for paste, and no document is committed here.
++    if (availability.oclLoadFailure !== undefined) throw new Error(availability.oclLoadFailure);
++    const { relayoutMolfile2D, perceiveStereoCentersFromMolfile } = await import("@chemdraft/ocl-adapter");
++    const { prepareNativeMoleculeEngineRelayout } = await import("../documentWorkflow");
++    const prepared = await prepareNativeMoleculeEngineRelayout(document, molecule.id, relayoutMolfile2D, async () => {
++      if (availability.rdkitLoadFailure !== undefined) return [];
++      const { createRdkit2DRelayouts } = await import("@chemdraft/rdkit-adapter/depiction");
++      return createRdkit2DRelayouts();
++    }, { targetBondLengthPx: nativeDrawingStyleFromObjectStyle(molecule.style).bondLengthPx,
++      perceiveStereo: perceiveStereoCentersFromMolfile });
++    const after = prepared.pages[0].objects[0] as MoleculeObject;
++    if (hardPasteDefects(nativeMoleculeLayoutQuality(after, false)) === 0) {
++      const indices = new Map(after.atoms.map((atom, i) => [atom.id, i]));
++      return { ...result, depiction: {
++        atoms: after.atoms.map(atom => ({ element: atom.element, charge: atom.formalCharge,
++          ...(atom.isotope === undefined ? {} : { isotope: atom.isotope }), x: atom.x, y: -atom.y })),
++        bonds: after.bonds.map(bond => ({ from: indices.get(bond.fromAtomId)!, to: indices.get(bond.toAtomId)!,
++          order: bond.order, ...(bond.stereo === "either" ? { stereo: "either" as const } : {}),
++          wedge: bond.display?.bondStyle === "wedge" ? "wedge" : bond.display?.bondStyle === "hashed" ? "hashed" : null }))
++      } };
++    }
++  } catch (error) {
++    warnings.push(`Paste layout repair failed: ${error instanceof Error ? error.message : String(error)}`);
++  }
++  warnings.push(`Pasted structure still has ${overlapDescription(original)}; no generated layout cleared the overlaps.`);
++  return { ...result, warnings };
++}
+diff --git a/apps/desktop/src/documentWorkflow.test.ts b/apps/desktop/src/documentWorkflow.test.ts
+index 108461230..f39fc8647 100644
+--- a/apps/desktop/src/documentWorkflow.test.ts
++++ b/apps/desktop/src/documentWorkflow.test.ts
+@@ -4622,9 +4622,9 @@ describe("Phase 4 document workflow", () => {
+         .map(b => ({ from: ids.get(b.fromAtomId)!, to: ids.get(b.toAtomId)! }));
+       const q = layoutEngine.evaluateLayoutQuality(after.atoms, bonds, target, undefined, undefined,
+         layoutEngine.moleculeLayoutLabelBoxes(after));
+-      // Record the unexempted final contacts at default font size: only two Zn/donor pairs.
++      // Glyph extents no longer touch for the Zn/donor pairs at default font size.
+       expect(q.labelLabelOverlaps.map(pair => pair.map(i => after.atoms[i].id)))
+-        .toEqual([["atom_008", "atom_009"], ["atom_008", "atom_014"]]);
++        .toEqual([]);
+       expect(q.labelBondOverlaps).toEqual([]);
+       expect(q.overlappingAtoms).toEqual([]);
+       expect(q.atomBondOverlaps).toEqual([]);
+diff --git a/apps/desktop/src/documentWorkflow.ts b/apps/desktop/src/documentWorkflow.ts
+index 7322eb58b..03524d04e 100644
+--- a/apps/desktop/src/documentWorkflow.ts
++++ b/apps/desktop/src/documentWorkflow.ts
+@@ -1,4 +1,5 @@
+ import { formulaSpansFromText } from "@chemdraft/document-workflow-core";
++import { nativeMoleculeLayoutQuality } from "./depiction2d/layoutQuality";
+ import { planObjectArrangement, moleculeAnchorForArrangement, moleculeVisualBoundsForArrangement, textVisualBoundsForArrangement, type ArrangementLayout, type ArrangementOptions, type ArrangementItem, type LayoutBounds } from "@chemdraft/layout-engine";
+ import { snapRotationDegrees } from "./rotationSnap";
+ import { snapPlacementDegrees } from "./placementSnap";
+@@ -134,6 +135,8 @@ import {
+ } from "@chemdraft/export-engine";
+ import {
+   compareLayoutQuality,
++  layoutAtomAndLabelDefects,
++  repairBridgedLayoutContacts,
+   compareLayoutRepairs,
+   evaluateLayoutQuality,
+   prepareLayoutTopology,
+@@ -15101,6 +15104,24 @@ function cleanupDoubleBondGeometryExemptions(molecule: MoleculeObject): Readonly
+ /** Avoid replacing an ordinary drawing for a negligible soft-geometry improvement. */
+ export const MIN_CLEANUP_SOFT_SCORE_IMPROVEMENT = 0.05;
+ 
++export function cleanUpStructureStatus(
++  document: ChemDraftDocument, objectIds: readonly string[], changed: boolean, warnings: readonly string[] = []
++): string {
++  const label = objectIds.length === 1 ? "structure" : "structures";
++  const defective = objectIds.map(id => {
++    const molecule = findMoleculeObject(document, id);
++    return molecule ? nativeMoleculeLayoutQuality(molecule) : undefined;
++  }).find(quality => quality && layoutAtomAndLabelDefects(quality) > 0);
++  const overlap = defective?.overlappingAtoms.length ? "overlapping atoms"
++    : defective?.atomBondOverlaps.length ? "atoms overlapping bonds"
++    : defective?.collinearBondOverlaps.length ? "overlapping bonds" : "overlapping atom labels";
++  const status = changed ? `Cleaned up selected ${label}` : defective
++    ? `Clean Up couldn't fix the selected ${label}: the drawing still has ${overlap}.`
++    : `Selected ${label} already clean`;
++  const details = [...new Set(warnings)].filter(warning => warning !== status);
++  return status + (details.length ? ` — ${details.join(" ")}` : "");
++}
++
+ function evaluateEngineRelayoutCandidate(
+   document: ChemDraftDocument, objectId: string, relayout: NativeMoleculeRelayoutEngine,
+   options: NativeEngineRelayoutOptions, conventionalOrientation = false
+@@ -15156,12 +15177,12 @@ function chooseEngineRelayout(
+   }).sort((a, b) => compareLayoutRepairs(a.repair, b.repair));
+   const before = findMoleculeObject(document, objectId);
+   const exemptDoubleBonds = before ? cleanupDoubleBondGeometryExemptions(before) : new Set<string>();
+-  for (const { source, repair } of repairs) {
+-    const depiction = { ...source.depiction, atoms: source.depiction.atoms.map((atom, i) => ({ ...atom, ...repair.atoms[i] })) };
++  const guardedRepair = (source: NonNullable<EngineRelayoutCandidate["repairSource"]>, points: readonly PagePoint[]) => {
++    const depiction = { ...source.depiction, atoms: source.depiction.atoms.map((atom, i) => ({ ...atom, ...points[i] })) };
+     const attempt = evaluateEngineRelayoutCandidate(document, objectId, () => depiction, options, true);
+-    if (!attempt.ok || attempt.candidate.quality?.hardDefects !== 0) continue;
++    if (!attempt.ok || !attempt.candidate.quality || layoutAtomAndLabelDefects(attempt.candidate.quality) !== 0) return undefined;
+     const after = findMoleculeObject(attempt.candidate.document, objectId);
+-    if (!before || !after) continue;
++    if (!before || !after) return undefined;
+     // R/S has already passed the normal read-back/reconciliation above. A swing can also move
+     // an alkene ligand across its axis; guard its drawn E/Z with the same conservative state
+     // comparison used by flatten. Only aromatic/small-ring topology exempts geometry;
+@@ -15170,12 +15191,28 @@ function chooseEngineRelayout(
+     const actualDoubleStereo = doubleBondStereoState(after);
+     if ([...doubleBondStereoState(before)].some(([id, expected]) =>
+       (expected === "either" || !exemptDoubleBonds.has(id)) &&
+-      expected !== 0 && actualDoubleStereo.get(id) !== expected)) continue;
+-    if (attempt.candidate.quality.passes || attempt.candidate.quality.passesRelaxed) return finish(attempt.candidate);
++      expected !== 0 && actualDoubleStereo.get(id) !== expected)) return undefined;
++    return attempt.candidate;
++  };
++  for (const { source, repair } of repairs) {
++    const candidate = guardedRepair(source, repair.atoms);
++    if (!candidate) continue;
++    if (candidate.quality?.passes || candidate.quality?.passesRelaxed) return finish(candidate);
+     // Terminal labels can be cleared while the fixed macrocycle retains soft distortion.
+     // Compare that fully guarded, hard-clear repair with the drawing in the normal fallback;
+     // a repair never gets to bypass the final atom/label veto or the improvement requirement.
+-    candidates.push(attempt.candidate);
++    candidates.push(candidate);
++  }
++  // A cage may need crossings in every projection. Separate local atom contacts only after
++  // ordinary rigid repairs fail, then use exactly the same identity and R/S + E/Z guards.
++  if (!candidates.some(candidate => candidate.quality && layoutAtomAndLabelDefects(candidate.quality) === 0)) {
++    for (const candidate of [...candidates]) {
++      const source = candidate.repairSource;
++      if (!source || !candidate.quality?.hasBridgedRings) continue;
++      const points = repairBridgedLayoutContacts(source.depiction.atoms, source.bonds, source.labelBoxes);
++      const repaired = points && guardedRepair(source, points);
++      if (repaired) candidates.push(repaired);
++    }
+   }
+   if (!best) {
+     if (!primary.ok) throw primary.error;
+@@ -15184,15 +15221,15 @@ function chooseEngineRelayout(
+   // A rejected placement or overlapping geometry must not outrank a usable crossing-only
+   // alternative merely because its total hard-defect count is smaller.
+   const usable = candidates.filter(candidate => !candidate.placementAddsHardDefects &&
+-    candidate.quality?.overlappingAtoms.length === 0 && candidate.quality.atomBondOverlaps.length === 0 &&
+-    candidate.quality.collinearBondOverlaps.length === 0 && candidate.quality.labelBondOverlaps.length === 0 &&
+-    candidate.quality.labelLabelOverlaps.length === 0);
++    candidate.quality && layoutAtomAndLabelDefects(candidate.quality) === 0);
+   if (usable.length) best = usable.reduce((a, b) => compareLayoutQuality(a.quality!, b.quality!) <= 0 ? a : b);
+   // Preserve the existing bridged/cage policy; regular planar geometry may be impossible there.
+   const bridged = best.quality?.hasBridgedRings;
+   if (!bridged && bestRelaxed) return finish(bestRelaxed);
+   const generated = best.quality;
+   const drawn = best.drawnQuality;
++  // Clearing atom/label collisions is an improvement regardless of unavoidable cage crossings.
++  if (generated && drawn && usable.includes(best) && layoutAtomAndLabelDefects(drawn) > 0) return finish(best);
+   const improvesOrdinary = generated && drawn && (generated.hardDefects < drawn.hardDefects ||
+     (generated.hardDefects === 0 && generated.softScore <= drawn.softScore - MIN_CLEANUP_SOFT_SCORE_IMPROVEMENT));
+   if (generated && drawn && (best.placementAddsHardDefects || generated.overlappingAtoms.length > 0 ||
+@@ -15203,10 +15240,10 @@ function chooseEngineRelayout(
+     const reason = generated.overlappingAtoms.length > 0 && generated.crossings.length > 0
+       ? "put atoms on top of each other and crossed bonds"
+       : generated.overlappingAtoms.length > 0 ? "put atoms on top of each other"
+-      : generated.crossings.length > 0 ? "crossed bonds"
+       : generated.atomBondOverlaps.length > 0 ? "put atoms on bonds"
+       : generated.labelBondOverlaps.length > 0 || generated.labelLabelOverlaps.length > 0 ? "overlapped atom labels"
+-      : generated.collinearBondOverlaps.length > 0 ? "overlapped bonds" : "distorted bonds or rings beyond the cleanup limits";
++      : generated.collinearBondOverlaps.length > 0 ? "overlapped bonds"
++      : generated.crossings.length > 0 ? "crossed bonds" : "distorted bonds or rings beyond the cleanup limits";
+     options.warnings?.push(`Clean Up kept the drawn layout of this structure: the generated layouts ${reason}.`);
+     return document;
+   }
+diff --git a/packages/layout-engine/src/atomLabelGlyphBounds.test.ts b/packages/layout-engine/src/atomLabelGlyphBounds.test.ts
+new file mode 100644
+index 000000000..c7281c73c
+--- /dev/null
++++ b/packages/layout-engine/src/atomLabelGlyphBounds.test.ts
+@@ -0,0 +1,266 @@
++// The collision box of an atom label must enclose the ink the renderer draws, for every label font.
++// Ink comes from the public Adobe core-14 AFM metrics (Helvetica, Courier, regular and bold), each
++// entry "char:advance,llx,lly,urx,ury" in 1/1000 em, placed as SVG text draws a run: baseline at
++// run.y + 0.35 em, start/middle/end anchored by the font's own advance.
++
++import { describe, expect, it } from "vitest";
++import { DefaultNativeDrawingStyle, type MoleculeAtom, type NativeDrawingStyle } from "@chemdraft/chem-core";
++
++import { atomLabelGlyphBounds, atomLabelLayout, type AtomLabelPlan } from "./index";
++
++const AFM_SOURCE: Record<"helvetica" | "helveticaBold" | "courier" | "courierBold", string[]> = {
++  helvetica: [
++    "(:333,68,-207,299,733 ):333,34,-207,265,733 +:584,39,0,545,505 ,:278,87,-147,191,106",
++    "-:333,44,232,289,322 .:278,87,0,191,106 /:278,-17,-19,295,737 0:556,37,-19,519,703",
++    "1:556,101,0,359,703 2:556,26,0,507,703 3:556,34,-19,522,703 4:556,25,0,523,703",
++    "5:556,32,-19,514,688 6:556,38,-19,518,703 7:556,37,0,523,688 8:556,38,-19,517,703",
++    "9:556,42,-19,514,703 ;:278,87,-147,191,516 A:667,14,0,654,718 B:667,74,0,627,718",
++    "C:722,44,-19,681,737 D:722,81,0,674,718 E:667,86,0,616,718 F:611,86,0,583,718",
++    "G:778,48,-19,704,737 H:722,77,0,646,718 I:278,91,0,188,718 J:500,17,-19,428,718",
++    "K:667,76,0,663,718 L:556,76,0,537,718 M:833,73,0,761,718 N:722,76,0,646,718 O:778,39,-19,739,737",
++    "P:667,86,0,622,718 Q:778,39,-56,739,737 R:722,88,0,684,718 S:667,49,-19,620,737",
++    "T:611,14,0,597,718 U:722,79,-19,644,718 V:667,20,0,647,718 W:944,16,0,928,718 X:667,19,0,648,718",
++    "Y:667,14,0,653,718 Z:611,23,0,588,718 [:278,63,-196,250,722 ]:278,28,-196,215,722",
++    "_:556,0,-125,556,-75 a:556,36,-15,530,538 b:556,58,-15,517,718 c:500,30,-15,477,538",
++    "d:556,35,-15,499,718 e:556,40,-15,516,538 f:278,14,0,262,728 g:556,40,-220,499,538",
++    "h:556,65,0,491,718 i:222,67,0,155,718 j:222,-16,-210,155,718 k:500,67,0,501,718",
++    "l:222,67,0,155,718 m:833,65,0,769,538 n:556,65,0,491,538 o:556,35,-14,521,538",
++    "p:556,58,-207,517,538 q:556,35,-207,494,538 r:333,77,0,332,538 s:500,32,-15,464,538",
++    "t:278,14,-7,257,669 u:556,68,-15,489,523 v:500,8,0,492,523 w:722,14,0,709,523 x:500,11,0,490,523",
++    "y:500,11,-214,489,523 z:500,31,0,469,523 {:334,42,-196,292,722 }:334,42,-196,292,722",
++  ],
++  helveticaBold: [
++    "(:333,35,-208,314,734 ):333,19,-208,298,734 +:584,40,0,544,506 ,:278,64,-168,214,146",
++    "-:333,27,215,306,345 .:278,64,0,214,146 /:278,-33,-19,311,737 0:556,32,-19,524,710",
++    "1:556,69,0,378,710 2:556,26,0,511,710 3:556,27,-19,516,710 4:556,27,0,526,710",
++    "5:556,27,-19,516,698 6:556,31,-19,520,710 7:556,25,0,528,698 8:556,32,-19,524,710",
++    "9:556,30,-19,522,710 ;:333,92,-168,242,512 A:722,20,0,702,718 B:722,76,0,669,718",
++    "C:722,44,-19,684,737 D:722,76,0,685,718 E:667,76,0,621,718 F:611,76,0,587,718",
++    "G:778,44,-19,713,737 H:722,71,0,651,718 I:278,64,0,214,718 J:556,22,-18,484,718",
++    "K:722,87,0,722,718 L:611,76,0,583,718 M:833,69,0,765,718 N:722,69,0,654,718 O:778,44,-19,734,737",
++    "P:667,76,0,627,718 Q:778,44,-52,737,737 R:722,76,0,677,718 S:667,39,-19,629,737",
++    "T:611,14,0,598,718 U:722,72,-19,651,718 V:667,19,0,648,718 W:944,16,0,929,718 X:667,14,0,653,718",
++    "Y:667,15,0,653,718 Z:611,25,0,586,718 [:333,63,-196,309,722 ]:333,24,-196,270,722",
++    "_:556,0,-125,556,-75 a:556,29,-14,527,546 b:611,61,-14,578,718 c:556,34,-14,524,546",
++    "d:611,34,-14,551,718 e:556,23,-14,528,546 f:333,10,0,318,727 g:611,40,-217,553,546",
++    "h:611,65,0,546,718 i:278,69,0,209,725 j:278,3,-214,209,725 k:556,69,0,562,718 l:278,69,0,209,718",
++    "m:889,64,0,826,546 n:611,65,0,546,546 o:611,34,-14,578,546 p:611,62,-207,578,546",
++    "q:611,34,-207,552,546 r:389,64,0,373,546 s:556,30,-14,519,546 t:333,10,-6,309,676",
++    "u:611,66,-14,545,532 v:556,13,0,543,532 w:778,10,0,769,532 x:556,15,0,541,532",
++    "y:556,10,-214,539,532 z:500,20,0,480,532 {:389,48,-196,365,722 }:389,24,-196,341,722",
++  ],
++  courier: [
++    "(:600,269,-108,440,622 ):600,160,-108,331,622 +:600,80,44,520,470 ,:600,181,-112,344,122",
++    "-:600,103,231,497,285 .:600,229,-15,371,109 /:600,125,-80,475,629 0:600,106,-15,494,622",
++    "1:600,96,0,505,622 2:600,70,0,471,622 3:600,75,-15,466,622 4:600,78,0,500,622",
++    "5:600,92,-15,497,607 6:600,111,-15,497,622 7:600,82,0,483,607 8:600,102,-15,498,622",
++    "9:600,96,-15,489,622 ;:600,181,-112,371,385 A:600,3,0,597,562 B:600,43,0,559,562",
++    "C:600,41,-18,540,580 D:600,43,0,574,562 E:600,53,0,550,562 F:600,53,0,545,562",
++    "G:600,31,-18,575,580 H:600,32,0,568,562 I:600,96,0,504,562 J:600,34,-18,566,562",
++    "K:600,38,0,582,562 L:600,47,0,554,562 M:600,4,0,596,562 N:600,7,-13,593,562 O:600,43,-18,557,580",
++    "P:600,79,0,558,562 Q:600,43,-138,557,580 R:600,38,0,588,562 S:600,72,-20,529,580",
++    "T:600,38,0,563,562 U:600,17,-18,583,562 V:600,-4,-13,604,562 W:600,-3,-13,603,562",
++    "X:600,23,0,577,562 Y:600,24,0,576,562 Z:600,86,0,514,562 [:600,269,-108,442,622",
++    "]:600,158,-108,331,622 _:600,0,-125,600,-75 a:600,53,-15,559,441 b:600,14,-15,575,629",
++    "c:600,66,-15,529,441 d:600,45,-15,591,629 e:600,66,-15,548,441 f:600,114,0,531,629",
++    "g:600,45,-157,566,441 h:600,18,0,582,629 i:600,95,0,505,657 j:600,82,-157,410,657",
++    "k:600,43,0,580,629 l:600,95,0,505,629 m:600,-5,0,605,441 n:600,26,0,575,441 o:600,62,-15,538,441",
++    "p:600,9,-157,555,441 q:600,45,-157,591,441 r:600,60,0,559,441 s:600,80,-15,513,441",
++    "t:600,87,-15,530,561 u:600,21,-15,562,426 v:600,10,-10,590,426 w:600,-4,-10,604,426",
++    "x:600,20,0,580,426 y:600,7,-157,592,426 z:600,99,0,502,426 {:600,182,-108,437,622",
++    "}:600,163,-108,418,622",
++  ],
++  courierBold: [
++    "(:600,219,-102,461,616 ):600,139,-102,381,616 +:600,71,39,529,478 ,:600,123,-111,393,174",
++    "-:600,100,203,500,313 .:600,192,-15,408,171 /:600,98,-77,502,626 0:600,87,-15,513,616",
++    "1:600,81,0,539,616 2:600,61,0,499,616 3:600,63,-15,501,616 4:600,53,0,507,616",
++    "5:600,70,-15,521,601 6:600,90,-15,521,616 7:600,55,0,494,601 8:600,83,-15,517,616",
++    "9:600,79,-15,510,616 ;:600,123,-111,408,425 A:600,-9,0,609,562 B:600,30,0,573,562",
++    "C:600,22,-18,560,580 D:600,30,0,594,562 E:600,25,0,560,562 F:600,39,0,570,562",
++    "G:600,22,-18,594,580 H:600,20,0,580,562 I:600,77,0,523,562 J:600,37,-18,601,562",
++    "K:600,21,0,599,562 L:600,39,0,578,562 M:600,-2,0,602,562 N:600,8,-12,610,562",
++    "O:600,22,-18,578,580 P:600,48,0,559,562 Q:600,32,-138,578,580 R:600,24,0,599,562",
++    "S:600,47,-22,553,582 T:600,21,0,579,562 U:600,4,-18,596,562 V:600,-13,0,613,562",
++    "W:600,-18,0,618,562 X:600,12,0,588,562 Y:600,12,0,589,562 Z:600,62,0,539,562",
++    "[:600,245,-102,475,616 ]:600,125,-102,355,616 _:600,0,-125,600,-75 a:600,35,-15,570,454",
++    "b:600,0,-15,584,626 c:600,40,-15,545,459 d:600,20,-15,591,626 e:600,40,-15,563,454",
++    "f:600,83,0,547,626 g:600,30,-146,580,454 h:600,5,0,592,626 i:600,77,0,523,658",
++    "j:600,63,-146,440,658 k:600,20,0,585,626 l:600,77,0,523,626 m:600,-22,0,626,454",
++    "n:600,18,0,592,454 o:600,30,-15,570,454 p:600,-1,-142,570,454 q:600,20,-142,591,454",
++    "r:600,47,0,580,454 s:600,68,-17,535,459 t:600,47,-15,532,562 u:600,-1,-15,569,439",
++    "v:600,-1,0,601,439 w:600,-18,0,618,439 x:600,6,0,594,439 y:600,-4,-142,601,439",
++    "z:600,81,0,520,439 {:600,160,-102,464,616 }:600,136,-102,440,616",
++  ]
++};
++
++interface Glyph { advance: number; llx: number; lly: number; urx: number; ury: number }
++const AFM = Object.fromEntries(Object.entries(AFM_SOURCE).map(([font, lines]) => [font,
++  new Map(lines.flatMap(line => line.split(" ")).map((line): [string, Glyph] => {
++    const split = line.indexOf(":");
++    const [advance, llx, lly, urx, ury] = line.slice(split + 1).split(",").map(Number);
++    return [line.slice(0, split), { advance: advance!, llx: llx!, lly: lly!, urx: urx!, ury: ury! }];
++  }))])) as Record<keyof typeof AFM_SOURCE, Map<string, Glyph>>;
++
++const SANS_STACKS = ["Arial, Helvetica, sans-serif", "Helvetica", "Arial", "'Helvetica', sans-serif", "sans-serif"];
++const MONO_STACKS = ["Courier New, Courier, monospace", "Courier", "'Courier New', monospace"];
++const FOREIGN_STACKS = ["Times New Roman, Times, serif", "Georgia, serif", "Menlo", "Arial, Georgia, serif",
++  "Courier New, Arial, sans-serif", "system-ui", ""];
++
++const atom: MoleculeAtom = { id: "a", element: "C", x: 0, y: 0, formalCharge: 0 };
++
++function planFor(label: string, style: Partial<NativeDrawingStyle>, anchor?: { side: "start" | "end"; length: number }): AtomLabelPlan {
++  const drawingStyle: NativeDrawingStyle = { ...DefaultNativeDrawingStyle, ...style };
++  const layout = atomLabelLayout(label, drawingStyle, anchor);
++  return { atom, label, ...(anchor ? { labelAnchor: anchor } : {}), anchor: { x: 0, y: 0 }, anchorOffset: { x: 0, y: 0 },
++    layout, drawingStyle, color: drawingStyle.atomLabelColor, backgroundColor: drawingStyle.atomLabelBackgroundColor,
++    backgroundVisible: false, fontFamily: drawingStyle.atomLabelFontFamily, fontSizePx: drawingStyle.atomLabelFontSizePx,
++    fontWeight: drawingStyle.atomLabelFontWeight, fontStyle: drawingStyle.atomLabelFontStyle };
++}
++
++/** The union of the ink every run draws, in the label's own coordinates (y down), from the AFM boxes. */
++function drawnInk(plan: AtomLabelPlan, font: keyof typeof AFM_SOURCE, shear = 0): { left: number; right: number; top: number; bottom: number } {
++  const glyphs = AFM[font];
++  let left = Infinity, right = -Infinity, top = Infinity, bottom = -Infinity;
++  for (const run of plan.layout.runs) {
++    const size = atomLabelRunSize(plan, run.script);
++    const total = [...run.text].reduce((sum, ch) => sum + glyphs.get(ch)!.advance, 0) / 1000 * size;
++    let pen = run.x - (run.textAnchor === "middle" ? total / 2 : run.textAnchor === "end" ? total : 0);
++    const baseline = run.y + 0.35 * size;
++    for (const ch of run.text) {
++      const glyph = glyphs.get(ch);
++      if (!glyph) throw new Error(`no AFM metrics for ${JSON.stringify(ch)}`);
++      const yUp = [glyph.lly, glyph.ury].map(v => v / 1000 * size);
++      // A slanted glyph leans right above its baseline and left below it.
++      for (const [x, up] of [[glyph.llx, yUp[0]!], [glyph.llx, yUp[1]!], [glyph.urx, yUp[0]!], [glyph.urx, yUp[1]!]] as const) {
++        const px = pen + x / 1000 * size + shear * up;
++        left = Math.min(left, px); right = Math.max(right, px);
++      }
++      top = Math.min(top, baseline - yUp[1]!); bottom = Math.max(bottom, baseline - yUp[0]!);
++      pen += glyph.advance / 1000 * size;
++    }
++  }
++  return { left, right, top, bottom };
++}
++
++function atomLabelRunSize(plan: AtomLabelPlan, script: "normal" | "subscript" | "superscript"): number {
++  const base = plan.drawingStyle.atomLabelFontSizePx;
++  return script === "normal" ? base : base * (script === "superscript" ? 0.88 : 0.72);
++}
++
++function expectEncloses(plan: AtomLabelPlan, font: keyof typeof AFM_SOURCE, shear = 0): void {
++  const box = atomLabelGlyphBounds(plan), ink = drawnInk(plan, font, shear), eps = 1e-9;
++  const where = JSON.stringify({ label: plan.label, font, box, ink });
++  expect(box.x, where).toBeLessThanOrEqual(ink.left + eps);
++  expect(box.x + box.width, where).toBeGreaterThanOrEqual(ink.right - eps);
++  expect(box.y, where).toBeLessThanOrEqual(ink.top + eps);
++  expect(box.y + box.height, where).toBeGreaterThanOrEqual(ink.bottom - eps);
++}
++
++// Labels cover parentheses and brackets, a Q, a lowercase descender, commas, charges, isotopes,
++// subscripts and superscripts. Upper-case/digit labels also run in bold, whose advance the layout
++// scales from the regular one.
++const LABELS = ["OH", "NH2", "I", "Q", "O", "H", "N(CH3)2", "(CH2)3", "[Fe]", "[Cu(NH3)4]2+", "C(O)Q", "CH3,", "S;O",
++  "O-", "NH4+", "N2+", "O2-", "Mg2+", "13C", "2H", "Cl-", "OMe", "tBu", "Cp", "Pyg", "Q-", "P{O}", "C/O", "C_6"];
++const CAPS_LABELS = LABELS.filter(label => !/[a-z]/.test(label.replace(/^\d+/, "")) || /^\[Fe\]$/.test(label));
++const ANCHORS = [undefined, { side: "start" as const, length: 1 }, { side: "end" as const, length: 1 }];
++
++describe("atomLabelGlyphBounds encloses the ink of the label font", () => {
++  it.each(SANS_STACKS)("Helvetica/Arial stack %s: every label, anchor and size", (fontFamily) => {
++    for (const label of LABELS) for (const anchor of ANCHORS) for (const atomLabelFontSizePx of [10, 15, 23]) {
++      if (/^[^a-z]*$/.test(label) || anchor === undefined) {
++        // An anchored layout needs the anchor characters in a normal-script run.
++        expectEncloses(planFor(label, { atomLabelFontFamily: fontFamily, atomLabelFontSizePx }, anchor), "helvetica");
++      }
++    }
++  });
++
++  it("covers bold Helvetica ink for upper-case labels", () => {
++    for (const label of CAPS_LABELS) {
++      expectEncloses(planFor(label, { atomLabelFontWeight: 700, atomLabelFontSizePx: 18 }), "helveticaBold");
++    }
++  });
++
++  it("covers slanted Helvetica ink (real and synthetic italics)", () => {
++    for (const label of LABELS) {
++      expectEncloses(planFor(label, { atomLabelFontStyle: "italic", atomLabelFontSizePx: 16 }), "helvetica", 0.25);
++    }
++  });
++
++  it.each(MONO_STACKS)("monospace stack %s: every label at Courier's 0.6 em advance", (fontFamily) => {
++    for (const label of LABELS) for (const anchor of ANCHORS) for (const atomLabelFontSizePx of [10, 15, 23]) {
++      if (/^[^a-z]*$/.test(label) || anchor === undefined) {
++        expectEncloses(planFor(label, { atomLabelFontFamily: fontFamily, atomLabelFontSizePx }, anchor), "courier");
++      }
++    }
++    for (const label of CAPS_LABELS) {
++      expectEncloses(planFor(label, { atomLabelFontFamily: fontFamily, atomLabelFontWeight: 700 }), "courierBold");
++    }
++  });
++
++  it("widens a monospace 'I' to its advance, where Helvetica's is under half as wide", () => {
++    const courier = atomLabelGlyphBounds(planFor("I", { atomLabelFontFamily: "Courier New, Courier, monospace", atomLabelFontSizePx: 20 }));
++    const helvetica = atomLabelGlyphBounds(planFor("I", { atomLabelFontSizePx: 20 }));
++    expect(courier.width).toBeGreaterThanOrEqual(0.6 * 20);
++    expect(helvetica.width).toBeLessThan(0.3 * 20);
++  });
++
++  it("keeps the run's text anchor when widening a monospace run", () => {
++    const size = 20, family = "Courier New, Courier, monospace";
++    const plan = planFor("MeO2C", { atomLabelFontFamily: family, atomLabelFontSizePx: size }, { side: "end", length: 1 });
++    const box = atomLabelGlyphBounds(plan);
++    const runs = plan.layout.runs;
++    const anchored = runs.filter(run => run.textAnchor === "end")[0]!;
++    expect(box.x + box.width).toBeGreaterThanOrEqual(anchored.x);
++    expect(box.x).toBeLessThanOrEqual(anchored.x - anchored.text.length * 0.6 * size);
++  });
++
++  it("descends below the baseline for Q, brackets, parentheses and commas, and rises for brackets", () => {
++    const size = 20;
++    const baseline = (plan: AtomLabelPlan) => plan.layout.runs[0]!.y + 0.35 * size;
++    for (const [label, descent, ascent] of [["Q", 0.138, 0.737], ["(", 0.208, 0.734], [")", 0.208, 0.734],
++      ["[", 0.196, 0.722], ["]", 0.196, 0.722], ["{", 0.196, 0.722], [",", 0.168, 0.2], [";", 0.168, 0.5], ["/", 0.019, 0.737]] as const) {
++      const plan = planFor(label, { atomLabelFontSizePx: size });
++      const box = atomLabelGlyphBounds(plan);
++      expect(box.y + box.height, label).toBeGreaterThanOrEqual(baseline(plan) + descent * size);
++      expect(box.y, label).toBeLessThanOrEqual(baseline(plan) - ascent * size);
++    }
++  });
++
++  it("encloses the plus and minus ink of a charge, and the isotope and subscript digits", () => {
++    for (const label of ["N+", "O-", "N3+", "O2-", "13CH3", "H2O", "CO2H"]) {
++      expectEncloses(planFor(label, { atomLabelFontSizePx: 20 }), "helvetica");
++      expectEncloses(planFor(label, { atomLabelFontSizePx: 20, atomLabelFontFamily: "Courier" }), "courier");
++    }
++  });
++
++  it("keeps the sans-serif glyph box inside the padded renderer bounds for ordinary labels", () => {
++    for (const label of ["OH", "NH2", "CO2H", "O-", "NH4+", "N2+", "13C", "H2N", "I", "Cl"]) {
++      for (const anchor of ANCHORS) {
++        const plan = planFor(label, {}, anchor), box = atomLabelGlyphBounds(plan), bounds = plan.layout.bounds;
++        expect(box.x, label).toBeGreaterThanOrEqual(bounds.x - 1e-9);
++        expect(box.y, label).toBeGreaterThanOrEqual(bounds.y - 1e-9);
++        expect(box.x + box.width, label).toBeLessThanOrEqual(bounds.x + bounds.width + 1e-9);
++        expect(box.y + box.height, label).toBeLessThanOrEqual(bounds.y + bounds.height + 1e-9);
++      }
++    }
++  });
++
++  it.each(FOREIGN_STACKS)("an unknown font stack (%j) gets the padded renderer bounds", (fontFamily) => {
++    for (const label of ["OH", "Q", "I", "N(CH3)2", "O2-"]) {
++      const plan = planFor(label, { atomLabelFontFamily: fontFamily });
++      expect(atomLabelGlyphBounds(plan)).toEqual(plan.layout.bounds);
++    }
++  });
++
++  it.each(["La@C82", "\u0394H", "O\u2014H", "50%"])("a label with a character outside the metric tables (%j) gets the padded bounds", (label) => {
++    const plan = planFor(label, {});
++    expect(atomLabelGlyphBounds(plan)).toEqual(plan.layout.bounds);
++  });
++
++  it("treats a bare generic monospace as unknown but keeps the box when Courier is named first", () => {
++    const bare = planFor("OH", { atomLabelFontFamily: "monospace" });
++    expect(atomLabelGlyphBounds(bare)).toEqual(bare.layout.bounds);
++    const named = planFor("OH", { atomLabelFontFamily: "Courier New, monospace" });
++    expect(atomLabelGlyphBounds(named)).not.toEqual(named.layout.bounds);
++  });
++});
+diff --git a/packages/layout-engine/src/index.ts b/packages/layout-engine/src/index.ts
+index 233942ae9..f1d28296e 100644
+--- a/packages/layout-engine/src/index.ts
++++ b/packages/layout-engine/src/index.ts
+@@ -5415,13 +5415,98 @@ export function planMoleculeAtomLabels(
+   });
+ }
+ 
+-/** The same padded label geometry used by canvas, bond clipping and SVG export. */
++const sansSerifLabelFamilies: ReadonlySet<string> = new Set(["arial", "helvetica", "sans-serif"]);
++const monospaceLabelFamilies: ReadonlySet<string> = new Set(["courier", "courier new", "monospace"]);
++/** Courier's advance, in em, for every character; Courier New and the generic monospace stacks agree. */
++const monospaceAdvanceEm = 0.6;
++/** Horizontal shear of a (possibly synthetic) italic, as run-over-rise. */
++const italicShear = 0.25;
++
++/** How a label font's glyph extents are known: Helvetica/Arial metrics, Courier metrics, or not at all. */
++function atomLabelFontClass(fontFamily: string): "sans-serif" | "monospace" | "unknown" {
++  const families = fontFamily.split(",").map(family => family.trim().replace(/^["']|["']$/g, "").toLowerCase());
++  if (families.every(family => sansSerifLabelFamilies.has(family))) return "sans-serif";
++  // A bare generic monospace renders as Consolas on Windows, whose ink was never checked: only a
++  // stack that names Courier first is known.
++  if (families[0] !== "monospace" && families.every(family => monospaceLabelFamilies.has(family))) return "monospace";
++  return "unknown";
++}
++
++/** Characters whose advance (`sansSerifAdvanceEm`, or the 0.62 em fallback, which is at least as wide)
++ * and vertical extent (`atomLabelCharacterExtent`) are known; @, %, &, Greek, dashes and the like are not. */
++function atomLabelCharacterIsCovered(character: string): boolean {
++  return character in sansSerifAdvanceEm || /^[()[\]{},;_/|.:'"*=<>!?#~^`\u2212]$/.test(character);
++}
++
++/** A character's ink above and below its baseline, in em (below positive), enclosing the Helvetica
++ * and Courier core-14 AFM boxes, regular and bold. Signs sit mid-em, so a minus has no cap-height
++ * box above a negatively charged O; parentheses, brackets, braces, commas and Q descend; a character
++ * outside the table is given the room of an accented capital with a descender. */
++function atomLabelCharacterExtent(character: string): { ascent: number; descent: number } {
++  if (/[gjpqy]/.test(character)) return { ascent: 0.75, descent: 0.23 };
++  if (character === "Q") return { ascent: 0.75, descent: 0.15 };
++  if (/[()[\]{}]/.test(character)) return { ascent: 0.75, descent: 0.22 };
++  if (character === "," || character === ";") return { ascent: 0.75, descent: 0.17 };
++  if (character === "_") return { ascent: 0.75, descent: 0.13 };
++  if (character === "/") return { ascent: 0.75, descent: 0.08 };
++  if (character === "|") return { ascent: 0.78, descent: 0.23 };
++  if (character === "+") return { ascent: 0.62, descent: 0.03 };
++  if (character === "-" || character === "\u2212") return { ascent: 0.36, descent: -0.19 };
++  if (/^[A-Za-z0-9.:'"*=<>!?&%#@~^`]$/.test(character)) return { ascent: 0.75, descent: 0.03 };
++  return { ascent: 0.95, descent: 0.3 };
++}
++
++/** Glyph extents at the renderer's run positions, without bond-clipping padding.
++ * SVG/canvas text uses dy=0.35em, not a vertically centred em box. Keeping the
++ * clipping envelope here used to report separated acid labels as overlapping.
++ * The box must enclose the ink of whichever font draws the label. Helvetica/Arial
++ * (the advances anchored label placement uses) get glyph-tight horizontal extents;
++ * a monospace family is widened to Courier's advance from the run's text anchor; any other
++ * family, or a label with a character this module has no metrics for, gets the padded renderer
++ * bounds, whose extents are unknown to this module. */
++export function atomLabelGlyphBounds(plan: AtomLabelPlan): LayoutBounds {
++  const fontClass = atomLabelFontClass(plan.fontFamily);
++  if (fontClass === "unknown") return { ...plan.layout.bounds };
++  if (plan.layout.runs.some(run => [...run.text].some(character => !atomLabelCharacterIsCovered(character)))) {
++    return { ...plan.layout.bounds };
++  }
++  const italic = plan.drawingStyle.atomLabelFontStyle === "italic";
++  const boxes = plan.layout.runs.map(run => {
++    const size = atomLabelRunFontSize(run.script, plan.drawingStyle) ?? plan.fontSizePx;
++    const characters = [...run.text];
++    const width = fontClass === "monospace"
++      ? characters.length * monospaceAdvanceEm * size
++      : atomLabelRunAdvance(run, plan.drawingStyle);
++    const extents = characters.map(atomLabelCharacterExtent);
++    const ascent = Math.max(...extents.map(extent => extent.ascent));
++    const descent = Math.max(...extents.map(extent => extent.descent));
++    // Ink may overhang the advance a little (a slash, a bold Courier y), and a slanted
++    // glyph leans right above its baseline and left below it.
++    const overhang = size * (fontClass === "monospace" || characters.includes("/") ? 0.02 : 0);
++    const lean = italic ? size * italicShear : 0;
++    const leftEdge = run.x - (run.textAnchor === "middle" ? width / 2 : run.textAnchor === "end" ? width : 0);
++    const left = leftEdge - overhang - lean * Math.max(0, descent);
++    const right = leftEdge + width + overhang + lean * ascent;
++    return {
++      x: left,
++      y: run.y + size * (0.35 - ascent),
++      width: right - left,
++      height: size * (ascent + descent)
++    };
++  });
++  const x = Math.min(...boxes.map(box => box.x)), y = Math.min(...boxes.map(box => box.y));
++  return { x, y, width: Math.max(...boxes.map(box => box.x + box.width)) - x,
++    height: Math.max(...boxes.map(box => box.y + box.height)) - y };
++}
++
++/** Collision boxes follow the drawn glyphs; clipping/halos retain their own padding. */
+ export function moleculeLayoutLabelBoxes(object: MoleculeObject): LayoutLabelBox[] {
+   const indices = new Map(object.atoms.map((atom, i) => [atom.id, i]));
+-  return planMoleculeAtomLabels(object).map(plan => ({
+-    atom: indices.get(plan.atom.id)!, x: plan.anchor.x + plan.layout.bounds.x,
+-    y: plan.anchor.y + plan.layout.bounds.y, width: plan.layout.bounds.width, height: plan.layout.bounds.height
+-  }));
++  return planMoleculeAtomLabels(object).map(plan => {
++    const bounds = atomLabelGlyphBounds(plan);
++    return { atom: indices.get(plan.atom.id)!, x: plan.anchor.x + bounds.x,
++      y: plan.anchor.y + bounds.y, width: bounds.width, height: bounds.height };
++  });
+ }
+ 
+ /** Page-axis bounds of a caption's stored frame, using the same pivot as text SVG rendering. */
+diff --git a/packages/layout-engine/src/layoutQuality.test.ts b/packages/layout-engine/src/layoutQuality.test.ts
+index fcf490c80..763a4353a 100644
+--- a/packages/layout-engine/src/layoutQuality.test.ts
++++ b/packages/layout-engine/src/layoutQuality.test.ts
+@@ -1,8 +1,8 @@
+ import { describe, expect, it } from "vitest";
+ import { compareLayoutQuality, evaluateLayoutQuality, prepareLayoutLabelEvaluator, labelBoxBondDistance,
+-  LABEL_CLEARANCE_PADDING, MAX_BRIDGE_STRETCH, type LayoutPoint, type LayoutLabelBox } from "./layoutQuality";
++  LABEL_CLEARANCE_PADDING, MAX_BRIDGE_STRETCH, layoutAtomAndLabelDefects, type LayoutPoint, type LayoutLabelBox } from "./layoutQuality";
+ import { testMoleculeFromSmiles } from "./testing";
+-import { moleculeLayoutLabelBoxes, planMoleculeAtomLabels } from "./index";
++import { atomLabelGlyphBounds, moleculeLayoutLabelBoxes, planMoleculeAtomLabels } from "./index";
+ import type { MoleculeObject } from "@chemdraft/chem-core";
+ 
+ const polygon = (n: number): LayoutPoint[] => Array.from({ length: n }, (_, i) => ({
+@@ -11,6 +11,16 @@ const polygon = (n: number): LayoutPoint[] => Array.from({ length: n }, (_, i) =
+ const cycle = (n: number) => Array.from({ length: n }, (_, from) => ({ from, to: (from + 1) % n }));
+ 
+ describe("2D layout quality", () => {
++  it("ranks every atom and label defect ahead of any number of cage crossings", () => {
++    const clear = evaluateLayoutQuality(polygon(6), cycle(6));
++    const crossingOnly = { ...clear, crossings: [[0, 1], [1, 2], [2, 3]] as [number, number][], hardDefects: 3 };
++    for (const field of ["overlappingAtoms", "atomBondOverlaps", "collinearBondOverlaps", "labelBondOverlaps", "labelLabelOverlaps"] as const) {
++      const overlapping = { ...clear, [field]: [[0, 1]], hardDefects: 1 };
++      expect(layoutAtomAndLabelDefects(overlapping)).toBe(1);
++      expect(compareLayoutQuality(crossingOnly, overlapping)).toBeLessThan(0);
++    }
++    expect(compareLayoutQuality(clear, crossingOnly)).toBeLessThan(0);
++  });
+   it("rechecks stationary attachment labels against stationary bonds and labels", () => {
+     const atoms = [{ x: 0, y: 0 }, { x: 30, y: 0 }, { x: -20, y: 0 }, { x: -20, y: 30 }];
+     const bonds = [{ from: 0, to: 1 }, { from: 2, to: 3 }];
+@@ -45,6 +55,8 @@ describe("2D layout quality", () => {
+             labelBondOverlaps.push([box.atom, j]);
+         });
+         labels.slice(i + 1).forEach(other => {
++          // Directly bonded labels are exempt from label-label overlap checks.
++          if (bonds.some(b => (b.from === box.atom && b.to === other.atom) || (b.to === box.atom && b.from === other.atom))) return;
+           if (box.x <= other.x + other.width + padding && other.x <= box.x + box.width + padding &&
+               box.y <= other.y + other.height + padding && other.y <= box.y + box.height + padding)
+             labelLabelOverlaps.push([box.atom, other.atom]);
+@@ -87,9 +99,19 @@ describe("2D layout quality", () => {
+     const boxes = moleculeLayoutLabelBoxes(molecule);
+     expect(boxes.map(box => box.atom)).toEqual([1, 2, 3, 4]);
+     expect(plans.at(-1)!.fontSizePx).toBe(23);
+-    expect(boxes).toEqual(plans.map(plan => ({ atom: molecule.atoms.indexOf(plan.atom),
+-      x: plan.anchor.x + plan.layout.bounds.x, y: plan.anchor.y + plan.layout.bounds.y,
+-      width: plan.layout.bounds.width, height: plan.layout.bounds.height })));
++    // Quality checks use glyph extents, which remain inside the renderer's padded clipping bounds.
++    expect(boxes).toEqual(plans.map(plan => {
++      const bounds = atomLabelGlyphBounds(plan);
++      return { atom: molecule.atoms.indexOf(plan.atom), x: plan.anchor.x + bounds.x, y: plan.anchor.y + bounds.y,
++        width: bounds.width, height: bounds.height };
++    }));
++    plans.forEach((plan, i) => {
++      const box = boxes[i], bounds = plan.layout.bounds;
++      expect(box.x).toBeGreaterThanOrEqual(plan.anchor.x + bounds.x);
++      expect(box.y).toBeGreaterThanOrEqual(plan.anchor.y + bounds.y);
++      expect(box.x + box.width).toBeLessThanOrEqual(plan.anchor.x + bounds.x + bounds.width);
++      expect(box.y + box.height).toBeLessThanOrEqual(plan.anchor.y + bounds.y + bounds.height);
++    });
+   });
+   it("counts padded label/bond and label/label contacts as hard defects, excluding incident bonds", () => {
+     const atoms = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 0.5, y: 1 }];
+@@ -112,8 +134,8 @@ describe("2D layout quality", () => {
+     const raw = evaluateLayoutQuality(atoms, bonds, 1, undefined, undefined, boxes);
+     // Reversing the exemption's indices must not change which single pair is exempted.
+     const exempt = evaluateLayoutQuality(atoms, bonds, 1, undefined, undefined, boxes, [[3, 2]]);
+-    expect(raw.labelLabelOverlaps).toEqual([[0, 2], [0, 3], [2, 3]]);
+-    expect(exempt.labelLabelOverlaps).toEqual([[0, 2], [0, 3]]);
++    expect(raw.labelLabelOverlaps).toEqual([[0, 3], [2, 3]]); // Bonded atoms 0 and 2 are exempt.
++    expect(exempt.labelLabelOverlaps).toEqual([[0, 3]]); // The declared exemption also removes 2 and 3.
+     expect(exempt.labelBondOverlaps).toEqual(raw.labelBondOverlaps);
+     expect(exempt.labelBondOverlaps).toContainEqual([3, 0]);
+     expect(exempt.smallestLabelBondClearance).toBe(raw.smallestLabelBondClearance);
+diff --git a/packages/layout-engine/src/layoutQuality.ts b/packages/layout-engine/src/layoutQuality.ts
+index 3a7357140..8d8841718 100644
+--- a/packages/layout-engine/src/layoutQuality.ts
++++ b/packages/layout-engine/src/layoutQuality.ts
+@@ -235,63 +235,97 @@ export function prepareLayoutTopology(atomCount: number, bonds: readonly LayoutB
+  * reuse invariant geometry and score only moved-versus-stationary pairs on each trial. */
+ export type LayoutGeometry = Pick<LayoutQuality, "overlappingAtoms" | "crossings" | "collinearBondOverlaps" |
+   "atomBondOverlaps" | "nearestAtomPairDistance" | "nearestNonBondedAtomPairDistance">;
++export type LayoutContacts = Pick<LayoutGeometry, "overlappingAtoms" | "atomBondOverlaps" | "collinearBondOverlaps">;
+ 
+-/** All distances and bond statistics are fractions of the reference (default: mean bond length).
+- * Invalid/nonfinite geometry is refused rather than accidentally receiving a passing verdict. */
+-export function evaluateLayoutQuality(
+-  atoms: readonly LayoutPoint[], bonds: readonly LayoutBond[], referenceBondLength?: number,
+-  topology?: LayoutTopology, geometry?: LayoutGeometry, labelBoxes: readonly LayoutLabelBox[] = [],
+-  // Host-placed coordination pockets may intentionally touch labels on a metal/donor pair.
+-  // This exempts only those label pairs, never atom centres or label/bond clearance.
+-  labelLabelExemptions: readonly (readonly [number, number])[] = [],
+-  labelGeometry?: LayoutLabelGeometry
+-): LayoutQuality {
++/** Paste's hard-contact subset, without crossings or nearest-distance diagnostics. */
++export function evaluateLayoutContacts(
++  atoms: readonly LayoutPoint[], bonds: readonly LayoutBond[], referenceBondLength?: number
++): LayoutContacts {
++  return layoutGeometry(atoms, bonds, referenceBondLength, false);
++}
++
++/** Geometry snapshot shared by full Clean Up scoring and the cheap paste contact gate.
++ * No ring perception, label planning, document construction or chemistry engine is needed. */
++export function evaluateLayoutGeometry(
++  atoms: readonly LayoutPoint[], bonds: readonly LayoutBond[], referenceBondLength?: number
++): LayoutGeometry {
++  return layoutGeometry(atoms, bonds, referenceBondLength, true);
++}
++
++function layoutGeometry(
++  atoms: readonly LayoutPoint[], bonds: readonly LayoutBond[], referenceBondLength: number | undefined, diagnostics: boolean
++): LayoutGeometry {
+   if (atoms.some(a => !Number.isFinite(a.x) || !Number.isFinite(a.y)) || bonds.some(b =>
+     !Number.isInteger(b.from) || !Number.isInteger(b.to) || b.from === b.to ||
+     b.from < 0 || b.to < 0 || b.from >= atoms.length || b.to >= atoms.length)) {
+     throw new Error("Layout quality requires finite coordinates and valid bond endpoints.");
+   }
+-  const lengths = bonds.map(b => distance(atoms[b.from], atoms[b.to]));
+-  // A collapsed layout still needs a useful overlap count. With no measurable bond use one unit.
+-  const reference = referenceBondLength ?? (mean(lengths) || 1);
++  const reference = referenceBondLength ?? (mean(bonds.map(b => distance(atoms[b.from], atoms[b.to]))) || 1);
+   if (!Number.isFinite(reference) || reference <= 0) throw new Error("Layout reference bond length must be positive.");
+-  const fractions = lengths.map(length => length / reference);
+-  const avg = mean(fractions);
+-  const minBondLength = fractions.length ? Math.min(...fractions) : 1;
+-  const maxBondLength = fractions.length ? Math.max(...fractions) : 1;
+-  const bondLengthStdDev = Math.sqrt(mean(fractions.map(length => (length - avg) ** 2)));
+   // Scale the orientation tolerance so the verdict is invariant under uniform scaling.
+   const epsilon = 1e-10 * reference ** 2;
+-  let overlappingAtoms: [number, number][] = [];
++  const overlappingAtoms: [number, number][] = [];
+   let nearestAtomPairDistance = Infinity;
+   let nearestNonBondedAtomPairDistance = Infinity;
+-  const bondedPairs = new Set(bonds.map(b => pairKey(b.from, b.to)));
+-  if (!geometry) atoms.forEach((a, i) => {
++  const bondedPairs = diagnostics ? new Set(bonds.map(b => pairKey(b.from, b.to))) : undefined;
++  atoms.forEach((a, i) => {
+     for (let j = i + 1; j < atoms.length; j++) {
+       const d = distance(a, atoms[j]) / reference;
+-      nearestAtomPairDistance = Math.min(nearestAtomPairDistance, d);
+-      if (!bondedPairs.has(pairKey(i, j))) nearestNonBondedAtomPairDistance = Math.min(nearestNonBondedAtomPairDistance, d);
++      if (diagnostics) {
++        nearestAtomPairDistance = Math.min(nearestAtomPairDistance, d);
++        if (!bondedPairs!.has(pairKey(i, j))) nearestNonBondedAtomPairDistance = Math.min(nearestNonBondedAtomPairDistance, d);
++      }
+       if (d < 0.5) overlappingAtoms.push([i, j]);
+     }
+   });
+-  let crossings: [number, number][] = [];
+-  let collinearBondOverlaps: [number, number][] = [];
+-  if (!geometry) bonds.forEach((a, i) => {
++  const crossings: [number, number][] = [];
++  const collinearBondOverlaps: [number, number][] = [];
++  bonds.forEach((a, i) => {
+     for (let j = i + 1; j < bonds.length; j++) {
+       const b = bonds[j];
+       const p = atoms[a.from], q = atoms[a.to], r = atoms[b.from], t = atoms[b.to];
++      if (!diagnostics && (Math.abs(cross(p, q, r)) > epsilon || Math.abs(cross(p, q, t)) > epsilon)) continue;
+       if (bondsOverlap(p, q, r, t, reference)) {
+         if (Math.abs(cross(p, q, r)) <= epsilon && Math.abs(cross(p, q, t)) <= epsilon) collinearBondOverlaps.push([i, j]);
+         else crossings.push([i, j]);
+       }
+     }
+   });
+-  let atomBondOverlaps: [number, number][] = [];
+-  if (!geometry) atoms.forEach((p, i) => bonds.forEach((b, j) => {
++  const atomBondOverlaps: [number, number][] = [];
++  atoms.forEach((p, i) => bonds.forEach((b, j) => {
+     if (i !== b.from && i !== b.to && atomNearBond(p, atoms[b.from], atoms[b.to], reference)) atomBondOverlaps.push([i, j]);
+   }));
+-  if (geometry) ({ overlappingAtoms, crossings, collinearBondOverlaps, atomBondOverlaps,
+-    nearestAtomPairDistance, nearestNonBondedAtomPairDistance } = geometry);
++  return { overlappingAtoms, crossings, collinearBondOverlaps, atomBondOverlaps,
++    nearestAtomPairDistance, nearestNonBondedAtomPairDistance };
++}
++
++/** All distances and bond statistics are fractions of the reference (default: mean bond length).
++ * Invalid/nonfinite geometry is refused rather than accidentally receiving a passing verdict. */
++export function evaluateLayoutQuality(
++  atoms: readonly LayoutPoint[], bonds: readonly LayoutBond[], referenceBondLength?: number,
++  topology?: LayoutTopology, geometry?: LayoutGeometry, labelBoxes: readonly LayoutLabelBox[] = [],
++  // Host-placed coordination pockets may intentionally touch labels on a metal/donor pair.
++  // This exempts only those label pairs, never atom centres or label/bond clearance.
++  labelLabelExemptions: readonly (readonly [number, number])[] = [],
++  labelGeometry?: LayoutLabelGeometry
++): LayoutQuality {
++  if (atoms.some(a => !Number.isFinite(a.x) || !Number.isFinite(a.y)) || bonds.some(b =>
++    !Number.isInteger(b.from) || !Number.isInteger(b.to) || b.from === b.to ||
++    b.from < 0 || b.to < 0 || b.from >= atoms.length || b.to >= atoms.length)) {
++    throw new Error("Layout quality requires finite coordinates and valid bond endpoints.");
++  }
++  const lengths = bonds.map(b => distance(atoms[b.from], atoms[b.to]));
++  // A collapsed layout still needs a useful overlap count. With no measurable bond use one unit.
++  const reference = referenceBondLength ?? (mean(lengths) || 1);
++  if (!Number.isFinite(reference) || reference <= 0) throw new Error("Layout reference bond length must be positive.");
++  const fractions = lengths.map(length => length / reference);
++  const avg = mean(fractions);
++  const minBondLength = fractions.length ? Math.min(...fractions) : 1;
++  const maxBondLength = fractions.length ? Math.max(...fractions) : 1;
++  const bondLengthStdDev = Math.sqrt(mean(fractions.map(length => (length - avg) ** 2)));
++  const epsilon = 1e-10 * reference ** 2;
++  const { overlappingAtoms, crossings, collinearBondOverlaps, atomBondOverlaps,
++    nearestAtomPairDistance, nearestNonBondedAtomPairDistance } = geometry ?? evaluateLayoutGeometry(atoms, bonds, reference);
+   const smallest = topology ?? prepareLayoutTopology(atoms.length, bonds);
+   const rings: LayoutRingQuality[] = smallest.rings.map((ids, index) => {
+     if (smallest.bridgedRingIndices.has(index) || (ids.length !== 5 && ids.length !== 6)) return { atoms: ids };
+@@ -345,9 +379,60 @@ export function evaluateLayoutQuality(
+       regularRings };
+ }
+ 
+-/** Negative means a is better; hard defects always outrank the soft geometry score. */
++/** Crossings can be unavoidable in cages; atom and label collisions never are acceptable. */
++export function layoutAtomAndLabelDefects(quality: LayoutQuality): number {
++  return quality.overlappingAtoms.length + quality.atomBondOverlaps.length + quality.collinearBondOverlaps.length +
++    quality.labelBondOverlaps.length + quality.labelLabelOverlaps.length;
++}
++
++/** Negative means a is better; atom/label defects outrank crossings, then soft geometry. */
+ export function compareLayoutQuality(a: LayoutQuality, b: LayoutQuality): number {
+-  return a.hardDefects - b.hardDefects || a.softScore - b.softScore;
++  return layoutAtomAndLabelDefects(a) - layoutAtomAndLabelDefects(b) ||
++    a.crossings.length - b.crossings.length || a.softScore - b.softScore;
++}
++
++/** Bounded local separation for a cage projection, where removing crossings is impossible.
++ * Ordinary ring/fragment repairs stay preferred. Only coordinates are proposed; the caller
++ * must read back identity and stereo before accepting any moved atom. */
++export function repairBridgedLayoutContacts(
++  atoms: readonly LayoutPoint[], bonds: readonly LayoutBond[],
++  labelBoxes: (points: readonly LayoutPoint[]) => readonly LayoutLabelBox[] = () => []
++): LayoutPoint[] | undefined {
++  // This is a small-cage fallback, not an unbounded geometry optimiser for large graphs.
++  if (atoms.length > 100) return undefined;
++  const topology = prepareLayoutTopology(atoms.length, bonds);
++  const evaluate = (points: readonly LayoutPoint[]) => evaluateLayoutQuality(points, bonds, undefined,
++    topology, undefined, labelBoxes(points));
++  let points = atoms.map(atom => ({ ...atom }));
++  let quality = evaluate(points);
++  if (!quality.hasBridgedRings || layoutAtomAndLabelDefects(quality) === 0) return undefined;
++  const reference = quality.referenceBondLength;
++  let trials = 0;
++  for (let step = 0; step < 12; step++) {
++    const contacts = new Set([...quality.overlappingAtoms.flat(), ...quality.atomBondOverlaps.map(([atom]) => atom)]);
++    let best: { points: LayoutPoint[]; quality: LayoutQuality; displacement: number } | undefined;
++    for (const atom of contacts) for (const radius of [0.08, 0.16, 0.24, 0.32]) for (let direction = 0; direction < 16; direction++) {
++      if (++trials > 1024) return undefined;
++      const angle = direction * Math.PI / 8;
++      const trial = points.map((point, i) => i !== atom ? point : ({
++        x: point.x + radius * reference * Math.cos(angle), y: point.y + radius * reference * Math.sin(angle)
++      }));
++      // Never drift far from the engine's projection, even over successive accepted moves.
++      const displacement = trial.reduce((sum, p, i) => sum + distance(p, atoms[i]) ** 2, 0) / reference ** 2;
++      if (trial.some((p, i) => distance(p, atoms[i]) > 0.5 * reference)) continue;
++      const q = evaluate(trial);
++      if (layoutAtomAndLabelDefects(q) >= layoutAtomAndLabelDefects(quality)) continue;
++      if (!best || layoutAtomAndLabelDefects(q) < layoutAtomAndLabelDefects(best.quality) ||
++          (layoutAtomAndLabelDefects(q) === layoutAtomAndLabelDefects(best.quality) && displacement < best.displacement)) {
++        best = { points: trial, quality: q, displacement };
++      }
++    }
++    if (!best) return undefined;
++    points = best.points;
++    quality = best.quality;
++    if (layoutAtomAndLabelDefects(quality) === 0) return points;
++  }
++  return undefined;
+ }
+ 
+ /** Exact distance from an axis-aligned label box to a bond centreline. */
+@@ -424,7 +509,10 @@ export function prepareLayoutLabelEvaluator(
+ ): (points?: readonly LayoutPoint[], labels?: readonly LayoutLabelBox[]) => LayoutLabelGeometry {
+   if (!boxes.length) return () => ({ labelBondOverlaps: [], labelLabelOverlaps: [], smallestLabelBondClearance: Infinity });
+   const padding = LABEL_CLEARANCE_PADDING * reference;
+-  const exempt = new Set(exemptions.map(([a, b]) => pairKey(a, b)));
++  // Adjacent atom labels sit beside their own bond by design. Only non-bonded
++  // label pairs can be defects; labels still collide with unrelated bonds.
++  const exempt = new Set([...exemptions.map(([a, b]) => pairKey(a, b)),
++    ...bonds.map(({ from, to }) => pairKey(from, to))]);
+   const mobileBonds = bonds.map(b => moving.has(b.from) || moving.has(b.to));
+   const fixedBonds = new LayoutSpatialGrid(reference), fixedLabels = new LayoutSpatialGrid(reference);
+   const fixedBondIds: number[] = [], fixedLabelIds: number[] = [];
+diff --git a/packages/layout-engine/src/layoutRepair.test.ts b/packages/layout-engine/src/layoutRepair.test.ts
+index 043722b98..53931c4e9 100644
+--- a/packages/layout-engine/src/layoutRepair.test.ts
++++ b/packages/layout-engine/src/layoutRepair.test.ts
+@@ -87,7 +87,9 @@ describe("rigid fragment overlap repair", () => {
+   });
+   it("rejects the OMe swing whose turned label collides with isolated water", () => {
+     const ring = polygon(6, { x: 0, y: 0 }, 105 * Math.PI / 180).map(p => ({ x: p.x * 30, y: p.y * 30 }));
+-    const atoms = [...ring, { x: ring[0].x * 2, y: ring[0].y * 2 }, { x: -44.5, y: 36.5 }];
++    // Second isolated water (atom 8): ink-sized label boxes leave the base MeO label clear of atom 7, so atom 8 gives
++    // the base drawing a non-bonded label-label defect (6,8) that the 30-degree swing clears but the OMe turn does not hit.
++    const atoms = [...ring, { x: ring[0].x * 2, y: ring[0].y * 2 }, { x: -44.5, y: 36.5 }, { x: 1, y: 58.5 }];
+     const bonds = [...cycle(6), { from: 0, to: 6 }];
+     const molecule: MoleculeObject = {
+       id: "methoxy-water", type: "molecule", x: -60, y: -60, width: 120, height: 120, rotation: 0,
+@@ -139,7 +141,7 @@ describe("rigid fragment overlap repair", () => {
+     const labels = vi.fn((points: readonly LayoutPoint[]) => moleculeLayoutLabelBoxes({ ...molecule,
+       atoms: atoms.map((a, i) => ({ ...a, ...points[i] })) }));
+     expect(evaluateLayoutQuality(atoms, bonds).hardDefects).toBe(0);
+-    expect(evaluateLayoutQuality(atoms, bonds, 30, undefined, undefined, labels(atoms)).hardDefects).toBe(3);
++    expect(evaluateLayoutQuality(atoms, bonds, 30, undefined, undefined, labels(atoms)).hardDefects).toBe(2); // was 3: the (n-2,n-1) label-label contact is between bonded atoms, now exempt
+     labels.mockClear();
+     const snapshot = structuredClone(molecule);
+     const start = performance.now();

@@ -1,0 +1,710 @@
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index cc2619197..f0c7153a1 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -842,6 +842,7 @@ import {
+   type Vec3
+ } from "./interaction/rotation3d";
+ import { bondDepthWeights, initialViewQuaternion, medianBondLength3d, projectSpin, orientedOverlayScale, overlayScale, spinJoinedBondFragments, type ScreenPlacement } from "./interaction/spinOverlay";
++import { applySpinFragmentArrangement, computeSpinFragmentArrangement, type SpinFragmentArrangement } from "./interaction/spinFragmentPlacement";
+ import { getConformerWorkerClient } from "./conformerClient";
+ import { buildSpin3dFlattenStereoOptions } from "./spin3dFlattenStereoPolicy";
+ import {
+@@ -1614,7 +1615,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "10.27.12.30-codex";
++const CURRENT_BUILD_STAMP = "10.27.13.40-codex";
+ /** Starts in the background for the document webview under the existing probe gate. */
+ export function startMainWindowPerfProbe(): void {
+   perfHook(() => startPerfProbe(CURRENT_BUILD_STAMP));
+@@ -4949,6 +4950,8 @@ export function MainWindow({
+       atomCount: molecule.atoms.length
+     });
+ 
++    // Fragment placement uses the opening frame for BOTH stages, independent of any
++    // user rotation made while refinement was running.
+     // Stage 1 — the embedded conformer is fully manipulable; the overlay goes up NOW.
+     const handleEmbedded = (conformer: Generate3DConformerResult): void => {
+       clearSlowTimer();
+@@ -4969,13 +4972,16 @@ export function MainWindow({
+         setStatus("Selection changed; spin cancelled");
+         return;
+       }
+-      const coords3d = conformer.mapping.coords3dByOriginalAtom;
+-      const { bondPairs, atomLabels, atomLabelStyles, atoms, placement } = spinPlacementFor(molecule, coords3d);
++      const embeddedCoords = conformer.mapping.coords3dByOriginalAtom;
++      const openingOrientation = initialViewQuaternion(embeddedCoords);
++      const { bondPairs, atomLabels, atomLabelStyles, atoms, placement } = spinPlacementFor(molecule, embeddedCoords);
++      const fragmentArrangement = computeSpinFragmentArrangement(molecule.atoms, embeddedCoords, bondPairs, openingOrientation);
++      const coords3d = fragmentArrangement ? applySpinFragmentArrangement(embeddedCoords, fragmentArrangement, placement.scale) : embeddedCoords;
+       applySpin({
+         objectId,
+         // Open at a readable angle (principal plane toward the viewer + gentle tilt),
+         // not the engine's arbitrary — often edge-on — embedding orientation.
+-        quat: initialViewQuaternion(coords3d),
++        quat: openingOrientation,
+         coords3d,
+         bondPairs,
+         sourceMolecule: molecule,
+@@ -4983,6 +4989,7 @@ export function MainWindow({
+         atomLabelStyles,
+         atoms,
+         placement,
++        fragmentArrangement,
+         selectionBox: { x: molecule.x, y: molecule.y, width: molecule.width, height: molecule.height },
+         dragging: false,
+         engine: { name: conformer.engine.name, version: conformer.engine.version, forceField: conformer.forceField?.name }
+@@ -5010,14 +5017,17 @@ export function MainWindow({
+         warningCount: conformer.warnings.length,
+         message: conformer.forceField?.status
+       });
+-      const coords3d = conformer.mapping.coords3dByOriginalAtom;
+-      const { bondPairs, atomLabels, placement } = spinPlacementFor(molecule, coords3d);
++      const refinedCoords = conformer.mapping.coords3dByOriginalAtom;
++      // Match the unmodified single-fragment path exactly: the refined conformer
++      // determines its own bond-length scale. Fragment targets are stored in page px
++      // so that recomputing this scale also leaves disconnected centres in place.
++      const { placement } = spinPlacementFor(molecule, refinedCoords);
++      const coords3d = state.fragmentArrangement
++        ? applySpinFragmentArrangement(refinedCoords, state.fragmentArrangement, placement.scale)
++        : refinedCoords;
+       applySpin({
+         ...state,
+         coords3d,
+-        bondPairs,
+-        sourceMolecule: molecule,
+-        atomLabels,
+         placement,
+         engine: { name: conformer.engine.name, version: conformer.engine.version, forceField: conformer.forceField?.name }
+       });
+@@ -23071,6 +23081,7 @@ interface Spin3dState {
+    *  aware bond-end trimming, matching the committed 2D drawing. */
+   atoms: readonly MoleculeAtom[];
+   placement: ScreenPlacement;
++  fragmentArrangement?: SpinFragmentArrangement;
+   /** The molecule's selection box (page coords): drag inside to rotate, click outside to flatten. */
+   selectionBox: { x: number; y: number; width: number; height: number };
+   dragging: boolean;
+diff --git a/apps/desktop/src/interaction/spinFragmentPlacement.test.ts b/apps/desktop/src/interaction/spinFragmentPlacement.test.ts
+new file mode 100644
+index 000000000..923b6c76e
+--- /dev/null
++++ b/apps/desktop/src/interaction/spinFragmentPlacement.test.ts
+@@ -0,0 +1,245 @@
++import { afterAll, beforeAll, describe, expect, it } from "vitest";
++import { applyPatches, deserializeDocument, serializeDocument, type MoleculeObject } from "@chemdraft/chem-core";
++import { depictSmiles2D, ensureOclResources, generate3DConformerProgressive as oclGenerate } from "@chemdraft/ocl-adapter";
++import { ensureRdkit, generate3DConformerProgressive as rdkitGenerate, resetRdkitForTesting } from "../../../../packages/rdkit-adapter/src/conformer";
++import { installNodeRdkitModuleLoader } from "@chemdraft/rdkit-adapter/node";
++import * as OCL from "openchemlib";
++import {
++  attachSpin3dModelFromConformer, createPhase4Document, flattenNativeMolecule3d, flattenSpunMolecule,
++  spin3dModelCoordsForMolecule, validSpin3dModelFor
++} from "../documentWorkflow";
++import { applySpinFragmentArrangement, computeSpinFragmentArrangement, placeSpinFragments, spinFragmentIndices } from "./spinFragmentPlacement";
++import {
++  conformerCentroid, initialViewQuaternion, orientedOverlayScale, overlayScale, projectSpin
++} from "./spinOverlay";
++import { quatFromAxisAngle, quatIdentity, quatMultiply, quatToViewMatrix, rotateVectorByQuat } from "./rotation3d";
++
++type BondPair = readonly [number, number];
++
++function sphere(coords: ArrayLike<number>, indices: number[]) {
++  const center = conformerCentroid(indices.flatMap((index) => [coords[index * 3], coords[index * 3 + 1], coords[index * 3 + 2]]));
++  const radius = Math.max(...indices.map((index) => Math.hypot(
++    coords[index * 3] - center[0], coords[index * 3 + 1] - center[1], coords[index * 3 + 2] - center[2]
++  )));
++  return { center, radius };
++}
++
++function expectSeparated(coords: ArrayLike<number>, fragments: number[][]) {
++  const spheres = fragments.map((indices) => sphere(coords, indices));
++  for (let i = 0; i < spheres.length; i++) {
++    for (let j = 0; j < i; j++) {
++      const a = spheres[i];
++      const b = spheres[j];
++      expect(Math.hypot(...a.center.map((value, axis) => value - b.center[axis]))).toBeGreaterThan(a.radius + b.radius);
++    }
++  }
++}
++
++describe("Spin fragment placement", () => {
++  it("reuses crowded opening centres for different extents, correcting only overlapping pairs", () => {
++    const points = [{ x: -20, y: 0 }, { x: 20, y: 0 }, { x: -19, y: 0 }, { x: 21, y: 0 }, { x: -18, y: 0 }, { x: 22, y: 0 }];
++    const pairs: BondPair[] = [[0, 1], [2, 3], [4, 5]];
++    const embedded = new Float64Array([-2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0]);
++    const arrangement = computeSpinFragmentArrangement(points, embedded, pairs, quatIdentity())!;
++    const fragments = spinFragmentIndices(points.length, pairs);
++    const openingScale = overlayScale(points, embedded, pairs);
++    const opening = applySpinFragmentArrangement(embedded, arrangement, openingScale);
++    const smallerRaw = new Float64Array([-1, 0, 0, 1, 0, 0, -1.5, 0, 0, 1.5, 0, 0, -1, 0, 0, 1, 0, 0]);
++    const smallerScale = overlayScale(points, smallerRaw, pairs);
++    const smaller = applySpinFragmentArrangement(smallerRaw, arrangement, smallerScale);
++    expectSeparated(opening, fragments);
++    expectSeparated(smaller, fragments);
++    fragments.forEach((indices) => sphere(smaller, indices).center.forEach((value, axis) =>
++      expect(value * smallerScale).toBeCloseTo(sphere(opening, indices).center[axis] * openingScale, 12)));
++
++    // Only the final sphere grows enough to overlap its neighbour. It moves outward by
++    // precisely the overlap plus the documented floating-point clearance.
++    const larger = applySpinFragmentArrangement(new Float64Array([-2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0, -8, 0, 0, 8, 0, 0]), arrangement, openingScale);
++    expectSeparated(larger, fragments);
++    const before = fragments.map((indices) => sphere(opening, indices).center);
++    const after = fragments.map((indices) => sphere(larger, indices).center);
++    expect(after[0]).toEqual(before[0]);
++    expect(after[1]).toEqual(before[1]);
++    expect(after[2][0] - before[2][0]).toBeCloseTo(2, 9);
++    expect(after[2][1]).toBeCloseTo(before[2][1], 12);
++  });
++
++  it("escapes alternating overlap corrections with a bounded non-overlapping fallback", () => {
++    // The last sphere cannot fit between the first two: pairwise correction alternates
++    // forever between x = -1 and x = +1 on 02d521a7. A timeout cannot interrupt a
++    // synchronous UI loop, so the fallback must return and put it beyond both spheres.
++    const raw = new Float64Array([0, -1, 0, 0, 1, 0, 0, -1, 0, 0, 1, 0, 0, -3, 0, 0, 3, 0]);
++    const fragments = [[0, 1], [2, 3], [4, 5]];
++    const placed = applySpinFragmentArrangement(raw, {
++      fragments: fragments.map((indices, i) => ({ indices, targetPage: [[-3, 0, 0], [3, 0, 0], [0, 0, 0]][i] as [number, number, number] }))
++    }, 1);
++    expectSeparated(placed, fragments);
++    expect(sphere(placed, fragments[0]).center).toEqual([-3, 0, 0]);
++    expect(sphere(placed, fragments[1]).center).toEqual([3, 0, 0]);
++    expect(sphere(placed, fragments[2]).center[0]).toBeCloseTo(7, 9);
++    expect(sphere(placed, fragments[2]).center.slice(1)).toEqual([0, 0]);
++    fragments.forEach((indices) => expect(sphere(placed, indices).radius).toBe(sphere(raw, indices).radius));
++    expect(raw).toEqual(new Float64Array([0, -1, 0, 0, 1, 0, 0, -1, 0, 0, 1, 0, 0, -3, 0, 0, 3, 0]));
++  });
++  it("leaves a connected conformer byte-identical, including its opening orientation", () => {
++    const coords = new Float64Array([-0, 1.123456789, -2, 3, 4, 5, -6, 7, 8]);
++    const bytes = new Uint8Array(coords.buffer).slice();
++    const orientation = initialViewQuaternion(coords);
++    expect(computeSpinFragmentArrangement([{ x: 0, y: 0 }, { x: 30, y: 0 }, { x: 60, y: 0 }], coords, [[0, 1], [1, 2]], orientation)).toBeUndefined();
++    expect(placeSpinFragments([{ x: 0, y: 0 }, { x: 30, y: 0 }, { x: 60, y: 0 }], coords, [[0, 1], [1, 2]], orientation)).toBe(coords);
++    expect(new Uint8Array(coords.buffer)).toEqual(bytes);
++    expect(initialViewQuaternion(coords)).toEqual(orientation);
++  });
++
++  it("expands crowded centres uniformly, preserving left/right and vertical arrangement", () => {
++    const coords = new Float64Array([-2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0]);
++    const points = [{ x: -20, y: 0 }, { x: 20, y: 0 }, { x: -19, y: 1 }, { x: 21, y: 1 }, { x: -18, y: -1 }, { x: 22, y: -1 }];
++    const pairs: BondPair[] = [[0, 1], [2, 3], [4, 5]];
++    const placed = placeSpinFragments(points, coords, pairs, quatIdentity());
++    const fragments = spinFragmentIndices(points.length, pairs);
++    expectSeparated(placed, fragments);
++    const centers = fragments.map((indices) => sphere(placed, indices).center);
++    expect(centers[0][0]).toBeLessThan(centers[1][0]);
++    expect(centers[1][0]).toBeLessThan(centers[2][0]);
++    expect(centers[1][1]).toBeLessThan(centers[0][1]);
++    expect(centers[2][1]).toBeGreaterThan(centers[0][1]);
++    expect(coords).toEqual(new Float64Array([-2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0, -2, 0, 0, 2, 0, 0]));
++  });
++
++  it("keeps well-separated fragment centroids exactly at their drawn positions in the opening view", () => {
++    const points = [{ x: 10, y: 20 }, { x: 30, y: 20 }, { x: 210, y: 80 }, { x: 230, y: 80 }];
++    const coords = new Float64Array([0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0]);
++    const pairs: BondPair[] = [[0, 1], [2, 3]];
++    const opening = quatFromAxisAngle([1, 2, 3], 0.7);
++    const placed = placeSpinFragments(points, coords, pairs, opening);
++    const projection = projectSpin(placed, pairs, opening, { centerX: 120, centerY: 50, scale: 20 });
++    expect((projection.atoms[0].sx + projection.atoms[1].sx) / 2).toBeCloseTo(20, 10);
++    expect((projection.atoms[0].sy + projection.atoms[1].sy) / 2).toBeCloseTo(20, 10);
++    expect((projection.atoms[2].sx + projection.atoms[3].sx) / 2).toBeCloseTo(220, 10);
++    expect((projection.atoms[2].sy + projection.atoms[3].sy) / 2).toBeCloseTo(80, 10);
++  });
++
++  it("separates isolated atoms even when drawn centroids coincide", () => {
++    const placed = placeSpinFragments(Array.from({ length: 3 }, () => ({ x: 10, y: 10 })), new Float64Array(9), [], quatIdentity());
++    expectSeparated(placed, [[0], [1], [2]]);
++    expect(Array.from(placed).every(Number.isFinite)).toBe(true);
++  });
++});
++
++beforeAll(async () => {
++  installNodeRdkitModuleLoader();
++  await ensureOclResources();
++});
++afterAll(() => resetRdkitForTesting());
++
++function fixture(smiles: string) {
++  const depiction = depictSmiles2D(smiles);
++  const mol: MoleculeObject = {
++    id: "multi", type: "molecule", x: 0, y: 0, width: 400, height: 100, rotation: 0, style: {},
++    structureFormat: "molfile-v2000", structure: depiction.molfile, superatoms: [], rGroups: [],
++    atoms: depiction.atoms.map((atom, i) => ({ id: `a${i}`, element: atom.element, formalCharge: atom.charge, x: 100 + atom.x * 20, y: 200 - atom.y * 20 })),
++    bonds: depiction.bonds.map((bond, i) => ({ id: `b${i}`, fromAtomId: `a${bond.from}`, toAtomId: `a${bond.to}`, order: bond.order }))
++  };
++  return { mol, pairs: depiction.bonds.map((bond) => [bond.from, bond.to] as const), molfile: depiction.molfile };
++}
++
++async function canonicalSmiles(molfile: string) {
++  const rdkit = await ensureRdkit();
++  const molecule = rdkit.get_mol(molfile);
++  if (!molecule?.get_smiles) throw new Error("RDKit cannot read fixture chemistry");
++  try { return molecule.get_smiles(); }
++  finally { molecule.delete(); }
++}
++
++for (const [engine, generate] of [["RDKit", rdkitGenerate], ["OCL fallback", oclGenerate]] as const) {
++  describe(`${engine} disconnected conformer → overlay → flatten → reopen`, () => {
++    it.each(["c1ccccc1", "CC(C)(C)C", "OCCO"])("keeps the single-fragment %s result byte-identical", async (smiles) => {
++      const { mol, pairs, molfile } = fixture(smiles);
++      const { embedded } = await generate({ molfile, originalAtomCount: mol.atoms.length }, { optimize: "none" });
++      expect(embedded.embed.status).toBe("ok");
++      const raw = embedded.mapping.coords3dByOriginalAtom;
++      const orientation = initialViewQuaternion(raw);
++      const placed = placeSpinFragments(mol.atoms, raw, pairs, orientation);
++      expect(placed).toBe(raw);
++      expect(new Uint8Array(placed.buffer)).toEqual(new Uint8Array(raw.buffer));
++      expect(initialViewQuaternion(placed)).toEqual(orientation);
++      const original = flattenNativeMolecule3d(mol, raw, quatToViewMatrix(orientation));
++      expect(original.status).toBe("committed");
++      expect(flattenNativeMolecule3d(mol, placed, quatToViewMatrix(orientation))).toEqual(original);
++    });
++
++    it("keeps benzene, neopentane and glycol apart without changing chemistry", async () => {
++      const { mol, pairs, molfile } = fixture("c1ccccc1.CC(C)(C)C.OCCO");
++      const fragments = spinFragmentIndices(mol.atoms.length, pairs);
++      expect(fragments.map((indices) => indices.length).sort()).toEqual([4, 5, 6]);
++      const result = await generate({ molfile, originalAtomCount: mol.atoms.length }, { optimize: "auto", maxMinimiseIterations: 40 });
++      expect(result.embedded.embed.status).toBe("ok");
++      const opening = initialViewQuaternion(result.embedded.mapping.coords3dByOriginalAtom);
++      const arrangement = computeSpinFragmentArrangement(mol.atoms, result.embedded.mapping.coords3dByOriginalAtom, pairs, opening)!;
++      const refined = result.refineFromEmbedded?.(40);
++      expect(refined).toBeDefined();
++      for (const stage of [result.embedded, refined!]) {
++        const raw = stage.mapping.coords3dByOriginalAtom;
++        const placed = applySpinFragmentArrangement(raw, arrangement, overlayScale(mol.atoms, raw, pairs));
++        expectSeparated(placed, fragments);
++        for (const axis of [[1, 0, 0], [0, 1, 0], [1, 2, 3]] as const) {
++          const rotation = quatFromAxisAngle(axis, 1.2);
++          const rotatedCoords = Array.from({ length: mol.atoms.length }, (_, i) =>
++            rotateVectorByQuat(rotation, [placed[i * 3], placed[i * 3 + 1], placed[i * 3 + 2]])).flat();
++          expectSeparated(rotatedCoords, fragments);
++        }
++        // Translation preserves every intrafragment distance (and therefore shape/handedness).
++        for (const indices of fragments) {
++          for (const a of indices) for (const b of indices) {
++            const distance = (coords: Float64Array) => Math.hypot(...[0, 1, 2].map((axis) => coords[a * 3 + axis] - coords[b * 3 + axis]));
++            expect(distance(placed)).toBeCloseTo(distance(raw), 12);
++          }
++          expect(rotateVectorByQuat(opening, sphere(placed, indices).center)[2]).toBeCloseTo(0, 12);
++        }
++        const placement = {
++          centerX: mol.atoms.reduce((sum, atom) => sum + atom.x, 0) / mol.atoms.length,
++          centerY: mol.atoms.reduce((sum, atom) => sum + atom.y, 0) / mol.atoms.length,
++          scale: overlayScale(mol.atoms, raw, pairs)
++        };
++        const projection = projectSpin(placed, pairs, opening, placement);
++        expectSeparated(projection.atoms.flatMap((atom) => [atom.sx, atom.sy, 0]), fragments);
++        // Every pair retains both axes of the drawn centroid arrangement.
++        for (let i = 0; i < fragments.length; i++) for (let j = 0; j < i; j++) {
++          for (const axis of ["x", "y"] as const) {
++            const drawnCenter = (indices: number[]) => indices.reduce((sum, index) => sum + mol.atoms[index][axis], 0) / indices.length;
++            const projectedCenter = (indices: number[]) => indices.reduce((sum, index) => sum + projection.atoms[index][axis === "x" ? "sx" : "sy"], 0) / indices.length;
++            const delta = drawnCenter(fragments[i]) - drawnCenter(fragments[j]);
++            if (Math.abs(delta) > 1e-8) expect(Math.sign(projectedCenter(fragments[i]) - projectedCenter(fragments[j]))).toBe(Math.sign(delta));
++          }
++        }
++        const base = createPhase4Document("Multi-fragment spin");
++        const document = applyPatches(base, [{ op: "addObject", pageId: base.pages[0].id, object: mol }]);
++        // A real drag changes the view, while separated 3D bounding spheres stay apart.
++        const rotated = quatMultiply(quatFromAxisAngle([0, 0, 1], 0.2), opening);
++        const outcome = flattenSpunMolecule(document, mol.id, placed, quatToViewMatrix(rotated), { placement });
++        expect(outcome.status).toBe("committed");
++        const attached = attachSpin3dModelFromConformer(outcome.document, mol.id, { coords3d: placed, orientation: rotated });
++        const saved = deserializeDocument(serializeDocument(attached));
++        const next = saved.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
++        expect(next.atoms.map(({ x: _x, y: _y, ...atom }) => atom)).toEqual(mol.atoms.map(({ x: _x, y: _y, ...atom }) => atom));
++        expect(next.bonds.map(({ display: _display, ...bond }) => bond)).toEqual(mol.bonds);
++        expect(OCL.Molecule.fromMolfile(next.structure).getIDCode()).toBe(OCL.Molecule.fromMolfile(molfile).getIDCode());
++        expect(await canonicalSmiles(next.structure)).toBe(await canonicalSmiles(molfile));
++        expectSeparated(next.atoms.flatMap((atom) => [atom.x, atom.y, 0]), fragments);
++        const model = validSpin3dModelFor(next)!;
++        const reopened = spin3dModelCoordsForMolecule(model, next)!;
++        expect(reopened).toEqual(placed);
++        expectSeparated(reopened, fragments);
++        const reopenedProjection = projectSpin(reopened, pairs, model.orientation, {
++          centerX: next.atoms.reduce((sum, atom) => sum + atom.x, 0) / next.atoms.length,
++          centerY: next.atoms.reduce((sum, atom) => sum + atom.y, 0) / next.atoms.length,
++          scale: orientedOverlayScale(next.atoms, reopened, pairs, quatToViewMatrix(model.orientation))
++        });
++        next.atoms.forEach((atom, i) => {
++          expect(reopenedProjection.atoms[i].sx).toBeCloseTo(atom.x, 8);
++          expect(reopenedProjection.atoms[i].sy).toBeCloseTo(atom.y, 8);
++        });
++      }
++    }, 30000);
++  });
++}
+diff --git a/apps/desktop/src/interaction/spinFragmentPlacement.ts b/apps/desktop/src/interaction/spinFragmentPlacement.ts
+new file mode 100644
+index 000000000..67800544f
+--- /dev/null
++++ b/apps/desktop/src/interaction/spinFragmentPlacement.ts
+@@ -0,0 +1,158 @@
++import { quatConjugate, rotateVectorByQuat, type Quaternion } from "./rotation3d";
++import { conformerCentroid, medianBondLength3d, overlayScale } from "./spinOverlay";
++
++type BondPair = readonly [number, number];
++export type SpinFragmentArrangement = {
++  /** Opening centres relative to the molecule centroid, in page px in the conformer's frame.
++   * Independent of the embedded/refined ScreenPlacement.scale and the user's live rotation. */
++  fragments: { indices: number[]; targetPage: readonly [number, number, number] }[];
++};
++
++/** Connected components in original-atom order, including isolated atoms. */
++export function spinFragmentIndices(atomCount: number, bondPairs: readonly BondPair[]): number[][] {
++  const neighbors: number[][] = Array.from({ length: atomCount }, () => []);
++  for (const [a, b] of bondPairs) {
++    neighbors[a].push(b);
++    neighbors[b].push(a);
++  }
++  const seen = new Set<number>();
++  const fragments: number[][] = [];
++  for (let atom = 0; atom < atomCount; atom++) {
++    if (seen.has(atom)) continue;
++    const indices = [atom];
++    seen.add(atom);
++    for (let cursor = 0; cursor < indices.length; cursor++) {
++      for (const neighbor of neighbors[indices[cursor]]) {
++        if (seen.has(neighbor)) continue;
++        seen.add(neighbor);
++        indices.push(neighbor);
++      }
++    }
++    fragments.push(indices);
++  }
++  return fragments;
++}
++
++/**
++ * Engines embed disconnected fragments independently, often at the same origin.
++ * Translate each intact conformer to its drawn centroid in the opening view's
++ * plane (z centred), using the SAME bond-length scale as ScreenPlacement.
++ * Uniformly expand that arrangement only as far as bounding spheres require.
++ * This is done once on fresh engine results, never on persisted/reopened models;
++ * overlay, rotation and flatten then all consume the same separated coordinates.
++ * Refinement must use the embedded stage's opening orientation, even after a drag.
++ * Connected molecules have no fragment arrangement.
++ */
++export function computeSpinFragmentArrangement(
++  points2d: readonly { x: number; y: number }[],
++  coords3d: Float64Array,
++  bondPairs: readonly BondPair[],
++  openingOrientation: Quaternion
++): SpinFragmentArrangement | undefined {
++  const fragments = spinFragmentIndices(points2d.length, bondPairs);
++  if (fragments.length < 2) return undefined;
++
++  const scale = overlayScale(points2d, coords3d, bondPairs);
++  const gap = medianBondLength3d(coords3d, bondPairs) || 1;
++  const centers = fragments.map((indices) => {
++    const local = indices.flatMap((index) => Array.from(coords3d.subarray(index * 3, index * 3 + 3)));
++    const center = conformerCentroid(local);
++    const radius = indices.reduce((largest, index) => Math.max(largest, Math.hypot(
++      coords3d[index * 3] - center[0],
++      coords3d[index * 3 + 1] - center[1],
++      coords3d[index * 3 + 2] - center[2]
++    )), 0);
++    return {
++      indices, center, radius,
++      x: indices.reduce((sum, index) => sum + points2d[index].x, 0) / indices.length / scale,
++      y: -indices.reduce((sum, index) => sum + points2d[index].y, 0) / indices.length / scale
++    };
++  });
++
++  // Coincident drawn centres have no direction to preserve. Give just those centres
++  // a deterministic +X separation before expanding the complete arrangement.
++  for (let i = 0; i < centers.length; i++) {
++    for (let j = 0; j < i; j++) {
++      if (Math.hypot(centers[i].x - centers[j].x, centers[i].y - centers[j].y) < 1e-9) {
++        centers[i].x = Math.max(...centers.map((center) => center.x)) + centers[i].radius + centers[j].radius + gap;
++      }
++    }
++  }
++  let expansion = 1;
++  for (let i = 0; i < centers.length; i++) {
++    for (let j = 0; j < i; j++) {
++      const distance = Math.hypot(centers[i].x - centers[j].x, centers[i].y - centers[j].y);
++      expansion = Math.max(expansion, (centers[i].radius + centers[j].radius + gap) / distance);
++    }
++  }
++  const centerX = centers.reduce((sum, center) => sum + center.x * center.indices.length, 0) / points2d.length;
++  const centerY = centers.reduce((sum, center) => sum + center.y * center.indices.length, 0) / points2d.length;
++  const inverseOpening = quatConjugate(openingOrientation);
++  return { fragments: centers.map((fragment) => ({
++    indices: fragment.indices,
++    targetPage: rotateVectorByQuat(inverseOpening, [
++      (fragment.x - centerX) * expansion * scale, (fragment.y - centerY) * expansion * scale, 0
++    ])
++  })) };
++}
++
++/** Convert opening page targets with THIS stage's placement scale. For each later fragment, resolve overlapping earlier spheres by
++ * moving only that fragment along the current pair's centre-to-centre direction, by the
++ * overlap distance plus a tiny clearance. Recheck earlier pairs after every correction.
++ * At most fragments² corrections per fragment; if trapped between earlier spheres, place it
++ * beyond all their projected extents along its opening direction from the first centre.
++ * Earlier spheres stay fixed. projectSpin/flatten both recenter the resulting whole conformer. */
++export function applySpinFragmentArrangement(coords3d: Float64Array, arrangement: SpinFragmentArrangement, scale: number): Float64Array {
++  if (arrangement.fragments.length < 2) return coords3d;
++  const placed = new Float64Array(coords3d);
++  const spheres: { center: [number, number, number]; radius: number }[] = [];
++  for (const fragment of arrangement.fragments) {
++    const center = conformerCentroid(fragment.indices.flatMap((index) => Array.from(coords3d.subarray(index * 3, index * 3 + 3))));
++    const radius = fragment.indices.reduce((largest, index) => Math.max(largest, Math.hypot(
++      coords3d[index * 3] - center[0], coords3d[index * 3 + 1] - center[1], coords3d[index * 3 + 2] - center[2]
++    )), 0);
++    const target: [number, number, number] = [fragment.targetPage[0] / scale, fragment.targetPage[1] / scale, fragment.targetPage[2] / scale];
++    const openingTarget = [...target];
++    let corrections = 0;
++    const maxCorrections = arrangement.fragments.length ** 2;
++    for (let j = 0; j < spheres.length;) {
++      const other = spheres[j];
++      const delta = target.map((value, axis) => value - other.center[axis]);
++      const distance = Math.hypot(...delta);
++      const required = radius + other.radius;
++      if (distance < required) {
++        if (corrections >= maxCorrections) {
++          // A projection gap at least as large as the radii sum guarantees a 3D gap,
++          // even when earlier centres are not collinear. This bounded fallback also
++          // handles coincident targets (deterministically along +X).
++          const origin = spheres[0].center;
++          const delta = openingTarget.map((value, axis) => value - origin[axis]);
++          const length = Math.hypot(...delta);
++          const direction = length > 0 ? delta.map((value) => value / length) : [1, 0, 0];
++          const extent = Math.max(...spheres.map((sphere) =>
++            sphere.center.reduce((sum, value, axis) => sum + (value - origin[axis]) * direction[axis], 0) + sphere.radius));
++          const clearance = Math.max(1, Math.abs(extent), radius) * 1e-12;
++          for (let axis = 0; axis < 3; axis++) target[axis] = origin[axis] + direction[axis] * (extent + radius + clearance);
++          break;
++        }
++        const direction = distance > 0 ? delta.map((value) => value / distance) : [1, 0, 0];
++        const shift = required - distance + Math.max(1, required) * 1e-12;
++        for (let axis = 0; axis < 3; axis++) target[axis] += direction[axis] * shift;
++        corrections++;
++        j = 0;
++      } else j++;
++    }
++    spheres.push({ center: target, radius });
++    for (const index of fragment.indices) {
++      for (let axis = 0; axis < 3; axis++) {
++        placed[index * 3 + axis] += target[axis] - center[axis];
++      }
++    }
++  }
++  return placed;
++}
++
++export function placeSpinFragments(points2d: readonly { x: number; y: number }[], coords3d: Float64Array, bondPairs: readonly BondPair[], openingOrientation: Quaternion): Float64Array {
++  const arrangement = computeSpinFragmentArrangement(points2d, coords3d, bondPairs, openingOrientation);
++  return arrangement ? applySpinFragmentArrangement(coords3d, arrangement, overlayScale(points2d, coords3d, bondPairs)) : coords3d;
++}
+diff --git a/apps/desktop/src/spin3dSession.test.ts b/apps/desktop/src/spin3dSession.test.ts
+index 469db3eb5..a81854ee1 100644
+--- a/apps/desktop/src/spin3dSession.test.ts
++++ b/apps/desktop/src/spin3dSession.test.ts
+@@ -52,6 +52,10 @@ import {
+   selectDocumentObjects
+ } from "./documentWorkflow";
+ import { MainWindow } from "./MainWindow";
++import * as documentWorkflow from "./documentWorkflow";
++import * as fragmentPlacement from "./interaction/spinFragmentPlacement";
++import { initialViewQuaternion, medianBondLength3d, overlayScale, projectSpin } from "./interaction/spinOverlay";
++import { quatToViewMatrix } from "./interaction/rotation3d";
+ 
+ function installDomMocks() {
+   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+@@ -83,16 +87,20 @@ function installDomMocks() {
+   svgPrototype.hasPointerCapture ??= vi.fn(() => true);
+ }
+ 
+-function conformerResult(status: NonNullable<Generate3DConformerResult["forceField"]>["status"]): Generate3DConformerResult {
++function conformerResult(
++  status: NonNullable<Generate3DConformerResult["forceField"]>["status"],
++  coords = new Float64Array([0, 0, 0, 1, 0.5, 0.25])
++): Generate3DConformerResult {
++  const atomCount = coords.length / 3;
+   return {
+     mapping: {
+-      coords3dByOriginalAtom: new Float64Array([0, 0, 0, 1, 0.5, 0.25]),
+-      originalToEngineAtom: [0, 1],
+-      engineToOriginalAtom: [0, 1],
++      coords3dByOriginalAtom: coords,
++      originalToEngineAtom: Array.from({ length: atomCount }, (_, i) => i),
++      engineToOriginalAtom: Array.from({ length: atomCount }, (_, i) => i),
+       generatedHydrogenEngineAtoms: []
+     },
+-    originalAtomCount: 2,
+-    generatedAtomCount: 2,
++    originalAtomCount: atomCount,
++    generatedAtomCount: atomCount,
+     hydrogens: { added: false, explicitInputHydrogensPreserved: false },
+     embed: { status: "ok" },
+     forceField: { name: "UFF", status, iterations: 1 },
+@@ -206,6 +214,7 @@ function selectedObjectBounds(bridge: ChemDraftAgentBridge): { x: number; y: num
+ }
+ 
+ afterEach(() => {
++  vi.restoreAllMocks();
+   delete window[AGENT_BRIDGE_GLOBAL_NAME];
+   window.history.replaceState({}, "", "/");
+   document.body.innerHTML = "";
+@@ -213,6 +222,137 @@ afterEach(() => {
+ });
+ 
+ describe("Spin 3D session state", () => {
++  it("recomputes single-fragment refined placement and flattens exactly as main", async () => {
++    const initial = createSelectedMoleculeDocument();
++    const original = initial.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
++    const molecule: MoleculeObject = {
++      ...original,
++      atoms: [{ x: 300, y: 300 }, { x: 330, y: 300 }, { x: 318, y: 327 }].map((point, i) => ({
++        ...point, id: `a${i}`, element: "O", formalCharge: 0
++      })),
++      bonds: [[0, 1], [1, 2]].map(([a, b], i) => ({ id: `b${i}`, fromAtomId: `a${a}`, toAtomId: `a${b}`, order: "single" }))
++    };
++    const fixture = { ...initial, pages: initial.pages.map((page) => ({ ...page, objects: [molecule] })) };
++    const embedded = new Float64Array([-0, 0, 0, 1, 0.5, 0.25, 0.3, 1.4, -0.2]);
++    // Both shape and median bond length change; a uniform scale cannot reveal the old
++    // hot-swap error. The refined placement and flatten equality below fail on 02d521a7.
++    const refined = new Float64Array([1, -0.4, 0.3, 3.2, 1.1, 0.6, -1.4, 2.5, -1]);
++    const pairs: [number, number][] = [[0, 1], [1, 2]];
++    const placement = {
++      centerX: molecule.atoms.reduce((sum, atom) => sum + atom.x, 0) / molecule.atoms.length,
++      centerY: molecule.atoms.reduce((sum, atom) => sum + atom.y, 0) / molecule.atoms.length,
++      scale: overlayScale(molecule.atoms, refined, pairs)
++    };
++    expect(placement.scale).not.toBe(overlayScale(molecule.atoms, embedded, pairs));
++    const orientation = initialViewQuaternion(embedded);
++    const expected = documentWorkflow.flattenSpunMolecule(fixture, molecule.id, refined, quatToViewMatrix(orientation), { placement });
++    expect(expected.status).toBe("committed");
++    const flatten = vi.spyOn(documentWorkflow, "flattenSpunMolecule");
++    const applyFragments = vi.spyOn(fragmentPlacement, "applySpinFragmentArrangement");
++    const { bridge, container, root } = await renderMainWindow(fixture);
++    try {
++      await act(async () => { await bridge.command("structure.spin3d"); });
++      await act(async () => { conformerMock.handlers?.onEmbedded(conformerResult("converged", embedded)); });
++      await act(async () => { conformerMock.handlers?.onRefined(conformerResult("converged", refined)); });
++      // An independent projection with main's recomputed scale must be the live view.
++      const expectedPositions = projectSpin(refined, pairs, orientation, placement).atoms
++        .map((atom) => ({ x: atom.sx, y: atom.sy })).sort((a, b) => a.x - b.x);
++      const actualPositions = [...container.querySelectorAll('[data-spin3d-overlay="true"] [data-atom-label]')]
++        .map((label) => {
++          const match = /translate\(([^ ]+) ([^)]+)\)/.exec(label.getAttribute("transform")!)!;
++          return { x: Number(match[1]), y: Number(match[2]) };
++        }).sort((a, b) => a.x - b.x);
++      expect.soft(actualPositions).toEqual(expectedPositions);
++      await commitSpinOverlay(container, bridge);
++      expect(flatten).toHaveBeenCalledTimes(1);
++      const [, , actualCoords, actualView, actualOptions] = flatten.mock.calls[0];
++      expect(actualCoords).toBe(refined);
++      if (!(actualCoords instanceof Float64Array)) throw new Error("Expected the untouched refined coordinate buffer.");
++      expect(new Uint8Array(actualCoords.buffer)).toEqual(new Uint8Array(refined.buffer));
++      expect(actualView).toEqual(quatToViewMatrix(orientation));
++      expect.soft(actualOptions?.placement).toEqual(placement);
++      expect.soft(flatten.mock.results[0].value).toEqual(expected);
++      expect(applyFragments).not.toHaveBeenCalled();
++    } finally {
++      await act(async () => { root.unmount(); });
++    }
++  });
++
++  it("separates disconnected fragments at both engine stages and reopens the committed arrangement", async () => {
++    const initial = createSelectedMoleculeDocument();
++    const original = initial.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
++    const molecule: MoleculeObject = {
++      ...original,
++      x: 200, y: 300, width: 80, height: 30,
++      atoms: [0, 1, 2].flatMap((fragment) => [0, 1].map((atom) => ({
++        id: `f${fragment}a${atom}`, element: "O", formalCharge: 0, x: 200 + fragment * 25 + atom * 30, y: 300
++      }))),
++      bonds: [0, 1, 2].map((fragment) => ({
++        id: `f${fragment}b`, fromAtomId: `f${fragment}a0`, toAtomId: `f${fragment}a1`, order: "single"
++      }))
++    };
++    const fixture = { ...initial, pages: initial.pages.map((page) => ({ ...page, objects: [molecule] })) };
++    const result = conformerResult("converged", new Float64Array([0, 0, 0, 1, 0.5, 0.25, 0, 0, 0, 1, 0.5, 0.25, 0, 0, 0, 1, 0.5, 0.25]));
++    // Non-uniform refinement: lengths, directions and the median all change. Crowded
++    // opening centres need expansion, but the refined spheres fit the stored targets.
++    const refined = conformerResult("converged", new Float64Array([
++      0, 0, 0, 1.5, 0.3, 0.7, 0, 0, 0, 1.8, 0.8, -0.3, 0, 0, 0, 2, -0.2, 0.9
++    ]));
++    const pairs: [number, number][] = [[0, 1], [2, 3], [4, 5]];
++    expect(medianBondLength3d(refined.mapping.coords3dByOriginalAtom, pairs))
++      .not.toBe(medianBondLength3d(result.mapping.coords3dByOriginalAtom, pairs));
++    const flatten = vi.spyOn(documentWorkflow, "flattenSpunMolecule");
++    const { bridge, container, root } = await renderMainWindow(fixture);
++    const labelPositions = () => [...container.querySelectorAll('[data-spin3d-overlay="true"] [data-atom-label]')]
++      .map((label) => {
++        const match = /translate\(([^ ]+) ([^)]+)\)/.exec(label.getAttribute("transform")!)!;
++        return { x: Number(match[1]), y: Number(match[2]) };
++      }).sort((a, b) => a.x - b.x);
++    try {
++      await act(async () => { await bridge.command("structure.spin3d"); });
++      let openingCenters: { x: number; y: number }[] = [];
++      for (const handler of ["onEmbedded", "onRefined"] as const) {
++        const stage = handler === "onEmbedded" ? result : refined;
++        await act(async () => { conformerMock.handlers?.[handler](stage); });
++        const positions = labelPositions();
++        expect(positions).toHaveLength(6);
++        expect(positions[2].x - positions[1].x).toBeGreaterThan(20);
++        expect(positions[4].x - positions[3].x).toBeGreaterThan(20);
++        const centers = [0, 2, 4].map((i) => ({ x: (positions[i].x + positions[i + 1].x) / 2, y: (positions[i].y + positions[i + 1].y) / 2 }));
++        if (handler === "onEmbedded") openingCenters = centers;
++        else centers.forEach((center, i) => {
++          // Fails on e5233125: recomputing the crowded arrangement expands it by a
++          // different amount for the new shapes. Opening page targets prevent that jump.
++          expect(center.x).toBeCloseTo(openingCenters[i].x, 8);
++          expect(center.y).toBeCloseTo(openingCenters[i].y, 8);
++        });
++      }
++      const before = labelPositions();
++      await commitSpinOverlay(container, bridge);
++      expect(container.querySelector('[data-spin3d-overlay="true"]')).toBeNull();
++      expect(flatten).toHaveBeenCalledTimes(1);
++      // Fails on 02d521a7: even though its centres stay still, its scale is the
++      // embedded scale. The same refined ScreenPlacement must reach flatten and overlay.
++      expect(flatten.mock.calls[0][4]?.placement?.scale).toBe(overlayScale(molecule.atoms, refined.mapping.coords3dByOriginalAtom, pairs));
++      const committed = bridge.snapshot().document.pages[0].objects.find((object): object is MoleculeObject => object.type === "molecule")!;
++      const flattenedPositions = committed.atoms.map(({ x, y }) => ({ x, y })).sort((a, b) => a.x - b.x);
++      flattenedPositions.forEach((position, i) => {
++        expect(position.x).toBeCloseTo(before[i].x, 8);
++        expect(position.y).toBeCloseTo(before[i].y, 8);
++      });
++      await act(async () => { await bridge.command("structure.spin3d"); });
++      expect(conformerMock.client.generate).toHaveBeenCalledTimes(1);
++      const reopened = labelPositions();
++      expect(reopened).toHaveLength(6);
++      reopened.forEach((position, i) => {
++        expect(position.x).toBeCloseTo(before[i].x, 8);
++        expect(position.y).toBeCloseTo(before[i].y, 8);
++      });
++    } finally {
++      await act(async () => { root.unmount(); });
++    }
++  });
++
+   it("cancels the transient spin overlay before document undo mutates history", async () => {
+     const { bridge, container, root } = await renderMainWindow();
+     try {
+diff --git a/docs/manual-stress-checklist.md b/docs/manual-stress-checklist.md
+index 463f5d680..e4a3741a4 100644
+--- a/docs/manual-stress-checklist.md
++++ b/docs/manual-stress-checklist.md
+@@ -12,6 +12,13 @@ scaling, sparse override precedence, terminal carbon labels, hidden implicit hyd
+ hydrogens, fonts, save/reopen, undo/redo, Spin 3D, atom-label editor placement, SVG export, and ring
+ selection after tab switching/closing.
+ 
++## Spin 3D (macOS and Windows)
++
++Paste `c1ccccc1.CC(C)(C)C.OCCO` as one native molecule object; with RDKit and the OCL fallback,
++check that all three fragments open apart in their drawn arrangement, stay spatially separate while
++rotating, and remain apart after flatten, save/reopen and Spin again; Copy As SMILES and formula
++must stay unchanged.
++
+ ## Plugin 3D chemistry (macOS and Windows)
+ 
+ With a plugin that declares `chemistry.compute`, embed a two-component complex, arrange and minimize

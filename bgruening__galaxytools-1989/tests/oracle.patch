@@ -1,0 +1,539 @@
+diff --git a/tools/nomad_eosc_peak_finding/.shed.yml b/tools/nomad_eosc_peak_finding/.shed.yml
+new file mode 100644
+index 0000000000..9a01b74a8d
+--- /dev/null
++++ b/tools/nomad_eosc_peak_finding/.shed.yml
+@@ -0,0 +1,14 @@
++name: nomad_eosc_peak_finding
++owner: bgruening
++categories:
++  - Materials science
++description: Peak finding in XPS NeXus spectra, written back as NXfit/NXpeak
++long_description: |
++    Finds peaks in an X-ray photoelectron spectroscopy (XPS) spectrum stored in a
++    NeXus/HDF5 file and appends them to a copy of that file as a standard NXfit
++    group with one NXpeak child per detected peak, alongside a tabular and a JSON
++    peak table. This is the peak-finding step of the NOMAD/EOSC demonstrator that connects
++    NOMAD to Galaxy, ported from the standalone demo in nomad-eosc-galaxy-actions.
++homepage_url: https://github.com/FAIRmat-NFDI/nomad-eosc-galaxy-actions
++remote_repository_url: https://github.com/bgruening/galaxytools/tree/master/tools/nomad_eosc_peak_finding
++type: unrestricted
+\ No newline at end of file
+diff --git a/tools/nomad_eosc_peak_finding/macros.xml b/tools/nomad_eosc_peak_finding/macros.xml
+new file mode 100644
+index 0000000000..20f866ebf9
+--- /dev/null
++++ b/tools/nomad_eosc_peak_finding/macros.xml
+@@ -0,0 +1,45 @@
++<macros>
++    <token name="@TOOL_VERSION@">0.1.0</token>
++    <token name="@VERSION_SUFFIX@">0</token>
++    <token name="@PROFILE@">25.0</token>
++    <xml name="requirements">
++        <requirements>
++            <requirement type="package" version="3.12">python</requirement>
++            <requirement type="package" version="1.18.1">scipy</requirement>
++            <requirement type="package" version="3.16.0">h5py</requirement>
++            <yield/>
++        </requirements>
++    </xml>
++    <token name="@CMD_PEAK_ARGS@"><![CDATA[
++        #if str($peak_detection.prominence).strip()
++            --prominence $peak_detection.prominence
++        #end if
++        #if str($peak_detection.distance).strip()
++            --distance $peak_detection.distance
++        #end if
++        #if str($peak_detection.height).strip()
++            --height $peak_detection.height
++        #end if
++    ]]></token>
++    <xml name="citations">
++        <citations>
++            <citation type="bibtex">
++@misc{pynxtools_xps,
++    author = {{FAIRmat consortium}},
++    title = {pynxtools-xps: a pynxtools reader plugin for X-ray photoelectron spectroscopy (XPS) data},
++    publisher = {GitHub},
++    journal = {GitHub repository},
++    url = {https://github.com/FAIRmat-NFDI/pynxtools-xps}
++}
++            </citation>
++        </citations>
++    </xml>
++    <xml name="creators">
++        <creator>
++            <person givenName="Saim" familyName="Momin" url="https://github.com/SaimMomin12"/>
++            <person givenName="Björn" familyName="Grüning" url="https://github.com/bgruening"/>
++            <organization name="Galaxy Europe" url="https://galaxyproject.org/eu/"/>
++            <organization name="Fairmat-NFDI" url="https://www.fairmat-nfdi.eu/fairmat/"/>
++        </creator>
++    </xml>
++</macros>
+diff --git a/tools/nomad_eosc_peak_finding/test-data/vms_regular_ref.nxs b/tools/nomad_eosc_peak_finding/test-data/vms_regular_ref.nxs
+new file mode 100644
+index 0000000000..5ce6dadbae
+Binary files /dev/null and b/tools/nomad_eosc_peak_finding/test-data/vms_regular_ref.nxs differ
+diff --git a/tools/nomad_eosc_peak_finding/xps_peak_finding.py b/tools/nomad_eosc_peak_finding/xps_peak_finding.py
+new file mode 100644
+index 0000000000..2d8ca6b96d
+--- /dev/null
++++ b/tools/nomad_eosc_peak_finding/xps_peak_finding.py
+@@ -0,0 +1,286 @@
++#!/usr/bin/env python
++"""Peak finding for an already-converted XPS NeXus file.
++
++Reads the default NXdata group's signal/axes (energy vs. intensity) out of an
++existing NeXus/HDF5 file, runs ``scipy.signal.find_peaks`` on the intensity, and
++appends one NXfit/NXpeak group per detected peak carrying the peak's energy
++(``data/position``) and intensity (``data/intensity``).
++
++This is a standalone port of ``pynxtools_xps.peak_finding`` that writes the same
++NeXus structure using plain h5py, so the Galaxy tool depends only on scipy and
++h5py (both on conda-forge). Upstream lives on the unreleased
++``eosc-galaxy-peak-finding`` branch of pynxtools-xps and additionally requires
++pynxtools, which is not packaged for conda. See:
++https://github.com/FAIRmat-NFDI/nomad-eosc-galaxy-actions/tree/main/examples/galaxy_demo
++
++The NXfit written here is deliberately partial: ``scipy.signal.find_peaks``
++locates peaks but does not fit a background or a parametric peak shape, so
++NXfit's own required ``data`` (fit input/output) and ``backgroundBACKGROUND``
++groups are left out rather than filled with invented values. ``pynx validate``
++will flag both as missing -- that reflects this step's actual scope (peak
++finding, not peak fitting), not a bug.
++"""
++
++import argparse
++import json
++import logging
++import numbers
++import shutil
++import sys
++from pathlib import Path
++
++import h5py
++from scipy.signal import find_peaks
++
++__version__ = "0.1.0"
++
++FIT_LABEL = "Peaks found via scipy.signal.find_peaks"
++
++logger = logging.getLogger("xps_peak_finding")
++
++
++def decode_if_string(value):
++    """Return *value* as ``str`` if it is a (possibly HDF5 byte) string."""
++    if isinstance(value, bytes):
++        return value.decode("utf-8")
++    if isinstance(value, str):
++        return value
++    return value
++
++
++def nx_class(node):
++    """Return the ``NX_class`` attribute of *node* as ``str``, or None."""
++    return decode_if_string(node.attrs.get("NX_class"))
++
++
++def find_default_nxentry(root):
++    """Return the default NXentry under *root*, else the first NXentry found."""
++    default = decode_if_string(root.attrs.get("default"))
++    if default and default in root:
++        candidate = root[default]
++        if isinstance(candidate, h5py.Group) and nx_class(candidate) == "NXentry":
++            return candidate
++
++    for key in root:
++        child = root[key]
++        if isinstance(child, h5py.Group) and nx_class(child) == "NXentry":
++            return child
++    return None
++
++
++def _follow_default_chain(group):
++    """Follow ``@default`` from *group* until it stops pointing at a group."""
++    current = group
++    while True:
++        default = decode_if_string(current.attrs.get("default"))
++        if not default or default not in current:
++            return current if current is not group else None
++        target = current[default]
++        if not isinstance(target, h5py.Group):
++            return current if current is not group else None
++        current = target
++
++
++def find_default_nxdata(nxentry):
++    """Return the default plottable NXdata group under *nxentry*.
++
++    Prefers the NIAC2014 (v3) ``@default`` chain, which must land on a group
++    carrying ``@signal``; falls back to the first NXdata child (v2/v1 layouts).
++    """
++    nxdata = _follow_default_chain(nxentry)
++    if nxdata is not None and decode_if_string(nxdata.attrs.get("signal")):
++        return nxdata
++
++    for key in nxentry:
++        child = nxentry[key]
++        if isinstance(child, h5py.Group) and nx_class(child) == "NXdata":
++            return child
++    return None
++
++
++def inspect_nxdata(group):
++    """Return ``(signal, first_axis)`` datasets for the NXdata *group*.
++
++    Implements the v3 convention (group-level ``@signal``/``@axes``) first, then
++    falls back to v2 (a field carrying its own ``signal="1"`` and a
++    colon-separated ``@axes``). Returns ``(None, None)`` if neither applies.
++    """
++    # v3 (NIAC2014): the group names its signal and axes.
++    signal_name = decode_if_string(group.attrs.get("signal"))
++    if signal_name and signal_name in group:
++        signal = group[signal_name]
++        axes = group.attrs.get("axes")
++        if isinstance(axes, (str, bytes)):
++            axis_names = [decode_if_string(axes)]
++        elif axes is not None:
++            axis_names = [decode_if_string(axis) for axis in axes]
++        else:
++            axis_names = []
++        for name in axis_names:
++            if name in group:
++                return signal, group[name]
++
++    # v2: a field flags itself as the signal and lists its axes.
++    for key in group:
++        dataset = group[key]
++        if not isinstance(dataset, h5py.Dataset):
++            continue
++        if decode_if_string(dataset.attrs.get("signal")) != "1":
++            continue
++        axes = decode_if_string(dataset.attrs.get("axes"))
++        if isinstance(axes, str):
++            for name in axes.replace(",", ":").split(":"):
++                if name and name in group:
++                    return dataset, group[name]
++
++    # v1: axis fields carry an integer @axis attribute instead.
++    for key in group:
++        dataset = group[key]
++        if not isinstance(dataset, h5py.Dataset):
++            continue
++        if decode_if_string(dataset.attrs.get("signal")) != "1":
++            continue
++        for axis_key in group:
++            axis = group[axis_key]
++            if isinstance(axis, h5py.Dataset) and isinstance(
++                axis.attrs.get("axis"), numbers.Integral
++            ):
++                return dataset, axis
++
++    return None, None
++
++
++def _write_scalar(group, name, value, units):
++    """Write a scalar dataset, attaching ``@units`` when the source had them."""
++    dataset = group.create_dataset(name, data=value)
++    if units is not None:
++        dataset.attrs["units"] = decode_if_string(units)
++
++
++def find_xps_peaks(input_path, output_path=None, **find_peaks_kwargs):
++    """Find peaks in an XPS spectrum and append them to the NeXus file.
++
++    Args:
++        input_path: path to an existing NeXus file with a resolvable default
++            NXdata group (energy vs. intensity).
++        output_path: where to write the result. Defaults to ``input_path``
++            (in place). If different, ``input_path`` is copied first and left
++            untouched.
++        **find_peaks_kwargs: forwarded to ``scipy.signal.find_peaks`` (e.g.
++            ``height``, ``prominence``, ``distance``).
++
++    Returns:
++        One dict per detected peak, with ``position`` (energy) and ``intensity``.
++    """
++    input_path = Path(input_path)
++    output_path = Path(output_path) if output_path is not None else input_path
++    if output_path != input_path:
++        shutil.copyfile(input_path, output_path)
++
++    with h5py.File(output_path, "r+") as nexus_file:
++        entry = find_default_nxentry(nexus_file)
++        if entry is None:
++            raise ValueError(f"No NXentry found in {output_path}")
++
++        nxdata_group = find_default_nxdata(entry)
++        if nxdata_group is None:
++            raise ValueError(f"No default NXdata group found in {output_path}")
++
++        signal, axis = inspect_nxdata(nxdata_group)
++        if signal is None or axis is None:
++            raise ValueError(
++                f"NXdata group '{nxdata_group.name}' in {output_path} has no "
++                "resolvable signal/axes."
++            )
++
++        intensity = signal[()]
++        energy = axis[()]
++        position_units = axis.attrs.get("units")
++        intensity_units = signal.attrs.get("units")
++
++        peak_indices, _properties = find_peaks(intensity, **find_peaks_kwargs)
++
++        # NXfit is a recommended child group directly under ENTRY (a sibling of
++        # the spectrum's own NXdata group), not nested under it -- see
++        # NXxps.nxdl.xml. Drop any previous run so re-running is idempotent.
++        if "fit" in entry:
++            del entry["fit"]
++        fit_group = entry.create_group("fit")
++        fit_group.attrs["NX_class"] = "NXfit"
++        fit_group.create_dataset("label", data=FIT_LABEL)
++
++        peaks = []
++        for i, index in enumerate(peak_indices):
++            position = float(energy[index])
++            peak_intensity = float(intensity[index])
++            peaks.append({"position": position, "intensity": peak_intensity})
++
++            peak_id = f"peak_{i}"
++            peak_group = fit_group.create_group(peak_id)
++            peak_group.attrs["NX_class"] = "NXpeak"
++            peak_group.create_dataset("label", data=peak_id)
++            data_group = peak_group.create_group("data")
++            data_group.attrs["NX_class"] = "NXdata"
++            _write_scalar(data_group, "position", position, position_units)
++            _write_scalar(data_group, "intensity", peak_intensity, intensity_units)
++
++    return peaks
++
++
++def write_tsv(peaks, path):
++    """Write *peaks* as a tab-separated table with a header row."""
++    with open(path, "w") as handle:
++        handle.write("peak_id\tposition\tintensity\n")
++        for i, peak in enumerate(peaks):
++            handle.write(f"peak_{i}\t{peak['position']}\t{peak['intensity']}\n")
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description="Find peaks in an XPS NeXus spectrum and append them as NXfit/NXpeak."
++    )
++    parser.add_argument(
++        "input_path", help="Path to an already-converted XPS NeXus file."
++    )
++    parser.add_argument(
++        "-o", "--output-path", default=None, help="Output path (defaults to in-place)."
++    )
++    parser.add_argument("--height", type=float, default=None)
++    parser.add_argument("--prominence", type=float, default=None)
++    parser.add_argument("--distance", type=float, default=None)
++    parser.add_argument(
++        "--peaks-tsv", default=None, help="Also write the peak table as TSV."
++    )
++    parser.add_argument(
++        "--peaks-json", default=None, help="Also write the peak table as JSON."
++    )
++    args = parser.parse_args()
++
++    logging.basicConfig(
++        level=logging.INFO,
++        format="%(levelname)s - %(message)s",
++        handlers=[logging.StreamHandler(sys.stderr)],
++    )
++
++    kwargs = {
++        key: value
++        for key, value in {
++            "height": args.height,
++            "prominence": args.prominence,
++            "distance": args.distance,
++        }.items()
++        if value is not None
++    }
++
++    peaks = find_xps_peaks(args.input_path, args.output_path, **kwargs)
++    logger.info("Found %d peaks in %s", len(peaks), args.input_path)
++
++    if args.peaks_tsv:
++        write_tsv(peaks, args.peaks_tsv)
++    if args.peaks_json:
++        with open(args.peaks_json, "w") as handle:
++            json.dump(peaks, handle, indent=2)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/nomad_eosc_peak_finding/xps_peak_finding.xml b/tools/nomad_eosc_peak_finding/xps_peak_finding.xml
+new file mode 100644
+index 0000000000..8b1c89990c
+--- /dev/null
++++ b/tools/nomad_eosc_peak_finding/xps_peak_finding.xml
+@@ -0,0 +1,165 @@
++<tool id="nomad_eosc_peak_finding" name="XPS peak finding" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
++    <description>in a NeXus spectrum, written back as NXfit/NXpeak</description>
++    <macros>
++        <import>macros.xml</import>
++    </macros>
++    <expand macro="requirements"/>
++    <required_files>
++        <include path="xps_peak_finding.py"/>
++    </required_files>
++    <version_command>echo @TOOL_VERSION@</version_command>
++    <command detect_errors="aggressive"><![CDATA[
++        python '$__tool_directory__/xps_peak_finding.py'
++        '$input_nxs'
++        --output-path '$output_nxs'
++        --peaks-tsv '$peaks_tabular'
++        --peaks-json '$peaks_json'
++        @CMD_PEAK_ARGS@
++    ]]></command>
++    <inputs>
++        <param name="input_nxs" type="data" format="nxxps" label="XPS spectrum (NeXus/HDF5)" help="An already-converted NeXus file (for example NXxps) with a resolvable default NXdata group holding energy vs. intensity."/>
++        <section name="peak_detection" title="Peak detection" expanded="true">
++            <param argument="--prominence" type="float" value="" optional="true" min="0" label="Required prominence of peaks" help="How far a peak must stand out from the surrounding baseline, in the intensity units of the spectrum. Left empty, scipy applies no prominence filter and typically returns hundreds of peaks. For a survey spectrum in counts per second, 10000 is a reasonable starting point."/>
++            <param argument="--distance" type="float" value="" optional="true" min="1" label="Minimal horizontal distance between peaks" help="In data points, not energy units. Smaller peaks within this distance of a larger one are discarded. Try 20 for a survey spectrum."/>
++            <param argument="--height" type="float" value="" optional="true" label="Required absolute height of peaks" help="Minimum intensity a peak must reach, in the intensity units of the spectrum. Unlike prominence this ignores the local baseline, so it is mostly useful for picking out only the strongest lines."/>
++        </section>
++    </inputs>
++    <outputs>
++        <data name="output_nxs" format="nxxps" label="${tool.name} on ${on_string}: Annotated NeXus"/>
++        <data name="peaks_tabular" format="tabular" label="${tool.name} on ${on_string}: Peak table"/>
++        <data name="peaks_json" format="json" label="${tool.name} on ${on_string}: Peaks (JSON)"/>
++    </outputs>
++    <tests>
++        <!-- Test 01: prominence 10000, distance 20 -> 6 peaks. -->
++        <test expect_num_outputs="3">
++            <param name="input_nxs" value="vms_regular_ref.nxs" ftype="nxxps"/>
++            <section name="peak_detection">
++                <param name="prominence" value="10000"/>
++                <param name="distance" value="20"/>
++            </section>
++            <output name="output_nxs" ftype="nxxps">
++                <assert_contents>
++                    <has_h5_keys keys="1_as_loaded__Survey/fit,1_as_loaded__Survey/fit/peak_0/data/position,1_as_loaded__Survey/fit/peak_5/data/intensity"/>
++                    <has_h5_attribute key="NX_class" value="NXroot"/>
++                </assert_contents>
++            </output>
++            <output name="peaks_tabular" ftype="tabular">
++                <assert_contents>
++                    <has_text text="peak_id&#9;position&#9;intensity"/>
++                    <has_text text="182.61"/>
++                    <has_text text="1180.61"/>
++                    <has_n_lines n="7"/>
++                </assert_contents>
++            </output>
++            <output name="peaks_json" ftype="json">
++                <assert_contents>
++                    <has_text text="&quot;position&quot;"/>
++                    <has_text text="27570.7"/>
++                </assert_contents>
++            </output>
++        </test>
++        <!--Test 02: Default parameters -->
++        <test expect_num_outputs="3">
++            <param name="input_nxs" value="vms_regular_ref.nxs" ftype="nxxps"/>
++            <output name="output_nxs" ftype="nxxps">
++                <assert_contents>
++                    <has_h5_keys keys="1_as_loaded__Survey/fit/peak_300/data/position"/>
++                </assert_contents>
++            </output>
++            <output name="peaks_tabular" ftype="tabular">
++                <assert_contents>
++                    <has_text text="peak_id&#9;position&#9;intensity"/>
++                    <has_n_lines n="343"/>
++                </assert_contents>
++            </output>
++            <output name="peaks_json" ftype="json">
++                <assert_contents>
++                    <has_text text="&quot;intensity&quot;"/>
++                </assert_contents>
++            </output>
++        </test>
++        <!-- Height filter on its own: keeps only the single strongest line. -->
++        <test expect_num_outputs="3">
++            <param name="input_nxs" value="vms_regular_ref.nxs" ftype="nxxps"/>
++            <section name="peak_detection">
++                <param name="height" value="100000"/>
++            </section>
++            <output name="output_nxs" ftype="nxxps">
++                <assert_contents>
++                    <has_h5_keys keys="1_as_loaded__Survey/fit/peak_0/data/intensity"/>
++                </assert_contents>
++            </output>
++            <output name="peaks_tabular" ftype="tabular">
++                <assert_contents>
++                    <has_text text="peak_id&#9;position&#9;intensity"/>
++                    <has_text text="peak_0&#9;1180.61&#9;108366.0"/>
++                    <has_n_lines n="2"/>
++                </assert_contents>
++            </output>
++            <output name="peaks_json" ftype="json">
++                <assert_contents>
++                    <has_text text="108366.0"/>
++                </assert_contents>
++            </output>
++        </test>
++    </tests>
++    <help format="markdown"><![CDATA[
++**What it does**
++
++Finds peaks in an X-ray photoelectron spectroscopy (XPS) spectrum stored in a
++NeXus/HDF5 file, and writes the detected peaks back into a copy of that file as
++a standard ``NXfit`` group.
++
++The tool reads the spectrum from the file's *default* ``NXdata`` group (energy
++vs. intensity), runs ``scipy.signal.find_peaks`` over the intensity, and appends
++one ``NXpeak`` group per detected peak. The input dataset is never modified.
++
++This is the peak-finding step of the NOMAD ↔ Galaxy XPS demonstrator.
++
++-----
++
++**Inputs**
++
++A NeXus file that has already been converted from a vendor format - for example
++the output of ``pynxtools-xps``. It must contain an ``NXentry`` with a
++resolvable default ``NXdata`` group. Upload it to Galaxy as datatype ``nxxps``.
++
++-----
++
++**Peak detection parameters**
++
++All three are optional and map directly onto ``scipy.signal.find_peaks``. Leave
++them all empty and you get every local maximum in the spectrum, which is rarely
++what you want - ``prominence`` is usually the most useful single knob.
++
++The right values depend on the intensity scale of your data. For the survey
++spectrum used in the tool's tests (counts per second), ``prominence = 10000``
++with ``distance = 20`` picks out the six main lines.
++
++-----
++
++**Outputs**
++
++**Annotated NeXus** - a copy of the input with the peaks added under
++``/<entry>/fit``. For each detected peak *i*:
++
++``/<entry>/fit`` - ``@NX_class = NXfit``, holds a ``label`` describing how the
++peaks were found.
++
++``/<entry>/fit/peak_<i>`` - ``@NX_class = NXpeak``, holds a ``label``.
++
++``/<entry>/fit/peak_<i>/data`` - ``@NX_class = NXdata``, holds ``position``
++(with ``@units`` taken from the spectrum's energy axis, typically ``eV``) and
++``intensity`` (with ``@units`` taken from the signal, e.g. ``counts_per_second``).
++
++**Peak table** - tabular, with ``peak_id``, ``position`` and ``intensity``
++columns, ready for Galaxy's filtering, joining and plotting tools.
++
++**Peaks (JSON)** - the same peaks as a JSON list of
++``{"position": ..., "intensity": ...}`` objects.
++
++-----
++    ]]></help>
++    <expand macro="citations"/>
++    <expand macro="creators"/>
++</tool>

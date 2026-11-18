@@ -1,0 +1,1185 @@
+diff --git a/apps/desktop/src-tauri/src/lib.rs b/apps/desktop/src-tauri/src/lib.rs
+index da5c74379..bcf94829f 100644
+--- a/apps/desktop/src-tauri/src/lib.rs
++++ b/apps/desktop/src-tauri/src/lib.rs
+@@ -755,6 +755,20 @@ pub fn run() {
+                 schedule_suspended_utility_restore(window.app_handle());
+             }
+ 
++            // A window closed during a prompt must not come back. Plugin panels are hidden on close
++            // (below), never destroyed, so their CloseRequested counts; a toolbar's close request
++            // could still be refused, so for toolbars only Destroyed does.
++            if is_suspended_utility_label(window.label())
++                && (matches!(event, WindowEvent::Destroyed)
++                    || (is_plugin_panel_window_label(window.label())
++                        && matches!(event, WindowEvent::CloseRequested { .. })))
++            {
++                UTILITY_SUSPENSION
++                    .lock()
++                    .unwrap_or_else(|poisoned| poisoned.into_inner())
++                    .closed(window.label());
++            }
++
+             // A report or analysis window closed natively (Window > Close Window, Cmd+W) must take
+             // the same path as its own close control: hidden, not destroyed, and the main document
+             // told, so a plugin gets its close signal (AGENTS.md §8a) and a later report re-shows the
+@@ -1275,6 +1289,135 @@ fn is_suspended_utility_label(label: &str) -> bool {
+     label.starts_with("toolset-") || is_plugin_panel_window_label(label)
+ }
+ 
++fn utility_restore_priority(label: &str) -> u8 {
++    if label == TOOLSET_TOOLTIP_WINDOW_LABEL {
++        3
++    } else if label.starts_with("toolset-popover-") {
++        2
++    } else if is_plugin_panel_window_label(label) {
++        0
++    } else {
++        1
++    }
++}
++
++/// Main-thread-only, inside suspend_toolset_windows' run_on_main_thread_blocking transaction.
++/// Read before hiding anything. A partial native list is a failure too: silently mixing it with
++/// registry order would scramble siblings. The caller logs and keeps the old fallback ordering.
++fn utility_windows_top_to_bottom<R: Runtime>(
++    windows: &[tauri::WebviewWindow<R>],
++) -> Result<Vec<String>, String> {
++    if windows.is_empty() {
++        return Ok(Vec::new());
++    }
++    #[cfg(target_os = "macos")]
++    {
++        MainThreadMarker::new()
++            .ok_or_else(|| "AppKit stacking order must be read on the main thread.".to_string())?;
++        let mut labels = HashMap::new();
++        for window in windows {
++            let pointer = window.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
++            let native = unsafe { pointer.as_ref() }
++                .ok_or_else(|| "Could not access a native ChemDraft utility window.".to_string())?;
++            labels.insert(native.windowNumber(), window.label().to_string());
++        }
++        // Not NSApp.orderedWindows: it lists only scriptable windows and leaves panels out, and
++        // these are panels by style. +[NSWindow windowNumbersWithOptions:0] is the window server's
++        // front-to-back order of this app's on-screen windows on the active space, across window
++        // levels. SAFETY: a class method returning an autoreleased NSArray<NSNumber> (or nil),
++        // called on the main thread; Retained keeps the snapshot alive while it is read.
++        let numbers: Option<
++            objc2::rc::Retained<objc2_foundation::NSArray<objc2_foundation::NSNumber>>,
++        > = unsafe { objc2::msg_send![objc2::class!(NSWindow), windowNumbersWithOptions: 0usize] };
++        let numbers =
++            numbers.ok_or_else(|| "NSWindow windowNumbersWithOptions returned nil.".to_string())?;
++        let mut order = Vec::new();
++        for number in numbers.iter() {
++            if let Some(label) = labels.remove(&number.integerValue()) {
++                order.push(label);
++            }
++        }
++        if !labels.is_empty() {
++            return Err(format!(
++                "NSWindow windowNumbersWithOptions omitted {} visible utility window(s).",
++                labels.len()
++            ));
++        }
++        Ok(order)
++    }
++    #[cfg(windows)]
++    {
++        use windows_sys::Win32::{Foundation::HWND, UI::WindowsAndMessaging::EnumWindows};
++
++        struct Snapshot {
++            labels: HashMap<usize, String>,
++            order: Vec<String>,
++        }
++        unsafe extern "system" fn collect(hwnd: HWND, data: isize) -> i32 {
++            // SAFETY: EnumWindows invokes this synchronously with our live Snapshot pointer.
++            let snapshot = unsafe { &mut *(data as *mut Snapshot) };
++            if let Some(label) = snapshot.labels.remove(&(hwnd as usize)) {
++                snapshot.order.push(label);
++            }
++            1
++        }
++
++        let mut snapshot = Snapshot {
++            labels: HashMap::new(),
++            order: Vec::new(),
++        };
++        for window in windows {
++            let hwnd = window.hwnd().map_err(|error| error.to_string())?;
++            snapshot
++                .labels
++                .insert(hwnd.0 as usize, window.label().to_string());
++        }
++        // SAFETY: EnumWindows enumerates top-level windows (including the document's owned
++        // utilities) from top to bottom. The callback only records matching handles; it neither
++        // mutates windows nor changes focus. Snapshot outlives the synchronous enumeration.
++        if unsafe { EnumWindows(Some(collect), &mut snapshot as *mut Snapshot as isize) } == 0 {
++            return Err(format!(
++                "EnumWindows failed: {}",
++                std::io::Error::last_os_error()
++            ));
++        }
++        if !snapshot.labels.is_empty() {
++            return Err(format!(
++                "EnumWindows omitted {} visible utility window(s).",
++                snapshot.labels.len()
++            ));
++        }
++        Ok(snapshot.order)
++    }
++    #[cfg(not(any(target_os = "macos", windows)))]
++    {
++        Err("Native utility stacking order is unavailable on this platform.".to_string())
++    }
++}
++
++/// Main-thread-only: capture ownership before orderOut can detach document children.
++fn utility_is_document_child<R: Runtime>(
++    window: &tauri::WebviewWindow<R>,
++    main: &tauri::WebviewWindow<R>,
++) -> Result<bool, String> {
++    #[cfg(target_os = "macos")]
++    {
++        let pointer = window.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
++        let native = unsafe { pointer.as_ref() }
++            .ok_or_else(|| "Could not snapshot native ChemDraft utility parent.".to_string())?;
++        let owner = main.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
++        Ok(native
++            .parentWindow()
++            .is_some_and(|parent| std::ptr::eq(&*parent, owner)))
++    }
++    #[cfg(not(target_os = "macos"))]
++    {
++        // Windows ownership is retained by hide/show; restoration never changes the owner HWND.
++        let _ = (window, main);
++        Ok(false)
++    }
++}
++
+ /// Async for the same reason as window creation: never take WINDOW_CREATION on the main thread.
+ /// The actual hide/show transaction runs on the main thread, serializing it with late flyout and
+ /// tooltip reveals. Future in-app dialogs should acquire/release this same counter.
+@@ -1310,23 +1453,56 @@ async fn suspend_toolset_windows(
+                 .into_values()
+                 .filter(|window| is_suspended_utility_label(window.label()))
+                 .collect();
+-            let document_minimized = app
++            let main = app
+                 .get_webview_window(MAIN_WINDOW_LABEL)
+-                .is_some_and(|main| main.is_minimized().unwrap_or(true));
+-            let snapshot: Vec<_> = windows
++                .ok_or_else(|| "ChemDraft utility suspension owner disappeared.".to_string())?;
++            let document_minimized = main.is_minimized().unwrap_or(true);
++            let mut snapshot: Vec<_> = windows
+                 .iter()
+                 .map(|window| {
+-                    (
++                    Ok((
+                         window.label().to_string(),
+                         window.is_visible().unwrap_or(false),
+                         document_minimized || window.is_minimized().unwrap_or(true),
+-                    )
++                        utility_is_document_child(window, &main)?,
++                    ))
+                 })
+-                .collect();
++                .collect::<Result<_, String>>()?;
++            // Only the first acquisition reads the native order. A nested prompt must keep the
++            // first snapshot, including while waiting for a minimized document to return.
++            let top_to_bottom = if UTILITY_SUSPENSION
++                .lock()
++                .unwrap_or_else(|poisoned| poisoned.into_inner())
++                .active()
++            {
++                None
++            } else {
++                let visible_windows: Vec<_> = windows
++                    .iter()
++                    .filter(|window| {
++                        snapshot.iter().any(|(label, visible, minimized, _)| {
++                            label == window.label() && *visible && !*minimized
++                        })
++                    })
++                    .cloned()
++                    .collect();
++                match utility_windows_top_to_bottom(&visible_windows) {
++                    Ok(order) => Some(order),
++                    Err(error) => {
++                        eprintln!(
++                            "Could not read ChemDraft floating window stacking order; using the \
++                             default restore order: {error}"
++                        );
++                        None
++                    }
++                }
++            };
++            // Preserve the previous panel/toolbar/flyout/tooltip order if the native query fails.
++            snapshot.sort_by_key(|(label, _, _, _)| utility_restore_priority(label));
+             if !UTILITY_SUSPENSION
+                 .lock()
+                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+-                .begin(snapshot)
++                .begin(snapshot, top_to_bottom)
+             {
+                 return Ok(());
+             }
+@@ -1402,7 +1578,7 @@ fn restore_utility_labels<R: Runtime>(
+     app: &tauri::AppHandle<R>,
+     labels: Option<Vec<String>>,
+ ) -> Result<(), String> {
+-    let Some(mut labels) = labels else {
++    let Some(labels) = labels else {
+         return Ok(());
+     };
+     if quit_in_progress() {
+@@ -1418,32 +1594,34 @@ fn restore_utility_labels<R: Runtime>(
+     {
+         return Ok(());
+     }
++    // AppKit palettes use the floating level and hide on deactivation. Ordering them in while
++    // inactive could expose that level above another app even with a relative anchor. Keep the
++    // obligations until the document/utility Focused(true) event retries. Windows utilities are
++    // non-topmost owned windows and can safely restore behind the foreground app using HWNDs.
++    #[cfg(target_os = "macos")]
++    if !foreground_belongs_to_app() {
++        return Ok(());
++    }
+     UTILITY_SUSPENSION
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner())
+         .start_restore();
+-    // Restore panels and toolbars first, then their flyouts, and the shared tooltip last.
+-    labels.sort_by_key(|label| {
+-        if label == TOOLSET_TOOLTIP_WINDOW_LABEL {
+-            3
+-        } else if label.starts_with("toolset-popover-") {
+-            2
+-        } else if is_plugin_panel_window_label(label) {
+-            0
+-        } else {
+-            1
+-        }
+-    });
++    // Restore top-down so each next window can go directly below its restored sibling. Retried
++    // windows also use the full cycle's order, including siblings restored in an earlier pass.
+     let mut result = Ok(());
+-    for label in labels {
++    for label in labels.into_iter().rev() {
+         if quit_in_progress() {
+             result = Err(QUITTING_WINDOW_REFUSAL.to_string());
+             break;
+         }
+-        if app
+-            .get_webview_window(MAIN_WINDOW_LABEL)
+-            .is_none_or(|main| main.is_minimized().unwrap_or(true))
+-        {
++        let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
++            break;
++        };
++        if main.is_minimized().unwrap_or(true) || !main.is_visible().unwrap_or(false) {
++            break;
++        }
++        #[cfg(target_os = "macos")]
++        if !foreground_belongs_to_app() {
+             break;
+         }
+         let Some(window) = app.get_webview_window(&label) else {
+@@ -1463,7 +1641,7 @@ fn restore_utility_labels<R: Runtime>(
+             buffer_utility_recovery_position(&window);
+             recover_offscreen_toolset_window(app, &window);
+         }
+-        let shown = restore_utility_window(&window);
++        let shown = restore_utility_in_document_group(&window);
+         if let Err(error) = shown {
+             result = Err(error);
+         } else {
+@@ -1492,26 +1670,145 @@ fn buffer_utility_recovery_position<R: Runtime>(window: &tauri::WebviewWindow<R>
+     }
+ }
+ 
+-fn restore_utility_window<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
++/// Main-thread-only. Also used by deferred panel creation, so a worker retry uses the same retained
++/// sibling order as an existing window's Resized retry, without an app-wide reveal in between.
++fn restore_utility_in_document_group<R: Runtime>(
++    window: &tauri::WebviewWindow<R>,
++) -> Result<(), String> {
++    let app = window.app_handle();
++    let main = app
++        .get_webview_window(MAIN_WINDOW_LABEL)
++        .ok_or_else(|| "ChemDraft utility restore owner disappeared.".to_string())?;
++    if main.is_minimized().unwrap_or(true) || !main.is_visible().unwrap_or(false) {
++        return Err("ChemDraft utility restore owner is not visible; retrying.".into());
++    }
+     #[cfg(target_os = "macos")]
+-    {
+-        if is_plugin_panel_window_label(window.label()) {
+-            return configure_analysis_window_on_main_thread(window, false);
++    if !foreground_belongs_to_app() {
++        return Err("ChemDraft utility restore is waiting for app activation.".into());
++    }
++    let placement = UTILITY_SUSPENSION
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner())
++        .restore_placement(window.label(), |sibling| {
++            app.get_webview_window(sibling).is_some_and(|sibling| {
++                sibling.is_visible().unwrap_or(false) && !sibling.is_minimized().unwrap_or(true)
++            })
++        });
++    let (anchor, below) = match placement {
++        utility_suspension::RestorePlacement::Below(sibling) => {
++            (app.get_webview_window(&sibling), true)
++        }
++        utility_suspension::RestorePlacement::Above(sibling) => {
++            (app.get_webview_window(&sibling), false)
+         }
++        utility_suspension::RestorePlacement::AboveDocument => (Some(main.clone()), false),
++    };
++    let anchor =
++        anchor.ok_or_else(|| "ChemDraft utility restore anchor disappeared.".to_string())?;
++    restore_utility_window(window, &main, &anchor, below)
++}
++
++fn restore_utility_window<R: Runtime>(
++    window: &tauri::WebviewWindow<R>,
++    main: &tauri::WebviewWindow<R>,
++    anchor: &tauri::WebviewWindow<R>,
++    below: bool,
++) -> Result<(), String> {
++    #[cfg(target_os = "macos")]
++    {
+         // Already on the main thread. Preserve each panel's traits (in particular the tooltip's
+-        // click-through setting) and order it in without activating it.
++        // click-through setting). orderWindow:relativeTo: shows without making the window key,
++        // and anchors it to the document group rather than using orderFront's app-wide raise.
+         let pointer = window.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
+         let native = unsafe { pointer.as_ref() }
+             .ok_or_else(|| "Could not restore native ChemDraft utility window.".to_string())?;
+-        native.orderFront(None);
++        if is_plugin_panel_window_label(window.label()) {
++            configure_analysis_window_traits(window, native)?;
++        }
++        let main_pointer = main.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
++        let owner = unsafe { main_pointer.as_ref() }
++            .ok_or_else(|| "Could not access native ChemDraft document window.".to_string())?;
++        let anchor_pointer =
++            anchor.ns_window().map_err(|error| error.to_string())? as *mut NSWindow;
++        let anchor = unsafe { anchor_pointer.as_ref() }
++            .ok_or_else(|| "Could not access native ChemDraft restore anchor.".to_string())?;
++        // Ordering out can detach children. Preserve recorded relationships for original windows;
++        // newly deferred windows use the normal creation policy (panels parented, toolbars not).
++        // Both children and unparented utilities use the retained relative stacking position below.
++        let restore_as_document_child = UTILITY_SUSPENSION
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner())
++            .restore_as_document_child(window.label());
++        if restore_as_document_child
++            && native
++                .parentWindow()
++                .is_none_or(|parent| !std::ptr::eq(&*parent, owner))
++        {
++            unsafe {
++                owner.addChildWindow_ordered(native, objc2_app_kit::NSWindowOrderingMode::Above)
++            };
++        }
++        native.orderWindow_relativeTo(
++            if below {
++                objc2_app_kit::NSWindowOrderingMode::Below
++            } else {
++                objc2_app_kit::NSWindowOrderingMode::Above
++            },
++            anchor.windowNumber(),
++        );
+         Ok(())
+     }
+-    #[cfg(not(target_os = "macos"))]
++    #[cfg(windows)]
+     {
++        use windows_sys::Win32::UI::WindowsAndMessaging::{
++            GetWindow, SetWindowPos, GW_HWNDPREV, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
++            SWP_NOSIZE,
++        };
++        let _ = main;
++        let hwnd = window.hwnd().map_err(|error| error.to_string())?.0 as _;
++        let anchor = anchor.hwnd().map_err(|error| error.to_string())?.0 as _;
++        // SetWindowPos inserts BELOW its HWND anchor. To go above a lower sibling/the document,
++        // use its current predecessor, keeping the group's position below foreign windows/dialogs.
++        // SAFETY: live top-level HWNDs, queried/reordered on the main thread without activation.
++        let insert_after = if below {
++            anchor
++        } else {
++            unsafe { GetWindow(anchor, GW_HWNDPREV) }
++        };
++        if insert_after.is_null() {
++            // A null insert-after means HWND_TOP, not "no sibling". Refuse that global raise. An
++            // owned utility normally already precedes its owner, even while hidden; retain the
++            // obligation if that relationship is temporarily unavailable rather than moving apps.
++            return Err(
++                "ChemDraft utility restore has no window above its anchor; retrying.".into(),
++            );
++        }
++        if insert_after != hwnd
++            && unsafe {
++                SetWindowPos(
++                    hwnd,
++                    insert_after,
++                    0,
++                    0,
++                    0,
++                    0,
++                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
++                )
++            } == 0
++        {
++            return Err(format!(
++                "Could not restore ChemDraft utility stacking order: {}",
++                std::io::Error::last_os_error()
++            ));
++        }
+         // All utilities, including explicitly requested analysis panels, are BUILT focused(false).
+         // Tao retains MARKER_DONT_FOCUS for their lifetime, so set_visible uses SW_SHOWNOACTIVATE
+-        // even after a panel has received focus explicitly. Going through Tauri also updates Tao's
+-        // VISIBLE flag, so subsequent hide/show calls still work. Do not build panels focused(true).
++        // and keeps the z-order we just set. Going through Tauri also updates Tao's VISIBLE flag.
++        window.show().map_err(|error| error.to_string())
++    }
++    #[cfg(not(any(target_os = "macos", windows)))]
++    {
++        let _ = (main, anchor, below);
+         window.show().map_err(|error| error.to_string())
+     }
+ }
+@@ -1967,6 +2264,12 @@ fn is_plugin_panel_window_label(label: &str) -> bool {
+         && label.starts_with(PLUGIN_PANEL_WINDOW_LABEL_PREFIX)
+ }
+ 
++/// Normal document parenting policy, shared by plugin-panel creation and suspended restoration.
++/// Palettes/popovers stay unparented on macOS; their Windows ownership is set separately.
++fn utility_window_has_document_parent(label: &str) -> bool {
++    is_plugin_panel_window_label(label)
++}
++
+ #[cfg(test)]
+ mod plugin_panel_label_tests {
+     use super::{
+@@ -1978,8 +2281,8 @@ mod plugin_panel_label_tests {
+     fn suspended_panel_opens_skip_builder_and_duplicates_build_once_after_last_resume() {
+         use super::{dispatch_plugin_panel_open, resume_deferred_plugin_panels};
+         let state = std::sync::Mutex::new(super::utility_suspension::UtilitySuspension::default());
+-        state.lock().unwrap().begin([]);
+-        state.lock().unwrap().begin([]);
++        state.lock().unwrap().begin([], None);
++        state.lock().unwrap().begin([], None);
+         let request: OpenPluginPanelRequest = serde_json::from_value(serde_json::json!({
+             "panelId": "panel.test", "title": "Analyze", "focus": true
+         }))
+@@ -2024,7 +2327,7 @@ mod plugin_panel_label_tests {
+     fn quit_drops_new_and_previously_deferred_panel_requests() {
+         use super::{dispatch_plugin_panel_open, resume_deferred_plugin_panels};
+         let state = std::sync::Mutex::new(super::utility_suspension::UtilitySuspension::default());
+-        state.lock().unwrap().begin([]);
++        state.lock().unwrap().begin([], None);
+         let request: OpenPluginPanelRequest = serde_json::from_value(serde_json::json!({
+             "panelId": "panel.test", "title": "Analyze"
+         }))
+@@ -2036,7 +2339,7 @@ mod plugin_panel_label_tests {
+         state.lock().unwrap().release(false);
+         resume_deferred_plugin_panels(&state, || false, |_| panic!("quit request was queued"))
+             .unwrap();
+-        state.lock().unwrap().begin([]);
++        state.lock().unwrap().begin([], None);
+         dispatch_plugin_panel_open(&state, request, false, |_| panic!("suspended")).unwrap();
+         state.lock().unwrap().release(false);
+         resume_deferred_plugin_panels(&state, || true, |_| panic!("quitting")).unwrap();
+@@ -2222,7 +2525,7 @@ async fn open_plugin_panel_window(
+         &UTILITY_SUSPENSION,
+         request,
+         quit_in_progress(),
+-        |request| build_or_show_plugin_panel(&app, request),
++        |request| build_or_show_plugin_panel(&app, request, false),
+     )
+ }
+ 
+@@ -2263,8 +2566,17 @@ fn restore_deferred_plugin_panels<R: Runtime>(app: &tauri::AppHandle<R>) -> Resu
+     {
+         return Ok(());
+     }
++    #[cfg(target_os = "macos")]
++    {
++        let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
++            return Ok(());
++        };
++        if !run_on_main_thread_blocking(&main, foreground_belongs_to_app)? {
++            return Ok(());
++        }
++    }
+     resume_deferred_plugin_panels(&UTILITY_SUSPENSION, quit_in_progress, |request| {
+-        build_or_show_plugin_panel(app, request)
++        build_or_show_plugin_panel(app, request, true)
+     })
+ }
+ 
+@@ -2320,13 +2632,20 @@ fn resume_deferred_plugin_panels(
+ fn build_or_show_plugin_panel<R: Runtime>(
+     app: &tauri::AppHandle<R>,
+     request: OpenPluginPanelRequest,
++    restoring: bool,
+ ) -> Result<(), String> {
+     if quit_in_progress() {
+         return Err(QUITTING_WINDOW_REFUSAL.to_string());
+     }
+     let label = plugin_panel_window_label(&request.panel_id);
+-    let presentation = request.presentation(false);
++    let presentation = request.presentation(restoring);
+     if let Some(window) = app.get_webview_window(&label) {
++        if restoring {
++            let target = window.clone();
++            return run_on_main_thread_blocking(&window, move || {
++                restore_utility_in_document_group(&target)
++            })?;
++        }
+         // `show()` makes the window key on macOS (tao's `set_visible` is makeKeyAndOrderFront), so
+         // an automatic re-show leaves visibility to `configure_analysis_window`, which only orders
+         // the window front.
+@@ -2360,14 +2679,24 @@ fn build_or_show_plugin_panel<R: Runtime>(
+     .decorations(false)
+     .shadow(false)
+     .skip_taskbar(true);
+-    if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+-        builder = builder.parent(&main).map_err(|error| error.to_string())?;
++    // AppKit parent attachment orders even a hidden child in. A deferred build stays unparented
++    // until the main-thread restore checks activation and attaches it relative to the document.
++    if utility_window_has_document_parent(&label) && !(restoring && cfg!(target_os = "macos")) {
++        if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
++            builder = builder.parent(&main).map_err(|error| error.to_string())?;
++        }
+     }
+     if let Some(position) = position {
+         builder = builder.position(position.x, position.y);
+     }
+     let window = builder.build().map_err(|error| error.to_string())?;
+ 
++    if restoring {
++        let target = window.clone();
++        return run_on_main_thread_blocking(&window, move || {
++            restore_utility_in_document_group(&target)
++        })?;
++    }
+     configure_analysis_window(&window, presentation.focus_after_show)?;
+     Ok(())
+ }
+@@ -2540,6 +2869,22 @@ fn configure_analysis_window_on_main_thread<R: Runtime>(
+     let Some(ns_window) = (unsafe { ns_window_ptr.as_ref() }) else {
+         return Err("Could not access native ChemDraft analysis window.".to_string());
+     };
++    configure_analysis_window_traits(window, ns_window)?;
++    if focus {
++        window.set_focus().map_err(|error| error.to_string())?;
++    }
++    // Explicit panel opens keep their existing reveal behavior; suspension restores use only
++    // orderWindow:relativeTo: in restore_utility_window instead of this app-wide orderFront.
++    ns_window.orderFront(None);
++    attach_to_main_window(window.app_handle(), ns_window);
++    Ok(())
++}
++
++#[cfg(target_os = "macos")]
++fn configure_analysis_window_traits<R: Runtime>(
++    window: &tauri::WebviewWindow<R>,
++    ns_window: &NSWindow,
++) -> Result<(), String> {
+     // Normal level + a native parent keeps the window with its document without making it globally
+     // always-on-top. It remains an ordinary focusable, movable, resizable utility surface.
+     ns_window.setLevel(NSNormalWindowLevel);
+@@ -2548,14 +2893,7 @@ fn configure_analysis_window_on_main_thread<R: Runtime>(
+     ns_window.setIgnoresMouseEvents(false);
+     window
+         .set_focusable(true)
+-        .map_err(|error| error.to_string())?;
+-    if focus {
+-        window.set_focus().map_err(|error| error.to_string())?;
+-    }
+-    // orderFront shows the window without making it key, so this is also the unfocused show.
+-    ns_window.orderFront(None);
+-    attach_to_main_window(window.app_handle(), ns_window);
+-    Ok(())
++        .map_err(|error| error.to_string())
+ }
+ 
+ /// Makes `child` a child window of the main document window again, if it is not one already.
+diff --git a/apps/desktop/src-tauri/src/utility_suspension.rs b/apps/desktop/src-tauri/src/utility_suspension.rs
+index aa95aa84f..0d9696e1f 100644
+--- a/apps/desktop/src-tauri/src/utility_suspension.rs
++++ b/apps/desktop/src-tauri/src/utility_suspension.rs
+@@ -1,5 +1,13 @@
+ use std::collections::{HashMap, HashSet};
+ 
++/// An explicit document-group anchor, never the desktop's global frontmost position.
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum RestorePlacement {
++    Below(String),
++    Above(String),
++    AboveDocument,
++}
++
+ /// Shared by native prompts and, in future, in-app modal dialogs. A suspension is temporary;
+ /// logical toolbar visibility and persisted frames must remain unchanged throughout restoration.
+ #[derive(Default)]
+@@ -9,6 +17,10 @@ pub(crate) struct UtilitySuspension {
+     restoring_windows: bool,
+     visibility: HashMap<String, bool>,
+     restore: HashSet<String>,
++    /// Original macOS parent relationships, retained through nested prompts and restore retries.
++    document_children: HashMap<String, bool>,
++    /// Bottom to top, retained for the whole cycle, including already-restored siblings.
++    restore_order: Vec<String>,
+     recovery_positions: HashMap<String, HashSet<(i32, i32)>>,
+     deferred_panels: HashMap<String, super::OpenPluginPanelRequest>,
+ }
+@@ -24,22 +36,44 @@ impl UtilitySuspension {
+ 
+     pub(crate) fn begin(
+         &mut self,
+-        windows: impl IntoIterator<Item = (String, bool, bool)>,
++        windows: impl IntoIterator<Item = (String, bool, bool, bool)>,
++        top_to_bottom: Option<Vec<String>>,
+     ) -> bool {
+         let already_active = self.active();
+         self.depth += 1;
+         if already_active {
+             return false;
+         }
+-        for (label, visible, minimized) in windows {
++        for (label, visible, minimized, was_document_child) in windows {
++            self.document_children
++                .insert(label.clone(), was_document_child);
+             self.visibility.insert(label.clone(), visible);
+             if visible && !minimized {
+-                self.restore.insert(label);
++                self.restore.insert(label.clone());
++                self.restore_order.push(label);
+             }
+         }
++        if let Some(order) = top_to_bottom {
++            let fallback = std::mem::take(&mut self.restore_order);
++            let mut seen = HashSet::new();
++            self.restore_order = order
++                .into_iter()
++                .rev()
++                .chain(fallback)
++                .filter(|label| self.restore.contains(label) && seen.insert(label.clone()))
++                .collect();
++        }
+         true
+     }
+ 
++    #[cfg(any(target_os = "macos", test))]
++    pub(crate) fn restore_as_document_child(&self, label: &str) -> bool {
++        self.document_children
++            .get(label)
++            .copied()
++            .unwrap_or_else(|| super::utility_window_has_document_parent(label))
++    }
++
+     pub(crate) fn defer_panel(&mut self, label: String, request: super::OpenPluginPanelRequest) {
+         self.defer_show(label.clone());
+         self.deferred_panels.insert(label, request);
+@@ -63,7 +97,18 @@ impl UtilitySuspension {
+     /// Enroll a requested reveal in restoration, without constructing or parenting a window.
+     pub(crate) fn defer_show(&mut self, label: String) {
+         self.visibility.insert(label.clone(), true);
+-        self.restore.insert(label);
++        if self.restore.insert(label.clone()) && !self.restore_order.contains(&label) {
++            self.restore_order.push(label);
++        }
++    }
++
++    /// A native close can hide a reusable panel rather than destroying it. Neither kind of close
++    /// should bring the window back when the prompt ends.
++    pub(crate) fn closed(&mut self, label: &str) {
++        self.restore.remove(label);
++        self.restore_order.retain(|entry| entry != label);
++        self.visibility.remove(label);
++        self.deferred_panels.remove(label);
+     }
+ 
+     /// Keep restoration active after the last prompt ends, including while the owner is minimized.
+@@ -73,7 +118,9 @@ impl UtilitySuspension {
+             self.restoring = false;
+             self.restoring_windows = false;
+             self.visibility.clear();
++            self.document_children.clear();
+             self.restore.clear();
++            self.restore_order.clear();
+             self.recovery_positions.clear();
+             self.deferred_panels.clear();
+             return None;
+@@ -90,14 +137,39 @@ impl UtilitySuspension {
+ 
+     /// Used by owner/utility restore events without releasing another prompt acquisition.
+     pub(crate) fn pending_restore(&self) -> Option<Vec<String>> {
+-        (self.depth == 0 && self.restoring && !self.restoring_windows)
+-            .then(|| self.restore.iter().cloned().collect())
++        (self.depth == 0 && self.restoring && !self.restoring_windows).then(|| {
++            self.restore_order
++                .iter()
++                .filter(|label| self.restore.contains(*label))
++                .cloned()
++                .collect()
++        })
+     }
+ 
+     pub(crate) fn start_restore(&mut self) {
+         self.restoring_windows = true;
+     }
+ 
++    /// Retries must use the original order, not just the still-pending subset. Prefer the nearest
++    /// restored sibling above us; if none is available, use the nearest below, then the owner.
++    /// The caller checks actual visibility too: a restored sibling may since have closed/minimized.
++    pub(crate) fn restore_placement(
++        &self,
++        label: &str,
++        available: impl Fn(&str) -> bool,
++    ) -> RestorePlacement {
++        if let Some(index) = self.restore_order.iter().position(|entry| entry == label) {
++            let restored = |entry: &&String| !self.restore.contains(*entry) && available(entry);
++            if let Some(above) = self.restore_order[index + 1..].iter().find(restored) {
++                return RestorePlacement::Below(above.clone());
++            }
++            if let Some(below) = self.restore_order[..index].iter().rev().find(restored) {
++                return RestorePlacement::Above(below.clone());
++            }
++        }
++        RestorePlacement::AboveDocument
++    }
++
+     pub(crate) fn restored(&mut self, label: &str) {
+         self.restore.remove(label);
+     }
+@@ -131,6 +203,8 @@ impl UtilitySuspension {
+         if self.depth == 0 && self.restore.is_empty() {
+             self.restoring = false;
+             self.visibility.clear();
++            self.document_children.clear();
++            self.restore_order.clear();
+         }
+     }
+ }
+@@ -139,19 +213,325 @@ impl UtilitySuspension {
+ mod tests {
+     use super::*;
+ 
+-    fn snapshot() -> Vec<(String, bool, bool)> {
++    #[test]
++    fn original_parent_relationship_survives_nested_prompts_and_restore_retries() {
++        let mut state = UtilitySuspension::default();
++        state.begin(
++            [
++                ("Art".into(), true, false, false),
++                ("Rings".into(), true, false, false),
++                ("panel".into(), true, false, true),
++                ("hidden-panel".into(), false, false, true),
++            ],
++            Some(vec!["Rings".into(), "panel".into(), "Art".into()]),
++        );
++        // A nested snapshot after hide has detached the panel must not overwrite its parent.
++        assert!(!state.begin([("panel".into(), false, false, false)], None));
++        assert!(state.release(false).is_none());
++        state.release(false).unwrap();
++        state.start_restore();
++        state.restored("Rings");
++        state.finish_restore();
++        assert!(!state.restore_as_document_child("Art"));
++        assert!(!state.restore_as_document_child("Rings"));
++        assert!(state.restore_as_document_child("panel"));
++        // A reusable panel closed and explicitly reopened during the cycle keeps its parent too.
++        state.closed("hidden-panel");
++        state.defer_show("hidden-panel".into());
++        assert!(state.restore_as_document_child("hidden-panel"));
++        state.defer_show("new-panel".into());
++        // Deferred enrollment does not invent an original relationship.
++        assert!(!state.document_children.contains_key("new-panel"));
++        for label in state.pending_restore().unwrap() {
++            state.restored(&label);
++        }
++        state.finish_restore();
++        assert!(!state.restore_as_document_child("panel"));
++        assert!(!state.restore_as_document_child("hidden-panel"));
++
++        // The next cycle records a fresh relationship, and quitting clears it as well.
++        state.begin([("Art".into(), true, false, true)], None);
++        assert!(state.restore_as_document_child("Art"));
++        state.release(true);
++        assert!(!state.restore_as_document_child("Art"));
++    }
++
++    #[test]
++    fn deferred_new_panel_uses_creation_parent_and_relative_sibling_order() {
++        let mut state = UtilitySuspension::default();
++        state.begin(
++            [
++                ("toolset-art".into(), true, false, false),
++                // Even an originally unparented panel keeps its recorded relationship.
++                ("plugin-panel-original".into(), true, false, false),
++            ],
++            Some(vec!["plugin-panel-original".into(), "toolset-art".into()]),
++        );
++        let panel = "plugin-panel-new";
++        let request = serde_json::from_value(serde_json::json!({
++            "panelId": "new", "title": "Analyze", "focus": true
++        }))
++        .unwrap();
++        state.defer_panel(panel.into(), request);
++        state.defer_show("toolset-new".into());
++        state.release(false).unwrap();
++        let mut stack = document_stack();
++        state.start_restore();
++        place(&mut state, &mut stack, "plugin-panel-original");
++        place(&mut state, &mut stack, "toolset-art");
++        state.finish_restore();
++        assert!(state.take_deferred_panels().unwrap().contains_key(panel));
++
++        // The deferred builder creates this panel hidden and unparented. Restoration attaches it
++        // just as normal creation would, preserving every original window's relationship.
++        assert!(!state.document_children.contains_key(panel));
++        assert!(state.restore_as_document_child(panel));
++        assert!(!state.restore_as_document_child("plugin-panel-original"));
++        assert!(!state.restore_as_document_child("toolset-art"));
++        assert!(!state.restore_as_document_child("toolset-new"));
++        assert_eq!(
++            state.restore_placement(panel, |_| true),
++            RestorePlacement::Above("plugin-panel-original".into())
++        );
++        state.start_restore();
++        place(&mut state, &mut stack, panel);
++        place(&mut state, &mut stack, "toolset-new");
++        state.finish_restore();
++        assert_eq!(
++            stack,
++            vec![
++                "foreign-dialog",
++                "foreign-app",
++                "toolset-new",
++                panel,
++                "plugin-panel-original",
++                "toolset-art",
++                "document",
++            ]
++        );
++        assert!(!state.active());
++    }
++
++    fn snapshot() -> Vec<(String, bool, bool, bool)> {
+         vec![
+-            ("toolbar".into(), true, false),
+-            ("popover".into(), true, false),
+-            ("hidden".into(), false, false),
+-            ("minimized".into(), true, true),
++            ("toolbar".into(), true, false, false),
++            ("popover".into(), true, false, false),
++            ("hidden".into(), false, false, false),
++            ("minimized".into(), true, true, false),
+         ]
+     }
+ 
++    #[test]
++    fn native_order_records_bottom_to_top_instead_of_snapshot_or_window_type_order() {
++        let mut state = UtilitySuspension::default();
++        state.begin(
++            [
++                ("toolset-rings".into(), true, false, false),
++                ("plugin-panel-report".into(), true, false, false),
++                ("toolset-art".into(), true, false, false),
++                ("hidden".into(), false, false, false),
++                ("minimized".into(), true, true, false),
++            ],
++            Some(vec![
++                "hidden".into(),
++                "toolset-rings".into(),
++                "minimized".into(),
++                "plugin-panel-report".into(),
++                "toolset-art".into(),
++            ]),
++        );
++        let expected = vec!["toolset-art", "plugin-panel-report", "toolset-rings"];
++        assert_eq!(state.release(false).unwrap(), expected);
++        // Waiting for the owner to return must not discard or reorder the snapshot.
++        state.finish_restore();
++        assert_eq!(state.pending_restore().unwrap(), expected);
++    }
++
++    /// Model relative native insertion, with another app and its dialog above the document group.
++    fn place(state: &mut UtilitySuspension, stack: &mut Vec<String>, label: &str) {
++        let placement =
++            state.restore_placement(label, |sibling| stack.iter().any(|s| s == sibling));
++        let (anchor, below) = match placement {
++            RestorePlacement::Below(sibling) => (sibling, true),
++            RestorePlacement::Above(sibling) => (sibling, false),
++            RestorePlacement::AboveDocument => ("document".into(), false),
++        };
++        stack.retain(|entry| entry != label);
++        let index = stack.iter().position(|entry| entry == &anchor).unwrap();
++        stack.insert(index + usize::from(below), label.into());
++        state.restored(label);
++    }
++
++    fn document_stack() -> Vec<String> {
++        vec![
++            "foreign-dialog".into(),
++            "foreign-app".into(),
++            "document".into(),
++        ]
++    }
++
++    #[test]
++    fn minimized_art_retry_stays_below_already_restored_rings_and_foreign_windows() {
++        let mut state = UtilitySuspension::default();
++        state.begin(
++            [
++                ("Art".into(), true, false, false),
++                ("Rings".into(), true, false, false),
++            ],
++            Some(vec!["Rings".into(), "Art".into()]),
++        );
++        state.release(false).unwrap();
++        let mut stack = document_stack();
++        state.start_restore();
++        // Art became minimized during the prompt; Rings is the only successful first-pass show.
++        place(&mut state, &mut stack, "Rings");
++        state.finish_restore();
++        assert_eq!(state.pending_restore().unwrap(), vec!["Art"]);
++        assert_eq!(
++            state.restore_placement("Art", |_| true),
++            RestorePlacement::Below("Rings".into())
++        );
++        state.start_restore();
++        place(&mut state, &mut stack, "Art");
++        state.finish_restore();
++        assert_eq!(
++            stack,
++            vec!["foreign-dialog", "foreign-app", "Rings", "Art", "document"]
++        );
++        assert!(!state.active());
++    }
++
++    #[test]
++    fn three_windows_in_two_passes_keep_order_for_every_first_pass_subset() {
++        // Cover retries above, below and between restored siblings, including two pending windows.
++        for first_pass in [
++            vec!["Top"],
++            vec!["Middle"],
++            vec!["Bottom"],
++            vec!["Top", "Middle"],
++            vec!["Top", "Bottom"],
++            vec!["Middle", "Bottom"],
++        ] {
++            let mut state = UtilitySuspension::default();
++            state.begin(
++                ["Top", "Middle", "Bottom"].map(|label| (label.into(), true, false, false)),
++                Some(vec!["Top".into(), "Middle".into(), "Bottom".into()]),
++            );
++            state.release(false).unwrap();
++            let mut stack = document_stack();
++            state.start_restore();
++            for label in first_pass {
++                place(&mut state, &mut stack, label);
++            }
++            state.finish_restore();
++            let retry = state.pending_restore().unwrap();
++            state.start_restore();
++            for label in retry.into_iter().rev() {
++                place(&mut state, &mut stack, &label);
++            }
++            state.finish_restore();
++            assert_eq!(
++                stack,
++                vec![
++                    "foreign-dialog",
++                    "foreign-app",
++                    "Top",
++                    "Middle",
++                    "Bottom",
++                    "document"
++                ]
++            );
++            assert!(!state.active());
++        }
++    }
++
++    #[test]
++    fn retry_uses_nearest_available_restored_sibling_or_document() {
++        let mut state = UtilitySuspension::default();
++        state.begin(
++            ["Top", "Middle", "Bottom"].map(|label| (label.into(), true, false, false)),
++            Some(vec!["Top".into(), "Middle".into(), "Bottom".into()]),
++        );
++        state.release(false).unwrap();
++        state.restored("Top");
++        state.restored("Bottom");
++        state.finish_restore();
++        assert_eq!(
++            state.restore_placement("Middle", |_| true),
++            RestorePlacement::Below("Top".into())
++        );
++        assert_eq!(
++            state.restore_placement("Middle", |label| label != "Top"),
++            RestorePlacement::Above("Bottom".into())
++        );
++        state.closed("Top");
++        state.closed("Bottom");
++        assert_eq!(
++            state.restore_placement("Middle", |_| true),
++            RestorePlacement::AboveDocument
++        );
++    }
++
++    #[test]
++    fn repeated_reveal_of_restored_window_keeps_its_original_position() {
++        let mut state = UtilitySuspension::default();
++        state.begin(
++            [
++                ("Art".into(), true, false, false),
++                ("Rings".into(), true, false, false),
++            ],
++            Some(vec!["Rings".into(), "Art".into()]),
++        );
++        state.release(false).unwrap();
++        state.restored("Art");
++        state.finish_restore();
++        state.defer_show("Art".into());
++        assert_eq!(state.pending_restore().unwrap(), vec!["Art", "Rings"]);
++    }
++
++    #[test]
++    fn closed_window_is_skipped_without_reordering_surviving_siblings() {
++        let mut state = UtilitySuspension::default();
++        state.begin(snapshot(), Some(vec!["toolbar".into(), "popover".into()]));
++        state.closed("popover");
++        assert_eq!(state.release(false).unwrap(), vec!["toolbar"]);
++        state.restored("toolbar");
++        state.finish_restore();
++        assert!(!state.active());
++    }
++
++    #[test]
++    fn nested_acquisition_keeps_first_order_and_deferred_reveals_come_last_once() {
++        let mut state = UtilitySuspension::default();
++        state.begin(snapshot(), Some(vec!["toolbar".into(), "popover".into()]));
++        assert!(!state.begin(snapshot(), Some(vec!["popover".into(), "toolbar".into()]),));
++        state.defer_show("late-panel".into());
++        state.defer_show("late-panel".into());
++        assert!(state.release(false).is_none());
++        assert_eq!(
++            state.release(false).unwrap(),
++            vec!["popover", "toolbar", "late-panel"]
++        );
++    }
++
++    #[test]
++    fn unavailable_order_uses_supplied_fallback_and_a_new_snapshot_replaces_old_order() {
++        let mut state = UtilitySuspension::default();
++        state.begin(snapshot(), None);
++        let labels = state.release(false).unwrap();
++        assert_eq!(labels, vec!["toolbar", "popover"]);
++        for label in labels {
++            state.restored(&label);
++        }
++        state.finish_restore();
++        state.begin(snapshot(), Some(vec!["toolbar".into(), "popover".into()]));
++        assert_eq!(state.release(false).unwrap(), vec!["popover", "toolbar"]);
++    }
++
+     #[test]
+     fn restores_only_the_original_visible_non_minimized_set() {
+         let mut state = UtilitySuspension::default();
+-        assert!(state.begin(snapshot()));
++        assert!(state.begin(snapshot(), None));
+         assert!(state.visible("toolbar", false));
+         assert!(state.visible("minimized", false));
+         assert!(!state.visible("hidden", false));
+@@ -167,8 +547,8 @@ mod tests {
+     #[test]
+     fn overlapping_dialogs_share_the_first_snapshot_and_restore_only_after_the_last() {
+         let mut state = UtilitySuspension::default();
+-        state.begin(snapshot());
+-        assert!(!state.begin([("late tooltip".into(), true, false)]));
++        state.begin(snapshot(), None);
++        assert!(!state.begin([("late tooltip".into(), true, false, false)], None));
+         assert!(state.release(false).is_none());
+         assert!(state.active());
+         let labels = state.release(false).unwrap();
+@@ -183,7 +563,7 @@ mod tests {
+     #[test]
+     fn quitting_refuses_restoration_and_discards_the_snapshot() {
+         let mut state = UtilitySuspension::default();
+-        state.begin(snapshot());
++        state.begin(snapshot(), None);
+         assert!(state.release(true).is_none());
+         assert!(!state.active());
+         assert!(state.release(false).is_none());
+@@ -193,7 +573,7 @@ mod tests {
+     fn state_save_and_pending_shows_remain_suppressed_through_monitor_recovery() {
+         let mut state = UtilitySuspension::default();
+         assert!(!state.active());
+-        state.begin(snapshot());
++        state.begin(snapshot(), None);
+         assert!(state.active());
+         let labels = state.release(false).unwrap();
+         assert!(state.active());
+@@ -207,7 +587,7 @@ mod tests {
+     #[test]
+     fn panel_requested_during_a_prompt_is_restored_even_without_an_original_window() {
+         let mut state = UtilitySuspension::default();
+-        state.begin(snapshot());
++        state.begin(snapshot(), None);
+         state.defer_show("plugin-panel-new".into());
+         assert!(state.visible("plugin-panel-new", false));
+         let labels = state.release(false).unwrap();
+@@ -225,7 +605,7 @@ mod tests {
+     #[test]
+     fn minimized_owner_keeps_obligations_until_unminimize_and_a_new_prompt_keeps_the_snapshot() {
+         let mut state = UtilitySuspension::default();
+-        state.begin(snapshot());
++        state.begin(snapshot(), None);
+         let labels = state.release(false).unwrap();
+         // No shows while the owner is minimized. Even finish_restore cannot discard that work.
+         state.finish_restore();
+@@ -233,7 +613,7 @@ mod tests {
+         assert!(state.visible("toolbar", false));
+         assert_eq!(state.pending_restore().unwrap().len(), labels.len());
+         state.defer_show("plugin-panel-late".into());
+-        assert!(!state.begin([("toolbar".into(), false, false)]));
++        assert!(!state.begin([("toolbar".into(), false, false, false)], None));
+         assert!(state.pending_restore().is_none());
+         let labels = state.release(false).unwrap();
+         assert_eq!(labels.len(), 3);
+@@ -249,7 +629,7 @@ mod tests {
+     #[test]
+     fn buffered_windows_recovery_moves_after_finish_do_not_write_toolbar_state() {
+         let mut state = UtilitySuspension::default();
+-        state.begin([("toolbar".into(), true, false)]);
++        state.begin([("toolbar".into(), true, false, false)], None);
+         state.release(false).unwrap();
+         state.start_restore();
+         state.recovery_move("toolbar", (1800, 200));
+@@ -285,7 +665,7 @@ mod tests {
+     #[test]
+     fn quitting_discards_deferred_panels_and_waiting_restoration() {
+         let mut state = UtilitySuspension::default();
+-        state.begin(snapshot());
++        state.begin(snapshot(), None);
+         state.release(false).unwrap();
+         state.defer_show("plugin-panel-late".into());
+         state.release(true);
+diff --git a/apps/desktop/src/MainWindow.tsx b/apps/desktop/src/MainWindow.tsx
+index ecc370132..bc2b92213 100644
+--- a/apps/desktop/src/MainWindow.tsx
++++ b/apps/desktop/src/MainWindow.tsx
+@@ -1625,7 +1625,7 @@ const PEN_CONTROL_DRAG_THRESHOLD_PX = 10;
+ const LASSO_POINT_SPACING_PX = 3;
+ const OBJECT_RESIZE_MIN_SCALE = 0.12;
+ const DOCUMENT_OBJECT_LAYER_OFFSET = 20;
+-const CURRENT_BUILD_STAMP = "10.13.13.05-opus";
++const CURRENT_BUILD_STAMP = "10.13.17.25-opus";
+ /** Whether this page load already asked the native side for a crash note from the last run. */
+ let pendingCrashNoteChecked = false;
+ const SELECTION_CLIPBOARD_PASTE_OFFSET_PX = 24;
